@@ -1,0 +1,7 @@
+**target
+Cargo.lock
+plugins_compiled
+perf*
+flamegraph*
+**.db*
+log*
