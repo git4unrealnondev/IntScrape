@@ -1,11 +1,12 @@
 use std::{
     collections::HashMap,
-    fs, i32,
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use libloading::{Library, Symbol};
+use bytes::Bytes;
+use libloading::Library;
 
 use log::*;
 use parking_lot::RwLock;
@@ -163,7 +164,7 @@ impl PluginManager {
                 ) -> Vec<shared_types::ScraperReturn>,
             > = {
                 unsafe {
-                    match scraper_library.get(b"parser\0") {
+                    match scraper_library.get(b"parser_call") {
                         Err(err) => {
                             return vec![shared_types::ScraperReturn::Stop(
                                 "Missing parser block in scraper".to_string(),
@@ -178,4 +179,9 @@ impl PluginManager {
             vec![shared_types::ScraperReturn::Nothing]
         }
     }
+
+    ///
+    /// After file downloading run callbacks for on_download
+    ///
+    pub fn callback_on_download(&self, data: Bytes) {}
 }

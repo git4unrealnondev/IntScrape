@@ -40,12 +40,19 @@ fn setup_log() {
 async fn main() {
     setup_log();
 
+    let heavy_processing_pool = Arc::new(rayon::ThreadPoolBuilder::new().build().unwrap());
+
     let db = MainDatabase::new(Path::new(DB_PATH));
 
     let plugin_manager = PluginManager::new(Path::new(PLUGINS_PATH), db.clone());
 
-    let download_manager = DownloadsManager::new(db.clone(), plugin_manager.clone());
+    let download_manager = DownloadsManager::new(
+        db.clone(),
+        plugin_manager.clone(),
+        heavy_processing_pool.clone(),
+    );
 
+    // Does the CLI input processing
     cli::main(db.clone()).await;
 
     // Handles adding jobs into system

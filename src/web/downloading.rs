@@ -54,6 +54,9 @@ impl Scraper {
             let mut client = reqwest::ClientBuilder::new()
                 .pool_max_idle_per_host(100)
                 .user_agent(&useragent)
+                .cookie_store(false)
+                .gzip(true)
+                .deflate(true)
                 .connect_timeout(std::time::Duration::from_secs(15))
                 .timeout(std::time::Duration::from_secs(120));
 
@@ -73,7 +76,7 @@ impl Scraper {
     ///
     /// Downloads text into the client
     ///
-    pub(in crate::web) async fn dltext(&self, input_url: ScraperParam) -> Option<String> {
+    pub(in crate::web) async fn dltext(&self, input_url: ScraperParam) -> Option<(String, String)> {
         let url;
         let post_data;
         let mut cnt = 0;
@@ -110,7 +113,11 @@ impl Scraper {
             );
 
             let futureresult = match post_data {
-                None => self.text_client.get(url.clone()).send(),
+                None => self
+                    .text_client
+                    .get(url.clone())
+                    .header("Accept", "application/json")
+                    .send(),
                 Some(ref post_data_string) => self
                     .text_client
                     .post(url.clone())
@@ -136,15 +143,22 @@ impl Scraper {
 
                             cnt += 1;
                             continue;
-                        } else {
-                            match res.text().await {
-                                Ok(text) => {
-                                    return Some(text);
-                                }
-                                Err(_) => {
-                                    cnt += 1;
-                                    continue;
-                                }
+                        }
+                    } else {
+                        match res.text().await {
+                            Ok(text) => {
+                                return Some((text, url.as_str().to_string()));
+                            }
+                            Err(err) => {
+                                log::error!(
+                                    "Worker: {} JobId: {} -- While processing job {:?} had some error {:?}",
+                                    &self.plugin.name,
+                                    &self.job.id,
+                                    &url,
+                                    err
+                                );
+                                cnt += 1;
+                                continue;
                             }
                         }
                     }
@@ -164,6 +178,14 @@ impl Scraper {
 
                         cnt += 1;
                         continue;
+                    } else {
+                        log::error!(
+                            "Worker: {} JobId: {} -- While processing job {:?} was unable to download text. Had err {:?} ",
+                            &self.plugin.name,
+                            &self.job.id,
+                            &url,
+                            err,
+                        );
                     }
                 }
             }

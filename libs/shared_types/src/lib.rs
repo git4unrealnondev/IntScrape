@@ -22,7 +22,7 @@ pub struct UrlPost {
     // any post data to send if needed
     pub post_data: String,
 }
-#[derive(Deserialize, Debug, Serialize, Clone, PartialEq)]
+#[derive(Deserialize, Debug, Serialize, Clone, PartialEq, Eq, Hash)]
 pub enum ScraperParam {
     // User defined params like search terms
     Normal(String),
@@ -39,7 +39,7 @@ pub enum ScraperParam {
 ///
 /// Gets passed around to plugins will try and not change this too to much
 ///
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, Eq, Hash, PartialEq)]
 pub struct PluginJob {
     // Time to run job. 0 for immediate
     pub time: u64,
@@ -58,7 +58,7 @@ pub struct PluginJob {
 ///
 /// Used as a return from a plugin when doing text scraping
 ///
-#[derive(Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq, Debug)]
 pub enum ScraperReturn {
     // Valid data from the system
     Data(ScraperObject),
@@ -74,25 +74,25 @@ pub enum ScraperReturn {
     // Sends job back into queue with x waiting time
     RetryLater(Duration),
 }
-#[derive(Default, Clone, PartialEq)]
+#[derive(Default, Clone, PartialEq, Debug)]
 pub struct ScraperObject {
     pub files: HashSet<FileObject>,
-    //pub tags: HashSet<TagObject>,
-    //pub jobs: HashSet<ScraperDataReturn>,
+    pub tags: HashSet<PluginTag>,
+    pub jobs: HashSet<ScraperDataReturn>,
     //pub flags: Vec<ScraperFlags>,
 }
 
 ///
 /// What to do for a list of tags when they come in
 ///
-#[derive(Default, Clone, PartialEq, Eq, Hash)]
+#[derive(Default, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum TagOperation {
     #[default]
     Add,
     Del,
     Set,
 }
-#[derive(Default, Clone, PartialEq, Eq, Hash)]
+#[derive(Default, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct FileTagAction {
     pub operation: TagOperation,
     pub tags: Vec<PluginTag>,
@@ -100,7 +100,7 @@ pub struct FileTagAction {
 
 /// Represents one file
 /// Current version of FileObject
-#[derive(Default, Clone, PartialEq, Eq, Hash)]
+#[derive(Default, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct FileObject {
     pub source: Option<FileSource>,
     // Hash of file
@@ -110,13 +110,21 @@ pub struct FileObject {
     pub skip_if: Vec<SkipIf>,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Default, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct FileInternal {
+    pub id: Option<u64>,
+    pub hash: String,
+    pub ext: String,
+    pub storage_id: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum FileSource {
     Url(String),
     Bytes(Vec<u8>),
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum HashesSupported {
     Md5(String),
     Sha1(String),
@@ -134,7 +142,7 @@ pub struct DbJobsObj {
     pub config: PluginJob,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Eq, Hash, PartialEq)]
 pub struct ScraperDataReturn {
     pub job: PluginJob,
     pub skip_conditions: Vec<SkipIf>,
@@ -296,7 +304,7 @@ pub struct NamespaceProperty {
     pub description: Option<String>,
 }
 
-#[derive(Default, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Default, Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum TagType {
     #[default]
     Normal,
@@ -310,7 +318,7 @@ pub struct Tag {
     pub namespace: GenericNamespaceObj,
 }
 
-#[derive(Default, Clone, PartialEq, Eq, Hash)]
+#[derive(Default, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct PluginTag {
     /// Use composition: A TagObject *has* a fundamental Tag definition
     pub tag: Tag,
@@ -318,7 +326,7 @@ pub struct PluginTag {
     pub relates_to: Option<RelationContext>,
 }
 
-#[derive(Default, Clone, PartialEq, Eq, Hash)]
+#[derive(Default, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct RelationContext {
     pub tag: Tag,
     pub tag_type: TagType,

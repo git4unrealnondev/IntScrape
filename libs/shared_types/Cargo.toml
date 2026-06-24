@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 redact = { git = "https://github.com/git4unrealnondev/redact", features = ["serde", "bitcode"] }
-bitcode = { version = "0.6.9", features = ["arrayvec", "derive", "serde"] }
+#bitcode = { version = "0.6.9", features = ["arrayvec", "derive", "serde"] }
 
 [features]
 default = ["exe_build"]

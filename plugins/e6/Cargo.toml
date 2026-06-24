@@ -7,4 +7,6 @@ edition = "2024"
 crate-type = ["cdylib"] 
 
 [dependencies]
+chrono = "0.4.45"
+jsonic = "0.2.14"
 shared_types = { workspace = true }
