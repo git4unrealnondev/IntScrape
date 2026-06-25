@@ -7,13 +7,12 @@ edition = "2024"
 fast_log = "1.7.8"
 log = "0.4.33"
 r2d2 = "0.8.10"
-r2d2_sqlite = { version = "*", features = ["bundled"] }
-reqwest = {version = "0.12.22", features=["cookies", "gzip", "deflate", "default", "native-tls"]}
+r2d2_sqlite = { version = "*", default-features=false, features = [] }
+reqwest = {version = "0.12.22", default-features=false,features=["cookies", "gzip", "deflate", "default", "native-tls"]}
 #serde = { version = "1.0.228", features = ["derive"] }
 serde_rusqlite = "*"
-tokio = { version = "1.52.3", features = ["full"] }
+tokio = { version = "1.52.3", default-features=false, features = ["rt-multi-thread", "fs"] }
 shared_types = {path = "./libs/shared_types"}
-ipc_macro = { path = "libs/ipc_macro" }
 #redact = { git = "https://github.com/git4unrealnondev/redact", features = ["serde", "bitcode"] }
 libloading = "0.9.0"
 parking_lot = "0.12.5"
@@ -29,14 +28,15 @@ sha1 = "0.11.0"
 md5 = "0.8.0"
 hex = "0.4.3"
 rayon = "1.12.0"
-rusqlite = { version = "*", features = ["trace"] }
+rusqlite = { version = "*",default-features=false, features = ["trace"] }
+console-subscriber = "0.5.0"
+dhat = "0.3.3"
 
 [workspace.dependencies]
 shared_types = { path = "./libs/shared_types" }
 
 [workspace]
 members = [
-#"libs/ipc_macro",
     "plugins/*"
 ]
 
@@ -51,3 +51,7 @@ strip = true
 inherits = "release"
 debug = true
 strip = false
+
+[features]
+dhat-heap = []    # if you are doing heap profiling
+dhat-ad-hoc = []  # if you are doing ad hoc profiling

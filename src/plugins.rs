@@ -165,7 +165,7 @@ impl PluginManager {
             > = {
                 unsafe {
                     match scraper_library.get(b"parser_call") {
-                        Err(err) => {
+                        Err(_err) => {
                             return vec![shared_types::ScraperReturn::Stop(
                                 "Missing parser block in scraper".to_string(),
                             )];
@@ -183,5 +183,5 @@ impl PluginManager {
     ///
     /// After file downloading run callbacks for on_download
     ///
-    pub fn callback_on_download(&self, data: Bytes) {}
+    pub fn callback_on_download(&self, _data: Bytes) {}
 }

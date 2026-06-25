@@ -110,11 +110,11 @@ pub struct FileObject {
     pub skip_if: Vec<SkipIf>,
 }
 
-#[derive(Default, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Default, Clone, PartialEq, Eq, Hash, Debug, Deserialize)]
 pub struct FileInternal {
     pub id: Option<u64>,
     pub hash: String,
-    pub ext: String,
+    pub extension: String,
     pub storage_id: u64,
 }
 
@@ -288,7 +288,7 @@ pub enum SearchType {
 ///
 /// Holds namespace info
 ///
-#[derive(Hash, Eq, PartialEq, Clone, Default, Debug)]
+#[derive(Hash, Eq, PartialEq, Clone, Default, Debug, Deserialize)]
 pub struct GenericNamespaceObj {
     pub name: String,
     pub description: Option<String>,

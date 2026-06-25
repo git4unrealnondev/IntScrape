@@ -1,7 +1,9 @@
 use core::{convert::Into, option::Option::Some};
+use log::info;
+use parking_lot::RwLock;
 use r2d2::Pool;
 use r2d2_sqlite::{SqliteConnectionManager, rusqlite::Connection};
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use crate::{Arc, DB_VERSION};
 
@@ -9,6 +11,7 @@ pub mod main;
 
 pub struct MainDatabase {
     pool: Pool<SqliteConnectionManager>,
+    namespace_cache: Arc<RwLock<HashMap<String, u64>>>,
 }
 
 impl Drop for MainDatabase {
@@ -27,7 +30,7 @@ impl MainDatabase {
     pub fn new(db_path: &Path) -> Arc<Self> {
         let manager = SqliteConnectionManager::file(db_path).with_init(|c| {
             c.trace(Some(|statement: &str| {
-                println!("Executing SQL: {}", statement);
+                info!("Executing SQL: {}", statement);
             }));
 
             c.execute_batch(
@@ -47,11 +50,35 @@ PRAGMA cache_size = -64000;
             .build(manager)
             .expect("Failed to create pool");
 
-        let main_db: Arc<MainDatabase> = MainDatabase { pool }.into();
+        let main_db: Arc<MainDatabase> = MainDatabase {
+            pool,
+            namespace_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+        .into();
 
         main_db.check_db().unwrap();
 
+        main_db.load_cache();
+
         main_db
+    }
+
+    ///
+    /// Sets up the the namespace cache.
+    /// Im assuming that theirs going to be relatively small of these. Less then 1k
+    ///
+    fn load_cache(&self) {
+        let conn = self.pool.get().unwrap();
+        for ns_id in 1..u64::MAX {
+            match Self::internal_namespace_get_generic(&conn, &ns_id) {
+                None => {
+                    break;
+                }
+                Some(namespace) => {
+                    self.namespace_cache.write().insert(namespace.name, ns_id);
+                }
+            }
+        }
     }
 
     /// Checks to see if the DB exists

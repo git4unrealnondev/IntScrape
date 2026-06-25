@@ -1,8 +1,10 @@
 **target
 Cargo.lock
-plugins_compiled
+plugins_compiled/*
 perf*
 flamegraph*
 **.db*
 log*
 files
+compiled_plugins
+*.json

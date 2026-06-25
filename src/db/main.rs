@@ -1,12 +1,10 @@
+use log::info;
 use r2d2_sqlite::rusqlite::OptionalExtension;
 use r2d2_sqlite::rusqlite::{self, Connection, Row, params};
 use rusqlite::ToSql;
 use shared_types::*;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    time::SystemTime,
-};
 
 use crate::{db::MainDatabase, helper_functions::get_sys_time_in_secs};
 
@@ -122,7 +120,7 @@ END;
         conn.execute_batch(
             "
 CREATE TABLE IF NOT EXISTS Tags (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, 
+    id INTEGER PRIMARY KEY , 
     name TEXT NOT NULL, 
     namespace INTEGER NOT NULL, 
     count INTEGER NOT NULL DEFAULT 0, 
@@ -146,7 +144,7 @@ CREATE INDEX IF NOT EXISTS idx_tags_namespace ON Tags(namespace);
         conn.execute_batch(
             "
 CREATE TABLE IF NOT EXISTS Namespace (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, 
+    id INTEGER PRIMARY KEY , 
     name TEXT NOT NULL UNIQUE, 
     description TEXT
 );
@@ -180,7 +178,7 @@ CREATE TABLE IF NOT EXISTS Settings (
         conn.execute_batch(
             "
 CREATE TABLE IF NOT EXISTS Parents (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id INTEGER PRIMARY KEY ,
     tag_id INTEGER NOT NULL,
     relate_tag_id INTEGER NOT NULL,
     limit_to INTEGER,
@@ -208,7 +206,7 @@ CREATE INDEX IF NOT EXISTS idx_parents ON Parents (tag_id, relate_tag_id, limit_
     ///
     pub(in crate::db) fn internal_table_create_file_storage_locations_v1(conn: &Connection) {
         conn.execute_batch("
-CREATE TABLE IF NOT EXISTS FileStorageLocations (id INTEGER PRIMARY KEY AUTOINCREMENT, location TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS FileStorageLocations (id INTEGER PRIMARY KEY , location TEXT NOT NULL UNIQUE);
 
 ").unwrap();
     }
@@ -254,7 +252,7 @@ CREATE TABLE IF NOT EXISTS FileStorageLocations (id INTEGER PRIMARY KEY AUTOINCR
     ///
     pub(in crate::db) fn internal_table_create_file_v1(conn: &Connection) {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS File 
-            (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, 
+            (id INTEGER PRIMARY KEY  NOT NULL, 
             hash TEXT UNIQUE, 
             extension TEXT, 
             storage_id INTEGER, 
@@ -278,7 +276,7 @@ CREATE INDEX IF NOT EXISTS idx_file_hash ON File (hash);
         conn.execute_batch(
             "
 CREATE TABLE IF NOT EXISTS Jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, 
+    id INTEGER PRIMARY KEY  NOT NULL, 
     time INTEGER NOT NULL, 
     reptime INTEGER NOT NULL, 
     priority INTEGER NOT NULL,  
@@ -317,6 +315,23 @@ ON Jobs (time, reptime, site, param);
             Ok(None)
         }
     }
+
+    ///
+    /// Gets a file if its id exists in db
+    ///
+    pub(in crate::db) fn internal_file_id_get(
+        conn: &Connection,
+        file_id: &u64,
+    ) -> Result<FileInternal, rusqlite::Error> {
+        conn.query_row(
+            "SELECT id, hash, extension, storage_id FROM File WHERE id = ?1 LIMIT 1",
+            [file_id],
+            |row| {
+                serde_rusqlite::from_row::<FileInternal>(row)
+                    .map_err(|_| rusqlite::Error::ExecuteReturnedResults)
+            },
+        )
+    }
     ///
     /// Checks if we should download a file
     ///
@@ -328,6 +343,220 @@ ON Jobs (time, reptime, site, param);
         }
 
         true
+    }
+
+    ///
+    /// Gets a single fileid from a tag
+    ///
+    pub(in crate::db) fn internal_tag_get_fileid(conn: &Connection, tag: &Tag) -> Option<u64> {
+        if let Some(ns_id) = Self::internal_namespace_get_id(conn, &tag.namespace.name) {
+            if let Some(ref tag_id) = Self::internal_tag_get_id(conn, &tag.name, ns_id) {
+                return Self::internal_tag_id_get_file_id(conn, tag_id).ok();
+            }
+        }
+
+        None
+    }
+
+    ///
+    /// Gets a single file_internal from a tag
+    ///
+    pub(in crate::db) fn internal_tag_get_fileinternal(
+        conn: &Connection,
+        tag: &Tag,
+    ) -> Option<FileInternal> {
+        if let Some(ns_id) = Self::internal_namespace_get_id(conn, &tag.namespace.name)
+            && let Some(ref tag_id) = Self::internal_tag_get_id(conn, &tag.name, ns_id)
+            && let Ok(ref file_id) = Self::internal_tag_id_get_file_id(conn, tag_id)
+        {
+            return Self::internal_file_id_get(conn, file_id).ok();
+        }
+
+        None
+    }
+
+    ///
+    /// Gets a fileid from a tag_id
+    ///
+    pub(in crate::db) fn internal_tag_id_get_file_id(
+        conn: &Connection,
+        tag_id: &u64,
+    ) -> Result<u64, rusqlite::Error> {
+        conn.query_row(
+            "SELECT file_id FROM Relationship WHERE tag_id = ?1 LIMIT 1;",
+            params![tag_id],
+            |row| row.get(0),
+        )
+    }
+
+    ///
+    /// Gets tag_ids for file_ids
+    ///
+    pub(in crate::db) fn internal_file_id_get_tag_ids(
+        conn: &Connection,
+        file_id: &u64,
+    ) -> Result<HashSet<u64>, rusqlite::Error> {
+        let mut stmt = conn
+            .prepare("SELECT tag_id FROM Relationship where file_id = ?1;")
+            .unwrap();
+        let mut out = HashSet::new();
+        for tag_id in stmt.query_map([file_id], |row| row.get(0))?.flatten() {
+            out.insert(tag_id);
+        }
+
+        Ok(out)
+    }
+    ///
+    /// Builds a list of file -> tagid maps
+    ///
+    pub(in crate::db) fn internal_file_id_get_tag_ids_bulk(
+        conn: &Connection,
+        file_ids: &[u64],
+    ) -> Result<HashMap<u64, HashSet<u64>>, rusqlite::Error> {
+        let mut out: HashMap<u64, HashSet<u64>> = HashMap::new();
+        if file_ids.is_empty() {
+            return Ok(out);
+        }
+
+        // Build query: SELECT file_id, tag_id FROM Relationship WHERE file_id IN (?, ?, ...)
+        let mut query = String::from("SELECT file_id, tag_id FROM Relationship WHERE ");
+        let mut params_vector: Vec<&dyn rusqlite::types::ToSql> =
+            Vec::with_capacity(file_ids.len());
+
+        for (i, id) in file_ids.iter().enumerate() {
+            if i > 0 {
+                query.push_str(" OR ");
+            }
+            query.push_str(&format!("file_id = ?{}", i + 1));
+            params_vector.push(id);
+        }
+
+        let mut stmt = conn.prepare(&query)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params_vector))?;
+
+        while let Some(row) = rows.next()? {
+            let f_id: u64 = row.get(0)?;
+            let t_id: u64 = row.get(1)?;
+            out.entry(f_id).or_default().insert(t_id);
+        }
+
+        Ok(out)
+    }
+
+    pub(in crate::db) fn internal_tag_id_get_tag(
+        conn: &Connection,
+        tags: &HashSet<u64>,
+    ) -> HashMap<u64, Tag> {
+        let mut out = HashMap::new();
+
+        if tags.is_empty() {
+            return out;
+        }
+
+        // 1️⃣ Convert HashSet to a Vec for predictable ordering during mapping
+        let tag_ids: Vec<&u64> = tags.iter().collect();
+
+        // 2️⃣ Build a dynamic query containing query parameters: (?1, ?2, ?3...)
+        let mut query = String::from(
+            "SELECT t.id, t.name, n.name, n.description \
+         FROM Tags t \
+         JOIN Namespace n ON t.namespace = n.id \
+         WHERE t.id IN (",
+        );
+
+        let mut params_vector: Vec<&dyn ToSql> = Vec::with_capacity(tag_ids.len());
+
+        for (i, &id) in tag_ids.iter().enumerate() {
+            if i > 0 {
+                query.push_str(", ");
+            }
+            query.push_str(&format!("?{}", i + 1));
+            params_vector.push(id);
+        }
+        query.push(')');
+
+        // 3️⃣ Prepare the statement and map rows back into your structs
+        let mut stmt = conn.prepare(&query).unwrap();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(params_vector))
+            .unwrap();
+
+        while let Some(row) = rows.next().unwrap() {
+            let id: u64 = row.get(0).unwrap();
+            let tag_name: String = row.get(1).unwrap();
+            let namespace_name: String = row.get(2).unwrap();
+            let namespace_desc: Option<String> = row.get(3).unwrap();
+
+            let tag = Tag {
+                name: tag_name,
+                namespace: GenericNamespaceObj {
+                    name: namespace_name,
+                    description: namespace_desc,
+                },
+            };
+
+            out.insert(id, tag);
+        }
+
+        out
+    }
+
+    ///
+    /// Gets tags for file_ids
+    ///
+    pub(in crate::db) fn internal_file_ids_get_tags(
+        conn: &Connection,
+        file_ids: &HashSet<u64>,
+    ) -> HashMap<u64, HashSet<Tag>> {
+        let mut out: HashMap<u64, HashSet<Tag>> = HashMap::new();
+        if file_ids.is_empty() {
+            return out;
+        }
+
+        let file_id_vec: Vec<&u64> = file_ids.iter().collect();
+
+        // 1️⃣ Build a bulk query selecting relationships joined with Tags and Namespaces
+        let mut query = String::from(
+            "SELECT r.file_id, t.id, t.name, n.name, n.description \
+         FROM Relationship r \
+         JOIN Tags t ON r.tag_id = t.id \
+         JOIN Namespace n ON t.namespace = n.id \
+         WHERE r.file_id IN (",
+        );
+
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(file_id_vec.len());
+        for (i, &id) in file_id_vec.iter().enumerate() {
+            if i > 0 {
+                query.push_str(", ");
+            }
+            query.push_str(&format!("?{}", i + 1));
+            params.push(id);
+        }
+        query.push(')');
+
+        let mut stmt = conn.prepare(&query).unwrap();
+        let mut rows = stmt.query(rusqlite::params_from_iter(params)).unwrap();
+
+        // 2️⃣ Hydrate the nested data maps
+        while let Some(row) = rows.next().unwrap() {
+            let file_id: u64 = row.get(0).unwrap();
+            let _tag_id: u64 = row.get(1).unwrap(); // available if you ever need it
+            let tag_name: String = row.get(2).unwrap();
+            let namespace_name: String = row.get(3).unwrap();
+            let namespace_desc: Option<String> = row.get(4).unwrap();
+
+            let tag = Tag {
+                name: tag_name,
+                namespace: GenericNamespaceObj {
+                    name: namespace_name,
+                    description: namespace_desc,
+                },
+            };
+
+            out.entry(file_id).or_default().insert(tag);
+        }
+
+        out
     }
 
     ///
@@ -348,7 +577,7 @@ ON Jobs (time, reptime, site, param);
     ///
     pub(in crate::db) fn internal_tag_has_files(conn: &Connection, tag_id: u64) -> bool {
         let mut stmt = conn
-            .prepare_cached("SELECT EXISTS(SELECT 1 FROM Relationships WHERE tag_id = ?1)")
+            .prepare("SELECT EXISTS(SELECT 1 FROM Relationship WHERE tag_id = ?1)")
             .unwrap();
 
         stmt.query_row(params![tag_id], |row| row.get(0))
@@ -364,7 +593,7 @@ ON Jobs (time, reptime, site, param);
         namespace_id: u64,
     ) -> Option<u64> {
         let mut stmt = conn
-            .prepare_cached("SELECT id FROM Tags WHERE name = ?1 AND namespace = ?2")
+            .prepare("SELECT id FROM Tags WHERE name = ?1 AND namespace = ?2")
             .unwrap();
 
         stmt.query_row(params![name, namespace_id], |row| row.get(0))
@@ -380,12 +609,33 @@ ON Jobs (time, reptime, site, param);
         namespace_name: &str,
     ) -> Option<u64> {
         let mut stmt = conn
-            .prepare_cached("SELECT id FROM Namespaces WHERE name = ?1")
+            .prepare("SELECT id FROM Namespace WHERE name = ?1")
             .unwrap();
 
         stmt.query_row(params![namespace_name], |row| row.get(0))
             .optional() // Crucial: converts an Err(QueryReturnedNoRows) into Ok(None)
             .unwrap()
+    }
+
+    ///
+    /// Gets all namespace objects
+    ///
+    pub(in crate::db) fn internal_namespace_get_generic(
+        conn: &Connection,
+        ns_id: &u64,
+    ) -> Option<GenericNamespaceObj> {
+        let mut stmt = conn
+            .prepare("SELECT name, description FROM Namespace WHERE id = ?1;")
+            .unwrap();
+
+        stmt.query_row(params![ns_id], |row| {
+            Ok(GenericNamespaceObj {
+                name: row.get(0).unwrap(),
+                description: row.get(1).unwrap(),
+            })
+        })
+        .optional()
+        .unwrap()
     }
 
     ///
@@ -396,7 +646,7 @@ ON Jobs (time, reptime, site, param);
         namespace: &GenericNamespaceObj,
     ) -> u64 {
         let mut stmt = conn
-            .prepare_cached(
+            .prepare(
                 "INSERT INTO Namespace (name, description) VALUES (?1, ?2)
              ON CONFLICT(name) DO UPDATE SET description = excluded.description
              RETURNING id",
@@ -464,6 +714,7 @@ ON Jobs (time, reptime, site, param);
         conn: &Connection,
         job_id: u64,
     ) -> Result<(), rusqlite::Error> {
+        info!("JobId: {} Is being removed.", job_id);
         conn.execute("DELETE FROM Jobs WHERE id IS ?1;", params![job_id])
             .unwrap();
 
@@ -478,7 +729,7 @@ ON Jobs (time, reptime, site, param);
         site: &str,
     ) -> Result<Vec<shared_types::DbJobsObj>, rusqlite::Error> {
         // Select all jobs matching the given site
-        let mut stmt = conn.prepare_cached(
+        let mut stmt = conn.prepare(
             "SELECT id, time, reptime, priority, manager, site, param, user_data, is_running 
          FROM Jobs 
          WHERE site = ?1;",
@@ -498,7 +749,7 @@ ON Jobs (time, reptime, site, param);
 
     pub(in crate::db) fn internal_jobs_add(conn: &Connection, config: &PluginJob) -> u64 {
         let mut stmt = conn
-            .prepare_cached(
+            .prepare(
                 "INSERT INTO Jobs (time, reptime, priority, manager, site, param, user_data) 
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
 
@@ -541,8 +792,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         conn: &Connection,
     ) -> Result<Vec<String>, rusqlite::Error> {
         // Use DISTINCT so SQLite handles deduplication natively at the engine level
-        let mut stmt =
-            conn.prepare_cached("SELECT DISTINCT site FROM Jobs WHERE site IS NOT NULL;")?;
+        let mut stmt = conn.prepare("SELECT DISTINCT site FROM Jobs WHERE site IS NOT NULL;")?;
 
         // Map each row directly to a String extraction
         let site_iter = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -825,6 +1075,37 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     }
 
     ///
+    /// Deletes relationships from db
+    ///
+    pub(in crate::db) fn internal_relationship_bulk_delete(
+        conn: &Connection,
+        relationships: &HashSet<(u64, u64)>,
+    ) {
+        if relationships.is_empty() {
+            return;
+        }
+
+        let rel_vec: Vec<&(u64, u64)> = relationships.iter().collect();
+        let mut query = String::from("DELETE FROM Relationship WHERE ");
+        let mut params_vector: Vec<&dyn rusqlite::types::ToSql> =
+            Vec::with_capacity(rel_vec.len() * 2);
+
+        for (i, rel) in rel_vec.iter().enumerate() {
+            if i > 0 {
+                query.push_str(" OR ");
+            }
+            query.push_str(&format!(
+                "(file_id = ?{} AND tag_id = ?{})",
+                i * 2 + 1,
+                i * 2 + 2
+            ));
+            params_vector.push(&rel.0);
+            params_vector.push(&rel.1);
+        }
+
+        conn.execute(&query, &*params_vector).unwrap();
+    }
+    ///
     /// Bulk adds relationship into DB
     ///
     pub(in crate::db) fn internal_relationship_bulk_add(
@@ -912,9 +1193,9 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     ///
     pub(in crate::db) fn internal_file_bulk_add(
         conn: &Connection,
-        parents: &HashSet<shared_types::FileInternal>,
-    ) -> HashMap<shared_types::FileInternal, u64> {
-        let mut out = HashMap::new();
+        parents: HashSet<shared_types::FileInternal>,
+    ) -> HashSet<shared_types::FileInternal> {
+        let mut out = HashSet::new();
 
         if parents.is_empty() {
             return out;
@@ -933,7 +1214,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             }
             query.push_str(&format!("(?{}, ?{}, ?{})", i * 3 + 1, i * 3 + 2, i * 3 + 3));
             params_vector.push(&parent.hash);
-            params_vector.push(&parent.ext);
+            params_vector.push(&parent.extension);
             params_vector.push(&parent.storage_id);
         }
 
@@ -953,10 +1234,10 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
 
         let mut idx = 0;
         while let Some(row) = rows.next().unwrap() {
-            let parent_id: u64 = row.get(0).unwrap();
-            let parent_obj = parents_vec[idx];
+            let mut parent_obj = parents_vec[idx].clone();
+            parent_obj.id = row.get(0).ok();
 
-            out.insert((*parent_obj).clone(), parent_id);
+            out.insert(parent_obj);
             idx += 1;
         }
 
@@ -1002,6 +1283,181 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     }
 
     ///
+    /// Handles all the processing for files and tags and relational items
+    ///
+    pub async fn process_filetags(&self, map: HashMap<FileInternal, Vec<FileTagAction>>) {
+        // Early Exit
+        if map.is_empty() {
+            return;
+        }
+
+        let pool = self.pool.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut conn = match pool.get() {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("Failed to acquire DB connection from pool: {:?}", e);
+                    panic!();
+                }
+            };
+            let conn = conn.transaction().unwrap();
+
+            let unique_files: HashSet<FileInternal> = map.keys().cloned().collect();
+            let resolved_files = Self::internal_file_bulk_add(&conn, unique_files);
+
+            // Build a quick, zero-allocation lookup mapping: FileInternal -> Database u64 ID
+            let mut file_cache = HashMap::with_capacity(resolved_files.len());
+            for file in &resolved_files {
+                if let Some(db_id) = file.id {
+                    file_cache.insert(file.hash.clone(), db_id);
+                }
+            }
+
+            // 3️⃣ Step 2: Extract and Bulk Insert/Resolve All Tags
+            // Collect all action definitions across every file block into one flat vector
+            let all_tag_actions: Vec<FileTagAction> = map.values().flatten().cloned().collect();
+
+            // This function automatically creates missing namespaces, inserts tags on conflict,
+            // resolves structural parent trees, and returns a direct Tag -> u64 ID map
+            let tag_cache = Self::internal_tag_bulk_add(&conn, &all_tag_actions);
+
+            // 4️⃣ Step 3: Fetch Current File Relationships State
+            // (Assuming you have an internal helper to look up existing Tags associated with file IDs)
+            let file_ids: Vec<u64> = file_cache.values().copied().collect();
+            let current_file_relationships =
+                Self::internal_file_id_get_tag_ids_bulk(&conn, &file_ids).unwrap();
+
+            // 5️⃣ Step 4: Calculate Relationship Deltas (Hoisted Buffer Logic)
+            let mut rels_to_add = HashSet::new();
+            let mut rels_to_del = HashSet::new();
+
+            let mut current_ns_tags: HashMap<&str, HashSet<u64>> = HashMap::new();
+            let mut incoming_ns_tags: HashMap<&str, HashSet<u64>> = HashMap::new();
+            let mut explicit_adds = HashSet::new();
+            let mut set_deletions = HashSet::new();
+
+            let mut tag_id_to_obj = HashMap::with_capacity(tag_cache.len());
+            for (tag_obj, &tag_id) in &tag_cache {
+                tag_id_to_obj.insert(tag_id, tag_obj);
+            }
+
+            for (file_internal, tag_list) in map.iter() {
+                let file_id = match file_cache.get(&file_internal.hash) {
+                    Some(&id) => id,
+                    None => continue,
+                };
+
+                current_ns_tags.clear();
+                explicit_adds.clear();
+                set_deletions.clear();
+
+                // Map current database state for this file: Namespace (&str) -> HashSet<TagId>
+                if let Some(current_tag_ids) = current_file_relationships.get(&file_id) {
+                    for &tag_id in current_tag_ids {
+                        // Instantly resolve the full Tag object using the raw ID
+                        if let Some(tag) = tag_id_to_obj.get(&tag_id) {
+                            let ns_name = &tag.namespace.name;
+
+                            if ns_name != "source_url" && !ns_name.is_empty() {
+                                current_ns_tags
+                                    .entry(ns_name.as_str()) // Zero allocations!
+                                    .or_default()
+                                    .insert(tag_id);
+                            }
+                        }
+                    }
+                }
+                // Process operations
+                for tag_action in tag_list {
+                    match tag_action.operation {
+                        TagOperation::Add => {
+                            for tag in &tag_action.tags {
+                                if matches!(tag.tag_type, TagType::Normal | TagType::NormalNoRegex)
+                                {
+                                    if let Some(&tag_id) = tag_cache.get(&tag.tag) {
+                                        rels_to_add.insert((file_id, tag_id));
+                                        explicit_adds.insert(tag_id);
+                                    }
+                                }
+                            }
+                        }
+                        TagOperation::Del => {
+                            for tag in &tag_action.tags {
+                                if matches!(tag.tag_type, TagType::Normal | TagType::NormalNoRegex)
+                                {
+                                    if let Some(&tag_id) = tag_cache.get(&tag.tag) {
+                                        rels_to_del.insert((file_id, tag_id));
+                                    }
+                                }
+                            }
+                        }
+                        TagOperation::Set => {
+                            incoming_ns_tags.clear();
+
+                            for tag in &tag_action.tags {
+                                if !matches!(tag.tag_type, TagType::Normal | TagType::NormalNoRegex)
+                                {
+                                    continue;
+                                }
+                                let ns_name = &tag.tag.namespace.name;
+                                if ns_name == "source_url" || ns_name.is_empty() {
+                                    continue;
+                                }
+
+                                if let Some(&tag_id) = tag_cache.get(&tag.tag) {
+                                    incoming_ns_tags
+                                        .entry(ns_name.as_str())
+                                        .or_default()
+                                        .insert(tag_id);
+
+                                    rels_to_add.insert((file_id, tag_id));
+                                }
+                            }
+
+                            // Evaluate deletions ONLY for namespaces explicitly targeted by this Set operation
+                            for (ns_name, incoming_set) in &incoming_ns_tags {
+                                if let Some(current_tag_ids) = current_ns_tags.get(ns_name) {
+                                    for current_tag_id in current_tag_ids {
+                                        if !incoming_set.contains(current_tag_id) {
+                                            set_deletions.insert((file_id, *current_tag_id));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Apply targeted "Add overrides Set" rule
+                for (f_id, tag_id) in &set_deletions {
+                    if !explicit_adds.contains(tag_id) {
+                        rels_to_del.insert((*f_id, *tag_id));
+                    }
+                }
+            }
+
+            // Global sanitation check for any edge deletions
+            for del in &rels_to_del {
+                rels_to_add.remove(del);
+            }
+
+            // 6️⃣ Step 5: Flush Relationship Mutations to DB in Batch
+            if !rels_to_del.is_empty() {
+                Self::internal_relationship_bulk_delete(&conn, &rels_to_del);
+            }
+
+            if !rels_to_add.is_empty() {
+                Self::internal_relationship_bulk_add(&conn, &rels_to_add);
+            }
+
+            conn.commit().unwrap();
+        })
+        .await
+        .unwrap()
+    }
+
+    ///
     /// Checks if we should download the file or not
     ///
     pub async fn should_download_file(&self, url: String) -> bool {
@@ -1023,9 +1479,54 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     }
 
     ///
+    /// Gets a single fileid from a tag
+    ///
+    pub async fn tag_get_fileid(&self, tag: &Tag) -> Option<u64> {
+        let pool = self.pool.clone();
+
+        let tag = tag.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = match pool.get() {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("Failed to acquire DB connection from pool: {:?}", e);
+                    panic!();
+                }
+            };
+
+            Self::internal_tag_get_fileid(&conn, &tag)
+        })
+        .await
+        .unwrap()
+    }
+    ///
+    /// Gets a file if its id exists in db
+    ///
+    pub async fn file_id_get(&self, file_id: u64) -> Option<FileInternal> {
+        let pool = self.pool.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = match pool.get() {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("Failed to acquire DB connection from pool: {:?}", e);
+                    panic!();
+                }
+            };
+
+            Self::internal_file_id_get(&conn, &file_id).ok()
+        })
+        .await
+        .unwrap()
+    }
+    ///
     /// Adds relationship into db
     ///
     pub async fn add_relationship_bulk(&self, rel_list: HashSet<(u64, u64)>) {
+        if rel_list.is_empty() {
+            return;
+        }
+
         let pool = self.pool.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -1039,6 +1540,32 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             let tn = conn.transaction().unwrap();
 
             Self::internal_relationship_bulk_add(&tn, &rel_list);
+            tn.commit().unwrap();
+        })
+        .await
+        .unwrap()
+    }
+    ///
+    /// Deletes relationship into db
+    ///
+    pub async fn delete_relationship_bulk(&self, rel_list: HashSet<(u64, u64)>) {
+        if rel_list.is_empty() {
+            return;
+        }
+
+        let pool = self.pool.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut conn = match pool.get() {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("Failed to acquire DB connection from pool: {:?}", e);
+                    panic!();
+                }
+            };
+            let tn = conn.transaction().unwrap();
+
+            Self::internal_relationship_bulk_delete(&tn, &rel_list);
             tn.commit().unwrap();
         })
         .await
@@ -1084,6 +1611,27 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             (path_buf.with_extension(ext), path.1)
         })
     }
+
+    ///
+    /// Returns the full location of where a file should be stored
+    ///
+    pub async fn file_ids_get_tags(&self, file_ids: &HashSet<u64>) -> HashMap<u64, HashSet<Tag>> {
+        let mut out = HashMap::new();
+        // If our hash is less then 6 cant return a location
+        if file_ids.is_empty() {
+            return out;
+        }
+        let file_ids = file_ids.clone();
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = pool.get().unwrap();
+            Self::internal_file_ids_get_tags(&conn, &file_ids)
+        })
+        .await
+        .ok()
+        .unwrap()
+    }
+
     ///
     /// What everything else uses when getting a setting
     ///
@@ -1125,7 +1673,8 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             let conn = pool.get().ok().unwrap();
             Self::internal_jobs_set_isrunning(&conn, job_id).is_ok()
         })
-        .await;
+        .await
+        .unwrap();
     }
 
     ///
@@ -1139,7 +1688,8 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             let conn = pool.get().ok().unwrap();
             Self::internal_job_remove(&conn, job_id).is_ok()
         })
-        .await;
+        .await
+        .unwrap();
     }
 
     ///
@@ -1223,6 +1773,9 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     /// Adds tags into db in bulk. Also adds parents
     ///
     pub async fn tags_add_bulk(&self, tags: &[FileTagAction]) -> HashMap<shared_types::Tag, u64> {
+        if tags.is_empty() {
+            return HashMap::new();
+        }
         let pool = self.pool.clone();
 
         let tags_owned = tags.to_vec();
@@ -1248,7 +1801,10 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     ///
     /// Adds tags into db in bulk. Also adds parents
     ///
-    pub async fn file_add_bulk(&self, tags: HashSet<FileInternal>) -> HashMap<FileInternal, u64> {
+    pub async fn file_add_bulk(&self, tags: HashSet<FileInternal>) -> HashSet<FileInternal> {
+        if tags.is_empty() {
+            return HashSet::new();
+        }
         let pool = self.pool.clone();
 
         let tags_owned = tags.clone();
@@ -1261,7 +1817,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                 }
             };
             let tn = conn.transaction().unwrap();
-            let out_tags = Self::internal_file_bulk_add(&tn, &tags_owned);
+            let out_tags = Self::internal_file_bulk_add(&tn, tags_owned);
 
             tn.commit().unwrap();
             out_tags
@@ -1275,6 +1831,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
 mod tests {
     use super::*;
     use crate::DB_VERSION;
+    use parking_lot::lock_api::RwLock;
     use r2d2::Pool;
     use r2d2_sqlite::SqliteConnectionManager;
     use r2d2_sqlite::rusqlite::OpenFlags;
@@ -1304,7 +1861,10 @@ mod tests {
             .build(manager)
             .expect("Failed to create test pool");
 
-        let main_db = Arc::new(MainDatabase { pool });
+        let main_db = Arc::new(MainDatabase {
+            pool,
+            namespace_cache: Arc::new(RwLock::new(HashMap::new())),
+        });
         main_db.check_db().unwrap();
         main_db
     }
@@ -1405,8 +1965,8 @@ mod tests {
         };
 
         let mut set = HashSet::new();
-        set.insert(&ns1);
-        set.insert(&ns2);
+        set.insert(ns1.clone());
+        set.insert(ns2.clone());
 
         let conn = db
             .pool
@@ -1414,7 +1974,7 @@ mod tests {
             .expect("Failed to pull connection from test pool");
 
         // 1. Test insertion
-        let ids = MainDatabase::internal_namespace_bulk_add(&conn, set);
+        let ids = MainDatabase::internal_namespace_bulk_add(&conn, &set);
         assert_eq!(ids.len(), 2);
         assert!(ids.contains_key(&ns1));
         assert!(ids.contains_key(&ns2));
@@ -1426,9 +1986,9 @@ mod tests {
         };
 
         let mut update_set = HashSet::new();
-        update_set.insert(&ns1_updated);
+        update_set.insert(ns1_updated.clone());
 
-        let updated_ids = MainDatabase::internal_namespace_bulk_add(&conn, update_set);
+        let updated_ids = MainDatabase::internal_namespace_bulk_add(&conn, &update_set);
         assert_eq!(updated_ids.get(&ns1_updated), ids.get(&ns1)); // ID should remain unchanged
 
         // Verify description updated in DB

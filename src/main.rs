@@ -1,8 +1,10 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
-use tokio::task;
-
 use crate::{db::MainDatabase, plugins::PluginManager, web::manager::DownloadsManager};
+
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
 
 pub mod cli;
 pub mod db;
@@ -12,7 +14,7 @@ pub mod web;
 
 const DB_PATH: &str = "main.db";
 const LOG_PATH: &str = "log.txt";
-pub const PLUGINS_PATH: &str = "./target/release/";
+pub const PLUGINS_PATH: &str = "compiled_plugins";
 const DB_VERSION: u64 = 1;
 
 ///
@@ -31,13 +33,17 @@ fn setup_log() {
         fast_log::Config::new()
             .level(log::LevelFilter::Info)
             .file(log_path.to_str().unwrap())
-            .chan_len(Some(100000)),
+            .chan_len(None),
     )
     .unwrap();
 }
 
 #[tokio::main]
 async fn main() {
+    console_subscriber::init();
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
     setup_log();
 
     let heavy_processing_pool = Arc::new(rayon::ThreadPoolBuilder::new().build().unwrap());

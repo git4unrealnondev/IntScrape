@@ -1,5 +1,4 @@
-use clap::{Parser, Subcommand, ValueEnum, arg};
-use shared_types;
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// From: git4unrealnondev Das code sucks.
 #[derive(Parser, Debug)]

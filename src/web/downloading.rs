@@ -97,7 +97,7 @@ impl Scraper {
 
         let url = match Url::parse(&url) {
             Ok(out) => out,
-            Err(e) => {
+            Err(_e) => {
                 log::error!("ScraperDownloading: {url} is not a valid URL.");
                 return None;
             }

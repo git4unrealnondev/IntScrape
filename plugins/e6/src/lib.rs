@@ -124,13 +124,13 @@ pub fn parser_call(
     let mut files = HashSet::new();
     let mut jobs = HashSet::new();
     let mut tags = HashSet::new();
-    if let Ok(payload) = jsonic::parse(text_input) {
-        if let Some(posts) = payload["posts"].elements() {
-            for post in posts {
+    if let Ok(payload) = json::parse(text_input) {
+        if !payload["posts"].is_empty() {
+            for post in payload["posts"].members() {
                 let mut tag_vec = Vec::new();
 
                 // Extract the post ID
-                if let Some(id_val) = post["id"].as_i128() {
+                if let Some(id_val) = post["id"].as_u64() {
                     let file_tag = Tag {
                         name: id_val.to_string(),
                         namespace: nsobjplg(&NsIdent::PostId, &site),
@@ -157,21 +157,19 @@ pub fn parser_call(
                     }
 
                     // Gets children and puts them into the db
-                    if let Some(children) = post["relationships"]["children"].elements() {
-                        for child in children {
-                            if let Some(child) = child.as_i128() {
-                                tags.insert(PluginTag {
-                                    tag: Tag {
-                                        name: child.to_string(),
-                                        namespace: nsobjplg(&NsIdent::Children, &site),
-                                    },
-                                    relates_to: Some(RelationContext {
-                                        tag: file_tag.clone(),
-                                        ..Default::default()
-                                    }),
+                    for child in post["relationships"]["children"].members() {
+                        if let Some(child) = child.as_u64() {
+                            tags.insert(PluginTag {
+                                tag: Tag {
+                                    name: child.to_string(),
+                                    namespace: nsobjplg(&NsIdent::Children, &site),
+                                },
+                                relates_to: Some(RelationContext {
+                                    tag: file_tag.clone(),
                                     ..Default::default()
-                                });
-                            }
+                                }),
+                                ..Default::default()
+                            });
                         }
                     }
                 }
@@ -201,13 +199,29 @@ pub fn parser_call(
                 }
 
                 // Gets all sources from a file
-                if let Some(sources) = post["sources"].elements() {
-                    for source in sources {
-                        if let Some(source) = source.as_str() {
-                            tag_vec.push(PluginTag {
-                                tag: Tag {
-                                    name: source.to_string(),
-                                    namespace: nsobjplg(&NsIdent::Sources, &site),
+                for source in post["sources"].members() {
+                    if let Some(source) = source.as_str() {
+                        tag_vec.push(PluginTag {
+                            tag: Tag {
+                                name: source.to_string(),
+                                namespace: nsobjplg(&NsIdent::Sources, &site),
+                            },
+                            ..Default::default()
+                        });
+                    }
+                }
+
+                for pool in post["pools"].members() {
+                    if let Some(pool_id) = pool.as_u64() {
+                        if recursion {
+                            let parse_url =
+                                format!("https://{}.net/pools.json?search[id]={}", site, pool_id);
+                            jobs.insert(ScraperDataReturn {
+                                job: PluginJob {
+                                    site: scraperdata.job.site.clone(),
+                                    param: vec![ScraperParam::Url(parse_url)],
+                                    priority: DEFAULT_PRIORITY - 2,
+                                    ..Default::default()
                                 },
                                 ..Default::default()
                             });
@@ -215,73 +229,54 @@ pub fn parser_call(
                     }
                 }
 
-                if let Some(pools) = post["pools"].elements() {
-                    for pool in pools {
-                        if let Some(pool_id) = pool.as_i128() {
-                            if recursion {
-                                let parse_url = format!(
-                                    "https://{}.net/pools.json?search[id]={}",
-                                    site, pool_id
-                                );
-                                jobs.insert(ScraperDataReturn {
-                                    job: PluginJob {
-                                        site: scraperdata.job.site.clone(),
-                                        param: vec![ScraperParam::Url(parse_url)],
-                                        priority: DEFAULT_PRIORITY - 2,
-                                        ..Default::default()
-                                    },
-                                    ..Default::default()
-                                });
-                            }
-                        }
-                    }
-                }
-
                 // Gets all tags from a post
-                if let Some(tags_object) = post["tags"].entries() {
-                    for (category_name, entry) in tags_object {
-                        if let Some(raw_tags) = entry.elements() {
-                            let ns_ident = match category_name.as_str() {
-                                "general" => NsIdent::General,
-                                "contributor" => NsIdent::Contributor,
-                                "species" => NsIdent::Species,
-                                "character" => NsIdent::Character,
-                                "copyright" => NsIdent::Copyright,
-                                "artist" => NsIdent::Artist,
-                                "director" => NsIdent::Director,
-                                "franchise" => NsIdent::Franchise,
-                                "lore" => NsIdent::Lore,
-                                "meta" => NsIdent::Meta,
-                                "invalid" => NsIdent::Invalid,
-                                _ => continue,
-                            };
+                for (category_name, entry) in post["tags"].entries() {
+                    let ns_ident = match category_name {
+                        "general" => NsIdent::General,
+                        "contributor" => NsIdent::Contributor,
+                        "species" => NsIdent::Species,
+                        "character" => NsIdent::Character,
+                        "copyright" => NsIdent::Copyright,
+                        "artist" => NsIdent::Artist,
+                        "director" => NsIdent::Director,
+                        "franchise" => NsIdent::Franchise,
+                        "lore" => NsIdent::Lore,
+                        "meta" => NsIdent::Meta,
+                        "invalid" => NsIdent::Invalid,
+                        _ => continue,
+                    };
 
-                            let namespace_obj = nsobjplg(&ns_ident, &site);
+                    let namespace_obj = nsobjplg(&ns_ident, &site);
 
-                            for raw_tag in raw_tags {
-                                if let Some(tag_name) = raw_tag.as_str() {
-                                    tag_vec.push(PluginTag {
-                                        tag: Tag {
-                                            name: tag_name.to_string(),
-                                            namespace: namespace_obj.clone(),
-                                        },
-                                        ..Default::default()
-                                    });
-                                }
-                            }
+                    for raw_tag in entry.members() {
+                        if let Some(tag_name) = raw_tag.as_str() {
+                            tag_vec.push(PluginTag {
+                                tag: Tag {
+                                    name: tag_name.to_string(),
+                                    namespace: namespace_obj.clone(),
+                                },
+                                ..Default::default()
+                            });
                         }
                     }
                 }
+                let source = if post["file"]["url"].is_null() {
+                    None
+                } else {
+                    post["file"]["url"]
+                        .as_str()
+                        .map(|u| FileSource::Url(u.to_string()))
+                };
 
                 // Adds file into db
-                let source = post["file"]["url"]
+
+                let hash = post["file"]["md5"]
                     .as_str()
-                    .map(|u| FileSource::Url(u.to_string()));
-                let md5 = post["file"]["md5"].as_str().unwrap_or("").to_string();
+                    .map(|hash| HashesSupported::Md5(hash.to_string()));
 
                 files.insert(FileObject {
                     source,
-                    hash: Some(HashesSupported::Md5(md5)),
+                    hash,
                     tag_list: vec![FileTagAction {
                         tags: tag_vec,
                         ..Default::default()
@@ -290,16 +285,14 @@ pub fn parser_call(
                 });
             }
         // Used for pools parsing
-        } else if payload["posts"].is_null()
-            && let Some(payload) = payload.elements()
-        {
-            for item in payload {
+        } else if payload["posts"].is_empty() {
+            for item in payload.members() {
                 if item["id"].is_null() {
                     continue;
                 }
 
                 // Does pool parsing
-                if let Some(pool_id) = item["id"].as_i128() {
+                if let Some(pool_id) = item["id"].as_u64() {
                     let pool_id_tag = Tag {
                         name: pool_id.to_string(),
                         namespace: nsobjplg(&NsIdent::PoolId, &site),
@@ -352,25 +345,23 @@ pub fn parser_call(
                         });
                     }
 
-                    if let Some(post_ids) = item["post_ids"].elements() {
-                        for (cnt, post_id) in post_ids.enumerate() {
-                            if let Some(post_id) = post_id.as_i128() {
-                                tags.insert(PluginTag {
+                    for (cnt, post_id) in item["post_ids"].members().enumerate() {
+                        if let Some(post_id) = post_id.as_u64() {
+                            tags.insert(PluginTag {
+                                tag: Tag {
+                                    name: cnt.to_string(),
+                                    namespace: nsobjplg(&NsIdent::PoolPosition, &site),
+                                },
+                                relates_to: Some(RelationContext {
                                     tag: Tag {
-                                        name: cnt.to_string(),
-                                        namespace: nsobjplg(&NsIdent::PoolPosition, &site),
+                                        name: post_id.to_string(),
+                                        namespace: nsobjplg(&NsIdent::PostId, &site),
                                     },
-                                    relates_to: Some(RelationContext {
-                                        tag: Tag {
-                                            name: post_id.to_string(),
-                                            namespace: nsobjplg(&NsIdent::PostId, &site),
-                                        },
-                                        limit_to: Some(pool_id_tag.clone()),
-                                        ..Default::default()
-                                    }),
+                                    limit_to: Some(pool_id_tag.clone()),
                                     ..Default::default()
-                                });
-                            }
+                                }),
+                                ..Default::default()
+                            });
                         }
                     }
                 }

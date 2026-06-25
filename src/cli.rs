@@ -1,12 +1,8 @@
 extern crate clap;
 
-use crate::cli::cli_structs::CheckFilesEnum;
 use crate::db::MainDatabase;
 use crate::helper_functions;
-use std::collections::HashSet;
-use std::collections::{BTreeMap, HashMap};
-use std::fs::rename;
-use std::path::{self, Path};
+use std::collections::BTreeMap;
 use url::Url;
 // use std::str::pattern::Searcher;
 use clap::Parser;
@@ -117,7 +113,7 @@ pub async fn main(db: Arc<MainDatabase>) {
                         jobsmanager.clone(),
                     );*/
                 }
-                cli_structs::JobStruct::AddBulk(addstruct) => {
+                cli_structs::JobStruct::AddBulk(_addstruct) => {
                     /*  let (_jobtype, jobsmanager) =
                         return_jobtypemanager(addstruct.jobtype, addstruct.recursion.as_ref());
                     //  for bulk in addstruct.bulkadd.iter() {
@@ -150,7 +146,7 @@ pub async fn main(db: Arc<MainDatabase>) {
             }
         }
         cli_structs::Test::Search(searchstruct) => match searchstruct {
-            cli_structs::SearchStruct::Parent(parent) => {
+            cli_structs::SearchStruct::Parent(_parent) => {
                 /* match &data.tag_get_name(parent.tag.clone(), parent.namespace) {
                     None => {
                         dbg!("Cannot find tag.");
@@ -169,7 +165,7 @@ pub async fn main(db: Arc<MainDatabase>) {
                     }
                 }*/
             }
-            cli_structs::SearchStruct::Fid(id) => {
+            cli_structs::SearchStruct::Fid(_id) => {
                 /* let hstags = data.relationship_get_tagid(&id.id);
                 if hstags.is_empty() {
                     println!(
@@ -193,7 +189,7 @@ pub async fn main(db: Arc<MainDatabase>) {
                     }
                 }*/
             }
-            cli_structs::SearchStruct::Tid(id) => {
+            cli_structs::SearchStruct::Tid(_id) => {
                 /* let fids = data.relationship_get_fileid(&id.id);
                 if !fids.is_empty() {
                     log::info!("Found Fids:");
@@ -202,7 +198,7 @@ pub async fn main(db: Arc<MainDatabase>) {
                     }
                 }*/
             }
-            cli_structs::SearchStruct::Tag(tag) => {
+            cli_structs::SearchStruct::Tag(_tag) => {
                 /*      let nsid = data.namespace_get(&tag.namespace);
                 if let Some(nsid) = nsid {
                     let tid = &data.tag_get_name(tag.tag.clone(), nsid);
@@ -228,7 +224,7 @@ pub async fn main(db: Arc<MainDatabase>) {
                     log::info!("Please use a namespace below:".to_string());
                 }*/
             }
-            cli_structs::SearchStruct::Hash(hash) => {
+            cli_structs::SearchStruct::Hash(_hash) => {
                 /*let file_id = data.file_get_hash(&hash.hash);
                 match file_id {
                     None => {
@@ -268,7 +264,7 @@ pub async fn main(db: Arc<MainDatabase>) {
             }
         },
         cli_structs::Test::Tasks(taskstruct) => match taskstruct {
-            cli_structs::TasksStruct::Import(directory) => {
+            cli_structs::TasksStruct::Import(_directory) => {
                 /*  {
                     data.enclave_create_default_file_import();
                 }
@@ -343,7 +339,7 @@ pub async fn main(db: Arc<MainDatabase>) {
                 }
             },
             cli_structs::TasksStruct::Reimport(reimp) => match reimp {
-                cli_structs::Reimport::DirectoryLocation(loc) => {
+                cli_structs::Reimport::DirectoryLocation(_loc) => {
                     /*  //let data = data.read();
                         if !Path::new(&loc.location).exists() {
                             println!("Couldn't find location: {}", &loc.location);
@@ -432,7 +428,7 @@ pub async fn main(db: Arc<MainDatabase>) {
                     }*/
                 }
             },
-            cli_structs::TasksStruct::Database(db) => {
+            cli_structs::TasksStruct::Database(_db) => {
                 /* let dbstore = data.clone();
                 match db {
                     // Adds extensions back onto files if they dont have them
