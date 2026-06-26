@@ -2,6 +2,7 @@ extern crate clap;
 
 use crate::db::MainDatabase;
 use crate::helper_functions;
+use shared_types::DbJobRecreation;
 use std::collections::BTreeMap;
 use url::Url;
 // use std::str::pattern::Searcher;
@@ -82,6 +83,13 @@ pub async fn main(db: Arc<MainDatabase>) {
         cli_structs::Test::Job(jobstruct) => {
             match jobstruct {
                 cli_structs::JobStruct::Add(addstruct) => {
+                    let recreation = addstruct.recursion.as_ref().and_then(|f| match f {
+                        cli_structs::DbJobRecreationClap::AlwaysTime(timestamp) => Some(
+                            DbJobRecreation::AlwaysTime(timestamp.timestamp, timestamp.count),
+                        ),
+                        _ => None,
+                    });
+
                     let job = shared_types::PluginJob {
                         time: helper_functions::get_sys_time_in_secs(),
                         reptime: time_conv(&addstruct.time),
@@ -89,6 +97,7 @@ pub async fn main(db: Arc<MainDatabase>) {
                         site: addstruct.site.clone(),
                         param: parse_string_to_scraperparam(&addstruct.query),
                         user_data: BTreeMap::new(),
+                        recreation,
                     };
 
                     db.jobs_add_single(job).await;

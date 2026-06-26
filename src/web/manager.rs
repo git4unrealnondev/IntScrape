@@ -6,7 +6,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::create_dir_all,
     sync::{Arc, atomic::AtomicBool},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use url::Url;
 
@@ -17,11 +17,11 @@ use reqwest::Client;
 use sha2::{Sha256, Sha512};
 use shared_types::*;
 use tokio::{
-    sync::{Mutex, RwLock},
+    sync::{Mutex, RwLock, oneshot},
     task::JoinSet,
 };
 
-use crate::{db::MainDatabase, plugins::PluginManager};
+use crate::{db::MainDatabase, helper_functions::get_sys_time_in_secs, plugins::PluginManager};
 
 pub(in crate::web) struct Scraper {
     pub(in crate::web) job: DbJobsObj,
@@ -37,6 +37,7 @@ pub(in crate::web) struct Scraper {
 struct InternalStorage {
     plugin: Plugin,
     job_storage: Vec<DbJobsObj>,
+    completed_job_storage: Vec<DbJobsObj>,
     ratelimiter: Arc<DefaultDirectRateLimiter>,
     //Stores file urls that we're downloading
     file_urls: HashSet<String>,
@@ -117,6 +118,8 @@ impl Scraper {
         }
 
         let file_id_tag_map = Arc::new(Mutex::new(HashMap::new()));
+        let job_list = Arc::new(Mutex::new(Vec::new()));
+        let tag_list = Arc::new(Mutex::new(Vec::new()));
         let should_remove_job = Arc::new(AtomicBool::new(true));
 
         'scraperloop: for scrap_data in scraper_data_return.iter() {
@@ -147,42 +150,49 @@ impl Scraper {
                     for data in data_all {
                         match data {
                             ScraperReturn::Data(scraper_object) => {
+                                if scraper_object.files.is_empty()
+                                    && scraper_object.tags.is_empty()
+                                    && scraper_object.jobs.is_empty()
+                                {
+                                    log::info!(
+                                        "Worker: {} JobId: {} -- STOPPING JOB due to files, tags & jobs being empty inside of a valid scraperreturn data object.",
+                                        self.plugin.name,
+                                        self.job.id,
+                                    );
+
+                                    break 'scraperloop;
+                                }
+
+                                // Adds jobs from scraper into the list to process
+                                job_list.lock().await.extend(scraper_object.jobs);
+                                tag_list.lock().await.extend(scraper_object.tags);
+
                                 let mut set = JoinSet::new();
-                                for file in scraper_object.files {
+                                for mut file in scraper_object.files {
                                     let scraper = self.clone();
                                     let file_id_tag_map_clone = file_id_tag_map.clone();
                                     let should_remove_job_clone = should_remove_job.clone();
+                                    let job_list_clone = job_list.clone();
 
                                     set.spawn(async move {
-                                        let mut tag_list = file.tag_list.clone();
                                         let mut download_issue = false;
+                                        let mut jobs = Vec::new();
                                         if let Some(fileinternal) = scraper
-                                            .file_download_logic(file.clone(), &mut download_issue)
+                                            .file_download_logic(
+                                                &mut file,
+                                                &mut jobs,
+                                                &mut download_issue,
+                                            )
                                             .await
                                         {
-                                            if let FileSource::Url(file_url) = file.source.unwrap()
-                                            {
-                                                tag_list.push(FileTagAction {
-                                                    operation: TagOperation::Add,
-                                                    tags: vec![PluginTag {
-                                                        tag: Tag {
-                                                            name: file_url,
-                                                            namespace: GenericNamespaceObj {
-                                                                name: "source_url".into(),
-                                                                description: Some(
-                                                                    "A source for a file".into(),
-                                                                ),
-                                                            },
-                                                        },
+                                            // Adds jobs from the on_download callback
+                                            job_list_clone.lock().await.extend(jobs);
 
-                                                        ..Default::default()
-                                                    }],
-                                                });
-                                            }
+                                            // Adds tag data from the file
                                             file_id_tag_map_clone
                                                 .lock()
                                                 .await
-                                                .insert(fileinternal, tag_list);
+                                                .insert(fileinternal, file.tag_list);
                                         }
 
                                         if download_issue {
@@ -222,16 +232,112 @@ impl Scraper {
             .expect("Arc reference leak")
             .into_inner();
 
+        let mut job_list = Arc::try_unwrap(job_list)
+            .expect("Arc reference leak")
+            .into_inner();
+
+        let tags = Arc::try_unwrap(tag_list)
+            .expect("Arc reference leak")
+            .into_inner();
+
+        let completed_params: std::collections::HashSet<_> = {
+            let jobs_guard = self.download_manager.jobs.read().await;
+            if let Some(internal_storage) = jobs_guard.get(&self.plugin.name) {
+                // Collect historical parameters into a HashSet for O(1) lookups
+                internal_storage
+                    .completed_job_storage
+                    .iter()
+                    .map(|internal_job| internal_job.config.param.clone())
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            }
+        }; // <-- Lock drops here automatically!
+
+        // 3. Deduplicate 'job_list' in-place with O(1) efficiency
+        // Retain keeps elements only if the closure returns true
+        job_list.retain(|job| {
+            let is_dup = completed_params.contains(&job.job.param);
+            if is_dup {
+                info!(
+                    "Scraper: Skipping duplicate job parameter discovery: {:?}",
+                    job.job.param
+                );
+            }
+            !is_dup // Keep if NOT a duplicate
+        });
+
         self.download_manager
             .db
-            .process_filetags(file_id_tag_map)
+            .tags_add_bulk(&[FileTagAction {
+                operation: TagOperation::Add,
+                tags,
+            }])
             .await;
 
+        self.download_manager
+            .db
+            .process_scraper(file_id_tag_map, job_list)
+            .await;
+
+        if self.manage_recreation().await {
+            should_remove_job.store(false, std::sync::atomic::Ordering::Relaxed);
+            if let Some(internal_storage) = self
+                .download_manager
+                .jobs
+                .write()
+                .await
+                .get_mut(&self.plugin.name)
+            {
+                internal_storage.job_storage.retain(|f| *f != self.job);
+            }
+        }
+
         if should_remove_job.load(std::sync::atomic::Ordering::Relaxed) {
+            // Updates internal jobs cache
+            if let Some(internal_storage) = self
+                .download_manager
+                .jobs
+                .write()
+                .await
+                .get_mut(&self.plugin.name)
+            {
+                internal_storage
+                    .completed_job_storage
+                    .push(self.job.clone());
+            }
+
             self.download_manager
                 .remove_job(&self.plugin, &self.job)
                 .await;
         }
+    }
+
+    async fn manage_recreation(&self) -> bool {
+        if let Some(mut recreation) = self.job.config.recreation.clone() {
+            match recreation {
+                DbJobRecreation::AlwaysTime(timestamp, count) => {
+                    let mut job = self.job.clone();
+                    job.config.time = get_sys_time_in_secs();
+                    job.config.reptime = timestamp;
+                    job.isrunning=false;
+                    if let Some(mut count) = count {
+                        if count >= 1 {
+                            count -= 1;
+                        } else {
+                            return false;
+                        }
+                        job.config.recreation =
+                            Some(DbJobRecreation::AlwaysTime(timestamp, Some(count)));
+                    }
+
+                    self.download_manager.db.jobs_update(&job).await;
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     ///
@@ -253,7 +359,8 @@ impl Scraper {
     ///
     async fn file_download_logic(
         self: Arc<Self>,
-        file: FileObject,
+        file: &mut FileObject,
+        jobs: &mut Vec<ScraperDataReturn>,
         download_issue: &mut bool,
     ) -> Option<FileInternal> {
         let plugin_manager = self.download_manager.plugin_manager.clone();
@@ -264,7 +371,7 @@ impl Scraper {
 
                 return None;
             }
-            Some(url_source) => match url_source {
+            Some(ref url_source) => match url_source {
                 FileSource::Url(file_url) => {
                     match self
                         .download_manager
@@ -287,8 +394,22 @@ impl Scraper {
                             return self.download_manager.db.file_id_get(file_id).await;
                         }
                         None => {
-                            if self.should_download_file(&file_url).await {
-                                if let Some(bytes_out) = self_clone.download_file(&file_url).await {
+                            file.tag_list.push(FileTagAction {
+                                operation: TagOperation::Add,
+                                tags: vec![PluginTag {
+                                    tag: Tag {
+                                        name: file_url.to_string(),
+                                        namespace: GenericNamespaceObj {
+                                            name: "source_url".into(),
+                                            description: Some("A source for a file".into()),
+                                        },
+                                    },
+
+                                    ..Default::default()
+                                }],
+                            });
+                            if self.should_download_file(file_url).await {
+                                if let Some(bytes_out) = self_clone.download_file(file_url).await {
                                     info!(
                                         "Scraper: {} JobId: {} Successfully downloaded {}",
                                         self.plugin.name, self.job.id, &file_url
@@ -309,17 +430,21 @@ impl Scraper {
                         }
                     }
                 }
-                FileSource::Bytes(file_bytes) => bytes::Bytes::from(file_bytes),
+                FileSource::Bytes(file_bytes) => bytes::Bytes::from(file_bytes.clone()),
             },
         };
 
         // After we have our bytes will do our processing here
         let bytes_clone = bytes.clone();
-        tokio::task::spawn_blocking(move || {
-            plugin_manager.callback_on_download(bytes_clone);
-        })
-        .await
-        .unwrap();
+        let (tx, rx) = oneshot::channel();
+        let mut tags_owned = file.tag_list.clone();
+        let mut jobs_owned = jobs.clone();
+        self.download_manager.heavy_processing_pool.spawn(move || {
+            plugin_manager.callback_on_download(&bytes_clone, &mut tags_owned, &mut jobs_owned);
+            let _ = tx.send((tags_owned, jobs_owned));
+        });
+
+        (file.tag_list, *jobs) = rx.await.unwrap();
 
         let bytes_hash = bytes.clone();
         let (hash, extension) = tokio::task::spawn_blocking(move || {
@@ -506,40 +631,38 @@ impl DownloadsManager {
         let mut jobs_guard = self.jobs.write().await;
 
         for (plugin, job_storage) in jobs.iter() {
-            if !jobs_guard.contains_key(&plugin.name) {
-                let mut ratelimit = None;
+            if let Some(internal_storage) = jobs_guard.get_mut(&plugin.name) {
+                // Check if the worker loop had previously died/retired by verifying if storage was empty
+                let needs_resurrection = internal_storage.job_storage.is_empty();
 
-                for properties in plugin.properties.iter() {
-                    if let shared_types::PluginProperties::Ratelimit(count, time) = properties {
-                        let burst_count = u32::try_from(*count).unwrap_or(u32::MAX).max(1);
-                        let burst_nonzero = std::num::NonZeroU32::new(burst_count).unwrap();
-
-                        // Note: Governor uses allow_max_burst, not allow_burst
-                        ratelimit = Some(
-                            Quota::with_period(*time)
-                                .unwrap()
-                                .allow_burst(burst_nonzero),
-                        );
+                for new_job in job_storage {
+                    if !internal_storage
+                        .job_storage
+                        .iter()
+                        .any(|j| j.id == new_job.id)
+                    {
+                        internal_storage.job_storage.push(new_job.clone());
                     }
                 }
 
-                // Fallback default rate limiter
-                if ratelimit.is_none() {
+                // If the thread broke out and retired earlier, spawn a fresh task loop to consume the new jobs
+                if needs_resurrection && !internal_storage.job_storage.is_empty() {
                     info!(
-                        "DownloadManager was unable to pull ratelimiting information from {}",
-                        &plugin.name
+                        "DownloadManager: Resurrecting worker loop for active site: {}",
+                        plugin.name
                     );
-                    ratelimit = Some(
-                        Quota::with_period(Duration::from_secs(10))
-                            .unwrap()
-                            .allow_burst(std::num::NonZeroU32::new(1).unwrap()),
-                    );
+                    let manager_clone = self.clone();
+                    let scraper_name = plugin.name.clone();
+                    tokio::task::spawn(async move {
+                        manager_clone.spawn_scraper(scraper_name).await;
+                    });
                 }
-
-                info!(
-                    "DownloadManager made ratelimiter {:?} for {}",
-                    ratelimit.unwrap(),
-                    &plugin.name
+            } else {
+                // Brand new site configuration path
+                let mut ratelimit = Some(
+                    Quota::with_period(Duration::from_secs(1))
+                        .unwrap()
+                        .allow_burst(std::num::NonZeroU32::new(1).unwrap()),
                 );
 
                 jobs_guard.insert(
@@ -547,15 +670,14 @@ impl DownloadsManager {
                     InternalStorage {
                         plugin: plugin.clone(),
                         job_storage: job_storage.to_vec(),
-                        // Instantiate the Governor limiter using the built quota configuration blueprint
                         ratelimiter: Arc::new(governor::RateLimiter::direct(ratelimit.unwrap())),
+                        completed_job_storage: vec![],
                         file_urls: HashSet::new(),
                     },
                 );
 
                 let manager_clone = self.clone();
                 let scraper_name = plugin.name.clone();
-
                 tokio::task::spawn(async move {
                     manager_clone.spawn_scraper(scraper_name).await;
                 });
@@ -568,55 +690,62 @@ impl DownloadsManager {
     ///
     async fn spawn_scraper(self: &Arc<Self>, scraper_name: String) {
         loop {
-            let job_to_run = {
-                let mut guard = self.jobs.write().await;
+            let mut guard = self.jobs.write().await;
 
-                if let Some(scraper_internal) = guard.get_mut(&scraper_name) {
-                    if let Some(idx) = scraper_internal
-                        .job_storage
-                        .iter()
-                        .position(|j| !j.isrunning)
-                    {
-                        let job = &mut scraper_internal.job_storage[idx];
-                        job.isrunning = true;
-
-                        Some((
-                            job.clone(),
-                            scraper_internal.plugin.clone(),
-                            scraper_internal.ratelimiter.clone(),
-                        ))
-                    } else {
-                        if scraper_internal.job_storage.iter().all(|j| j.isrunning) {
-                            info!(
-                                "DownloadManager: All active jobs for {} are now dispatched.",
-                                scraper_name
-                            );
-                            break;
-                        }
-                        None
-                    }
-                } else {
-                    break;
-                }
+            let Some(scraper_internal) = guard.get_mut(&scraper_name) else {
+                // The storage for this site was deleted entirely. Kill this worker task.
+                info!(
+                    "DownloadManager: Internal storage for {} removed. Killing worker loop.",
+                    scraper_name
+                );
+                break;
             };
+
+            // 1. If there are literally no jobs tracked in memory, kill this thread.
+            if scraper_internal.job_storage.is_empty() {
+                info!(
+                    "DownloadManager: No jobs remaining in memory for {}. Retiring worker loop.",
+                    scraper_name
+                );
+                break;
+            }
+
+            // 2. Look for an idle job
+            let job_to_run = if let Some(idx) = scraper_internal
+                .job_storage
+                .iter()
+                .position(|j| !j.isrunning)
+            {
+                let job = &mut scraper_internal.job_storage[idx];
+                job.isrunning = true;
+                Some((
+                    job.clone(),
+                    scraper_internal.plugin.clone(),
+                    scraper_internal.ratelimiter.clone(),
+                ))
+            } else {
+                None
+            };
+
+            // Explicitly drop the guard before doing any async work or sleeping
+            drop(guard);
 
             if let Some((job, plugin, ratelimiter)) = job_to_run {
                 info!("DownloadManager: Setting job {} to running status.", job.id);
                 self.db.job_set_is_running(&job).await;
 
                 let scraper = Scraper::new(
-                    job.clone(),
-                    ratelimiter.clone(),
+                    job,
+                    ratelimiter,
                     self.plugin_manager.clone(),
                     plugin,
                     self.clone(),
                 );
 
-                // Actually handles the scraping
                 tokio::task::spawn(async move { scraper.run_scraper().await });
             } else {
-                // Dunno why I need this but it prevents a thread from zooming to 100
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                // All jobs are currently actively running. Wait a bit for them to finish.
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         }
     }

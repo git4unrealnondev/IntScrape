@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -17,6 +17,7 @@ use crate::db::MainDatabase;
 pub struct PluginManager {
     storage: RwLock<HashMap<String, shared_types::Plugin>>,
     storage_site: RwLock<HashMap<String, String>>,
+    storage_callbacks: RwLock<HashMap<GlobalCallbacks, HashSet<String>>>,
     storage_libs: RwLock<HashMap<String, Arc<Library>>>,
     db: Arc<MainDatabase>,
 }
@@ -27,6 +28,7 @@ impl PluginManager {
             storage: HashMap::new().into(),
             storage_libs: HashMap::new().into(),
             storage_site: HashMap::new().into(),
+            storage_callbacks: HashMap::new().into(),
             db,
         };
 
@@ -71,6 +73,20 @@ impl PluginManager {
                                     }
                                 }
 
+                                for callback in plugin.callbacks.iter() {
+                                    if let Some(site_list) =
+                                        self.storage_callbacks.write().get_mut(callback)
+                                    {
+                                        site_list.insert(plugin.name.to_string());
+                                    } else {
+                                        let mut list = HashSet::new();
+                                        list.insert(plugin.name.to_string());
+                                        self.storage_callbacks
+                                            .write()
+                                            .insert(callback.clone(), list);
+                                    }
+                                }
+
                                 // Loads plugin mapping into storage
                                 self.storage.write().insert(plugin.name.clone(), plugin);
                             }
@@ -104,7 +120,7 @@ impl PluginManager {
     ///
     /// Returns a list of jobs that a plugin can support
     ///
-    pub fn match_plugin(&self, jobs: Vec<DbJobsObj>) -> HashMap<Plugin, Vec<DbJobsObj>> {
+    pub fn match_plugin(&self, jobs: &Vec<DbJobsObj>) -> HashMap<Plugin, Vec<DbJobsObj>> {
         let mut out: HashMap<Plugin, Vec<DbJobsObj>> = HashMap::new();
 
         for job in jobs.iter() {
@@ -183,5 +199,38 @@ impl PluginManager {
     ///
     /// After file downloading run callbacks for on_download
     ///
-    pub fn callback_on_download(&self, _data: Bytes) {}
+    pub fn callback_on_download(
+        &self,
+        data: &Bytes,
+        tags: &mut Vec<FileTagAction>,
+        jobs: &mut Vec<ScraperDataReturn>,
+    ) {
+        if let Some(plugin_name_list) = self
+            .storage_callbacks
+            .read()
+            .get(&GlobalCallbacks::Download)
+        {
+            for plugin_name in plugin_name_list {
+                if let Some(lib) = self.storage_libs.read().get(plugin_name) {
+                    let temp: libloading::Symbol<unsafe extern "C" fn(&[u8]) -> CallbackReturn> = {
+                        unsafe {
+                            match lib.get(b"on_download") {
+                                Err(err) => {
+                                    error!(
+                                        "Plugins: {} could not call 'on_download' got error: {:?}",
+                                        &plugin_name, err
+                                    );
+                                    continue;
+                                }
+                                Ok(out) => out,
+                            }
+                        }
+                    };
+                    let return_data = unsafe { temp(data) };
+                    tags.extend(return_data.tags);
+                    jobs.extend(return_data.jobs);
+                }
+            }
+        }
+    }
 }

@@ -47,6 +47,8 @@ pub struct PluginJob {
     pub reptime: u64,
     /// Determines which job we should run first. Higher values go first
     pub priority: u64,
+    /// Manages the recreation of jobs
+    pub recreation: Option<DbJobRecreation>,
     /// Site we're processing
     pub site: String,
     /// Any params that need to get passed into the scraper, plugin etc.
@@ -80,6 +82,13 @@ pub struct ScraperObject {
     pub tags: HashSet<PluginTag>,
     pub jobs: HashSet<ScraperDataReturn>,
     //pub flags: Vec<ScraperFlags>,
+}
+
+/// Gets used for the on_download callback return
+#[derive(Default)]
+pub struct CallbackReturn {
+    pub tags: HashSet<FileTagAction>,
+    pub jobs: HashSet<ScraperDataReturn>,
 }
 
 ///
@@ -130,6 +139,13 @@ pub enum HashesSupported {
     Sha1(String),
     Sha256(String),
     Sha512(String),
+}
+
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Deserialize, Serialize)]
+pub enum DbJobRecreation {
+    OnTagId(u64, Option<u64>),
+    OnTag(String, u64, Option<u64>),
+    AlwaysTime(u64, Option<u64>),
 }
 
 ///

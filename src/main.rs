@@ -68,10 +68,10 @@ async fn main() {
             let jobs_to_run = db_spawn.jobs_get_torun().await;
 
             download_manager
-                .add_jobs(plugin_manager.match_plugin(jobs_to_run))
+                .add_jobs(plugin_manager.match_plugin(&jobs_to_run))
                 .await;
 
-            if download_manager.all_jobs_complete().await {
+            if download_manager.all_jobs_complete().await && jobs_to_run.is_empty() {
                 break;
             }
 

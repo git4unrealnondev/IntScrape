@@ -3,7 +3,7 @@ use std::{collections::HashSet, fmt};
 use shared_types::{
     DEFAULT_PRIORITY, FileObject, FileSource, FileTagAction, GenericNamespaceObj, HashesSupported,
     PluginJob, PluginProperties, PluginTag, RelationContext, ScraperDataReturn, ScraperParam,
-    ScraperReturn, Tag,
+    ScraperReturn, SkipIf, Tag,
 };
 
 pub enum Site {
@@ -37,6 +37,7 @@ pub enum NsIdent {
     Director,
     Franchise,
     Invalid,
+    PoolTimestamp,
 }
 
 impl fmt::Display for Site {
@@ -89,15 +90,32 @@ pub fn url_dump(
     for i in 1..hardlimit {
         let url = build_url(&scraperdata.job.param, i, &site);
 
-        out.push(ScraperDataReturn {
-            job: shared_types::PluginJob {
-                site: scraperdata.job.site.clone(),
-                priority: shared_types::DEFAULT_PRIORITY - 2,
-                param: vec![shared_types::ScraperParam::Url(url)],
+        if let Some(url) = url {
+            out.push(ScraperDataReturn {
+                job: shared_types::PluginJob {
+                    site: scraperdata.job.site.clone(),
+                    priority: shared_types::DEFAULT_PRIORITY - 2,
+                    param: vec![shared_types::ScraperParam::Url(url)],
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        })
+            });
+        }
+    }
+
+    // Handles URL passthrough
+    for param in scraperdata.job.param.iter() {
+        if let ScraperParam::Url(url) = param {
+            out.push(ScraperDataReturn {
+                job: shared_types::PluginJob {
+                    site: scraperdata.job.site.clone(),
+                    priority: shared_types::DEFAULT_PRIORITY - 2,
+                    param: vec![shared_types::ScraperParam::Url(url.clone())],
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
     }
 
     out
@@ -260,7 +278,7 @@ pub fn parser_call(
                         }
                     }
                 }
-                let source = if post["file"]["url"].is_null() {
+                let source = if post["file"]["url"].is_empty() {
                     None
                 } else {
                     post["file"]["url"]
@@ -287,44 +305,63 @@ pub fn parser_call(
         // Used for pools parsing
         } else if payload["posts"].is_empty() {
             for item in payload.members() {
-                if item["id"].is_null() {
-                    continue;
-                }
-
                 // Does pool parsing
-                if let Some(pool_id) = item["id"].as_u64() {
+                if let Some(pool_id) = item["id"].as_u64()
+                    && let Some(pool_updated) = item["updated_at"].as_str()
+                {
+                    let pool_updated =
+                        chrono::DateTime::parse_from_str(pool_updated, "%Y-%m-%dT%H:%M:%S.%f%:z")
+                            .unwrap()
+                            .timestamp()
+                            .to_string();
+
                     let pool_id_tag = Tag {
+                        name: format!("{}_{}", pool_id, pool_updated),
+                        namespace: nsobjplg(&NsIdent::PoolTimestamp, &site),
+                    };
+
+                    let pool_id = Tag {
                         name: pool_id.to_string(),
                         namespace: nsobjplg(&NsIdent::PoolId, &site),
                     };
 
                     let pool_id_relate = Some(RelationContext {
-                        tag: pool_id_tag.clone(),
+                        tag: pool_id.clone(),
+                        limit_to: Some(pool_id_tag.clone()),
+                        ..Default::default()
+                    });
+
+                    let pool_id = Some(RelationContext {
+                        tag: pool_id,
                         ..Default::default()
                     });
 
                     // Adds pool name
                     if let Some(pool_name) = item["name"].as_str() {
-                        tags.insert(PluginTag {
-                            tag: Tag {
-                                name: pool_name.to_string(),
-                                namespace: nsobjplg(&NsIdent::PoolName, &site),
-                            },
-                            relates_to: pool_id_relate.clone(),
-                            ..Default::default()
-                        });
+                        if !pool_name.is_empty() {
+                            tags.insert(PluginTag {
+                                tag: Tag {
+                                    name: pool_name.to_string(),
+                                    namespace: nsobjplg(&NsIdent::PoolName, &site),
+                                },
+                                relates_to: pool_id_relate.clone(),
+                                ..Default::default()
+                            });
+                        }
                     }
 
                     // Adds pool description
                     if let Some(pool_name) = item["description"].as_str() {
-                        tags.insert(PluginTag {
-                            tag: Tag {
-                                name: pool_name.to_string(),
-                                namespace: nsobjplg(&NsIdent::PoolName, &site),
-                            },
-                            relates_to: pool_id_relate.clone(),
-                            ..Default::default()
-                        });
+                        if !pool_name.is_empty() {
+                            tags.insert(PluginTag {
+                                tag: Tag {
+                                    name: pool_name.to_string(),
+                                    namespace: nsobjplg(&NsIdent::PoolDescription, &site),
+                                },
+                                relates_to: pool_id_relate.clone(),
+                                ..Default::default()
+                            });
+                        }
                     }
 
                     // Adds Pool Creation time
@@ -340,13 +377,33 @@ pub fn parser_call(
                                 .to_string(),
                                 namespace: nsobjplg(&NsIdent::PoolCreatedAt, &site),
                             },
-                            relates_to: pool_id_relate.clone(),
+                            relates_to: pool_id.clone(),
                             ..Default::default()
                         });
                     }
 
                     for (cnt, post_id) in item["post_ids"].members().enumerate() {
                         if let Some(post_id) = post_id.as_u64() {
+                            if recursion {
+                                let parse_url = format!(
+                                    "https://{}.net/posts.json?tags=id:{}",
+                                    site.to_string().to_lowercase(),
+                                    &post_id
+                                );
+                                jobs.insert(ScraperDataReturn {
+                                    job: PluginJob {
+                                        site: scraperdata.job.site.clone(),
+                                        param: vec![ScraperParam::Url(parse_url)],
+                                        priority: DEFAULT_PRIORITY - 2,
+                                        ..Default::default()
+                                    },
+                                    skip_conditions: vec![SkipIf::FileTagRelationship(Tag {
+                                        name: post_id.to_string(),
+                                        namespace: nsobjplg(&NsIdent::PostId, &site),
+                                    })],
+                                });
+                            }
+
                             tags.insert(PluginTag {
                                 tag: Tag {
                                     name: cnt.to_string(),
@@ -369,16 +426,16 @@ pub fn parser_call(
         }
     }
 
-    if !files.is_empty() {
-        return vec![ScraperReturn::Data(shared_types::ScraperObject {
-            files,
-            jobs,
-            tags,
-            ..Default::default()
-        })];
+    if files.is_empty() && jobs.is_empty() && tags.is_empty() {
+        return vec![ScraperReturn::Nothing];
     }
 
-    vec![]
+    vec![ScraperReturn::Data(shared_types::ScraperObject {
+        files,
+        jobs,
+        tags,
+        ..Default::default()
+    })]
 }
 
 fn nsobjplg(name: &NsIdent, site: &Site) -> GenericNamespaceObj {
@@ -390,6 +447,10 @@ fn nsobjplg(name: &NsIdent, site: &Site) -> GenericNamespaceObj {
     }
 
     let (suffix, desc_type) = match name {
+        NsIdent::PoolTimestamp => (
+            "Pool_Timestamp",
+            Desc::Static("A combination of pool_id and the timestamp of when it was last updated"),
+        ),
         NsIdent::Franchise => (
             "Franchise",
             Desc::Static("Franchise that this item came from."),
@@ -478,9 +539,9 @@ fn nsobjplg(name: &NsIdent, site: &Site) -> GenericNamespaceObj {
 ///
 /// Builds local URLs for parsing
 ///
-fn build_url(params: &[shared_types::ScraperParam], pagenum: u64, site: &Site) -> String {
+fn build_url(params: &[shared_types::ScraperParam], pagenum: u64, site: &Site) -> Option<String> {
     if params.is_empty() {
-        return String::new();
+        return None;
     }
 
     let lowercase_site = site.to_string().to_lowercase();
@@ -511,7 +572,7 @@ fn build_url(params: &[shared_types::ScraperParam], pagenum: u64, site: &Site) -
         .collect();
 
     if tags.is_empty() {
-        return String::new();
+        return None;
     }
 
     if let Some((username, api_key)) = login_info {
@@ -524,5 +585,5 @@ fn build_url(params: &[shared_types::ScraperParam], pagenum: u64, site: &Site) -
     // 4. Append the pagination tracker at the tail end
     url += &format!("&page={}", pagenum);
 
-    url
+    Some(url)
 }

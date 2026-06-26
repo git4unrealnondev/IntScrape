@@ -78,6 +78,7 @@ fn main() {
         // 2. Locate the compiled artifact
         // Adjust these filenames if your plugins are dynamic libraries (.so / .dll / .dylib)
         // instead of standard binary executables!
+        let plugin_name = plugin_name.replace("-", "_");
         let binary_name = if cfg!(windows) {
             format!("{}.dll", plugin_name)
         } else if cfg!(target_os = "macos") {

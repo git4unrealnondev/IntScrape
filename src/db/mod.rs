@@ -29,9 +29,9 @@ impl Drop for MainDatabase {
 impl MainDatabase {
     pub fn new(db_path: &Path) -> Arc<Self> {
         let manager = SqliteConnectionManager::file(db_path).with_init(|c| {
-            c.trace(Some(|statement: &str| {
-                info!("Executing SQL: {}", statement);
-            }));
+            //c.trace(Some(|statement: &str| {
+            //    info!("Executing SQL: {}", statement);
+            //}));
 
             c.execute_batch(
                 "

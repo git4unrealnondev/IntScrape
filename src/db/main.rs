@@ -19,6 +19,7 @@ impl DbJobsObjExt for DbJobsObj {
     fn from_row(row: &Row) -> rusqlite::Result<Self> {
         // Deserialize the JSON string columns back into native Rust types
         let param_raw: String = row.get("param")?;
+        let recreation_raw: String = row.get("recreation")?;
         let user_data_raw: String = row.get("user_data")?;
 
         let param: Vec<ScraperParam> = serde_json::from_str(&param_raw).map_err(|e| {
@@ -28,6 +29,14 @@ impl DbJobsObjExt for DbJobsObj {
                 Box::new(e),
             )
         })?;
+        let recreation: Option<DbJobRecreation> =
+            serde_json::from_str(&recreation_raw).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5, // Column index reference
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
 
         let user_data: BTreeMap<String, String> =
             serde_json::from_str(&user_data_raw).map_err(|e| {
@@ -44,6 +53,7 @@ impl DbJobsObjExt for DbJobsObj {
             reptime: row.get::<_, i64>("reptime")? as u64,
             priority: row.get::<_, i64>("priority")? as u64,
             site: row.get("site")?,
+            recreation,
             param,
             user_data,
         };
@@ -281,7 +291,7 @@ CREATE TABLE IF NOT EXISTS Jobs (
     reptime INTEGER NOT NULL, 
     priority INTEGER NOT NULL,  
     is_running BOOL NOT NULL DEFAULT False,
-    manager TEXT NOT NULL, 
+    recreation TEXT NOT NULL, 
     site TEXT NOT NULL, 
     param TEXT NOT NULL, 
     user_data TEXT NOT NULL
@@ -290,6 +300,37 @@ CREATE TABLE IF NOT EXISTS Jobs (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedup 
 ON Jobs (time, reptime, site, param);
 ",
+        )
+        .unwrap();
+    }
+
+    pub(in crate::db) fn internal_jobs_update(conn: &Connection, job: &DbJobsObj) {
+        let recreation = serde_json::to_string(&job.config.recreation).unwrap();
+        let param = serde_json::to_string(&job.config.param).unwrap();
+        let user_data = serde_json::to_string(&job.config.user_data).unwrap();
+
+        conn.execute(
+            "UPDATE Jobs 
+         SET time = ?1, 
+             reptime = ?2, 
+             priority = ?3, 
+             is_running = ?4, 
+             recreation = ?5, 
+             site = ?6, 
+             param = ?7, 
+             user_data = ?8 
+         WHERE id = ?9",
+            params![
+                job.config.time,
+                job.config.reptime,
+                job.config.priority,
+                job.isrunning, // true/false state
+                recreation,
+                job.config.site,
+                param,
+                user_data,
+                job.id
+            ],
         )
         .unwrap();
     }
@@ -730,7 +771,7 @@ ON Jobs (time, reptime, site, param);
     ) -> Result<Vec<shared_types::DbJobsObj>, rusqlite::Error> {
         // Select all jobs matching the given site
         let mut stmt = conn.prepare(
-            "SELECT id, time, reptime, priority, manager, site, param, user_data, is_running 
+            "SELECT id, time, reptime, priority, recreation, site, param, user_data, is_running 
          FROM Jobs 
          WHERE site = ?1;",
         )?;
@@ -750,7 +791,7 @@ ON Jobs (time, reptime, site, param);
     pub(in crate::db) fn internal_jobs_add(conn: &Connection, config: &PluginJob) -> u64 {
         let mut stmt = conn
             .prepare(
-                "INSERT INTO Jobs (time, reptime, priority, manager, site, param, user_data) 
+                "INSERT INTO Jobs (time, reptime, priority, recreation, site, param, user_data) 
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
 
 ON CONFLICT(time, reptime, site, param) DO UPDATE SET
@@ -765,7 +806,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         // Serialize on-the-fly for the TEXT columns
         let param_json = serde_json::to_string(&config.param).unwrap();
         let user_data_json = serde_json::to_string(&config.user_data).unwrap();
-        let dummy_manager_json = "{}"; // Replace with your actual serialized DbJobsManager struct
+        let manager_json = serde_json::to_string(&config.recreation).unwrap(); // Replace with your actual serialized DbJobsManager struct
 
         let id: u64 = stmt
             .query_row(
@@ -773,7 +814,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                     config.time,
                     config.reptime,
                     config.priority,
-                    dummy_manager_json,
+                    manager_json,
                     config.site,
                     param_json,
                     user_data_json
@@ -932,21 +973,30 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
 
         for tag in valid_tags {
             if let Some(&ns_id) = namespace_ids.get(&tag.tag.namespace) {
+                if tag.tag.name.is_empty() {
+                    continue;
+                }
                 if unique_tags_set.insert((tag.tag.name.clone(), ns_id)) {
                     pending_tags.push((tag.tag.clone(), ns_id));
                 }
 
                 if let Some(relate_tag) = &tag.relates_to {
+                    if relate_tag.tag.name.is_empty() {
+                        continue;
+                    }
                     if let Some(&rel_ns_id) = namespace_ids.get(&relate_tag.tag.namespace) {
                         if unique_tags_set.insert((relate_tag.tag.name.clone(), rel_ns_id)) {
                             pending_tags.push((relate_tag.tag.clone(), rel_ns_id));
                         }
 
                         if let Some(limit_to_tag) = &relate_tag.limit_to {
-                            if let Some(&lim_ns_id) = namespace_ids.get(&limit_to_tag.namespace) {
-                                if unique_tags_set.insert((limit_to_tag.name.clone(), lim_ns_id)) {
-                                    pending_tags.push((limit_to_tag.clone(), lim_ns_id));
-                                }
+                            if limit_to_tag.name.is_empty() {
+                                continue;
+                            }
+                            if let Some(&lim_ns_id) = namespace_ids.get(&limit_to_tag.namespace)
+                                && unique_tags_set.insert((limit_to_tag.name.clone(), lim_ns_id))
+                            {
+                                pending_tags.push((limit_to_tag.clone(), lim_ns_id));
                             }
                         }
                     }
@@ -1285,9 +1335,13 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     ///
     /// Handles all the processing for files and tags and relational items
     ///
-    pub async fn process_filetags(&self, map: HashMap<FileInternal, Vec<FileTagAction>>) {
+    pub async fn process_scraper(
+        &self,
+        map: HashMap<FileInternal, Vec<FileTagAction>>,
+        jobs: Vec<ScraperDataReturn>,
+    ) {
         // Early Exit
-        if map.is_empty() {
+        if map.is_empty() && jobs.is_empty() {
             return;
         }
 
@@ -1303,6 +1357,28 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             };
             let conn = conn.transaction().unwrap();
 
+            'ScraperLoop: for scraperdatareturn in jobs {
+                for skip_conditions in scraperdatareturn.skip_conditions {
+                    match skip_conditions {
+                        SkipIf::FileHash(file_hash) => {}
+                        SkipIf::FileTagRelationship(tag) => {
+                            if let Some(ns_id) =
+                                Self::internal_namespace_get_id(&conn, &tag.namespace.name)
+                                && let Some(tag_id) =
+                                    Self::internal_tag_get_id(&conn, &tag.name, ns_id)
+                                    && Self::internal_tag_has_files(&conn, tag_id) {
+                                        info!("DB Skipping adding job due to FileTagRelationship tag_id: {} having files.", tag_id);
+                                        continue 'ScraperLoop;
+                                    }
+                        }
+                        SkipIf::FileNamespaceNumber((tag, namespace, id)) => {}
+                        SkipIf::NoFilesDownloaded => {}
+                    }
+                }
+
+                Self::internal_jobs_add(&conn, &scraperdatareturn.job);
+            }
+
             let unique_files: HashSet<FileInternal> = map.keys().cloned().collect();
             let resolved_files = Self::internal_file_bulk_add(&conn, unique_files);
 
@@ -1314,21 +1390,15 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                 }
             }
 
-            // 3️⃣ Step 2: Extract and Bulk Insert/Resolve All Tags
             // Collect all action definitions across every file block into one flat vector
             let all_tag_actions: Vec<FileTagAction> = map.values().flatten().cloned().collect();
 
-            // This function automatically creates missing namespaces, inserts tags on conflict,
-            // resolves structural parent trees, and returns a direct Tag -> u64 ID map
             let tag_cache = Self::internal_tag_bulk_add(&conn, &all_tag_actions);
 
-            // 4️⃣ Step 3: Fetch Current File Relationships State
-            // (Assuming you have an internal helper to look up existing Tags associated with file IDs)
             let file_ids: Vec<u64> = file_cache.values().copied().collect();
             let current_file_relationships =
                 Self::internal_file_id_get_tag_ids_bulk(&conn, &file_ids).unwrap();
 
-            // 5️⃣ Step 4: Calculate Relationship Deltas (Hoisted Buffer Logic)
             let mut rels_to_add = HashSet::new();
             let mut rels_to_del = HashSet::new();
 
@@ -1374,22 +1444,18 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                         TagOperation::Add => {
                             for tag in &tag_action.tags {
                                 if matches!(tag.tag_type, TagType::Normal | TagType::NormalNoRegex)
-                                {
-                                    if let Some(&tag_id) = tag_cache.get(&tag.tag) {
+                                    && let Some(&tag_id) = tag_cache.get(&tag.tag) {
                                         rels_to_add.insert((file_id, tag_id));
                                         explicit_adds.insert(tag_id);
                                     }
-                                }
                             }
                         }
                         TagOperation::Del => {
                             for tag in &tag_action.tags {
                                 if matches!(tag.tag_type, TagType::Normal | TagType::NormalNoRegex)
-                                {
-                                    if let Some(&tag_id) = tag_cache.get(&tag.tag) {
+                                    && let Some(&tag_id) = tag_cache.get(&tag.tag) {
                                         rels_to_del.insert((file_id, tag_id));
                                     }
-                                }
                             }
                         }
                         TagOperation::Set => {
@@ -1456,7 +1522,27 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         .await
         .unwrap()
     }
+    ///
+    /// Checks if we should download the file or not
+    ///
+    pub async fn jobs_update(&self, job: &DbJobsObj) {
+        let pool = self.pool.clone();
 
+        let job = job.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = match pool.get() {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("Failed to acquire DB connection from pool: {:?}", e);
+                    panic!();
+                }
+            };
+
+            Self::internal_jobs_update(&conn, &job)
+        })
+        .await
+        .unwrap();
+    }
     ///
     /// Checks if we should download the file or not
     ///
@@ -1616,10 +1702,9 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     /// Returns the full location of where a file should be stored
     ///
     pub async fn file_ids_get_tags(&self, file_ids: &HashSet<u64>) -> HashMap<u64, HashSet<Tag>> {
-        let mut out = HashMap::new();
         // If our hash is less then 6 cant return a location
         if file_ids.is_empty() {
-            return out;
+            return HashMap::new();
         }
         let file_ids = file_ids.clone();
         let pool = self.pool.clone();
