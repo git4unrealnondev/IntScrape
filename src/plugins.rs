@@ -3,6 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
+    thread::JoinHandle,
 };
 
 use bytes::Bytes;
@@ -20,8 +21,23 @@ pub struct PluginManager {
     storage_callbacks: RwLock<HashMap<GlobalCallbacks, HashSet<String>>>,
     storage_libs: RwLock<HashMap<String, Arc<Library>>>,
     db: Arc<MainDatabase>,
+    threads: RwLock<Vec<JoinHandle<()>>>,
 }
-pub type PluginInitFn = extern "C" fn();
+
+impl Drop for PluginManager {
+    fn drop(&mut self) {
+        let mut guard = self.threads.write();
+        let threads_to_join = std::mem::take(&mut *guard);
+
+        for thread in threads_to_join {
+            // Now we own the handle and can safely call .join()
+            if let Err(err) = thread.join() {
+                log::error!("PluginManager thread had error {:?}", err);
+            }
+        }
+    }
+}
+
 impl PluginManager {
     pub fn new(path: &Path, db: Arc<MainDatabase>) -> Arc<Self> {
         let plugin_manager = PluginManager {
@@ -30,6 +46,7 @@ impl PluginManager {
             storage_site: HashMap::new().into(),
             storage_callbacks: HashMap::new().into(),
             db,
+            threads: Vec::new().into(),
         };
 
         plugin_manager.load_libs(path);
@@ -231,6 +248,93 @@ impl PluginManager {
                     jobs.extend(return_data.jobs);
                 }
             }
+        }
+    }
+
+    pub fn callback_on_start(&self) {
+        // Spawns each plugin and waits till its finished before the next plugin gets called
+        if let Some(plugin_name_list) = self
+            .storage_callbacks
+            .read()
+            .get(&GlobalCallbacks::Start(StartupThreadType::Inline))
+        {
+            for plugin_name in plugin_name_list {
+                if let Some(lib) = self.storage_libs.read().get(plugin_name) {
+                    let temp: libloading::Symbol<unsafe extern "C" fn()> = {
+                        unsafe {
+                            match lib.get(b"on_start") {
+                                Err(err) => {
+                                    error!(
+                                        "Plugins: {} could not call 'on_download' got error: {:?}",
+                                        &plugin_name, err
+                                    );
+                                    continue;
+                                }
+                                Ok(out) => out,
+                            }
+                        }
+                    };
+                    unsafe { temp() };
+                }
+            }
+        }
+        // Spawns threads and throws them into the background functions
+        if let Some(plugin_name_list) = self
+            .storage_callbacks
+            .read()
+            .get(&GlobalCallbacks::Start(StartupThreadType::Spawn))
+        {
+            for plugin_name in plugin_name_list {
+                if let Some(lib) = self.storage_libs.read().get(plugin_name) {
+                    let lib_clone = Arc::clone(lib);
+
+                    let name_log = plugin_name.clone();
+
+                    self.threads.write().push(std::thread::spawn(move || {
+                        unsafe {
+                            match lib_clone.get::<unsafe extern "C" fn()>(b"on_start") {
+                                Ok(temp) => {
+                                    temp();
+                                }
+                                Err(err) => {
+                                    error!("Plugins: background execution for '{}' failed to load symbol: {:?}", name_log, err);
+                                }
+                            }
+                        }
+                    }));
+                }
+            }
+        }
+        // Spawns threads and waits
+        let mut threads = Vec::new();
+        if let Some(plugin_name_list) = self
+            .storage_callbacks
+            .read()
+            .get(&GlobalCallbacks::Start(StartupThreadType::SpawnInline))
+        {
+            for plugin_name in plugin_name_list {
+                if let Some(lib) = self.storage_libs.read().get(plugin_name) {
+                    let lib_clone = Arc::clone(lib);
+
+                    let name_log = plugin_name.clone();
+
+                    threads.push(std::thread::spawn(move || {
+                        unsafe {
+                            match lib_clone.get::<unsafe extern "C" fn()>(b"on_start") {
+                                Ok(temp) => {
+                                    temp();
+                                }
+                                Err(err) => {
+                                    error!("Plugins: background execution for '{}' failed to load symbol: {:?}", name_log, err);
+                                }
+                            }
+                        }
+                    }));
+                }
+            }
+        }
+        for thread in threads {
+            thread.join().unwrap();
         }
     }
 }

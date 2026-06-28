@@ -5,7 +5,10 @@ use rusqlite::ToSql;
 use shared_types::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use crate::db::roaring::{InternalCacheType, SearchQuery};
+use crate::db::{CacheType, RelationshipStorage};
 use crate::{db::MainDatabase, helper_functions::get_sys_time_in_secs};
 
 pub trait DbJobsObjExt {
@@ -96,6 +99,89 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
         .unwrap();
     }
 
+    pub(in crate::db) fn internal_load_caching(self: Arc<Self>, conn: &Connection) {
+        let temp;
+        loop {
+            let cache = match Self::internal_setting_get(conn, "SYSTEM_cachemode") {
+                Err(_) | Ok(None) => {
+                    Self::internal_setup_default_cache(conn);
+                    Self::internal_setting_get(conn, "SYSTEM_cachemode")
+                        .unwrap()
+                        .unwrap()
+                        .param
+                        .clone()
+                }
+                Ok(Some(setting)) => setting.param.clone(),
+            };
+
+            if let Some(ref cache) = cache {
+                let cachemode = match cache.as_str() {
+                    "Bare" => (Some(CacheType::Bare), None),
+                    "RelationshipRoaringFull" => (
+                        Some(CacheType::RelationshipRoaring(InternalCacheType::Full)),
+                        Some(RelationshipStorage::new(
+                            self.clone(),
+                            InternalCacheType::Full,
+                        )),
+                    ),
+                    "RelationshipRoaringTable" => (
+                        Some(CacheType::RelationshipRoaring(InternalCacheType::Table)),
+                        Some(RelationshipStorage::new(
+                            self.clone(),
+                            InternalCacheType::Table,
+                        )),
+                    ),
+                    "RelationshipRoaringPopular" => {
+                        if let Ok(Some(popular_count)) =
+                            Self::internal_setting_get(conn, "SYSTEM_tag_count_popular_division")
+                            && let Some(popular_count) = popular_count.num
+                        {
+                            (
+                                Some(CacheType::RelationshipRoaring(InternalCacheType::Popular(
+                                    popular_count,
+                                ))),
+                                Some(RelationshipStorage::new(
+                                    self.clone(),
+                                    InternalCacheType::Popular(popular_count),
+                                )),
+                            )
+                        } else {
+                            (None, None)
+                        }
+                    }
+
+                    _ => {
+                        Self::internal_setup_default_cache(conn);
+                        (None, None)
+                    }
+                };
+                if cachemode.0.is_some() {
+                    temp = cachemode;
+                    break;
+                }
+            } else {
+                Self::internal_setup_default_cache(conn);
+            }
+        }
+        *self.relationship_roaring_storage.write() = temp.1;
+        *self.cache_type.write() = temp.0.unwrap();
+    }
+
+    /// Sets up internal cache structure
+    pub(in crate::db) fn internal_setup_default_cache(conn: &Connection) {
+        Self::internal_setting_set(
+            conn,
+            &DbSettingsObj {
+                name: "SYSTEM_cachemode".to_string(),
+                description: Some(
+                    "The database caching options. Supports: Bare, InMemdb and InMemory"
+                        .to_string(),
+                ),
+                num: None,
+                param: Some("RelationshipRoaringFull".to_string()),
+            },
+        );
+    }
     ///
     /// Handles creating the triggers to manage the count in the Tags column
     ///
@@ -139,10 +225,63 @@ CREATE TABLE IF NOT EXISTS Tags (
 
     FOREIGN KEY (namespace) REFERENCES Namespace(id) ON DELETE CASCADE ON UPDATE CASCADE
 );
+CREATE INDEX IF NOT EXISTS idx_tags_count_covering ON Tags(count DESC, name, namespace);
+--CREATE INDEX IF NOT EXISTS idx_tags_namespace ON Tags(namespace);
 
-CREATE INDEX IF NOT EXISTS idx_tags_count ON Tags(count DESC);
-CREATE INDEX IF NOT EXISTS idx_tags_namespace ON Tags(namespace);
+CREATE VIEW High_Value_Tags AS 
+    SELECT id, name, namespace 
+    FROM Tags 
+    WHERE count >= 5;
 
+CREATE VIRTUAL TABLE Tags_Popular_fts USING fts5(
+    name,
+    namespace UNINDEXED,
+    content='High_Value_Tags',
+    content_rowid='id',
+    tokenize = \"unicode61 separators '_/'\"
+);
+
+-- OPTIMIZATION: Only insert if it meets the threshold
+CREATE TRIGGER IF NOT EXISTS tags_ai AFTER INSERT ON Tags 
+WHEN new.count >= 5
+BEGIN
+    INSERT INTO Tags_Popular_fts(rowid, name, namespace) 
+    VALUES (new.id, new.name, new.namespace);
+END;
+
+-- OPTIMIZATION: Only attempt FTS delete if the old row actually qualified to be in there
+CREATE TRIGGER IF NOT EXISTS tags_ad AFTER DELETE ON Tags 
+WHEN old.count >= 5
+BEGIN
+    INSERT INTO Tags_Popular_fts(Tags_Popular_fts, rowid, name, namespace) 
+    VALUES('delete', old.id, old.name, old.namespace);
+END;
+
+-- OPTIMIZATION: Divided into precise conditional logic to prevent unnecessary 
+-- FTS virtual table thrashing during standard increments.
+CREATE TRIGGER IF NOT EXISTS tags_au_upgrade AFTER UPDATE ON Tags
+WHEN old.count < 5 AND new.count >= 5
+BEGIN
+    INSERT INTO Tags_Popular_fts(rowid, name, namespace) 
+    VALUES (new.id, new.name, new.namespace);
+END;
+
+CREATE TRIGGER IF NOT EXISTS tags_au_downgrade AFTER UPDATE ON Tags
+WHEN old.count >= 5 AND new.count < 5
+BEGIN
+    INSERT INTO Tags_Popular_fts(Tags_Popular_fts, rowid, name, namespace) 
+    VALUES('delete', old.id, old.name, old.namespace);
+END;
+
+CREATE TRIGGER IF NOT EXISTS tags_au_maintain AFTER UPDATE ON Tags
+WHEN old.count >= 5 AND new.count >= 5 AND (old.name != new.name OR old.namespace != new.namespace)
+BEGIN
+    INSERT INTO Tags_Popular_fts(Tags_Popular_fts, rowid, name, namespace) 
+    VALUES('delete', old.id, old.name, old.namespace);
+    
+    INSERT INTO Tags_Popular_fts(rowid, name, namespace) 
+    VALUES (new.id, new.name, new.namespace);
+END;
 ",
         )
         .unwrap();
@@ -390,10 +529,10 @@ ON Jobs (time, reptime, site, param);
     /// Gets a single fileid from a tag
     ///
     pub(in crate::db) fn internal_tag_get_fileid(conn: &Connection, tag: &Tag) -> Option<u64> {
-        if let Some(ns_id) = Self::internal_namespace_get_id(conn, &tag.namespace.name) {
-            if let Some(ref tag_id) = Self::internal_tag_get_id(conn, &tag.name, ns_id) {
-                return Self::internal_tag_id_get_file_id(conn, tag_id).ok();
-            }
+        if let Some(ns_id) = Self::internal_namespace_get_id(conn, &tag.namespace.name)
+            && let Some(ref tag_id) = Self::internal_tag_get_id(conn, &tag.name, ns_id)
+        {
+            return Self::internal_tag_id_get_file_id(conn, tag_id).ok();
         }
 
         None
@@ -777,7 +916,7 @@ ON Jobs (time, reptime, site, param);
         )?;
 
         // query_map processes each row through a closure safely
-        let job_iter = stmt.query_map([site], |row| shared_types::DbJobsObj::from_row(row))?;
+        let job_iter = stmt.query_map([site], shared_types::DbJobsObj::from_row)?;
 
         // Collect the iterator results, propagating any underlying row or parsing errors
         let mut jobs = Vec::new();
@@ -850,12 +989,10 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     ) -> Result<Option<(PathBuf, u64)>, rusqlite::Error> {
         if let Some(setting) = Self::internal_setting_get(conn, "SYSTEM_file_location")?
             && let Some(setting_param) = setting.param
-        {
-            if let Ok(Some(path_id)) =
+            && let Ok(Some(path_id)) =
                 Self::internal_file_storage_location_get(conn, &setting_param)
-            {
-                return Ok(Some((PathBuf::from(setting_param), path_id)));
-            }
+        {
+            return Ok(Some((PathBuf::from(setting_param), path_id)));
         }
         Ok(None)
     }
@@ -1045,27 +1182,26 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             .filter(is_valid_tag);
 
         for tag in valid_tags {
-            if let Some(&tag_id) = out.get(&tag.tag) {
-                if let Some(relate_tag) = &tag.relates_to {
-                    if let Some(&relate_tag_id) = out.get(&relate_tag.tag) {
-                        if relate_tag.limit_to.is_none() {
-                            parents.insert(shared_types::TagParents {
-                                tag_id,
-                                relate_tag_id,
-                                limit_to: None,
-                            });
-                        }
+            if let Some(&tag_id) = out.get(&tag.tag)
+                && let Some(relate_tag) = &tag.relates_to
+                && let Some(&relate_tag_id) = out.get(&relate_tag.tag)
+            {
+                if relate_tag.limit_to.is_none() {
+                    parents.insert(shared_types::TagParents {
+                        tag_id,
+                        relate_tag_id,
+                        limit_to: None,
+                    });
+                }
 
-                        if let Some(limit_to_tag) = &relate_tag.limit_to {
-                            if let Some(&limit_id) = out.get(limit_to_tag) {
-                                parents.insert(shared_types::TagParents {
-                                    tag_id,
-                                    relate_tag_id,
-                                    limit_to: Some(limit_id),
-                                });
-                            }
-                        }
-                    }
+                if let Some(limit_to_tag) = &relate_tag.limit_to
+                    && let Some(&limit_id) = out.get(limit_to_tag)
+                {
+                    parents.insert(shared_types::TagParents {
+                        tag_id,
+                        relate_tag_id,
+                        limit_to: Some(limit_id),
+                    });
                 }
             }
         }
@@ -1128,6 +1264,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     /// Deletes relationships from db
     ///
     pub(in crate::db) fn internal_relationship_bulk_delete(
+        self: Arc<Self>,
         conn: &Connection,
         relationships: &HashSet<(u64, u64)>,
     ) {
@@ -1139,6 +1276,16 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         let mut query = String::from("DELETE FROM Relationship WHERE ");
         let mut params_vector: Vec<&dyn rusqlite::types::ToSql> =
             Vec::with_capacity(rel_vec.len() * 2);
+
+        // removes relationships between roaring
+        {
+            let mut guard = self.relationship_roaring_storage.write();
+            if let Some(roaring) = guard.as_mut() {
+                for (file_id, tag_id) in relationships.iter() {
+                    roaring.remove_roaring(conn, *tag_id, *file_id);
+                }
+            }
+        }
 
         for (i, rel) in rel_vec.iter().enumerate() {
             if i > 0 {
@@ -1159,28 +1306,39 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     /// Bulk adds relationship into DB
     ///
     pub(in crate::db) fn internal_relationship_bulk_add(
+        self: Arc<Self>,
         conn: &Connection,
-        namespaces: &HashSet<(u64, u64)>,
+        relationships: &HashSet<(u64, u64)>,
     ) {
-        if namespaces.is_empty() {
+        if relationships.is_empty() {
             return;
         }
 
-        let namespace_vec: Vec<&(u64, u64)> = namespaces.iter().collect();
+        // adds relationships between roaring
+        {
+            let mut guard = self.relationship_roaring_storage.write();
+            if let Some(roaring) = guard.as_mut() {
+                for (file_id, tag_id) in relationships.iter() {
+                    roaring.relationship_roaring_add(conn, *tag_id, *file_id);
+                }
+            }
+        }
+
+        let relationships_vec: Vec<&(u64, u64)> = relationships.iter().collect();
 
         let mut query =
             String::from("INSERT OR IGNORE INTO Relationship (file_id, tag_id) VALUES ");
         let mut params_vector: Vec<&dyn rusqlite::types::ToSql> =
-            Vec::with_capacity(namespace_vec.len() * 2);
+            Vec::with_capacity(relationships_vec.len() * 2);
 
         // String building
-        for (i, namespace) in namespace_vec.iter().enumerate() {
+        for (i, relationship) in relationships_vec.iter().enumerate() {
             if i > 0 {
                 query.push_str(", ");
             }
             query.push_str(&format!("(?{}, ?{})", i * 2 + 1, i * 2 + 2));
-            params_vector.push(&namespace.0);
-            params_vector.push(&namespace.1);
+            params_vector.push(&relationship.0);
+            params_vector.push(&relationship.1);
         }
 
         conn.execute(&query, &*params_vector).unwrap();
@@ -1313,18 +1471,16 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         println!("--- Parents Table Contents ---");
 
         // 3. Iterate and print each row
-        for row in parent_rows {
-            if let Ok((tag_id, relate_tag_id, limit_to)) = row {
-                match limit_to {
-                    Some(limit_id) => {
-                        println!(
-                            "Tag ID: {} -> Relate Tag ID: {} (Limited To: {})",
-                            tag_id, relate_tag_id, limit_id
-                        );
-                    }
-                    None => {
-                        println!("Tag ID: {} -> Relate Tag ID: {}", tag_id, relate_tag_id);
-                    }
+        for (tag_id, relate_tag_id, limit_to) in parent_rows.flatten() {
+            match limit_to {
+                Some(limit_id) => {
+                    println!(
+                        "Tag ID: {} -> Relate Tag ID: {} (Limited To: {})",
+                        tag_id, relate_tag_id, limit_id
+                    );
+                }
+                None => {
+                    println!("Tag ID: {} -> Relate Tag ID: {}", tag_id, relate_tag_id);
                 }
             }
         }
@@ -1336,7 +1492,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     /// Handles all the processing for files and tags and relational items
     ///
     pub async fn process_scraper(
-        &self,
+        self: Arc<Self>,
         map: HashMap<FileInternal, Vec<FileTagAction>>,
         jobs: Vec<ScraperDataReturn>,
     ) {
@@ -1360,7 +1516,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             'ScraperLoop: for scraperdatareturn in jobs {
                 for skip_conditions in scraperdatareturn.skip_conditions {
                     match skip_conditions {
-                        SkipIf::FileHash(file_hash) => {}
+                        SkipIf::FileHash(_file_hash) => {}
                         SkipIf::FileTagRelationship(tag) => {
                             if let Some(ns_id) =
                                 Self::internal_namespace_get_id(&conn, &tag.namespace.name)
@@ -1371,7 +1527,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                                         continue 'ScraperLoop;
                                     }
                         }
-                        SkipIf::FileNamespaceNumber((tag, namespace, id)) => {}
+                        SkipIf::FileNamespaceNumber((_tag, _namespace, _id)) => {}
                         SkipIf::NoFilesDownloaded => {}
                     }
                 }
@@ -1510,11 +1666,11 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
 
             // 6️⃣ Step 5: Flush Relationship Mutations to DB in Batch
             if !rels_to_del.is_empty() {
-                Self::internal_relationship_bulk_delete(&conn, &rels_to_del);
+                Self::internal_relationship_bulk_delete(self.clone(), &conn, &rels_to_del);
             }
 
             if !rels_to_add.is_empty() {
-                Self::internal_relationship_bulk_add(&conn, &rels_to_add);
+                Self::internal_relationship_bulk_add(self, &conn, &rels_to_add);
             }
 
             conn.commit().unwrap();
@@ -1608,7 +1764,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     ///
     /// Adds relationship into db
     ///
-    pub async fn add_relationship_bulk(&self, rel_list: HashSet<(u64, u64)>) {
+    pub async fn add_relationship_bulk(self: Arc<Self>, rel_list: HashSet<(u64, u64)>) {
         if rel_list.is_empty() {
             return;
         }
@@ -1625,7 +1781,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             };
             let tn = conn.transaction().unwrap();
 
-            Self::internal_relationship_bulk_add(&tn, &rel_list);
+            Self::internal_relationship_bulk_add(self, &tn, &rel_list);
             tn.commit().unwrap();
         })
         .await
@@ -1634,7 +1790,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     ///
     /// Deletes relationship into db
     ///
-    pub async fn delete_relationship_bulk(&self, rel_list: HashSet<(u64, u64)>) {
+    pub async fn delete_relationship_bulk(self: Arc<Self>, rel_list: HashSet<(u64, u64)>) {
         if rel_list.is_empty() {
             return;
         }
@@ -1651,7 +1807,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             };
             let tn = conn.transaction().unwrap();
 
-            Self::internal_relationship_bulk_delete(&tn, &rel_list);
+            Self::internal_relationship_bulk_delete(self, &tn, &rel_list);
             tn.commit().unwrap();
         })
         .await
@@ -1717,35 +1873,181 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         .unwrap()
     }
 
+    pub fn search_db_files_sync(&self, search: &SearchObj, limit: &Option<u64>) -> Vec<u64> {
+        use rusqlite::params_from_iter;
+        use std::time::Instant;
+
+        let start_time = Instant::now();
+
+        // 1. Extract and Categorize Tags
+        let mut and_tags = Vec::new();
+        let mut or_groups: Vec<Vec<u64>> = Vec::new();
+        let mut not_groups: Vec<Vec<u64>> = Vec::new();
+
+        for holder in search.searches.clone() {
+            match holder {
+                SearchHolder::And(ids) => and_tags.extend(ids),
+                SearchHolder::Or(ids) if !ids.is_empty() => or_groups.push(ids),
+                SearchHolder::Not(ids) if !ids.is_empty() => not_groups.push(ids),
+                _ => {}
+            }
+        }
+
+        if and_tags.is_empty() && or_groups.is_empty() {
+            return vec![];
+        }
+
+        let conn = self.pool.get().unwrap();
+        // 2. PATH A: Roaring Bitmap Optimization (Memory Speed)
+        let read_guard = self.relationship_roaring_storage.read();
+        if let Some(ref roaring) = *read_guard {
+            let mut should_quick_search = true;
+
+            for and_tag in and_tags.iter() {
+                if !roaring.relationship_cache_tagid_exists(&conn, *and_tag) {
+                    should_quick_search = false;
+                    break;
+                }
+            }
+            let start_time = Instant::now();
+            if should_quick_search {
+                let results = SearchQuery::new(roaring)
+                    .sort()
+                    .limit(*limit)
+                    .and_search(&and_tags)
+                    .build();
+
+                println!("Roaring Search took: {:?}", start_time.elapsed());
+                return results;
+            }
+        }
+
+        // 3. PATH B: Optimized SQL (Database Speed)
+        // If cache is off, we use Inner Joins on the rarest tag to minimize index lookups.
+
+        // Sort AND tags by rarity using the 'count' column in Tags table
+        let mut sorted_and = and_tags;
+        if sorted_and.len() > 1 {
+            let placeholders = vec!["?"; sorted_and.len()].join(",");
+            let count_sql = format!(
+                "SELECT id FROM Tags WHERE id IN ({}) ORDER BY count ASC",
+                placeholders
+            );
+            if let Ok(mut stmt) = conn.prepare(&count_sql) {
+                let ids: Vec<u64> = stmt
+                    .query_map(params_from_iter(&sorted_and), |r| r.get(0))
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .collect();
+                if !ids.is_empty() {
+                    sorted_and = ids;
+                }
+            }
+        }
+
+        let mut params = Vec::new();
+        let driver_tag = sorted_and[0];
+
+        // We start the query with our rarest tag
+        let mut sql = "SELECT r0.fileid FROM Relationship r0".to_string();
+
+        // Only add JOINs if there are more AND tags
+        for (i, tag) in sorted_and.iter().skip(1).enumerate() {
+            let alias = format!("r{}", i + 1);
+            sql.push_str(&format!(
+                " JOIN Relationship {0} ON r0.fileid = {0}.fileid AND {0}.tagid = ?",
+                alias
+            ));
+            params.push(*tag);
+        }
+
+        // Start conditions with the Driver Tag
+        sql.push_str(" WHERE r0.tagid = ?");
+        params.push(driver_tag);
+
+        // Add OR groups
+        for (i, group) in or_groups.iter().enumerate() {
+            let placeholders = vec!["?"; group.len()].join(",");
+            sql.push_str(&format!(
+        " AND EXISTS (SELECT 1 FROM Relationship or{} WHERE or{}.fileid = r0.fileid AND or{}.tagid IN ({}))", 
+        i, i, i, placeholders
+    ));
+            for &tag_id in group {
+                params.push(tag_id);
+            }
+        }
+
+        // Add NOT groups
+        for (i, group) in not_groups.iter().enumerate() {
+            let placeholders = vec!["?"; group.len()].join(",");
+            sql.push_str(&format!(
+        " AND NOT EXISTS (SELECT 1 FROM Relationship not{} WHERE not{}.fileid = r0.fileid AND not{}.tagid IN ({}))", 
+        i, i, i, placeholders
+    ));
+            for &tag_id in group {
+                params.push(tag_id);
+            }
+        }
+
+        // Finalize
+        sql.push_str(" ORDER BY r0.fileid DESC");
+
+        if let Some(l) = limit {
+            sql.push_str(" LIMIT ?");
+            params.push(*l);
+        }
+        dbg!(&sql, &params);
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .ok()
+            .expect("Unable to prepare a db search");
+        let results: Vec<u64> = stmt
+            .query_map(params_from_iter(params), |row| row.get(0))
+            .ok()
+            .expect(" Unable to querymap")
+            .filter_map(|r| r.ok())
+            .collect();
+
+        println!("SQL Search took: {:?}", start_time.elapsed());
+        results
+    }
+
+    /// A sync function to get a function
+    pub fn setting_get_sync(&self, name: &str) -> Option<DbSettingsObj> {
+        let pool = self.pool.clone();
+        let conn = pool.get().ok()?;
+        Self::internal_setting_get(&conn, name).ok().flatten()
+    }
+
     ///
     /// What everything else uses when getting a setting
     ///
-    pub async fn setting_get(&self, name: String) -> Option<shared_types::DbSettingsObj> {
-        let pool = self.pool.clone();
+    pub async fn setting_get(self: Arc<Self>, name: String) -> Option<shared_types::DbSettingsObj> {
+        let name = name.clone();
+        let self_clone = self.clone();
+        tokio::task::spawn_blocking(move || self_clone.setting_get_sync(&name))
+            .await
+            .ok()
+            .flatten() // Flattens the JoinError wrapper Option as well
+    }
 
-        tokio::task::spawn_blocking(move || {
-            let conn = pool.get().ok()?;
-            Self::internal_setting_get(&conn, &name).ok().flatten()
-        })
-        .await
-        .ok()
-        .flatten() // Flattens the JoinError wrapper Option as well
+    pub fn setting_set_sync(&self, obj: &DbSettingsObj) -> bool {
+        let pool = self.pool.clone();
+        let conn = pool.get().ok().unwrap();
+        Self::internal_setting_set(&conn, obj).ok().is_some()
     }
 
     ///
     /// What anything outside of the db uses to set a setting
     ///
-    pub async fn setting_set(&self, obj: shared_types::DbSettingsObj) -> bool {
-        let pool = self.pool.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let conn = pool.get().ok()?;
-            Some(Self::internal_setting_set(&conn, &obj).is_ok())
-        })
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(false)
+    pub async fn setting_set(self: Arc<Self>, obj: shared_types::DbSettingsObj) -> bool {
+        let obj = obj.clone();
+        let _self_clone = self.clone();
+        tokio::task::spawn_blocking(move || self.setting_set_sync(&obj))
+            .await
+            .ok()
+            .is_some()
     }
     ///
     /// Sets a job to be running inside of the db

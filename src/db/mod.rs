@@ -1,17 +1,29 @@
 use core::{convert::Into, option::Option::Some};
-use log::info;
 use parking_lot::RwLock;
 use r2d2::Pool;
 use r2d2_sqlite::{SqliteConnectionManager, rusqlite::Connection};
 use std::{collections::HashMap, path::Path};
 
-use crate::{Arc, DB_VERSION};
+use crate::{
+    Arc, DB_VERSION,
+    db::roaring::{InternalCacheType, RelationshipStorage},
+};
 
 pub mod main;
+pub mod roaring;
+
+pub enum CacheType {
+    // Will be use to query the DB directly. No caching. DEFAULT OPTION
+    Bare,
+    // New cache method for relationships
+    RelationshipRoaring(InternalCacheType),
+}
 
 pub struct MainDatabase {
     pool: Pool<SqliteConnectionManager>,
     namespace_cache: Arc<RwLock<HashMap<String, u64>>>,
+    cache_type: RwLock<CacheType>,
+    relationship_roaring_storage: RwLock<Option<RelationshipStorage>>,
 }
 
 impl Drop for MainDatabase {
@@ -53,10 +65,12 @@ PRAGMA cache_size = -64000;
         let main_db: Arc<MainDatabase> = MainDatabase {
             pool,
             namespace_cache: Arc::new(RwLock::new(HashMap::new())),
+            cache_type: CacheType::Bare.into(),
+            relationship_roaring_storage: None.into(),
         }
         .into();
 
-        main_db.check_db().unwrap();
+        main_db.clone().check_db().unwrap();
 
         main_db.load_cache();
 
@@ -82,8 +96,9 @@ PRAGMA cache_size = -64000;
     }
 
     /// Checks to see if the DB exists
-    fn check_db(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let conn = self.pool.get()?;
+    fn check_db(self: Arc<Self>) -> Result<(), Box<dyn std::error::Error>> {
+        let mut conn = self.pool.get()?;
+        let conn = conn.transaction().unwrap();
 
         if let Ok(Some(_)) = Self::internal_setting_get(&conn, "SYSTEM_VERSION") {
         } else {
@@ -94,6 +109,16 @@ PRAGMA cache_size = -64000;
 
         // Resetting is_running to false
         Self::internal_jobs_reset_isrunning(&conn).unwrap();
+
+        Self::internal_load_caching(self.clone(), &conn);
+        {
+            let mut guard = self.relationship_roaring_storage.write();
+            if let Some(roaring) = guard.as_mut() {
+                roaring.load_relationship_cache(&conn);
+            }
+        }
+
+        conn.commit().unwrap();
 
         Ok(())
     }
@@ -115,6 +140,7 @@ PRAGMA cache_size = -64000;
         Self::internal_table_create_file_v1(conn);
 
         Self::internal_table_create_jobs_v1(conn);
+        RelationshipStorage::internal_table_relationship_cache_create_v1(conn);
 
         Self::internal_setting_set(
             conn,
@@ -173,5 +199,6 @@ PRAGMA cache_size = -64000;
             },
         )
         .unwrap();
+        Self::internal_setup_default_cache(conn);
     }
 }

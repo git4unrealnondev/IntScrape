@@ -172,6 +172,27 @@ pub fn parser_call(
                             }),
                             ..Default::default()
                         });
+
+                        // Adds job to get parent
+                        if recursion {
+                            let parse_url = format!(
+                                "https://{}.net/posts.json?tags=id:{}",
+                                site.to_string().to_lowercase(),
+                                &parent
+                            );
+                            jobs.insert(ScraperDataReturn {
+                                job: PluginJob {
+                                    site: scraperdata.job.site.clone(),
+                                    param: vec![ScraperParam::Url(parse_url)],
+                                    priority: DEFAULT_PRIORITY - 2,
+                                    ..Default::default()
+                                },
+                                skip_conditions: vec![SkipIf::FileTagRelationship(Tag {
+                                    name: parent.to_string(),
+                                    namespace: nsobjplg(&NsIdent::PostId, &site),
+                                })],
+                            });
+                        }
                     }
 
                     // Gets children and puts them into the db
@@ -188,6 +209,27 @@ pub fn parser_call(
                                 }),
                                 ..Default::default()
                             });
+
+                            // Adds job to get child
+                            if recursion {
+                                let parse_url = format!(
+                                    "https://{}.net/posts.json?tags=id:{}",
+                                    site.to_string().to_lowercase(),
+                                    &child
+                                );
+                                jobs.insert(ScraperDataReturn {
+                                    job: PluginJob {
+                                        site: scraperdata.job.site.clone(),
+                                        param: vec![ScraperParam::Url(parse_url)],
+                                        priority: DEFAULT_PRIORITY - 2,
+                                        ..Default::default()
+                                    },
+                                    skip_conditions: vec![SkipIf::FileTagRelationship(Tag {
+                                        name: child.to_string(),
+                                        namespace: nsobjplg(&NsIdent::PostId, &site),
+                                    })],
+                                });
+                            }
                         }
                     }
                 }

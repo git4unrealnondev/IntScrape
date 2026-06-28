@@ -1,0 +1,22 @@
+[package]
+name = "thumbnailer"
+readme = "README.md"
+license = "Apache-2.0"
+authors = ["trivernis <trivernis@protonmail.com>"]
+description = "An image thumbnail creation library"
+version = "0.5.1"
+edition = "2024"
+repository = "https://github.com/Trivernis/thumbnailer"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+webp = "*"
+rayon = "*"
+tempfile = "*"
+image = { version = "*", default-features = false, features=["jpeg", "png", "gif"]}
+lazy_static = "*"
+file-format = { workspace = true }
+[features]
+default = ["webp"]
+webp = ["image/webp"]

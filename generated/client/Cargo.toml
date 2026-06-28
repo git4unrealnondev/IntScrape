@@ -1,0 +1,10 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+shared_types = {workspace=true}
+bitcode = { workspace = true }
+interprocess = { workspace = true }
+serde = { workspace = true }

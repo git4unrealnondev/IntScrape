@@ -277,6 +277,7 @@ impl Scraper {
 
         self.download_manager
             .db
+            .clone()
             .process_scraper(file_id_tag_map, job_list)
             .await;
 
@@ -314,28 +315,24 @@ impl Scraper {
     }
 
     async fn manage_recreation(&self) -> bool {
-        if let Some(mut recreation) = self.job.config.recreation.clone() {
-            match recreation {
-                DbJobRecreation::AlwaysTime(timestamp, count) => {
-                    let mut job = self.job.clone();
-                    job.config.time = get_sys_time_in_secs();
-                    job.config.reptime = timestamp;
-                    job.isrunning=false;
-                    if let Some(mut count) = count {
-                        if count >= 1 {
-                            count -= 1;
-                        } else {
-                            return false;
-                        }
-                        job.config.recreation =
-                            Some(DbJobRecreation::AlwaysTime(timestamp, Some(count)));
-                    }
-
-                    self.download_manager.db.jobs_update(&job).await;
-                    return true;
+        if let Some(recreation) = self.job.config.recreation.clone()
+            && let DbJobRecreation::AlwaysTime(timestamp, count) = recreation
+        {
+            let mut job = self.job.clone();
+            job.config.time = get_sys_time_in_secs();
+            job.config.reptime = timestamp;
+            job.isrunning = false;
+            if let Some(mut count) = count {
+                if count >= 1 {
+                    count -= 1;
+                } else {
+                    return false;
                 }
-                _ => {}
+                job.config.recreation = Some(DbJobRecreation::AlwaysTime(timestamp, Some(count)));
             }
+
+            self.download_manager.db.jobs_update(&job).await;
+            return true;
         }
         false
     }
@@ -659,7 +656,7 @@ impl DownloadsManager {
                 }
             } else {
                 // Brand new site configuration path
-                let mut ratelimit = Some(
+                let ratelimit = Some(
                     Quota::with_period(Duration::from_secs(1))
                         .unwrap()
                         .allow_burst(std::num::NonZeroU32::new(1).unwrap()),
@@ -936,13 +933,14 @@ pub fn calculate_relationship_deltas(
         if let Some(current_tags) = current_file_relationships.get(&file_id) {
             for tag in current_tags {
                 let ns_name = &tag.namespace.name;
-                if ns_name != "source_url" && !ns_name.is_empty() {
-                    if let Some(&tag_id) = tag_cache.get(tag) {
-                        current_ns_tags
-                            .entry(ns_name.as_str()) // Replaced .clone() with &str slice reference
-                            .or_default()
-                            .insert(tag_id);
-                    }
+                if ns_name != "source_url"
+                    && !ns_name.is_empty()
+                    && let Some(&tag_id) = tag_cache.get(tag)
+                {
+                    current_ns_tags
+                        .entry(ns_name.as_str()) // Replaced .clone() with &str slice reference
+                        .or_default()
+                        .insert(tag_id);
                 }
             }
         }

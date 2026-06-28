@@ -1,12 +1,30 @@
+use redact::{Secret, expose_secret};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
-use redact::{Secret, expose_secret};
-
 pub const DEFAULT_PRIORITY: u64 = 10;
 
-#[derive(Deserialize, Debug, Serialize)]
+#[derive(Debug, Default, Copy, Clone)]
+#[repr(C)]
+pub struct SensorData {
+    pub value: f64,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[repr(C)]
+pub enum DbRequest {
+    GetUserById { client_id: u64, user_id: u64 },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[repr(C)]
+pub enum DbResponse {
+    UserData { user_id: u64, balance: f64 },
+}
+
+#[derive(Deserialize, Debug, Serialize, bitcode::Encode, bitcode::Decode, Clone)]
 pub struct DbSettingsObj {
     pub name: String,
     pub description: Option<String>,
@@ -14,7 +32,45 @@ pub struct DbSettingsObj {
     pub param: Option<String>,
 }
 
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
+pub enum DbSearchTypeEnum {
+    And,
+    Or,
+}
+#[derive(Deserialize, Debug, Serialize, bitcode::Encode, bitcode::Decode, Clone)]
+pub struct SearchObj {
+    pub search_relate: Option<Vec<SearchHolder>>,
+    pub searches: Vec<SearchHolder>,
+}
+#[derive(Deserialize, Debug, Serialize, bitcode::Encode, bitcode::Decode, Clone)]
+pub enum SearchHolder {
+    And(Vec<u64>),
+    Or(Vec<u64>),
+    Not(Vec<u64>),
+}
+pub struct DbSearchQuery {
+    pub tag_one: DbSearchObject,
+    pub tag_two: DbSearchObject,
+    pub search_enum: DbSearchTypeEnum,
+}
+pub struct DbSearchObject {
+    pub tag: String,
+    pub namespace: Option<String>,
+    pub namespace_id: Option<u64>,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Eq,
+    Hash,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Deserialize,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
 pub struct UrlPost {
     pub url: String,
     // Any goofball request modifiers
@@ -22,7 +78,9 @@ pub struct UrlPost {
     // any post data to send if needed
     pub post_data: String,
 }
-#[derive(Deserialize, Debug, Serialize, Clone, PartialEq, Eq, Hash)]
+#[derive(
+    Deserialize, Debug, Serialize, Clone, PartialEq, Eq, Hash, bitcode::Encode, bitcode::Decode,
+)]
 pub enum ScraperParam {
     // User defined params like search terms
     Normal(String),
@@ -39,7 +97,18 @@ pub enum ScraperParam {
 ///
 /// Gets passed around to plugins will try and not change this too to much
 ///
-#[derive(Debug, Clone, Default, Eq, Hash, PartialEq)]
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    Eq,
+    Hash,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
 pub struct PluginJob {
     // Time to run job. 0 for immediate
     pub time: u64,
@@ -141,7 +210,9 @@ pub enum HashesSupported {
     Sha512(String),
 }
 
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Deserialize, Serialize)]
+#[derive(
+    Debug, Clone, Eq, Hash, PartialEq, Deserialize, Serialize, bitcode::Encode, bitcode::Decode,
+)]
 pub enum DbJobRecreation {
     OnTagId(u64, Option<u64>),
     OnTag(String, u64, Option<u64>),
@@ -151,7 +222,7 @@ pub enum DbJobRecreation {
 ///
 /// Internal db obj
 ///
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct DbJobsObj {
     pub id: u64,
     pub isrunning: bool,
@@ -210,7 +281,19 @@ pub enum PluginProperties {
     Modifier(TargetModifier),
 }
 
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Eq,
+    Hash,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Deserialize,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
 pub enum DownloadModifiers {
     // A useragent to use when scraping text or pulling siteinfo
     Useragent(String),
@@ -238,7 +321,19 @@ pub enum ModifierTarget {
 ///
 /// Holds the login type that we need
 ///
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Eq,
+    Hash,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Deserialize,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
 pub enum LoginType {
     Cookie(String, Option<String>),
     Api(String, Option<String>),
@@ -259,7 +354,19 @@ pub enum LoginNeed {
 }
 
 /// Struct holding username and password as secrets
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Eq,
+    Hash,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Serialize,
+    Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
 pub struct LoginUsernameOrPassword {
     #[serde(serialize_with = "expose_secret")]
     pub username: Secret<String>,
@@ -278,11 +385,54 @@ pub enum GlobalCallbacks {
     // Used for when we need to get / register a login
     LoginNeeded,
     // Custom callback to be used for cross communication
-    //Callback(CallbackInfo),
+    Callback(CallbackInfo),
     // Runs when a tag has exists.
     // First when the ns exists, 2nd when the namespace does not exist
     // Use None when searching all or Some when searching restrictivly
     Tag((Option<SearchType>, Vec<String>, Vec<String>)),
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub struct CallbackInfo {
+    // Name of plugin's function
+    pub func: String,
+    // Version of plugin
+    pub vers: u64,
+    // Name of variable
+    pub data_name: Vec<String>,
+    // Data for variable of data_name
+    pub data: Vec<CallbackCustomData>,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub struct CallbackInfoInput {
+    // Version of the expected call. Its on the plugin to handle this properly
+    pub vers: u64,
+    // Name of variable
+    pub data_name: Vec<String>,
+    // Data for variable of data_name
+    pub data: Vec<CallbackCustomDataReturning>,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub enum CallbackCustomDataReturning {
+    String(String),
+    U8(Vec<u8>),
+    U64(u64),
+    VString(Vec<String>),
+    VU8(Vec<u8>),
+    Vu64(Vec<u64>),
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub enum CallbackCustomData {
+    String,
+    U8,
+    U64,
+    VString,
+    VU8,
+    Vu64,
+    VCallback,
 }
 
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Ord, PartialOrd)]

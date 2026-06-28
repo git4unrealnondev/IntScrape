@@ -19,11 +19,11 @@ fn parse_string_to_scraperparam(input: &str) -> Vec<shared_types::ScraperParam> 
 
     for item in input.split(' ') {
         // Gets a url if its a proper URL
-        if let Ok(url) = Url::parse(item) {
-            if url.scheme() == "http" || url.scheme() == "https" {
-                out.push(shared_types::ScraperParam::Url(url.to_string()));
-                continue;
-            }
+        if let Ok(url) = Url::parse(item)
+            && (url.scheme() == "http" || url.scheme() == "https")
+        {
+            out.push(shared_types::ScraperParam::Url(url.to_string()));
+            continue;
         }
         out.push(shared_types::ScraperParam::Normal(item.to_string()));
     }

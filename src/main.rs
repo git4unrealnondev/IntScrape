@@ -1,6 +1,8 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
-use crate::{db::MainDatabase, plugins::PluginManager, web::manager::DownloadsManager};
+use crate::{
+    db::MainDatabase, ipc::IpcServer, plugins::PluginManager, web::manager::DownloadsManager,
+};
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -9,6 +11,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 pub mod cli;
 pub mod db;
 pub mod helper_functions;
+pub mod ipc;
 pub mod plugins;
 pub mod web;
 
@@ -58,20 +61,26 @@ async fn main() {
         heavy_processing_pool.clone(),
     );
 
+    let ipc_server = IpcServer::new(db.clone());
+
+    plugin_manager.callback_on_start();
+
     // Does the CLI input processing
     cli::main(db.clone()).await;
 
     // Handles adding jobs into system
+    let plugin_manager_clone = plugin_manager.clone();
+    let download_manager_clone = download_manager.clone();
     let db_spawn = db.clone();
     let spawner = tokio::task::spawn(async move {
         loop {
             let jobs_to_run = db_spawn.jobs_get_torun().await;
 
-            download_manager
-                .add_jobs(plugin_manager.match_plugin(&jobs_to_run))
+            download_manager_clone
+                .add_jobs(plugin_manager_clone.match_plugin(&jobs_to_run))
                 .await;
 
-            if download_manager.all_jobs_complete().await && jobs_to_run.is_empty() {
+            if download_manager_clone.all_jobs_complete().await && jobs_to_run.is_empty() {
                 break;
             }
 
@@ -81,4 +90,11 @@ async fn main() {
     });
 
     spawner.await.unwrap();
+
+    // Ensures that everything gets dropped properly
+    drop(heavy_processing_pool);
+    drop(ipc_server);
+    drop(download_manager);
+    drop(plugin_manager);
+    drop(db);
 }

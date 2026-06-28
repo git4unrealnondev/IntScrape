@@ -8,3 +8,4 @@ log*
 files
 compiled_plugins
 *.json
+thumbnail

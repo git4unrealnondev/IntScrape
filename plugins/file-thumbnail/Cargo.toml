@@ -1,0 +1,16 @@
+[package]
+name = "file-thumbnail"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"] 
+
+[dependencies]
+shared_types = { workspace = true }
+client = { workspace = true }
+thumbnailer = {path= "thumbnailer"} 
+image = { version = "^0.25.9", default-features = true, features = ["jpeg", "png", "gif"] }
+sha2 = "0.11.0"
+file-format = { workspace = true }
+webp-animation = "0.10.0"

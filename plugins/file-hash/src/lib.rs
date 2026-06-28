@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, error::Error, path::Path};
 
 use shared_types::{
     CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks, PluginTag, Tag,
@@ -14,6 +14,9 @@ enum Supset {
     IPFSCID1,
     Imagehash,
 }
+
+#[unsafe(no_mangle)]
+fn on_start() {}
 
 #[unsafe(no_mangle)]
 fn get_plugin_info() -> Vec<shared_types::Plugin> {
