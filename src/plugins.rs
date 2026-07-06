@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::{Write, stdin, stdout},
     path::{Path, PathBuf},
     sync::Arc,
     thread::JoinHandle,
@@ -60,6 +61,22 @@ impl PluginManager {
         info!("Plugin Storage: {:?}", self.storage.read());
     }
 
+    pub fn get_storage_sites(&self) -> Vec<String> {
+        let guard = self.storage_site.read();
+        guard.keys().cloned().collect()
+    }
+
+    pub fn are_start_threads_closed(&self) -> bool {
+        let guard = self.threads.read();
+        for item in guard.iter() {
+            if !item.is_finished() {
+                return false;
+            }
+        }
+
+        true
+    }
+
     fn load_libs(&self, path: &Path) {
         for entry in fs::read_dir(path).unwrap().flatten() {
             let path = entry.path();
@@ -81,6 +98,93 @@ impl PluginManager {
 
                                 // Loads sites into storage
                                 for property in plugin.properties.iter() {
+                                    if let PluginProperties::Login((login_need, login_type)) =
+                                        property
+                                    {
+                                        if login_need == &LoginNeed::Required {
+                                            match login_type {
+                                                LoginType::Api(key, api) => {
+                                                    if self
+                                                        .db
+                                                        .setting_get_sync(&format!(
+                                                            "PLUGIN_{}_{}",
+                                                            plugin.name, "API_KEY"
+                                                        ))
+                                                        .is_none()
+                                                    {
+                                                        dbg!(&plugin.name, &key, &api);
+                                                        let mut user_name = String::new();
+                                                        print!("Api Key: ");
+                                                        let _ = stdout().flush();
+                                                        stdin().read_line(&mut user_name).expect(
+                                                            "Did not enter a correct string",
+                                                        );
+                                                        if let Some('\n') =
+                                                            user_name.chars().next_back()
+                                                        {
+                                                            user_name.pop();
+                                                        }
+                                                        if let Some('\r') =
+                                                            user_name.chars().next_back()
+                                                        {
+                                                            user_name.pop();
+                                                        }
+                                                        let mut user_pass = String::new();
+                                                        print!("Password: ");
+                                                        let _ = stdout().flush();
+                                                        stdin().read_line(&mut user_pass).expect(
+                                                            "Did not enter a correct string",
+                                                        );
+                                                        if let Some('\n') =
+                                                            user_pass.chars().next_back()
+                                                        {
+                                                            user_pass.pop();
+                                                        }
+                                                        if let Some('\r') =
+                                                            user_pass.chars().next_back()
+                                                        {
+                                                            user_pass.pop();
+                                                        }
+                                                        self.db.setting_set_sync(&DbSettingsObj {
+                                                            name: format!(
+                                                                "PLUGIN_{}_API_KEY",
+                                                                plugin.name
+                                                            ),
+                                                            description: Some(
+                                                                "API Login for site.".into(),
+                                                            ),
+                                                            num: None,
+                                                            param: Some(user_name),
+                                                        });
+                                                        self.db.setting_set_sync(&DbSettingsObj {
+                                                            name: format!(
+                                                                "PLUGIN_{}_API_PASS",
+                                                                plugin.name
+                                                            ),
+                                                            description: Some(
+                                                                "API Login for site.".into(),
+                                                            ),
+                                                            num: None,
+                                                            param: Some(user_pass),
+                                                        });
+                                                    }
+                                                }
+                                                LoginType::ApiNamespaced(ns, key, api) => {
+                                                    if self
+                                                        .db
+                                                        .setting_get_sync(&format!(
+                                                            "PLUGIN_{}_{}_{}",
+                                                            plugin.name, &ns, "API_NS"
+                                                        ))
+                                                        .is_none()
+                                                    {
+                                                        dbg!(&key, &api);
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
                                     if let PluginProperties::Sites(site_list) = property {
                                         for site in site_list {
                                             self.storage_site

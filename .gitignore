@@ -9,3 +9,4 @@ files
 compiled_plugins
 *.json
 thumbnail
+*.sh

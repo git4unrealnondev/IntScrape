@@ -3,7 +3,6 @@ use log::info;
 use roaring::RoaringTreemap;
 use rusqlite::{Connection, params, params_from_iter};
 use rusqlite::{Error, OptionalExtension};
-use std::borrow::Cow;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -156,7 +155,7 @@ impl RelationshipStorage {
             .unwrap();
         tn.execute("DELETE FROM RelationshipRoaringFileid", [])
             .unwrap();
-        let mut stmt = tn.prepare("SELECT CAST(fileid AS INTEGER), CAST(tagid AS INTEGER) FROM Relationship ORDER BY fileid")?;
+        let mut stmt = tn.prepare("SELECT CAST(file_id AS INTEGER), CAST(tag_id AS INTEGER) FROM Relationship ORDER BY file_id")?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, u64>(0).unwrap(), row.get::<_, u64>(1).unwrap()))
@@ -189,7 +188,7 @@ impl RelationshipStorage {
             self.relationship_cache_add_fileid_sql(tn, fileid, &bitmap);
         }
 
-        let mut stmt = tn.prepare("SELECT CAST(fileid AS INTEGER), CAST(tagid AS INTEGER) FROM Relationship ORDER BY tagid")?;
+        let mut stmt = tn.prepare("SELECT CAST(file_id AS INTEGER), CAST(tag_id AS INTEGER) FROM Relationship ORDER BY tag_id")?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)))?;
 
         processed = 0;
@@ -228,6 +227,10 @@ impl RelationshipStorage {
 
     /// Loads entire relationships into db
     pub(in crate::db) fn load_relationship_cache(&mut self, conn: &Connection) {
+        info!(
+            "Relationship Roaring is loading data in from the db table: {:?}",
+            self.internal_cache
+        );
         // No need to load this
         if let InternalCacheType::Table = self.internal_cache {
             return;

@@ -1,13 +1,14 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     error::Error,
     fs::create_dir_all,
     path::{Path, PathBuf},
+    sync::atomic::AtomicUsize,
 };
 
 use shared_types::{
-    CallbackCustomData, CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks,
-    PluginTag, Tag,
+    CallbackCustomData, CallbackCustomDataReturning, CallbackInfoInput, CallbackReturn,
+    FileTagAction, GenericNamespaceObj, GlobalCallbacks, PluginTag, Tag,
 };
 use webp_animation::EncodingConfig;
 
@@ -70,6 +71,43 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
         ..Default::default()
     }]
 }
+
+/*
+#[unsafe(no_mangle)]
+pub fn file_thumbnailer_generate_thumbnail_fid(
+    callback: &CallbackInfoInput,
+) -> HashMap<String, CallbackCustomDataReturning> {
+    let index = callback.data_name.iter().position(|x| x == "file_id");
+    if let Some(index) = index {
+        if callback.data.len() >= index {
+            if let Some(custom_data) = callback.data.get(index) {
+                if let CallbackCustomDataReturning::U64(inp) = custom_data {
+                    let _counter = &AtomicUsize::new(0);
+                    if let Some(location) = &setup_thumbnail_location() {
+                        // Gets namespace id if it doesn't exist then recreate
+                        let utable;
+                        {
+                            utable = match client::namespace_get(PLUGIN_NAME.to_string()) {
+                                None => client::namespace_cwput(
+                                    PLUGIN_NAME.to_string(),
+                                    Some(PLUGIN_DESCRIPTION.to_string()),
+                                ),
+                                Some(id) => id,
+                            }
+                        }
+
+                        if let Some(file_thumb_hash) =
+                            process_fid(inp, location, &utable.try_into().unwrap())
+                        {
+                            client::relationship_file_tag_add(*inp, file_thumb_hash, utable, None);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    HashMap::new()
+}*/
 
 fn process_thumb_location() -> Result<PathBuf, Box<dyn Error>> {
     if client::setting_get("PLUGIN_thumbnail_location".into()).is_none_or(|f| f.param.is_none())

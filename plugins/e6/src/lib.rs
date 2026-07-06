@@ -95,7 +95,10 @@ pub fn url_dump(
                 job: shared_types::PluginJob {
                     site: scraperdata.job.site.clone(),
                     priority: shared_types::DEFAULT_PRIORITY - 2,
-                    param: vec![shared_types::ScraperParam::Url(url)],
+                    param: vec![shared_types::ScraperParam::Url(shared_types::Url {
+                        url,
+                        ..Default::default()
+                    })],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -139,6 +142,10 @@ pub fn parser_call(
     } else {
         Site::E6AI
     };
+
+    // Adds the posts from pool parsing
+    //let mut post_ids = Vec::new();
+
     let mut files = HashSet::new();
     let mut jobs = HashSet::new();
     let mut tags = HashSet::new();
@@ -183,7 +190,10 @@ pub fn parser_call(
                             jobs.insert(ScraperDataReturn {
                                 job: PluginJob {
                                     site: scraperdata.job.site.clone(),
-                                    param: vec![ScraperParam::Url(parse_url)],
+                                    param: vec![ScraperParam::Url(shared_types::Url {
+                                        url: parse_url,
+                                        ..Default::default()
+                                    })],
                                     priority: DEFAULT_PRIORITY - 2,
                                     ..Default::default()
                                 },
@@ -220,7 +230,10 @@ pub fn parser_call(
                                 jobs.insert(ScraperDataReturn {
                                     job: PluginJob {
                                         site: scraperdata.job.site.clone(),
-                                        param: vec![ScraperParam::Url(parse_url)],
+                                        param: vec![ScraperParam::Url(shared_types::Url {
+                                            url: parse_url,
+                                            ..Default::default()
+                                        })],
                                         priority: DEFAULT_PRIORITY - 2,
                                         ..Default::default()
                                     },
@@ -279,7 +292,10 @@ pub fn parser_call(
                             jobs.insert(ScraperDataReturn {
                                 job: PluginJob {
                                     site: scraperdata.job.site.clone(),
-                                    param: vec![ScraperParam::Url(parse_url)],
+                                    param: vec![ScraperParam::Url(shared_types::Url {
+                                        url: parse_url,
+                                        ..Default::default()
+                                    })],
                                     priority: DEFAULT_PRIORITY - 2,
                                     ..Default::default()
                                 },
@@ -435,7 +451,10 @@ pub fn parser_call(
                                 jobs.insert(ScraperDataReturn {
                                     job: PluginJob {
                                         site: scraperdata.job.site.clone(),
-                                        param: vec![ScraperParam::Url(parse_url)],
+                                        param: vec![ScraperParam::Url(shared_types::Url {
+                                            url: parse_url,
+                                            ..Default::default()
+                                        })],
                                         priority: DEFAULT_PRIORITY - 2,
                                         ..Default::default()
                                     },

@@ -3,10 +3,7 @@ use hex::encode_upper;
 use rayon::ThreadPool;
 use sha2::Digest;
 use std::{
-    collections::{HashMap, HashSet},
-    fs::create_dir_all,
-    sync::{Arc, atomic::AtomicBool},
-    time::Duration,
+    collections::{HashMap, HashSet}, env::temp_dir, fs::create_dir_all, io::Write, path::PathBuf, sync::{Arc, atomic::AtomicBool}, time::Duration
 };
 use url::Url;
 
@@ -17,12 +14,14 @@ use reqwest::Client;
 use sha2::{Sha256, Sha512};
 use shared_types::*;
 use tokio::{
-    sync::{Mutex, RwLock, oneshot},
-    task::JoinSet,
+    fs::File, io::AsyncWriteExt, sync::{Mutex, RwLock, Semaphore, oneshot}, task::JoinSet
 };
 
-use crate::{db::MainDatabase, helper_functions::get_sys_time_in_secs, plugins::PluginManager};
-
+use crate::{
+    db::MainDatabase,
+    helper_functions::{get_sys_time_in_secs, memory_manage},
+    plugins::PluginManager,
+};
 pub(in crate::web) struct Scraper {
     pub(in crate::web) job: DbJobsObj,
     pub(in crate::web) ratelimiter: Arc<DefaultDirectRateLimiter>,
@@ -48,6 +47,7 @@ pub struct DownloadsManager {
     plugin_manager: Arc<PluginManager>,
     jobs: RwLock<HashMap<String, InternalStorage>>,
     heavy_processing_pool: Arc<ThreadPool>,
+    job_limiter: Arc<Semaphore>,
 }
 
 impl Scraper {
@@ -66,7 +66,9 @@ impl Scraper {
             }
         }
 
-        Arc::new(Scraper {
+        let mut job = job.clone();
+
+        let mut scraper = Scraper {
             job,
             ratelimiter,
             plugin_manager,
@@ -74,7 +76,9 @@ impl Scraper {
             download_manager,
             text_client: Arc::new(Self::client_create(modifiers.clone(), true)),
             file_client: Arc::new(Self::client_create(modifiers.clone(), false)),
-        })
+        };
+
+        scraper.into()
     }
 
     ///
@@ -117,12 +121,16 @@ impl Scraper {
             return;
         }
 
-        let file_id_tag_map = Arc::new(Mutex::new(HashMap::new()));
-        let job_list = Arc::new(Mutex::new(Vec::new()));
-        let tag_list = Arc::new(Mutex::new(Vec::new()));
         let should_remove_job = Arc::new(AtomicBool::new(true));
 
+        let max_concurrent_downloads = 5;
+        let semaphore = Arc::new(Semaphore::new(max_concurrent_downloads));
+
         'scraperloop: for scrap_data in scraper_data_return.iter() {
+            let file_id_tag_map = Arc::new(Mutex::new(HashMap::new()));
+            let job_list = Arc::new(Mutex::new(Vec::new()));
+            let tag_list = Arc::new(Mutex::new(Vec::new()));
+
             for param in scrap_data.job.param.iter() {
                 let scraper = self.clone();
                 let param_clone = param.clone();
@@ -173,15 +181,21 @@ impl Scraper {
                                     let file_id_tag_map_clone = file_id_tag_map.clone();
                                     let should_remove_job_clone = should_remove_job.clone();
                                     let job_list_clone = job_list.clone();
-
+                                    let semaphore_clone = semaphore.clone();
+                                    let permit = semaphore_clone.acquire_owned().await.unwrap();
                                     set.spawn(async move {
                                         let mut download_issue = false;
                                         let mut jobs = Vec::new();
+
+                                        // Implements concurent ratelimit protection
+                                        let _permit = permit;
+
                                         if let Some(fileinternal) = scraper
                                             .file_download_logic(
                                                 &mut file,
                                                 &mut jobs,
                                                 &mut download_issue,
+                                                temp_dir().as_path()
                                             )
                                             .await
                                         {
@@ -199,9 +213,17 @@ impl Scraper {
                                             should_remove_job_clone
                                                 .store(false, std::sync::atomic::Ordering::Relaxed);
                                         }
+                                        memory_manage();
                                     });
+
+                                    while let Some(Ok(_)) = set.try_join_next() {
+                                        // Explicitly drains finished tasks to release internal tracking heap allocations
+                                    }
                                 }
-                                set.join_all().await;
+                                //set.join_all().await;
+                                while set.join_next().await.is_some() {}
+
+
                             }
                             ScraperReturn::Nothing => {
                                 log::info!(
@@ -224,63 +246,33 @@ impl Scraper {
                         }
                     }
                 }
-            }
+            } // Do all our happy db stuff down here :D
+            let file_id_tag_map = Arc::try_unwrap(file_id_tag_map)
+                .expect("Arc reference leak")
+                .into_inner();
+
+            let job_list = Arc::try_unwrap(job_list)
+                .expect("Arc reference leak")
+                .into_inner();
+
+            let tags = Arc::try_unwrap(tag_list)
+                .expect("Arc reference leak")
+                .into_inner();
+
+            self.download_manager
+                .db
+                .tags_add_bulk(&[FileTagAction {
+                    operation: TagOperation::Add,
+                    tags,
+                }])
+                .await;
+
+            self.download_manager
+                .db
+                .clone()
+                .process_scraper(file_id_tag_map, job_list)
+                .await;
         }
-
-        // Do all our happy db stuff down here :D
-        let file_id_tag_map = Arc::try_unwrap(file_id_tag_map)
-            .expect("Arc reference leak")
-            .into_inner();
-
-        let mut job_list = Arc::try_unwrap(job_list)
-            .expect("Arc reference leak")
-            .into_inner();
-
-        let tags = Arc::try_unwrap(tag_list)
-            .expect("Arc reference leak")
-            .into_inner();
-
-        let completed_params: std::collections::HashSet<_> = {
-            let jobs_guard = self.download_manager.jobs.read().await;
-            if let Some(internal_storage) = jobs_guard.get(&self.plugin.name) {
-                // Collect historical parameters into a HashSet for O(1) lookups
-                internal_storage
-                    .completed_job_storage
-                    .iter()
-                    .map(|internal_job| internal_job.config.param.clone())
-                    .collect()
-            } else {
-                std::collections::HashSet::new()
-            }
-        }; // <-- Lock drops here automatically!
-
-        // 3. Deduplicate 'job_list' in-place with O(1) efficiency
-        // Retain keeps elements only if the closure returns true
-        job_list.retain(|job| {
-            let is_dup = completed_params.contains(&job.job.param);
-            if is_dup {
-                info!(
-                    "Scraper: Skipping duplicate job parameter discovery: {:?}",
-                    job.job.param
-                );
-            }
-            !is_dup // Keep if NOT a duplicate
-        });
-
-        self.download_manager
-            .db
-            .tags_add_bulk(&[FileTagAction {
-                operation: TagOperation::Add,
-                tags,
-            }])
-            .await;
-
-        self.download_manager
-            .db
-            .clone()
-            .process_scraper(file_id_tag_map, job_list)
-            .await;
-
         if self.manage_recreation().await {
             should_remove_job.store(false, std::sync::atomic::Ordering::Relaxed);
             if let Some(internal_storage) = self
@@ -303,15 +295,18 @@ impl Scraper {
                 .await
                 .get_mut(&self.plugin.name)
             {
-                internal_storage
-                    .completed_job_storage
-                    .push(self.job.clone());
+                // internal_storage
+                //     .completed_job_storage
+                //     .push(self.job.clone());
             }
 
             self.download_manager
                 .remove_job(&self.plugin, &self.job)
                 .await;
         }
+
+        // Cleans up memory
+        memory_manage();
     }
 
     async fn manage_recreation(&self) -> bool {
@@ -354,7 +349,7 @@ impl Scraper {
     ///
     /// Checks if a file needs to be downloaded and parsed
     ///
-    async fn file_download_logic(
+    /*async fn file_download_logic(
         self: Arc<Self>,
         file: &mut FileObject,
         jobs: &mut Vec<ScraperDataReturn>,
@@ -362,6 +357,213 @@ impl Scraper {
     ) -> Option<FileInternal> {
         let plugin_manager = self.download_manager.plugin_manager.clone();
         let self_clone = self.clone();
+
+        let bytes = match file.source {
+            None => {
+                // Will update the UI here later
+                return None;
+            }
+            Some(ref url_source) => match url_source {
+                FileSource::Url(file_url) => {
+                    match self
+                        .download_manager
+                        .db
+                        .tag_get_file_id(&Tag {
+                            name: file_url.clone(),
+                            namespace: GenericNamespaceObj {
+                                name: "source_url".into(),
+                                description: None,
+                            },
+                        })
+                        .await
+                    {
+                        Some(file_id) => {
+                            info!(
+                                "Scraper: {} JobId: {} Skipping file because already in db. {} file_id: {}",
+                                self.plugin.name, self.job.id, &file_url, &file_id
+                            );
+
+                            return self.download_manager.db.file_id_get(file_id).await;
+                        }
+                        None => {
+                            for skip in file.skip_if.iter() {
+                                match skip {
+                                    SkipIf::FileTagRelationship(tag) => {
+                                        if let Some(file_id) =
+                                            self.download_manager.db.tag_get_file_id(&tag).await
+                                        {
+                                            if let Some(file_internal) =
+                                                self.download_manager.db.file_id_get(file_id).await
+                                            {
+                                                info!(
+                                                    "Scraper: {} JobId: {} Skipping file because skip_tag has file: {:?}",
+                                                    self.plugin.name, self.job.id, &tag
+                                                );
+                                                return Some(file_internal);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+
+                            file.tag_list.push(FileTagAction {
+                                operation: TagOperation::Add,
+                                tags: vec![PluginTag {
+                                    tag: Tag {
+                                        name: file_url.to_string(),
+                                        namespace: GenericNamespaceObj {
+                                            name: "source_url".into(),
+                                            description: Some("A source for a file".into()),
+                                        },
+                                    },
+                                    ..Default::default()
+                                }],
+                            });
+                            if self.should_download_file(file_url).await {
+                                if let Some(bytes_out) =
+                                    self_clone.download_file(file_url, &file.hash).await
+                                {
+                                    info!(
+                                        "Scraper: {} JobId: {} Successfully downloaded {}",
+                                        self.plugin.name, self.job.id, &file_url
+                                    );
+                                    bytes_out
+                                } else {
+                                    *download_issue = true;
+                                    return None;
+                                }
+                            } else {
+                                info!(
+                                    "Scraper: {} JobId: {} Skipping file because internal file_urls already contains object. {}",
+                                    self.plugin.name, self.job.id, &file_url
+                                );
+
+                                return None;
+                            }
+                        }
+                    }
+                }
+                FileSource::Bytes(file_bytes) => bytes::Bytes::copy_from_slice(file_bytes),
+            },
+        };
+
+        // After we have our bytes will do our processing here
+        let bytes_clone = bytes.clone();
+        let (tx, rx) = oneshot::channel();
+        let mut tags_owned = file.tag_list.clone();
+        let mut jobs_owned = jobs.clone();
+        self.download_manager.heavy_processing_pool.spawn(move || {
+            plugin_manager.callback_on_download(&bytes_clone, &mut tags_owned, &mut jobs_owned);
+            let _ = tx.send((tags_owned, jobs_owned));
+        });
+
+        (file.tag_list, *jobs) = rx.await.unwrap();
+
+        // 1. We have the temp_file_path from download_file
+        let temp_file_path = downloaded_temp_path; 
+
+        // 2. Move the file handling completely into spawn_blocking
+        let (hash, extension, storage_id_result) = tokio::task::spawn_blocking(move || {
+            // Load the bytes into memory sequentially right here
+            let bytes = Bytes::from(std::fs::read(&temp_file_path).ok().unwrap());
+            
+            let hash = hash_bytes(&bytes, &HashesSupported::Sha512("".into())).0;
+            let extension = FileFormat::from_bytes(&bytes).extension().to_string();
+            
+            // Execute your .so plugin callback using the raw byte slice reference
+            plugin_manager.callback_on_download(&bytes, &mut tags_owned, &mut jobs_owned);
+            
+            // Copy the file to its permanent storage location synchronously
+            let mut storage_id = None;
+            if let Some((file_storage_path, storage_id_db)) = file_download_location 
+                && let Some(parent_dir) = file_storage_path.parent()
+            {
+                if std::fs::create_dir_all(parent_dir).is_ok()
+                    && std::fs::write(&file_storage_path, &bytes).is_ok() 
+                {
+                    storage_id = Some(storage_id_db);
+                }
+            }
+            
+            // Cleanup the temporary downloaded file
+            let _ = std::fs::remove_file(&temp_file_path);
+            
+            // CRITICAL: `bytes` falls out of scope here and is dropped IMMEDIATELY.
+            // The memory is reclaimed before the async context even wakes up.
+            (hash, extension, storage_id)
+        })
+        .await
+        .unwrap();
+
+        Some(FileInternal {
+            id: None,
+            hash,
+            extension,
+            storage_id,
+        })
+
+        /* (file.tag_list, *jobs) = rx.await.unwrap();
+
+        let bytes_clone = bytes.clone();
+        let (hash, extension) = tokio::task::spawn_blocking(move || {
+            (
+                hash_bytes(&bytes_clone, &HashesSupported::Sha512("".into())).0,
+                FileFormat::from_bytes(&bytes_clone).extension().to_string(),
+            )
+        })
+        .await
+        .unwrap();
+
+        let bytes_clone = bytes.clone();
+        let storage_id;
+        if let Some((file_storage_path, storage_id_db)) = self
+            .download_manager
+            .db
+            .file_download_location_get(&hash, &extension)
+            .await
+            && let Some(parent_dir) = file_storage_path.parent()
+        {
+            let mut cnt = 0;
+
+            loop {
+                if create_dir_all(parent_dir).is_ok()
+                    && tokio::fs::write(&file_storage_path, &bytes_clone).await.is_ok()
+                {
+                    storage_id = storage_id_db;
+                    break;
+                }
+
+                cnt += 1;
+                if cnt >= 3 {
+                    log::error!(
+                        "Failed to save file after 3 attempts: {:?}",
+                        file_storage_path
+                    );
+                    return None;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        } else {
+            return None;
+        }
+        Some(FileInternal {
+            id: None,
+            hash,
+            extension,
+            storage_id,
+        })*/
+    }*/
+    /* async fn file_download_logic(
+        self: Arc<Self>,
+        file: &mut FileObject,
+        jobs: &mut Vec<ScraperDataReturn>,
+        download_issue: &mut bool,
+    ) -> Option<FileInternal> {
+        let plugin_manager = self.download_manager.plugin_manager.clone();
+        let self_clone = self.clone();
+
         let bytes = match file.source {
             None => {
                 // Will update the UI here later
@@ -373,7 +575,7 @@ impl Scraper {
                     match self
                         .download_manager
                         .db
-                        .tag_get_fileid(&Tag {
+                        .tag_get_file_id(&Tag {
                             name: file_url.clone(),
                             namespace: GenericNamespaceObj {
                                 name: "source_url".into(),
@@ -384,13 +586,34 @@ impl Scraper {
                     {
                         Some(file_id) => {
                             info!(
-                                "Scraper: {} JobId: {} Skipping file because already in db. {}",
-                                self.plugin.name, self.job.id, &file_url
+                                "Scraper: {} JobId: {} Skipping file because already in db. {} file_id: {}",
+                                self.plugin.name, self.job.id, &file_url, &file_id
                             );
 
                             return self.download_manager.db.file_id_get(file_id).await;
                         }
                         None => {
+                            for skip in file.skip_if.iter() {
+                                match skip {
+                                    SkipIf::FileTagRelationship(tag) => {
+                                        if let Some(file_id) =
+                                            self.download_manager.db.tag_get_file_id(&tag).await
+                                        {
+                                            if let Some(file_internal) =
+                                                self.download_manager.db.file_id_get(file_id).await
+                                            {
+                                                info!(
+                                                    "Scraper: {} JobId: {} Skipping file because skip_tag has file: {:?}",
+                                                    self.plugin.name, self.job.id, &tag
+                                                );
+                                                return Some(file_internal);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+
                             file.tag_list.push(FileTagAction {
                                 operation: TagOperation::Add,
                                 tags: vec![PluginTag {
@@ -406,7 +629,9 @@ impl Scraper {
                                 }],
                             });
                             if self.should_download_file(file_url).await {
-                                if let Some(bytes_out) = self_clone.download_file(file_url).await {
+                                if let Some(bytes_out) =
+                                    self_clone.download_file(file_url, &file.hash).await
+                                {
                                     info!(
                                         "Scraper: {} JobId: {} Successfully downloaded {}",
                                         self.plugin.name, self.job.id, &file_url
@@ -418,7 +643,7 @@ impl Scraper {
                                 }
                             } else {
                                 info!(
-                                    "Scraper: {} JobId: {} Skipping file because already in db. {}",
+                                    "Scraper: {} JobId: {} Skipping file because internal file_urls already contains object. {}",
                                     self.plugin.name, self.job.id, &file_url
                                 );
 
@@ -464,9 +689,8 @@ impl Scraper {
             let mut cnt = 0;
 
             loop {
-                let bytes_clone = bytes.clone();
                 if create_dir_all(parent_dir).is_ok()
-                    && tokio::fs::write(&file_storage_path, bytes_clone)
+                    && tokio::fs::write(&file_storage_path, &bytes)
                         .await
                         .is_ok()
                 {
@@ -494,27 +718,334 @@ impl Scraper {
             extension,
             storage_id,
         })
-    }
+    }*/
 
-    ///
-    /// Downloads a singular file
-    ///
-    async fn download_file(self: Arc<Self>, file_url: &str) -> Option<Bytes> {
+async fn download_file(
+        self: Arc<Self>,
+        file_url: &str,
+        hash: &Option<HashesSupported>,
+        temp_dir: &std::path::Path,
+    ) -> Option<PathBuf> {
         let mut cnt = 0;
-        let url = Url::parse(file_url);
-        if url.is_err() {
-            log::error!("Error while parsing url {} {:?}", file_url, url);
-            return None;
-        }
-        let url = url.unwrap();
+        let mut hash_cnt = 0;
+
+        let url = match Url::parse(file_url) {
+            Ok(u) => u,
+            Err(err) => {
+                log::error!("Error while parsing url {} {:?}", file_url, err);
+                return None;
+            }
+        };
 
         loop {
-            self.ratelimiter.until_ready().await;
+            // Rate limiting
+            while self.ratelimiter.check().is_err() {
+                let jitter = rand::random::<u64>() % 50;
+                tokio::time::sleep(Duration::from_millis(100 + jitter)).await;
+            }
 
             info!(
                 "Scraper: {} JobId: {} -- Downloading url: {}",
                 self.plugin.name, self.job.id, file_url
             );
+
+            let mut response = match self.file_client.get(url.clone()).send().await {
+                Ok(res) => res,
+                Err(err) => {
+                    log::error!(
+                        "Scraper: {} JobId: {} While processing url: {} found err {:?}",
+                        self.plugin.name, self.job.id, file_url, err
+                    );
+                    cnt += 1;
+                    if cnt >= 3 { break; }
+                    continue;
+                }
+            };
+
+            let content_length_header = response.content_length();
+            
+            // Build unique temp file path
+            let temp_file_name = format!("download_{}_{}.tmp", self.job.id, rand::random::<u32>());
+            let temp_file_path = temp_dir.join(temp_file_name);
+            
+            let mut file = match File::create(&temp_file_path).await {
+                Ok(f) => f,
+                Err(err) => {
+                    log::error!("Failed to create temporary file: {:?}", err);
+                    return None;
+                }
+            };
+
+            let mut downloaded_bytes_count = 0;
+            let mut stream_failed = false;
+
+            // Stream network chunks straight to disk (Constantly uses ~8KB to 64KB max per active task)
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        downloaded_bytes_count += chunk.len();
+                        if let Err(err) = file.write_all(&chunk).await {
+                            log::error!("Failed to write chunk to disk: {:?}", err);
+                            stream_failed = true;
+                            break;
+                        }
+                    }
+                    Ok(None) => break, // Finished downloading successfully
+                    Err(err) => {
+                        log::error!(
+                            "Scraper: {} JobId: {} Stream chunk error: {:?}",
+                            self.plugin.name, self.job.id, err
+                        );
+                        stream_failed = true;
+                        break;
+                    }
+                }
+            }
+
+            let _ = file.flush().await;
+
+            if stream_failed {
+                let _ = tokio::fs::remove_file(&temp_file_path).await;
+                cnt += 1;
+                if cnt >= 3 { break; }
+                continue;
+            }
+
+            let size_matches = match content_length_header {
+                Some(expected) => downloaded_bytes_count == expected as usize,
+                None => true,
+            };
+
+            if size_matches {
+                let temp_path_clone = temp_file_path.clone();
+                let hash_clone = hash.clone();
+
+                // Compute validation hashes synchronously inside spawn_blocking
+                let hash_matches = if let Some(hash_rule) = hash_clone {
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(bytes) = std::fs::read(&temp_path_clone) {
+                            hash_bytes(&Bytes::from(bytes), &hash_rule).1
+                        } else {
+                            false
+                        }
+                    })
+                    .await
+                    .ok()
+                    .unwrap_or(false)
+                } else {
+                    true
+                };
+
+                if hash_matches || hash_cnt >= 2 {
+                    if hash.is_some() && hash_matches {
+                        hash_cnt += 1;
+                    }
+                    if hash_cnt >= 2 {
+                        info!("Overriding downloaded md5 with downloaded one.");
+                    }
+                    return Some(temp_file_path);
+                } else {
+                    log::warn!(
+                        "Scraper: {} JobId: {} Hash mismatch detected. Retrying. Attempt: {}",
+                        self.plugin.name, self.job.id, hash_cnt + 1
+                    );
+                    let _ = tokio::fs::remove_file(&temp_file_path).await;
+                    hash_cnt += 1;
+                }
+            } else {
+                log::error!(
+                    "Scraper: {} JobId: {} Mismatched length. Downloaded {} Expected {:?}",
+                    self.plugin.name, self.job.id, downloaded_bytes_count, content_length_header
+                );
+                let _ = tokio::fs::remove_file(&temp_file_path).await;
+            }
+
+            cnt += 1;
+            if cnt >= 3 { break; }
+        }
+
+        None
+    }
+
+    ///
+    /// Downloads a singular file
+    ///
+    async fn file_download_logic(
+        self: Arc<Self>,
+        file: &mut FileObject,
+        jobs: &mut Vec<ScraperDataReturn>,
+        download_issue: &mut bool,
+        temp_dir: &std::path::Path, // Added to provide path context to download_file
+    ) -> Option<FileInternal> {
+        let plugin_manager = self.download_manager.plugin_manager.clone();
+        let self_clone = self.clone();
+
+        // Download or fetch file via its disk path reference
+        let temp_file_path = match file.source {
+            None => return None,
+            Some(ref url_source) => match url_source {
+                FileSource::Url(file_url) => {
+                    match self
+                        .download_manager
+                        .db
+                        .tag_get_file_id(&Tag {
+                            name: file_url.clone(),
+                            namespace: GenericNamespaceObj {
+                                name: "source_url".into(),
+                                description: None,
+                            },
+                        })
+                        .await
+                    {
+                        Some(file_id) => {
+                            info!("Scraper: {} JobId: {} Skipping file because already in db.", self.plugin.name, self.job.id);
+                            return self.download_manager.db.file_id_get(file_id).await;
+                        }
+                        None => {
+                            for skip in file.skip_if.iter() {
+                                if let SkipIf::FileTagRelationship(tag) = skip {
+                                    if let Some(file_id) = self.download_manager.db.tag_get_file_id(&tag).await {
+                                        if let Some(file_internal) = self.download_manager.db.file_id_get(file_id).await {
+                                            return Some(file_internal);
+                                        }
+                                    }
+                                }
+                            }
+
+                            file.tag_list.push(FileTagAction {
+                                operation: TagOperation::Add,
+                                tags: vec![PluginTag {
+                                    tag: Tag {
+                                        name: file_url.to_string(),
+                                        namespace: GenericNamespaceObj {
+                                            name: "source_url".into(),
+                                            description: Some("A source for a file".into()),
+                                        },
+                                    },
+                                    ..Default::default()
+                                }],
+                            });
+
+                            if self.should_download_file(file_url).await {
+                                // Calls disk streaming download helper
+                                if let Some(path_out) = self_clone.download_file(file_url, &file.hash, temp_dir).await {
+                                    path_out
+                                } else {
+                                    *download_issue = true;
+                                    return None;
+                                }
+                            } else {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                // If bytes are fed instantly, spill them out to a temporary file right away 
+                // to maintain identical architectural tracking shapes.
+                FileSource::Bytes(file_bytes) => {
+                    let path = temp_dir.join(format!("direct_bytes_{}.tmp", rand::random::<u32>()));
+                    if std::fs::write(&path, file_bytes).is_err() {
+                        return None;
+                    }
+                    path
+                }
+            },
+        };
+
+        let mut tags_owned = file.tag_list.clone();
+        let mut jobs_owned = jobs.clone();
+
+        // RUN EVERYTHING HEAVY SEQUENTIALLY ON THE THREAD POOL
+        let (hash, extension, storage_id_result, final_tags, final_jobs) = tokio::task::spawn_blocking(move || {
+            // 1. Read bytes from local disk (Hits OS Page Cache, near instantaneous)
+            let bytes = Bytes::from(std::fs::read(&temp_file_path).ok().unwrap());
+            
+            // 2. Compute format and layout
+            let hash = hash_bytes(&bytes, &HashesSupported::Sha512("".into())).0;
+            let extension = FileFormat::from_bytes(&bytes).extension().to_string();
+
+        let file_download_location = self
+            .download_manager
+            .db
+            .file_download_location_get_sync(&hash, &extension);
+
+            // 3. Fire your dynamic plugin boundary (.so loading boundary takes a slice safely)
+            plugin_manager.callback_on_download(&bytes, &mut tags_owned, &mut jobs_owned);
+
+            // 4. Save file out to its designated destination location path context
+            let mut storage_id = None;
+            if let Some((file_storage_path, storage_id_db)) = file_download_location 
+                && let Some(parent_dir) = file_storage_path.parent()
+            {
+                let mut cnt = 0;
+                loop {
+                    if std::fs::create_dir_all(parent_dir).is_ok()
+                        && std::fs::write(&file_storage_path, &bytes).is_ok() 
+                    {
+                        storage_id = Some(storage_id_db);
+                        break;
+                    }
+                    cnt += 1;
+                    if cnt >= 3 { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+
+            // Clean up the temporary file immediately
+            let _ = std::fs::remove_file(&temp_file_path);
+
+            // CRITICAL: `bytes` falls out of scope HERE.
+            // Allocated heap memory drops back down to absolute zero before task returns.
+            Some((hash, extension, storage_id, tags_owned, jobs_owned))
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .next()?;
+
+        file.tag_list = final_tags;
+        *jobs = final_jobs;
+
+        let storage_id = match storage_id_result {
+            Some(id) => id,
+            None => return None,
+        };
+
+        Some(FileInternal {
+            id: None,
+            hash,
+            extension,
+            storage_id,
+        })
+    }
+ /*   async fn download_file(
+        self: Arc<Self>,
+        file_url: &str,
+        hash: &Option<HashesSupported>,
+    ) -> Option<Bytes> {
+        let mut cnt = 0;
+        let mut hash_cnt = 0;
+
+        let url = match Url::parse(file_url) {
+            Ok(u) => u,
+            Err(err) => {
+                log::error!("Error while parsing url {} {:?}", file_url, err);
+                return None;
+            }
+        };
+
+        loop {
+            // Rate limiting
+            while self.ratelimiter.check().is_err() {
+                let jitter = rand::random::<u64>() % 50;
+                tokio::time::sleep(Duration::from_millis(100 + jitter)).await;
+            }
+
+            info!(
+                "Scraper: {} JobId: {} -- Downloading url: {}",
+                self.plugin.name, self.job.id, file_url
+            );
+
             let mut response = match self.file_client.get(url.clone()).send().await {
                 Ok(res) => res,
                 Err(err) => {
@@ -526,43 +1057,97 @@ impl Scraper {
                         err
                     );
                     cnt += 1;
+                    if cnt >= 3 {
+                        break;
+                    }
                     continue;
                 }
             };
 
-            let response_content_length: usize = response
-                .content_length()
-                .unwrap_or(1024)
-                .try_into()
-                .unwrap_or(1024);
+            // Track if content-length header was actually sent by server
+            let content_length_header = response.content_length().map(|l| l as usize);
+            let initial_capacity = content_length_header.unwrap_or(1024);
 
-            let mut downloaded: usize = 0;
-            let mut collected_bytes = BytesMut::with_capacity(response_content_length);
+            let mut collected_bytes = BytesMut::with_capacity(initial_capacity);
+            let mut stream_failed = false;
 
-            while let Ok(Some(chunk)) = response.chunk().await {
-                let bytes_recieved = chunk.len();
-                downloaded += bytes_recieved;
-                collected_bytes.extend_from_slice(&chunk);
-
-                let _current_progress = if downloaded > 0 {
-                    (downloaded as f64 / response_content_length as f64) * 100.0
-                } else {
-                    (downloaded as f64) / (1024.0 * 1024.0)
-                };
-
-                //NOTE put UI updaing stuff here
+            // Explicitly handle stream errors
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        collected_bytes.extend_from_slice(&chunk);
+                        // UI progress updates can be derived safely here from collected_bytes.len()
+                    }
+                    Ok(None) => break, // End of stream reached successfully
+                    Err(err) => {
+                        log::error!(
+                            "Scraper: {} JobId: {} Stream chunk error: {:?}",
+                            self.plugin.name,
+                            self.job.id,
+                            err
+                        );
+                        stream_failed = true;
+                        break;
+                    }
+                }
             }
 
-            if collected_bytes.len() == response_content_length {
-                return Some(collected_bytes.into());
+            // If the stream dropped mid-way, skip validation and retry
+            if stream_failed {
+                cnt += 1;
+                if cnt >= 3 {
+                    break;
+                }
+                continue;
+            }
+
+            // Validate size only if the server explicitly gave us a Content-Length
+            let size_matches = match content_length_header {
+                Some(expected) => collected_bytes.len() == expected,
+                None => true, // Trust the stream end if no header was provided
+            };
+
+            if size_matches {
+                let collected_bytes = collected_bytes.freeze();
+                let collected_bytes_clone = collected_bytes.clone();
+                let hash_clone = hash.clone();
+
+                // 1. Run heavy CPU hash matching on blocking thread pool
+                let hash_matches = if let Some(hash) = hash_clone {
+                    tokio::task::spawn_blocking(move || hash_bytes(&collected_bytes_clone, &hash).1)
+                        .await
+                        .ok()
+                        .unwrap_or(false)
+                } else {
+                    true
+                };
+
+                // 2. Evaluate hash validation or failure override rules
+                if hash_matches || hash_cnt >= 2 {
+                    if hash.is_some() && hash_matches {
+                        hash_cnt += 1;
+                    }
+                    if hash_cnt >= 2 {
+                        info!("Overriding downloaded md5 with downloaded one.");
+                    }
+                    return Some(collected_bytes);
+                } else {
+                    log::warn!(
+                        "Scraper: {} JobId: {} Hash mismatch detected. Retrying download. Hash attempt: {}",
+                        self.plugin.name,
+                        self.job.id,
+                        hash_cnt + 1
+                    );
+                    hash_cnt += 1; // Increment hash failures across download attempts
+                }
             } else {
                 log::error!(
-                    "Scraper: {} JobId: {} File downloading had mismatched download length. Downloaded {} Parsed {}",
+                    "Scraper: {} JobId: {} File downloading had mismatched download length. Downloaded {} Expected {:?}",
                     self.plugin.name,
                     self.job.id,
                     collected_bytes.len(),
-                    response_content_length
-                )
+                    content_length_header
+                );
             }
 
             cnt += 1;
@@ -572,7 +1157,7 @@ impl Scraper {
         }
 
         None
-    }
+    }*/
 }
 
 impl DownloadsManager {
@@ -586,9 +1171,30 @@ impl DownloadsManager {
             plugin_manager,
             jobs: HashMap::new().into(),
             heavy_processing_pool,
+            job_limiter: Arc::new(Semaphore::new(3)),
         };
 
         dm.into()
+    }
+    ///
+    /// Loads the logins in from the DB and inserts them into the job parameters.
+    ///
+    fn load_logins(&self, plugin: &Plugin) -> Vec<ScraperParam> {
+        let mut out = Vec::new();
+        if let Some(api_key) = self
+            .db
+            .setting_get_sync(&format!("PLUGIN_{}_API_KEY", plugin.name))
+            && let Some(api_pass) = self
+                .db
+                .setting_get_sync(&format!("PLUGIN_{}_API_PASS", plugin.name))
+        {
+            out.push(ScraperParam::Login(LoginType::Api(
+                api_key.param.unwrap(),
+                api_pass.param,
+            )));
+        }
+
+        out
     }
 
     ///
@@ -655,12 +1261,52 @@ impl DownloadsManager {
                     });
                 }
             } else {
-                // Brand new site configuration path
-                let ratelimit = Some(
-                    Quota::with_period(Duration::from_secs(1))
-                        .unwrap()
-                        .allow_burst(std::num::NonZeroU32::new(1).unwrap()),
-                );
+                // Sets up ratelimit for job
+                let mut ratelimit = None;
+                for properties in plugin.properties.iter() {
+                    if let PluginProperties::Ratelimit(num, duration) = properties {
+                        let hits = *num;
+                        let total_duration = *duration;
+
+                        info!(
+                            "DownloadManager: Creating Ratelimiter with properties: {} tries per: {:?}",
+                            hits, total_duration
+                        );
+
+                        // Guard against division by zero just in case
+                        let hits_nonzero = std::num::NonZeroU32::new(hits)
+                            .unwrap_or(std::num::NonZeroU32::new(1).unwrap());
+
+                        // Calculate how long it takes to regenerate ONE single cell
+                        let cell_replenish_interval = total_duration / hits_nonzero.get();
+
+                        ratelimit = Some(
+                            Quota::with_period(cell_replenish_interval)
+                                .unwrap()
+                                .allow_burst(hits_nonzero),
+                        );
+                    }
+                }
+                if ratelimit.is_none() {
+                    info!(
+                        "DownloadManager: Creating Ratelimiter with properties: {} tries per: {:?}",
+                        &1,
+                        &Duration::from_secs(1)
+                    );
+                    ratelimit = Some(
+                        Quota::with_period(Duration::from_secs(1))
+                            .unwrap()
+                            .allow_burst(std::num::NonZeroU32::new(1).unwrap()),
+                    )
+                }
+
+                // Loads login parameters from db into job
+                let mut job_storage = job_storage.clone();
+                for job in job_storage.iter_mut() {
+                    for login in self.load_logins(plugin) {
+                        job.config.param.push(login);
+                    }
+                }
 
                 jobs_guard.insert(
                     plugin.name.clone(),
@@ -707,6 +1353,15 @@ impl DownloadsManager {
                 break;
             }
 
+            let permit = match self.job_limiter.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    drop(guard);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+
             // 2. Look for an idle job
             let job_to_run = if let Some(idx) = scraper_internal
                 .job_storage
@@ -739,7 +1394,10 @@ impl DownloadsManager {
                     self.clone(),
                 );
 
-                tokio::task::spawn(async move { scraper.run_scraper().await });
+                tokio::task::spawn(async move {
+                    let _permit = permit;
+                    scraper.run_scraper().await
+                });
             } else {
                 // All jobs are currently actively running. Wait a bit for them to finish.
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -765,7 +1423,7 @@ pub fn hash_bytes(bytes: &Bytes, hash: &HashesSupported) -> (String, bool) {
             hasher.update(bytes);
             let hastring = encode_upper(hasher.finalize());
             let dune = &hastring == hash;
-            if !dune {
+            if !dune && !hash.is_empty() {
                 info!("Parser returned: {} Got: {}", &hash, &hastring);
             }
             (hastring, dune)
@@ -775,7 +1433,7 @@ pub fn hash_bytes(bytes: &Bytes, hash: &HashesSupported) -> (String, bool) {
             hasher.update(bytes);
             let hastring = encode_upper(hasher.finalize());
             let dune = &hastring == hash;
-            if !dune {
+            if !dune && !hash.is_empty() {
                 info!("Parser returned: {} Got: {}", &hash, &hastring);
             }
             (hastring, dune)
@@ -784,615 +1442,10 @@ pub fn hash_bytes(bytes: &Bytes, hash: &HashesSupported) -> (String, bool) {
             let hasher = Sha512::digest(bytes);
             let hastring = encode_upper(hasher);
             let dune = &hastring == hash;
-            if !dune {
+            if !dune && !hash.is_empty() {
                 info!("Parser returned: {} Got: {}", &hash, &hastring);
             }
             (hastring, dune)
         }
-    }
-}
-
-/*pub fn calculate_relationship_deltas(
-    file_tag_match: &HashMap<FileInternal, Vec<FileTagAction>>,
-    file_cache: &HashMap<FileInternal, u64>,
-    tag_cache: &HashMap<Tag, u64>,
-    current_file_relationships: &HashMap<u64, HashSet<Tag>>,
-) -> (HashSet<(u64, u64)>, HashSet<(u64, u64)>) {
-    let mut rels_to_add = HashSet::new();
-    let mut rels_to_del = HashSet::new();
-
-    for (file_internal, tag_list) in file_tag_match.iter() {
-        let file_id = match file_cache.get(file_internal) {
-            Some(&id) => id,
-            None => continue,
-        };
-
-        // 1. Map current database state for this file: Namespace -> HashSet<TagId>
-        let mut current_ns_tags: HashMap<String, HashSet<u64>> = HashMap::new();
-        if let Some(current_tags) = current_file_relationships.get(&file_id) {
-            for tag in current_tags {
-                let ns_name = &tag.namespace.name;
-                // "source_url" and empty namespaces are explicitly excluded from Set logic
-                if ns_name != "source_url" && !ns_name.is_empty() {
-                    if let Some(&tag_id) = tag_cache.get(tag) {
-                        current_ns_tags
-                            .entry(ns_name.clone())
-                            .or_default()
-                            .insert(tag_id);
-                    }
-                }
-            }
-        }
-
-        // Track what tags are explicitly being added across this file's entire payload
-        // to support the "Add overrides Set" business rule.
-        let mut explicit_adds = HashSet::new();
-        // Track deletions that originate strictly from a 'Set' operation
-        let mut set_deletions = HashSet::new();
-
-        // 2. Process operations
-        for tag_action in tag_list {
-            match tag_action.operation {
-                TagOperation::Add => {
-                    for tag in &tag_action.tags {
-                        if matches!(tag.tag_type, TagType::Normal | TagType::NormalNoRegex) {
-                            let tag_id = *tag_cache.get(&tag.tag).unwrap();
-                            rels_to_add.insert((file_id, tag_id));
-                            explicit_adds.insert(tag_id);
-                        }
-                    }
-                }
-                TagOperation::Del => {
-                    for tag in &tag_action.tags {
-                        if matches!(tag.tag_type, TagType::Normal | TagType::NormalNoRegex) {
-                            let tag_id = *tag_cache.get(&tag.tag).unwrap();
-                            rels_to_del.insert((file_id, tag_id));
-                        }
-                    }
-                }
-                TagOperation::Set => {
-                    let mut incoming_ns_tags: HashMap<String, HashSet<u64>> = HashMap::new();
-
-                    for tag in &tag_action.tags {
-                        if !matches!(tag.tag_type, TagType::Normal | TagType::NormalNoRegex) {
-                            continue;
-                        }
-                        let ns_name = &tag.tag.namespace.name;
-                        if ns_name == "source_url" || ns_name.is_empty() {
-                            continue;
-                        }
-
-                        let tag_id = *tag_cache.get(&tag.tag).unwrap();
-                        incoming_ns_tags
-                            .entry(ns_name.clone())
-                            .or_default()
-                            .insert(tag_id);
-
-                        rels_to_add.insert((file_id, tag_id));
-                    }
-
-                    // Evaluate deletions ONLY for namespaces explicitly targeted by this Set operation
-                    for (ns_name, incoming_set) in &incoming_ns_tags {
-                        if let Some(current_tag_ids) = current_ns_tags.get(ns_name) {
-                            for current_tag_id in current_tag_ids {
-                                if !incoming_set.contains(current_tag_id) {
-                                    // Track this specifically as a Set-induced deletion
-                                    set_deletions.insert((file_id, *current_tag_id));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Apply targeted "Add overrides Set" rule
-        for (f_id, tag_id) in set_deletions {
-            // Only commit the Set deletion if an explicit Add didn't countermand it
-            if !explicit_adds.contains(&tag_id) {
-                rels_to_del.insert((f_id, tag_id));
-            }
-        }
-    }
-
-    // Global sanitation check for any edge deletions
-    for del in &rels_to_del {
-        rels_to_add.remove(del);
-    }
-
-    (rels_to_add, rels_to_del)
-}*/
-
-pub fn calculate_relationship_deltas(
-    file_tag_match: &HashMap<FileInternal, Vec<FileTagAction>>,
-    file_cache: &HashMap<FileInternal, u64>,
-    tag_cache: &HashMap<Tag, u64>,
-    current_file_relationships: &HashMap<u64, HashSet<Tag>>,
-) -> (HashSet<(u64, u64)>, HashSet<(u64, u64)>) {
-    let mut rels_to_add = HashSet::new();
-    let mut rels_to_del = HashSet::new();
-
-    // Hoist working collections outside the loop to preserve allocated capacity
-    let mut current_ns_tags: HashMap<&str, HashSet<u64>> = HashMap::new();
-    let mut incoming_ns_tags: HashMap<&str, HashSet<u64>> = HashMap::new();
-    let mut explicit_adds = HashSet::new();
-    let mut set_deletions = HashSet::new();
-
-    for (file_internal, tag_list) in file_tag_match.iter() {
-        let file_id = match file_cache.get(file_internal) {
-            Some(&id) => id,
-            None => continue,
-        };
-
-        // Clear hoisted structures instead of re-allocating them
-        current_ns_tags.clear();
-        explicit_adds.clear();
-        set_deletions.clear();
-
-        // 1. Map current database state for this file: Namespace (&str) -> HashSet<TagId>
-        if let Some(current_tags) = current_file_relationships.get(&file_id) {
-            for tag in current_tags {
-                let ns_name = &tag.namespace.name;
-                if ns_name != "source_url"
-                    && !ns_name.is_empty()
-                    && let Some(&tag_id) = tag_cache.get(tag)
-                {
-                    current_ns_tags
-                        .entry(ns_name.as_str()) // Replaced .clone() with &str slice reference
-                        .or_default()
-                        .insert(tag_id);
-                }
-            }
-        }
-
-        // 2. Process operations
-        for tag_action in tag_list {
-            match tag_action.operation {
-                TagOperation::Add => {
-                    for tag in &tag_action.tags {
-                        if matches!(tag.tag_type, TagType::Normal | TagType::NormalNoRegex) {
-                            let tag_id = *tag_cache.get(&tag.tag).unwrap();
-                            rels_to_add.insert((file_id, tag_id));
-                            explicit_adds.insert(tag_id);
-                        }
-                    }
-                }
-                TagOperation::Del => {
-                    for tag in &tag_action.tags {
-                        if matches!(tag.tag_type, TagType::Normal | TagType::NormalNoRegex) {
-                            let tag_id = *tag_cache.get(&tag.tag).unwrap();
-                            rels_to_del.insert((file_id, tag_id));
-                        }
-                    }
-                }
-                TagOperation::Set => {
-                    incoming_ns_tags.clear(); // Clear the nested map instead of letting it drop
-
-                    for tag in &tag_action.tags {
-                        if !matches!(tag.tag_type, TagType::Normal | TagType::NormalNoRegex) {
-                            continue;
-                        }
-                        let ns_name = &tag.tag.namespace.name;
-                        if ns_name == "source_url" || ns_name.is_empty() {
-                            continue;
-                        }
-
-                        let tag_id = *tag_cache.get(&tag.tag).unwrap();
-                        incoming_ns_tags
-                            .entry(ns_name.as_str()) // Replaced .clone() with &str slice reference
-                            .or_default()
-                            .insert(tag_id);
-
-                        rels_to_add.insert((file_id, tag_id));
-                    }
-
-                    // Evaluate deletions ONLY for namespaces explicitly targeted by this Set operation
-                    for (ns_name, incoming_set) in &incoming_ns_tags {
-                        if let Some(current_tag_ids) = current_ns_tags.get(ns_name) {
-                            for current_tag_id in current_tag_ids {
-                                if !incoming_set.contains(current_tag_id) {
-                                    set_deletions.insert((file_id, *current_tag_id));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Apply targeted "Add overrides Set" rule
-        for (f_id, tag_id) in &set_deletions {
-            if !explicit_adds.contains(tag_id) {
-                rels_to_del.insert((*f_id, *tag_id));
-            }
-        }
-    }
-
-    // Global sanitation check for any edge deletions
-    for del in &rels_to_del {
-        rels_to_add.remove(del);
-    }
-
-    (rels_to_add, rels_to_del)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Simple structural helpers to generate minimal testing datasets
-    fn mock_tag(name: &str, ns: &str) -> Tag {
-        Tag {
-            name: name.to_string(),
-            namespace: GenericNamespaceObj {
-                name: ns.to_string(),
-                description: None,
-            },
-        }
-    }
-
-    fn mock_file(hash: &str) -> FileInternal {
-        FileInternal {
-            id: None,
-            hash: hash.to_string(),
-            extension: "jpg".to_string(),
-            storage_id: 1,
-        }
-    }
-    #[test]
-    fn test_set_operation_isolates_by_namespace_and_leaves_others_untouched() {
-        let file = mock_file("hash_1");
-        let tag_ns1_old = mock_tag("action", "genre");
-        let tag_ns1_new = mock_tag("comedy", "genre");
-        let tag_ns2_keep = mock_tag("bruce_willis", "actor"); // Should remain untouched
-
-        let mut file_cache = HashMap::new();
-        file_cache.insert(file.clone(), 100);
-
-        let mut tag_cache = HashMap::new();
-        tag_cache.insert(tag_ns1_old.clone(), 201);
-        tag_cache.insert(tag_ns1_new.clone(), 202);
-        tag_cache.insert(tag_ns2_keep.clone(), 301);
-
-        // Historical DB State: Has both a genre tag and an actor tag
-        let mut current_rels = HashMap::new();
-        current_rels.insert(
-            100,
-            HashSet::from([tag_ns1_old.clone(), tag_ns2_keep.clone()]),
-        );
-
-        // Payload action: Set only targets the "genre" namespace
-        let file_tag_match = HashMap::from([(
-            file,
-            vec![FileTagAction {
-                operation: TagOperation::Set,
-                tags: vec![PluginTag {
-                    tag_type: TagType::Normal,
-                    tag: tag_ns1_new.clone(),
-                    ..Default::default()
-                }],
-            }],
-        )]);
-
-        let (to_add, to_del) =
-            calculate_relationship_deltas(&file_tag_match, &file_cache, &tag_cache, &current_rels);
-
-        // Assert updates within targeted namespace occurred
-        assert!(to_add.contains(&(100, 202)), "Should add new genre");
-        assert!(to_del.contains(&(100, 201)), "Should remove omitted genre");
-
-        // CRITICAL ASSERT: The actor namespace was not in the Set payload, so its tags must NOT be deleted
-        assert!(
-            !to_del.contains(&(100, 301)),
-            "Should NOT delete tags from untouched namespaces"
-        );
-    }
-
-    #[test]
-    fn test_add_operation_overrides_set_deletion_in_same_namespace() {
-        let file = mock_file("hash_1");
-        let tag_old = mock_tag("action", "genre");
-        let tag_new = mock_tag("comedy", "genre");
-
-        let mut file_cache = HashMap::new();
-        file_cache.insert(file.clone(), 100);
-
-        let mut tag_cache = HashMap::new();
-        tag_cache.insert(tag_old.clone(), 201);
-        tag_cache.insert(tag_new.clone(), 202);
-
-        // Historical DB State: File currently has "action" (201)
-        let mut current_rels = HashMap::new();
-        current_rels.insert(100, HashSet::from([tag_old.clone()]));
-
-        // Payload action: Set namespace to contain ONLY "comedy" (omitting "action"),
-        // BUT followed immediately by an explicit ADD instruction for "action".
-        let file_tag_match = HashMap::from([(
-            file,
-            vec![
-                FileTagAction {
-                    operation: TagOperation::Set,
-                    tags: vec![PluginTag {
-                        tag_type: TagType::Normal,
-                        tag: tag_new.clone(),
-                        ..Default::default()
-                    }],
-                },
-                FileTagAction {
-                    operation: TagOperation::Add,
-                    tags: vec![PluginTag {
-                        tag_type: TagType::Normal,
-                        tag: tag_old.clone(),
-                        ..Default::default()
-                    }],
-                },
-            ],
-        )]);
-
-        let (to_add, to_del) =
-            calculate_relationship_deltas(&file_tag_match, &file_cache, &tag_cache, &current_rels);
-
-        // Assert new item from Set is added
-        assert!(to_add.contains(&(100, 202)));
-
-        // CRITICAL ASSERT: Add overrides Set. Even though Set omitted tag 201,
-        // the explicit Add rescues it from the deletion set.
-        assert!(
-            !to_del.contains(&(100, 201)),
-            "Explicit Add must rescue the tag from Set deletion"
-        );
-    }
-
-    #[test]
-    fn test_source_url_and_empty_namespaces_are_immune_to_set_overrides() {
-        let file = mock_file("hash_1");
-        let tag_source = mock_tag("https://example.com/image.jpg", "source_url");
-        let tag_empty_ns = mock_tag("untracked_tag", "");
-        let tag_normal = mock_tag("comedy", "genre");
-
-        let mut file_cache = HashMap::new();
-        file_cache.insert(file.clone(), 100);
-
-        let mut tag_cache = HashMap::new();
-        tag_cache.insert(tag_source.clone(), 701);
-        tag_cache.insert(tag_empty_ns.clone(), 702);
-        tag_cache.insert(tag_normal.clone(), 202);
-
-        // Historical DB State: File has a source url and an un-namespaced tag
-        let mut current_rels = HashMap::new();
-        current_rels.insert(
-            100,
-            HashSet::from([tag_source.clone(), tag_empty_ns.clone()]),
-        );
-
-        // Payload action: Execute a Set operation containing a completely different namespace
-        let file_tag_match = HashMap::from([(
-            file,
-            vec![FileTagAction {
-                operation: TagOperation::Set,
-                tags: vec![PluginTag {
-                    tag_type: TagType::Normal,
-                    tag: tag_normal.clone(),
-                    ..Default::default()
-                }],
-            }],
-        )]);
-
-        let (_, to_del) =
-            calculate_relationship_deltas(&file_tag_match, &file_cache, &tag_cache, &current_rels);
-
-        // CRITICAL ASSERT: Set should never parse or drop source_url or "" namespaces
-        assert!(
-            !to_del.contains(&(100, 701)),
-            "source_url tags must be immune to Set clears"
-        );
-        assert!(
-            !to_del.contains(&(100, 702)),
-            "Empty namespace tags must be immune to Set clears"
-        );
-    }
-
-    #[test]
-    fn test_unmatched_tag_types_are_ignored_across_all_operations() {
-        let file = mock_file("hash_1");
-        let tag_invalid = mock_tag("regex_pattern", "genre");
-
-        let mut file_cache = HashMap::new();
-        file_cache.insert(file.clone(), 100);
-
-        let mut tag_cache = HashMap::new();
-        tag_cache.insert(tag_invalid.clone(), 888);
-
-        // Payload contains an unsupported TagType variant (e.g., Regex) across updates
-        let file_tag_match = HashMap::from([(
-            file,
-            vec![
-                FileTagAction {
-                    operation: TagOperation::Add,
-                    tags: vec![PluginTag {
-                        tag_type: TagType::Special, // Invalid type variant
-                        tag: tag_invalid.clone(),
-                        ..Default::default()
-                    }],
-                },
-                FileTagAction {
-                    operation: TagOperation::Del,
-                    tags: vec![PluginTag {
-                        tag_type: TagType::Special, // Invalid type variant
-                        tag: tag_invalid.clone(),
-                        ..Default::default()
-                    }],
-                },
-            ],
-        )]);
-
-        let (to_add, to_del) = calculate_relationship_deltas(
-            &file_tag_match,
-            &file_cache,
-            &tag_cache,
-            &HashMap::new(),
-        );
-
-        // CRITICAL ASSERT: Non-Normal / Non-NormalNoRegex types must never generate deltas
-        assert!(
-            !to_add.contains(&(100, 888)),
-            "Should ignore non-normal tags on Add"
-        );
-        assert!(
-            !to_del.contains(&(100, 888)),
-            "Should ignore non-normal tags on Del"
-        );
-    }
-    #[test]
-    fn test_tag_operation_add() {
-        let file = mock_file("hash_1");
-        let tag = mock_tag("rust", "language");
-
-        // Caches mimicking established DB values mapped to real IDs
-        let mut file_cache = HashMap::new();
-        file_cache.insert(file.clone(), 100); // File ID 100
-
-        let mut tag_cache = HashMap::new();
-        tag_cache.insert(tag.clone(), 500); // Tag ID 500
-
-        let file_tag_match = HashMap::from([(
-            file,
-            vec![FileTagAction {
-                operation: TagOperation::Add,
-                tags: vec![PluginTag {
-                    tag: tag.clone(),
-                    ..Default::default()
-                }],
-            }],
-        )]);
-
-        let current_rels = HashMap::new(); // Empty DB history
-
-        let (to_add, to_del) =
-            calculate_relationship_deltas(&file_tag_match, &file_cache, &tag_cache, &current_rels);
-
-        assert!(to_add.contains(&(100, 500)));
-        assert!(to_del.is_empty());
-    }
-
-    #[test]
-    fn test_tag_operation_del() {
-        let file = mock_file("hash_1");
-        let tag = mock_tag("c++", "language");
-
-        let mut file_cache = HashMap::new();
-        file_cache.insert(file.clone(), 100);
-
-        let mut tag_cache = HashMap::new();
-        tag_cache.insert(tag.clone(), 600);
-
-        let file_tag_match = HashMap::from([(
-            file,
-            vec![FileTagAction {
-                operation: TagOperation::Del,
-                tags: vec![PluginTag {
-                    tag: tag.clone(),
-                    ..Default::default()
-                }],
-            }],
-        )]);
-
-        let current_rels = HashMap::new();
-
-        let (to_add, to_del) =
-            calculate_relationship_deltas(&file_tag_match, &file_cache, &tag_cache, &current_rels);
-
-        assert!(to_add.is_empty());
-        assert!(to_del.contains(&(100, 600)));
-    }
-
-    #[test]
-    fn test_tag_operation_set_clears_omitted_historical_tags_in_namespace() {
-        let file = mock_file("hash_1");
-        let tag_old = mock_tag("action", "genre");
-        let tag_new = mock_tag("comedy", "genre");
-
-        let mut file_cache = HashMap::new();
-        file_cache.insert(file.clone(), 100);
-
-        let mut tag_cache = HashMap::new();
-        tag_cache.insert(tag_old.clone(), 201);
-        tag_cache.insert(tag_new.clone(), 202);
-
-        // Historical DB State: File 100 currently contains "action" (201)
-        let mut current_rels = HashMap::new();
-        current_rels.insert(100, HashSet::from([tag_old.clone()]));
-
-        // Payload action: Update "genre" namespace to contain ONLY "comedy" (202)
-        let file_tag_match = HashMap::from([(
-            file,
-            vec![FileTagAction {
-                operation: TagOperation::Set,
-                tags: vec![PluginTag {
-                    tag_type: TagType::Normal,
-                    tag: tag_new.clone(),
-                    ..Default::default()
-                }],
-            }],
-        )]);
-
-        let (to_add, to_del) =
-            calculate_relationship_deltas(&file_tag_match, &file_cache, &tag_cache, &current_rels);
-
-        // Assert new relationship added
-        assert!(to_add.contains(&(100, 202)));
-        // Assert old relationship dropped entirely because it was missing from the new Set payload
-        assert!(to_del.contains(&(100, 201)));
-    }
-
-    #[test]
-    fn test_sanitization_removes_overlapping_add_and_delete_operations() {
-        let file = mock_file("hash_1");
-        let tag = mock_tag("overlap", "test");
-
-        let mut file_cache = HashMap::new();
-        file_cache.insert(file.clone(), 100);
-
-        let mut tag_cache = HashMap::new();
-        tag_cache.insert(tag.clone(), 999);
-
-        // Payload contains conflicting operations to Add AND Delete the same item
-        let file_tag_match = HashMap::from([(
-            file,
-            vec![
-                FileTagAction {
-                    operation: TagOperation::Add,
-                    tags: vec![PluginTag {
-                        tag_type: TagType::Normal,
-                        tag: tag.clone(),
-
-                        ..Default::default()
-                    }],
-                },
-                FileTagAction {
-                    operation: TagOperation::Del,
-                    tags: vec![PluginTag {
-                        tag_type: TagType::Normal,
-                        tag: tag.clone(),
-
-                        ..Default::default()
-                    }],
-                },
-            ],
-        )]);
-
-        let (to_add, to_del) = calculate_relationship_deltas(
-            &file_tag_match,
-            &file_cache,
-            &tag_cache,
-            &HashMap::new(),
-        );
-
-        // Sanitization priority states: If explicitly deleting, remove from processing updates
-        assert!(to_del.contains(&(100, 999)));
-        assert!(
-            !to_add.contains(&(100, 999)),
-            "Should filter out from insertion set"
-        );
     }
 }

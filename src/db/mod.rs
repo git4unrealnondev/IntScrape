@@ -111,12 +111,6 @@ PRAGMA cache_size = -64000;
         Self::internal_jobs_reset_isrunning(&conn).unwrap();
 
         Self::internal_load_caching(self.clone(), &conn);
-        {
-            let mut guard = self.relationship_roaring_storage.write();
-            if let Some(roaring) = guard.as_mut() {
-                roaring.load_relationship_cache(&conn);
-            }
-        }
 
         conn.commit().unwrap();
 

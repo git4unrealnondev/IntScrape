@@ -1,7 +1,7 @@
 use interprocess::local_socket::ToNsName;
 use interprocess::local_socket::{GenericNamespaced, prelude::*};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
 use std::io::Read;
 use std::io::Write;
@@ -17,6 +17,8 @@ pub fn test() -> bool {
 #[derive(Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub enum SupportedDBRequests {
     GetTagId(u64),
+    GetTagIds(HashSet<u64>),
+    GetTag(String, u64),
     PutTag(String, u64, Option<u64>),
     PutTagRelationship(u64, String, u64, Option<u64>),
     GetTagName((String, u64)),
@@ -27,9 +29,12 @@ pub enum SupportedDBRequests {
     GetFile(u64),
     GetFileExt(u64),
     GetFileHash(String),
+    GetFileLocation(u64),
     GetNamespace(String),
     CreateNamespace(String, Option<String>),
     GetNamespaceTagIDs(u64),
+    GetNamespaceTagIdsFiltered(u64, u64),
+    GetNamespaceIds(),
     GetNamespaceString(u64),
     SettingsGetName(String),
     SettingsSet(DbSettingsObj),
@@ -41,7 +46,6 @@ pub enum SupportedDBRequests {
     Logging(String),
     LoggingNoPrint(String),
     GetFileByte(u64),
-    GetFileLocation(u64),
     NamespaceContainsId(u64, u64),
     FilterNamespaceById((HashSet<u64>, u64)),
     ReloadLoadedPlugins(),
@@ -56,6 +60,9 @@ pub enum SupportedDBRequests {
     GetFileRaw(u64),
     Test,
     SearchFiles(SearchObj, Option<u64>),
+    SearchTags(String, Option<u64>),
+    ParentsRel(u64),
+    ExternalPluginCall(String, CallbackInfoInput),
 }
 
 macro_rules! define_db_requests {
@@ -89,11 +96,16 @@ define_db_requests! {
     /// Sets a setting by setting
     setting_set(setting: DbSettingsObj) -> bool => SupportedDBRequests::SettingsSet(setting);
 
+    relationship_get_fileid(tag_id: u64) -> Vec<u64> => SupportedDBRequests::RelationshipGetFileid(tag_id);
+
     /// Logs to fast_log without printing
     log_silent(log: String) -> bool => SupportedDBRequests::LoggingNoPrint(log);
 
     /// Gets a tag
-    get_tag_id(id: u64) -> Option<u64> => SupportedDBRequests::GetTagId(id);
+    get_tag_id(id: u64) -> Option<Tag> => SupportedDBRequests::GetTagId(id);
+    get_tag_id_bulk(id: HashSet<u64>) -> HashMap<u64, Tag> => SupportedDBRequests::GetTagIds(id);
+
+    get_tag(name: String, namespace: u64) -> Option<u64> => SupportedDBRequests::GetTag(name, namespace) ;
 
     /// Puts a tag into the db
     put_tag(name: String, id: u64, parent: Option<u64>) -> bool => SupportedDBRequests::PutTag(name, id, parent);
@@ -103,6 +115,23 @@ define_db_requests! {
 
     /// Gets tag_id where namespace id is x
     get_namespace_tag_ids(id: u64) -> Vec<u64> => SupportedDBRequests::GetNamespaceTagIDs(id);
+
+    // Gets a namespace if it exists
+    namespace_get(name: String) -> Option<u64> => SupportedDBRequests::GetNamespace(name);
+
+    /// Gets all namespace ids in the db
+    namespace_all() -> Vec<GenericNamespaceObj> => SupportedDBRequests::GetNamespaceIds();
+
+    /// Gets a file object if its id exists
+    get_file(file_id: u64) -> Option<FileInternal> => SupportedDBRequests::GetFile(file_id);
+
+    get_file_path(file_id: u64) -> Option<String> => SupportedDBRequests::GetFileLocation(file_id);
+
+    search_tag_fts(search: String, limit: Option<u64>) -> Vec<TagSearch> => SupportedDBRequests::SearchTags(search, limit);
+
+    parents_rel_get(id: u64) -> Vec<TagParents> => SupportedDBRequests::ParentsRel(id);
+    get_tags_filtered(file_id: u64, namespace_id: u64) -> HashSet<u64> => SupportedDBRequests::GetNamespaceTagIdsFiltered(file_id, namespace_id);
+
 
 }
 

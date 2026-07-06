@@ -5,6 +5,37 @@ use std::time::Duration;
 
 pub const DEFAULT_PRIORITY: u64 = 10;
 
+use std::slice;
+
+/// FFI-safe alternative to String
+#[repr(C)]
+pub struct CVec<T> {
+    pub ptr: *mut T,
+    pub len: usize,
+    pub cap: usize,
+}
+
+impl<T> CVec<T> {
+    /// Convert a standard Vec into an FFI safe structure (Leaks the vec memory safely)
+    pub fn from_vec(mut v: Vec<T>) -> Self {
+        v.shrink_to_fit();
+        let ptr = v.as_mut_ptr();
+        let len = v.len();
+        let cap = v.capacity();
+        std::mem::forget(v); // Prevent dropping the vector elements
+        Self { ptr, len, cap }
+    }
+
+    /// Reconstruct the standard Vec (Takes back ownership to read or free it)
+    pub unsafe fn into_vec(self) -> Vec<T> {
+        if self.ptr.is_null() {
+            vec![]
+        } else {
+            unsafe { Vec::from_raw_parts(self.ptr, self.len, self.cap) }
+        }
+    }
+}
+
 #[derive(Debug, Default, Copy, Clone)]
 #[repr(C)]
 pub struct SensorData {
@@ -78,6 +109,26 @@ pub struct UrlPost {
     // any post data to send if needed
     pub post_data: String,
 }
+
+#[derive(
+    Debug,
+    Clone,
+    Eq,
+    Hash,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Deserialize,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    Default,
+)]
+pub struct Url {
+    pub url: String,
+    pub local_modifiers: Vec<TargetModifier>,
+}
+
 #[derive(
     Deserialize, Debug, Serialize, Clone, PartialEq, Eq, Hash, bitcode::Encode, bitcode::Decode,
 )]
@@ -85,7 +136,7 @@ pub enum ScraperParam {
     // User defined params like search terms
     Normal(String),
     // A GET url not a POST
-    Url(String),
+    Url(Url),
     // Special type of url. is designed for weird requests like POST JSON and such
     UrlPost(UrlPost),
     // Login info
@@ -188,12 +239,32 @@ pub struct FileObject {
     pub skip_if: Vec<SkipIf>,
 }
 
-#[derive(Default, Clone, PartialEq, Eq, Hash, Debug, Deserialize)]
+#[derive(
+    Default, Clone, PartialEq, Eq, Hash, Debug, Deserialize, bitcode::Encode, bitcode::Decode,
+)]
 pub struct FileInternal {
     pub id: Option<u64>,
     pub hash: String,
     pub extension: String,
     pub storage_id: u64,
+}
+
+#[derive(
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Debug,
+    Deserialize,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
+pub struct TagSearch {
+    pub tag: Tag,
+    pub tag_id: u64,
+    pub count: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -229,6 +300,7 @@ pub struct DbJobsObj {
     pub config: PluginJob,
 }
 
+#[repr(C)]
 #[derive(Debug, Clone, Default, Eq, Hash, PartialEq)]
 pub struct ScraperDataReturn {
     pub job: PluginJob,
@@ -239,15 +311,17 @@ pub struct ScraperDataReturn {
 pub enum SkipIf {
     // If a relationship between any file and tag exists.
     FileTagRelationship(Tag),
-    // The tag is qnique and if their are X number or more of GenericNamespaceObj
+    // The tag is unique and if their are X number or more of GenericNamespaceObj
     // associated with the file Then we'll skip it
     FileNamespaceNumber((Tag, GenericNamespaceObj, u64)),
     // Skips a file if the hash X exists
     FileHash(String),
     // Skips if no files are downloaded
     NoFilesDownloaded,
+    // Skips job if plugintag exists EXACTLY as it appears here
+    ParentsRelate(PluginTag),
 }
-
+#[repr(C)]
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Default)]
 pub struct Plugin {
     /// Name of the site (human readable plz)
@@ -269,16 +343,19 @@ pub struct Plugin {
     pub properties: Vec<PluginProperties>,
 }
 
+#[repr(C)]
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub enum PluginProperties {
     /// Ratelimit number of tokens per time
-    Ratelimit(u64, Duration),
+    Ratelimit(u32, Duration),
     /// Sets the sites that are supported by the plugin
     Sites(Vec<String>),
     /// Sets the number of concurrent access the sites
     ThreadNum(u64),
     /// Changes the text or file downloading
     Modifier(TargetModifier),
+    /// Tells the system that we are going to ideally process a login type
+    Login((LoginNeed, LoginType)),
 }
 
 #[derive(
@@ -306,13 +383,38 @@ pub enum DownloadModifiers {
 ///
 /// Determines if we should apply this to a text or media entry
 ///
-#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+#[repr(C)]
+#[derive(
+    Debug,
+    Clone,
+    Eq,
+    Hash,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Deserialize,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
 pub struct TargetModifier {
     pub target: ModifierTarget,
     pub modifier: DownloadModifiers,
 }
 
-#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+#[derive(
+    Debug,
+    Clone,
+    Eq,
+    Hash,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Deserialize,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
 pub enum ModifierTarget {
     Text,
     Media,
@@ -404,7 +506,9 @@ pub struct CallbackInfo {
     pub data: Vec<CallbackCustomData>,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[derive(
+    Debug, PartialEq, Eq, Hash, Clone, bitcode::Encode, bitcode::Decode, Serialize, Deserialize,
+)]
 pub struct CallbackInfoInput {
     // Version of the expected call. Its on the plugin to handle this properly
     pub vers: u64,
@@ -414,7 +518,9 @@ pub struct CallbackInfoInput {
     pub data: Vec<CallbackCustomDataReturning>,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[derive(
+    Debug, PartialEq, Eq, Hash, Clone, bitcode::Encode, bitcode::Decode, Serialize, Deserialize,
+)]
 pub enum CallbackCustomDataReturning {
     String(String),
     U8(Vec<u8>),
@@ -454,7 +560,18 @@ pub enum SearchType {
 ///
 /// Holds namespace info
 ///
-#[derive(Hash, Eq, PartialEq, Clone, Default, Debug, Deserialize)]
+#[derive(
+    Hash,
+    Eq,
+    PartialEq,
+    Clone,
+    Default,
+    Debug,
+    Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    Serialize,
+)]
 pub struct GenericNamespaceObj {
     pub name: String,
     pub description: Option<String>,
@@ -478,7 +595,18 @@ pub enum TagType {
     Special,
 }
 
-#[derive(Default, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Debug,
+    bitcode::Encode,
+    bitcode::Decode,
+    Deserialize,
+    Serialize,
+)]
 pub struct Tag {
     pub name: String,
     pub namespace: GenericNamespaceObj,
@@ -499,7 +627,9 @@ pub struct RelationContext {
     pub limit_to: Option<Tag>,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(
+    Clone, Debug, Hash, PartialEq, Eq, bitcode::Encode, bitcode::Decode, Deserialize, Serialize,
+)]
 pub struct TagParents {
     pub tag_id: u64,
     pub relate_tag_id: u64,

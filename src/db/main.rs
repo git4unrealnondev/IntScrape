@@ -165,6 +165,12 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
         }
         *self.relationship_roaring_storage.write() = temp.1;
         *self.cache_type.write() = temp.0.unwrap();
+
+        let mut guard = self.relationship_roaring_storage.write();
+
+        if let Some(rel) = guard.as_mut() {
+            rel.load_relationship_cache(conn);
+        }
     }
 
     /// Sets up internal cache structure
@@ -180,7 +186,8 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
                 num: None,
                 param: Some("RelationshipRoaringFull".to_string()),
             },
-        );
+        )
+        .unwrap();
     }
     ///
     /// Handles creating the triggers to manage the count in the Tags column
@@ -207,6 +214,72 @@ END;
 ",
         )
         .unwrap();
+    }
+
+    pub fn search_db_namespace_sync(&self, name: &String) -> Option<u64> {
+        let conn = self.pool.get().unwrap();
+
+        let mut stmt = conn
+            .prepare("SELECT id FROM Namespace WHERE name = ?1")
+            .ok()?;
+
+        let result = stmt.query_row(params![name], |row| row.get::<_, u64>(0));
+
+        result.optional().ok().flatten()
+    }
+
+    pub fn search_db_tags_fts(&self, tag: &String, limit: &Option<u64>) -> Vec<TagSearch> {
+        let conn = self.pool.get().unwrap();
+        let cleaned_tag = tag.trim().replace('"', "\"\"");
+        let fts_query = format!("\"{}\"*", cleaned_tag);
+        let max_rows = limit.unwrap_or(10);
+
+        // Join FTS results back to real tables to hydrate Namespace name
+        let mut stmt = conn
+            .prepare(
+                "SELECT 
+    t.id, 
+    t.name, 
+    t.count, 
+    n.name AS ns_name,
+    n.description AS ns_desc
+ FROM Tags_Popular_fts f
+ JOIN Tags t ON f.rowid = t.id
+ JOIN Namespace n ON t.namespace = n.id
+ WHERE Tags_Popular_fts MATCH ?1
+ ORDER BY t.count DESC, f.rank ASC
+ LIMIT ?2",
+            )
+            .unwrap();
+
+        let tag_iter = stmt
+            .query_map(params![fts_query, max_rows], |row| {
+                let tag_id: u64 = row.get(0)?;
+                let tag_name: String = row.get(1)?;
+                let count: u64 = row.get(2)?;
+                let ns_name: String = row.get(3)?;
+                let ns_desc: Option<String> = row.get(4)?;
+
+                Ok(TagSearch {
+                    tag_id,
+                    count,
+                    tag: Tag {
+                        name: tag_name,
+                        namespace: GenericNamespaceObj {
+                            name: ns_name,
+                            description: ns_desc,
+                        },
+                    },
+                })
+            })
+            .unwrap();
+
+        let mut results = Vec::new();
+        for item in tag_iter.flatten() {
+            results.push(item);
+        }
+
+        results
     }
 
     ///
@@ -382,6 +455,23 @@ CREATE TABLE IF NOT EXISTS FileStorageLocations (id INTEGER PRIMARY KEY , locati
         }
     }
 
+    /// Retrieves the ID of a storage location.
+    /// If the location does not exist in the database, it automatically creates it.
+    pub(in crate::db) fn internal_file_storage_location_get_or_create(
+        conn: &Connection,
+        location_path: &str,
+    ) -> Result<u64, rusqlite::Error> {
+        if let Some(path_id) = Self::internal_file_storage_location_get(conn, location_path)? {
+            return Ok(path_id);
+        }
+
+        Self::internal_file_storage_location_set(conn, location_path)?;
+
+        let path_id = conn.last_insert_rowid() as u64;
+
+        Ok(path_id)
+    }
+
     ///
     /// Adds a file storage location
     ///
@@ -441,6 +531,58 @@ ON Jobs (time, reptime, site, param);
 ",
         )
         .unwrap();
+    }
+
+    pub fn file_get_physical_path_sync(&self, file_id: &u64) -> Option<String> {
+        let conn = self.pool.get().unwrap();
+        Self::internal_file_get_physical_path(&conn, file_id).ok()?
+    }
+
+    pub(in crate::db) fn internal_file_get_physical_path(
+        conn: &Connection,
+        file_id: &u64,
+    ) -> Result<Option<String>, rusqlite::Error> {
+        // 1. Get the file's hash and extension from the File table
+        let file_info: Option<(String, String)> = conn
+            .query_row(
+                "SELECT hash, extension FROM File WHERE id = ?1",
+                params![file_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        // If the file doesn't exist in the DB, or hash/extension are NULL, we can't find it on disk
+        let (hash, extension) = match file_info {
+            Some((h, e)) if !h.is_empty() && !e.is_empty() => (h, e),
+            _ => return Ok(None),
+        };
+
+        // 2. Fetch all possible base storage locations
+        let mut stmt = conn.prepare("SELECT location FROM FileStorageLocations")?;
+        let locations = stmt.query_map([], |row| row.get::<_, String>(0))?;
+
+        // 3. Iterate through locations and check if the file physically exists
+        for location_res in locations {
+            let base_location = location_res?;
+
+            // Construct the full path (e.g., "/path/to/storage/abcdef123456.png")
+            let mut path = PathBuf::from(base_location);
+            path.push(&hash[0..2]);
+            path.push(&hash[2..4]);
+            path.push(&hash[4..6]);
+            path.push(&hash);
+            let path = path.with_extension(&extension);
+
+            // Check the actual filesystem
+            if path.exists() {
+                // Return the successful path as a lossy UTF-8 String
+                return Ok(Some(
+                    path.canonicalize().unwrap().to_string_lossy().into_owned(),
+                ));
+            }
+        }
+
+        // File not found in any of the physical directories
+        Ok(None)
     }
 
     pub(in crate::db) fn internal_jobs_update(conn: &Connection, job: &DbJobsObj) {
@@ -526,9 +668,9 @@ ON Jobs (time, reptime, site, param);
     }
 
     ///
-    /// Gets a single fileid from a tag
+    /// Gets a single file_id from a tag
     ///
-    pub(in crate::db) fn internal_tag_get_fileid(conn: &Connection, tag: &Tag) -> Option<u64> {
+    pub(in crate::db) fn internal_tag_get_file_id(conn: &Connection, tag: &Tag) -> Option<u64> {
         if let Some(ns_id) = Self::internal_namespace_get_id(conn, &tag.namespace.name)
             && let Some(ref tag_id) = Self::internal_tag_get_id(conn, &tag.name, ns_id)
         {
@@ -556,7 +698,7 @@ ON Jobs (time, reptime, site, param);
     }
 
     ///
-    /// Gets a fileid from a tag_id
+    /// Gets a file_id from a tag_id
     ///
     pub(in crate::db) fn internal_tag_id_get_file_id(
         conn: &Connection,
@@ -586,8 +728,47 @@ ON Jobs (time, reptime, site, param);
 
         Ok(out)
     }
+
+    pub fn internal_file_id_get_tag_ids_where_namespace_id_sync(
+        &self,
+        file_id: &u64,
+        namespace_id: &u64,
+    ) -> HashSet<u64> {
+        let conn = self.pool.get().unwrap();
+
+        Self::internal_file_id_get_tag_ids_where_namespace_id(&conn, file_id, namespace_id)
+            .unwrap_or_default()
+    }
+
     ///
-    /// Builds a list of file -> tagid maps
+    /// Gets filtered tag_ids for a fileid filters by nsid
+    ///
+    pub(in crate::db) fn internal_file_id_get_tag_ids_where_namespace_id(
+        conn: &Connection,
+        file_id: &u64,
+        namespace_id: &u64,
+    ) -> Result<HashSet<u64>, rusqlite::Error> {
+        // Join with your tags table to filter by the namespace_id
+        let mut stmt = conn.prepare(
+            "SELECT r.tag_id 
+         FROM Relationship r
+         JOIN Tags t ON r.tag_id = t.id
+         WHERE r.file_id = ?1 AND t.namespace = ?2;",
+        )?;
+
+        let mut out = HashSet::new();
+
+        let rows = stmt.query_map(params![file_id, namespace_id], |row| row.get(0))?;
+
+        for tag_id in rows.flatten() {
+            out.insert(tag_id);
+        }
+
+        Ok(out)
+    }
+
+    ///
+    /// Builds a list of file -> tag_id maps
     ///
     pub(in crate::db) fn internal_file_id_get_tag_ids_bulk(
         conn: &Connection,
@@ -623,6 +804,70 @@ ON Jobs (time, reptime, site, param);
         Ok(out)
     }
 
+    pub fn tag_id_get_tag_sync(&self, tags: &HashSet<u64>) -> HashMap<u64, Tag> {
+        let conn = self.pool.get().unwrap();
+        Self::internal_tag_id_get_tag(&conn, &tags)
+    }
+
+    ///
+    /// Checks if the relationship structure defined inside a single PluginTag exists.
+    ///
+    pub(in crate::db) fn internal_parent_structure_exists(
+        conn: &Connection,
+        plugin_tag: &PluginTag,
+    ) -> Result<bool, rusqlite::Error> {
+        // 1️⃣ If this tag doesn't even define a relationship context, it has no parent structure
+        let Some(relation_ctx) = &plugin_tag.relates_to else {
+            return Ok(false);
+        };
+
+        // 2️⃣ Helper closure to look up a Tag's database ID using Name and Namespace strings
+        let get_tag_db_id = |tag: &Tag| -> Result<Option<u64>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT t.id FROM Tags t \
+                 JOIN Namespace n ON t.namespace = n.id \
+                 WHERE t.name = ?1 AND n.name = ?2 \
+                 LIMIT 1",
+            )?;
+            stmt.query_row([&tag.name, &tag.namespace.name], |row| row.get(0))
+                .optional()
+        };
+
+        // 3️⃣ Resolve IDs for the base tag and its parent tag
+        let Some(child_id) = get_tag_db_id(&plugin_tag.tag)? else {
+            return Ok(false);
+        };
+        let Some(parent_id) = get_tag_db_id(&relation_ctx.tag)? else {
+            return Ok(false);
+        };
+
+        // 4️⃣ Resolve the optional limit_to validation criteria context
+        let limit_to_id = match &relation_ctx.limit_to {
+            Some(lim_tag) => get_tag_db_id(lim_tag)?,
+            None => None,
+        };
+
+        // 5️⃣ Verify if this specific layout pattern matches a row in the Parents table
+        let mut stmt = conn.prepare(
+            "SELECT EXISTS (
+                SELECT 1 
+                FROM Parents 
+                WHERE tag_id = ?1 \
+                  AND relate_tag_id = ?2 \
+                  AND (
+                    (?3 IS NULL AND limit_to IS NULL) OR \
+                    (limit_to = ?3)
+                  )
+            )",
+        )?;
+
+        let structural_link_exists: bool = stmt
+            .query_row(rusqlite::params![child_id, parent_id, limit_to_id], |row| {
+                row.get(0)
+            })?;
+
+        Ok(structural_link_exists)
+    }
     pub(in crate::db) fn internal_tag_id_get_tag(
         conn: &Connection,
         tags: &HashSet<u64>,
@@ -844,9 +1089,11 @@ ON Jobs (time, reptime, site, param);
     ///
     pub(in crate::db) fn internal_jobs_get_torun(
         conn: &Connection,
+        sites: Vec<String>,
     ) -> Result<Vec<DbJobsObj>, rusqlite::Error> {
         let mut out = Vec::new();
-        for site in Self::internal_jobs_get_all_sites(conn)? {
+        //for site in Self::internal_jobs_get_all_sites(conn)? {
+        for site in sites {
             for job in Self::internal_jobs_get_site(conn, &site)? {
                 // Filters the jobs so we only run jobs that should be run
                 if job.config.time + job.config.reptime <= get_sys_time_in_secs() && !job.isrunning
@@ -986,15 +1233,22 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     ///
     pub(in crate::db) fn internal_file_download_location_get(
         conn: &Connection,
-    ) -> Result<Option<(PathBuf, u64)>, rusqlite::Error> {
-        if let Some(setting) = Self::internal_setting_get(conn, "SYSTEM_file_location")?
-            && let Some(setting_param) = setting.param
-            && let Ok(Some(path_id)) =
-                Self::internal_file_storage_location_get(conn, &setting_param)
-        {
-            return Ok(Some((PathBuf::from(setting_param), path_id)));
-        }
-        Ok(None)
+    ) -> Result<(PathBuf, u64), rusqlite::Error> {
+        let target_location = match Self::internal_setting_get(conn, "SYSTEM_file_location")? {
+            Some(setting) => match setting.param {
+                Some(param) => param,
+                None => "files".to_string(), // Fallback if param is null
+            },
+            None => {
+                // No setting found at all; initialize the system defaults
+                Self::internal_file_download_location_set_default(conn)?;
+                "files".to_string()
+            }
+        };
+
+        let path_id = Self::internal_file_storage_location_get_or_create(conn, &target_location)?;
+
+        Ok((PathBuf::from(target_location), path_id))
     }
 
     ///
@@ -1319,7 +1573,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             let mut guard = self.relationship_roaring_storage.write();
             if let Some(roaring) = guard.as_mut() {
                 for (file_id, tag_id) in relationships.iter() {
-                    roaring.relationship_roaring_add(conn, *tag_id, *file_id);
+                    roaring.relationship_roaring_add(conn, *file_id, *tag_id);
                 }
             }
         }
@@ -1516,6 +1770,14 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             'ScraperLoop: for scraperdatareturn in jobs {
                 for skip_conditions in scraperdatareturn.skip_conditions {
                     match skip_conditions {
+                        SkipIf::ParentsRelate(plugin_tag) => {
+                          if let Ok(status)=  Self::internal_parent_structure_exists(&conn, &plugin_tag) {
+                                if status {
+       info!("DB Skipping adding job due to Parent existing {:?}",scraperdatareturn.job);
+                                        continue 'ScraperLoop;
+                                }
+                            }
+                        }
                         SkipIf::FileHash(_file_hash) => {}
                         SkipIf::FileTagRelationship(tag) => {
                             if let Some(ns_id) =
@@ -1578,7 +1840,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                 explicit_adds.clear();
                 set_deletions.clear();
 
-                // Map current database state for this file: Namespace (&str) -> HashSet<TagId>
+                // Map current database state for this file: Namespace (&str) -> HashSet<tag_id>
                 if let Some(current_tag_ids) = current_file_relationships.get(&file_id) {
                     for &tag_id in current_tag_ids {
                         // Instantly resolve the full Tag object using the raw ID
@@ -1721,9 +1983,9 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     }
 
     ///
-    /// Gets a single fileid from a tag
+    /// Gets a single file_id from a tag
     ///
-    pub async fn tag_get_fileid(&self, tag: &Tag) -> Option<u64> {
+    pub async fn tag_get_file_id(&self, tag: &Tag) -> Option<u64> {
         let pool = self.pool.clone();
 
         let tag = tag.clone();
@@ -1736,7 +1998,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                 }
             };
 
-            Self::internal_tag_get_fileid(&conn, &tag)
+            Self::internal_tag_get_file_id(&conn, &tag)
         })
         .await
         .unwrap()
@@ -1823,13 +2085,16 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
 
         tokio::task::spawn_blocking(move || {
             let conn = pool.get().ok()?;
-            Self::internal_file_download_location_get(&conn)
-                .ok()
-                .flatten()
+            Self::internal_file_download_location_get(&conn).ok()
         })
         .await
         .ok()
         .flatten()
+    }
+    pub fn file_download_location_main_sync(&self) -> Option<(PathBuf, u64)> {
+        let pool = self.pool.clone();
+        let conn = pool.get().ok()?;
+        Self::internal_file_download_location_get(&conn).ok()
     }
 
     ///
@@ -1845,6 +2110,19 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             return None;
         }
         self.file_download_location_main().await.map(|path| {
+            let mut path_buf = path.0;
+            path_buf.push(&hash[0..2]);
+            path_buf.push(&hash[2..4]);
+            path_buf.push(&hash[4..6]);
+            path_buf.push(hash);
+            (path_buf.with_extension(ext), path.1)
+        })
+    }
+    pub fn file_download_location_get_sync(&self, hash: &str, ext: &str) -> Option<(PathBuf, u64)> {
+        if hash.len() <= 6 {
+            return None;
+        }
+        self.file_download_location_main_sync().map(|path| {
             let mut path_buf = path.0;
             path_buf.push(&hash[0..2]);
             path_buf.push(&hash[2..4]);
@@ -1912,12 +2190,11 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             let start_time = Instant::now();
             if should_quick_search {
                 let results = SearchQuery::new(roaring)
+                    .and_search(&and_tags)
                     .sort()
                     .limit(*limit)
-                    .and_search(&and_tags)
                     .build();
 
-                println!("Roaring Search took: {:?}", start_time.elapsed());
                 return results;
             }
         }
@@ -1949,27 +2226,27 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         let driver_tag = sorted_and[0];
 
         // We start the query with our rarest tag
-        let mut sql = "SELECT r0.fileid FROM Relationship r0".to_string();
+        let mut sql = "SELECT r0.file_id FROM Relationship r0".to_string();
 
         // Only add JOINs if there are more AND tags
         for (i, tag) in sorted_and.iter().skip(1).enumerate() {
             let alias = format!("r{}", i + 1);
             sql.push_str(&format!(
-                " JOIN Relationship {0} ON r0.fileid = {0}.fileid AND {0}.tagid = ?",
+                " JOIN Relationship {0} ON r0.file_id = {0}.fileid AND {0}.tag_id = ?",
                 alias
             ));
             params.push(*tag);
         }
 
         // Start conditions with the Driver Tag
-        sql.push_str(" WHERE r0.tagid = ?");
+        sql.push_str(" WHERE r0.tag_id = ?");
         params.push(driver_tag);
 
         // Add OR groups
         for (i, group) in or_groups.iter().enumerate() {
             let placeholders = vec!["?"; group.len()].join(",");
             sql.push_str(&format!(
-        " AND EXISTS (SELECT 1 FROM Relationship or{} WHERE or{}.fileid = r0.fileid AND or{}.tagid IN ({}))", 
+        " AND EXISTS (SELECT 1 FROM Relationship or{} WHERE or{}.file_id = r0.fileid AND or{}.tag_id IN ({}))", 
         i, i, i, placeholders
     ));
             for &tag_id in group {
@@ -1981,7 +2258,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         for (i, group) in not_groups.iter().enumerate() {
             let placeholders = vec!["?"; group.len()].join(",");
             sql.push_str(&format!(
-        " AND NOT EXISTS (SELECT 1 FROM Relationship not{} WHERE not{}.fileid = r0.fileid AND not{}.tagid IN ({}))", 
+        " AND NOT EXISTS (SELECT 1 FROM Relationship not{} WHERE not{}.file_id = r0.fileid AND not{}.tag_id IN ({}))", 
         i, i, i, placeholders
     ));
             for &tag_id in group {
@@ -1990,13 +2267,12 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         }
 
         // Finalize
-        sql.push_str(" ORDER BY r0.fileid DESC");
+        sql.push_str(" ORDER BY r0.file_id DESC");
 
         if let Some(l) = limit {
             sql.push_str(" LIMIT ?");
             params.push(*l);
         }
-        dbg!(&sql, &params);
 
         let mut stmt = conn
             .prepare(&sql)
@@ -2009,7 +2285,6 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             .filter_map(|r| r.ok())
             .collect();
 
-        println!("SQL Search took: {:?}", start_time.elapsed());
         results
     }
 
@@ -2113,7 +2388,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     ///
     /// Gets all jobs that can run
     ///
-    pub async fn jobs_get_torun(&self) -> Vec<DbJobsObj> {
+    pub async fn jobs_get_torun(&self, sites: Vec<String>) -> Vec<DbJobsObj> {
         let pool = self.pool.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -2124,7 +2399,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                     return Vec::new();
                 }
             };
-            match Self::internal_jobs_get_torun(&conn) {
+            match Self::internal_jobs_get_torun(&conn, sites) {
                 Ok(jobs) => jobs,
                 Err(e) => {
                     log::error!("Database error fetching jobs: {:?}", e);

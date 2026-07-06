@@ -4,16 +4,16 @@ use crate::{
     db::MainDatabase, ipc::IpcServer, plugins::PluginManager, web::manager::DownloadsManager,
 };
 
-#[cfg(feature = "dhat-heap")]
-#[global_allocator]
-static ALLOC: dhat::Alloc = dhat::Alloc;
-
 pub mod cli;
 pub mod db;
 pub mod helper_functions;
 pub mod ipc;
 pub mod plugins;
 pub mod web;
+
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
 
 const DB_PATH: &str = "main.db";
 const LOG_PATH: &str = "log.txt";
@@ -43,9 +43,10 @@ fn setup_log() {
 
 #[tokio::main]
 async fn main() {
-    console_subscriber::init();
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
+
+    //console_subscriber::init();
 
     setup_log();
 
@@ -74,13 +75,17 @@ async fn main() {
     let db_spawn = db.clone();
     let spawner = tokio::task::spawn(async move {
         loop {
-            let jobs_to_run = db_spawn.jobs_get_torun().await;
+            let sites = plugin_manager_clone.get_storage_sites();
+            let jobs_to_run = db_spawn.jobs_get_torun(sites).await;
 
             download_manager_clone
                 .add_jobs(plugin_manager_clone.match_plugin(&jobs_to_run))
                 .await;
 
-            if download_manager_clone.all_jobs_complete().await && jobs_to_run.is_empty() {
+            if download_manager_clone.all_jobs_complete().await
+                && jobs_to_run.is_empty()
+                && plugin_manager_clone.are_start_threads_closed()
+            {
                 break;
             }
 

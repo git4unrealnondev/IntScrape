@@ -17,12 +17,5 @@ pub fn on_start() {
     let wait = time::Duration::from_secs(1);
     loop {
         thread::sleep(wait);
-        dbg!(client::search_db_files(
-            SearchObj {
-                searches: vec![SearchHolder::And(vec![18])],
-                search_relate: None
-            },
-            None
-        ));
     }
 }

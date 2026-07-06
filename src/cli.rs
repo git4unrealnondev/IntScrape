@@ -22,7 +22,10 @@ fn parse_string_to_scraperparam(input: &str) -> Vec<shared_types::ScraperParam> 
         if let Ok(url) = Url::parse(item)
             && (url.scheme() == "http" || url.scheme() == "https")
         {
-            out.push(shared_types::ScraperParam::Url(url.to_string()));
+            out.push(shared_types::ScraperParam::Url(shared_types::Url {
+                url: url.to_string(),
+                ..Default::default()
+            }));
             continue;
         }
         out.push(shared_types::ScraperParam::Normal(item.to_string()));
