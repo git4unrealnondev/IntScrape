@@ -3,18 +3,26 @@ use hex::encode_upper;
 use rayon::ThreadPool;
 use sha2::Digest;
 use std::{
-    collections::{HashMap, HashSet}, env::temp_dir, fs::create_dir_all, io::Write, path::PathBuf, sync::{Arc, atomic::AtomicBool}, time::Duration
+    collections::{HashMap, HashSet},
+    env::temp_dir,
+    io::Write,
+    sync::{Arc, atomic::AtomicBool},
+    time::Duration,
 };
+use tempfile::NamedTempFile;
 use url::Url;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use governor::{DefaultDirectRateLimiter, Quota};
 use log::info;
 use reqwest::Client;
 use sha2::{Sha256, Sha512};
 use shared_types::*;
 use tokio::{
-    fs::File, io::AsyncWriteExt, sync::{Mutex, RwLock, Semaphore, oneshot}, task::JoinSet
+    fs::File,
+    io::AsyncWriteExt,
+    sync::{Mutex, RwLock, Semaphore},
+    task::JoinSet,
 };
 
 use crate::{
@@ -22,6 +30,22 @@ use crate::{
     helper_functions::{get_sys_time_in_secs, memory_manage},
     plugins::PluginManager,
 };
+
+enum TrackedFile {
+    Temp(tempfile::NamedTempFile),
+    Manual(std::path::PathBuf),
+}
+
+impl TrackedFile {
+    // A helper method to easily extract the path reference
+    fn path(&self) -> &std::path::Path {
+        match self {
+            TrackedFile::Temp(f) => f.path(),
+            TrackedFile::Manual(p) => p,
+        }
+    }
+}
+
 pub(in crate::web) struct Scraper {
     pub(in crate::web) job: DbJobsObj,
     pub(in crate::web) ratelimiter: Arc<DefaultDirectRateLimiter>,
@@ -66,9 +90,9 @@ impl Scraper {
             }
         }
 
-        let mut job = job.clone();
+        let job = job.clone();
 
-        let mut scraper = Scraper {
+        let scraper = Scraper {
             job,
             ratelimiter,
             plugin_manager,
@@ -195,7 +219,7 @@ impl Scraper {
                                                 &mut file,
                                                 &mut jobs,
                                                 &mut download_issue,
-                                                temp_dir().as_path()
+                                                temp_dir().as_path(),
                                             )
                                             .await
                                         {
@@ -222,8 +246,6 @@ impl Scraper {
                                 }
                                 //set.join_all().await;
                                 while set.join_next().await.is_some() {}
-
-
                             }
                             ScraperReturn::Nothing => {
                                 log::info!(
@@ -288,7 +310,7 @@ impl Scraper {
 
         if should_remove_job.load(std::sync::atomic::Ordering::Relaxed) {
             // Updates internal jobs cache
-            if let Some(internal_storage) = self
+            if let Some(_internal_storage) = self
                 .download_manager
                 .jobs
                 .write()
@@ -460,35 +482,35 @@ impl Scraper {
 
         (file.tag_list, *jobs) = rx.await.unwrap();
 
-        // 1. We have the temp_file_path from download_file
-        let temp_file_path = downloaded_temp_path; 
+        // 1. We have the temp_file from download_file
+        let temp_file = downloaded_temp_path;
 
         // 2. Move the file handling completely into spawn_blocking
         let (hash, extension, storage_id_result) = tokio::task::spawn_blocking(move || {
             // Load the bytes into memory sequentially right here
-            let bytes = Bytes::from(std::fs::read(&temp_file_path).ok().unwrap());
-            
+            let bytes = Bytes::from(std::fs::read(&temp_file).ok().unwrap());
+
             let hash = hash_bytes(&bytes, &HashesSupported::Sha512("".into())).0;
             let extension = FileFormat::from_bytes(&bytes).extension().to_string();
-            
+
             // Execute your .so plugin callback using the raw byte slice reference
             plugin_manager.callback_on_download(&bytes, &mut tags_owned, &mut jobs_owned);
-            
+
             // Copy the file to its permanent storage location synchronously
             let mut storage_id = None;
-            if let Some((file_storage_path, storage_id_db)) = file_download_location 
+            if let Some((file_storage_path, storage_id_db)) = file_download_location
                 && let Some(parent_dir) = file_storage_path.parent()
             {
                 if std::fs::create_dir_all(parent_dir).is_ok()
-                    && std::fs::write(&file_storage_path, &bytes).is_ok() 
+                    && std::fs::write(&file_storage_path, &bytes).is_ok()
                 {
                     storage_id = Some(storage_id_db);
                 }
             }
-            
+
             // Cleanup the temporary downloaded file
-            let _ = std::fs::remove_file(&temp_file_path);
-            
+            let _ = std::fs::remove_file(&temp_file);
+
             // CRITICAL: `bytes` falls out of scope here and is dropped IMMEDIATELY.
             // The memory is reclaimed before the async context even wakes up.
             (hash, extension, storage_id)
@@ -720,12 +742,12 @@ impl Scraper {
         })
     }*/
 
-async fn download_file(
+    async fn download_file(
         self: Arc<Self>,
         file_url: &str,
         hash: &Option<HashesSupported>,
-        temp_dir: &std::path::Path,
-    ) -> Option<PathBuf> {
+        _temp_dir: &std::path::Path,
+    ) -> Option<NamedTempFile> {
         let mut cnt = 0;
         let mut hash_cnt = 0;
 
@@ -754,20 +776,25 @@ async fn download_file(
                 Err(err) => {
                     log::error!(
                         "Scraper: {} JobId: {} While processing url: {} found err {:?}",
-                        self.plugin.name, self.job.id, file_url, err
+                        self.plugin.name,
+                        self.job.id,
+                        file_url,
+                        err
                     );
                     cnt += 1;
-                    if cnt >= 3 { break; }
+                    if cnt >= 3 {
+                        break;
+                    }
                     continue;
                 }
             };
 
             let content_length_header = response.content_length();
-            
+
             // Build unique temp file path
-            let temp_file_name = format!("download_{}_{}.tmp", self.job.id, rand::random::<u32>());
-            let temp_file_path = temp_dir.join(temp_file_name);
-            
+            let temp_file = tempfile::NamedTempFile::new().unwrap();
+            let temp_file_path = temp_file.path().to_path_buf();
+
             let mut file = match File::create(&temp_file_path).await {
                 Ok(f) => f,
                 Err(err) => {
@@ -794,7 +821,9 @@ async fn download_file(
                     Err(err) => {
                         log::error!(
                             "Scraper: {} JobId: {} Stream chunk error: {:?}",
-                            self.plugin.name, self.job.id, err
+                            self.plugin.name,
+                            self.job.id,
+                            err
                         );
                         stream_failed = true;
                         break;
@@ -805,9 +834,11 @@ async fn download_file(
             let _ = file.flush().await;
 
             if stream_failed {
-                let _ = tokio::fs::remove_file(&temp_file_path).await;
+                let _ = tokio::fs::remove_file(&temp_file).await;
                 cnt += 1;
-                if cnt >= 3 { break; }
+                if cnt >= 3 {
+                    break;
+                }
                 continue;
             }
 
@@ -843,25 +874,32 @@ async fn download_file(
                     if hash_cnt >= 2 {
                         info!("Overriding downloaded md5 with downloaded one.");
                     }
-                    return Some(temp_file_path);
+                    return Some(temp_file);
                 } else {
                     log::warn!(
                         "Scraper: {} JobId: {} Hash mismatch detected. Retrying. Attempt: {}",
-                        self.plugin.name, self.job.id, hash_cnt + 1
+                        self.plugin.name,
+                        self.job.id,
+                        hash_cnt + 1
                     );
-                    let _ = tokio::fs::remove_file(&temp_file_path).await;
+                    let _ = tokio::fs::remove_file(&temp_file).await;
                     hash_cnt += 1;
                 }
             } else {
                 log::error!(
                     "Scraper: {} JobId: {} Mismatched length. Downloaded {} Expected {:?}",
-                    self.plugin.name, self.job.id, downloaded_bytes_count, content_length_header
+                    self.plugin.name,
+                    self.job.id,
+                    downloaded_bytes_count,
+                    content_length_header
                 );
-                let _ = tokio::fs::remove_file(&temp_file_path).await;
+                let _ = tokio::fs::remove_file(&temp_file).await;
             }
 
             cnt += 1;
-            if cnt >= 3 { break; }
+            if cnt >= 3 {
+                break;
+            }
         }
 
         None
@@ -881,7 +919,7 @@ async fn download_file(
         let self_clone = self.clone();
 
         // Download or fetch file via its disk path reference
-        let temp_file_path = match file.source {
+        let temp_file = match file.source {
             None => return None,
             Some(ref url_source) => match url_source {
                 FileSource::Url(file_url) => {
@@ -898,17 +936,21 @@ async fn download_file(
                         .await
                     {
                         Some(file_id) => {
-                            info!("Scraper: {} JobId: {} Skipping file because already in db.", self.plugin.name, self.job.id);
+                            info!(
+                                "Scraper: {} JobId: {} Skipping file because already in db.",
+                                self.plugin.name, self.job.id
+                            );
                             return self.download_manager.db.file_id_get(file_id).await;
                         }
                         None => {
                             for skip in file.skip_if.iter() {
-                                if let SkipIf::FileTagRelationship(tag) = skip {
-                                    if let Some(file_id) = self.download_manager.db.tag_get_file_id(&tag).await {
-                                        if let Some(file_internal) = self.download_manager.db.file_id_get(file_id).await {
-                                            return Some(file_internal);
-                                        }
-                                    }
+                                if let SkipIf::FileTagRelationship(tag) = skip
+                                    && let Some(file_id) =
+                                        self.download_manager.db.tag_get_file_id(tag).await
+                                    && let Some(file_internal) =
+                                        self.download_manager.db.file_id_get(file_id).await
+                                {
+                                    return Some(file_internal);
                                 }
                             }
 
@@ -928,8 +970,11 @@ async fn download_file(
 
                             if self.should_download_file(file_url).await {
                                 // Calls disk streaming download helper
-                                if let Some(path_out) = self_clone.download_file(file_url, &file.hash, temp_dir).await {
-                                    path_out
+                                if let Some(path_out) = self_clone
+                                    .download_file(file_url, &file.hash, temp_dir)
+                                    .await
+                                {
+                                    TrackedFile::Temp(path_out)
                                 } else {
                                     *download_issue = true;
                                     return None;
@@ -940,14 +985,14 @@ async fn download_file(
                         }
                     }
                 }
-                // If bytes are fed instantly, spill them out to a temporary file right away 
+                // If bytes are fed instantly, spill them out to a temporary file right away
                 // to maintain identical architectural tracking shapes.
                 FileSource::Bytes(file_bytes) => {
                     let path = temp_dir.join(format!("direct_bytes_{}.tmp", rand::random::<u32>()));
                     if std::fs::write(&path, file_bytes).is_err() {
                         return None;
                     }
-                    path
+                    TrackedFile::Manual(path)
                 }
             },
         };
@@ -955,53 +1000,58 @@ async fn download_file(
         let mut tags_owned = file.tag_list.clone();
         let mut jobs_owned = jobs.clone();
 
+        let temp_file_path = temp_file.path().to_path_buf();
+
         // RUN EVERYTHING HEAVY SEQUENTIALLY ON THE THREAD POOL
-        let (hash, extension, storage_id_result, final_tags, final_jobs) = tokio::task::spawn_blocking(move || {
-            // 1. Read bytes from local disk (Hits OS Page Cache, near instantaneous)
-            let bytes = Bytes::from(std::fs::read(&temp_file_path).ok().unwrap());
-            
-            // 2. Compute format and layout
-            let hash = hash_bytes(&bytes, &HashesSupported::Sha512("".into())).0;
-            let extension = FileFormat::from_bytes(&bytes).extension().to_string();
+        let (hash, extension, storage_id_result, final_tags, final_jobs) =
+            tokio::task::spawn_blocking(move || {
+                // 1. Read bytes from local disk (Hits OS Page Cache, near instantaneous)
+                let bytes = Bytes::from(std::fs::read(&temp_file_path).ok().unwrap());
 
-        let file_download_location = self
-            .download_manager
-            .db
-            .file_download_location_get_sync(&hash, &extension);
+                // 2. Compute format and layout
+                let hash = hash_bytes(&bytes, &HashesSupported::Sha512("".into())).0;
+                let extension = FileFormat::from_bytes(&bytes).extension().to_string();
 
-            // 3. Fire your dynamic plugin boundary (.so loading boundary takes a slice safely)
-            plugin_manager.callback_on_download(&bytes, &mut tags_owned, &mut jobs_owned);
+                let file_download_location = self
+                    .download_manager
+                    .db
+                    .file_download_location_get_sync(&hash, &extension);
 
-            // 4. Save file out to its designated destination location path context
-            let mut storage_id = None;
-            if let Some((file_storage_path, storage_id_db)) = file_download_location 
-                && let Some(parent_dir) = file_storage_path.parent()
-            {
-                let mut cnt = 0;
-                loop {
-                    if std::fs::create_dir_all(parent_dir).is_ok()
-                        && std::fs::write(&file_storage_path, &bytes).is_ok() 
-                    {
-                        storage_id = Some(storage_id_db);
-                        break;
+                // 3. Fire your dynamic plugin boundary (.so loading boundary takes a slice safely)
+                plugin_manager.callback_on_download(&bytes, &mut tags_owned, &mut jobs_owned);
+
+                // 4. Save file out to its designated destination location path context
+                let mut storage_id = None;
+                if let Some((file_storage_path, storage_id_db)) = file_download_location
+                    && let Some(parent_dir) = file_storage_path.parent()
+                {
+                    let mut cnt = 0;
+                    loop {
+                        if std::fs::create_dir_all(parent_dir).is_ok()
+                            && std::fs::write(&file_storage_path, &bytes).is_ok()
+                        {
+                            storage_id = Some(storage_id_db);
+                            break;
+                        }
+                        cnt += 1;
+                        if cnt >= 3 {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
                     }
-                    cnt += 1;
-                    if cnt >= 3 { break; }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-            }
 
-            // Clean up the temporary file immediately
-            let _ = std::fs::remove_file(&temp_file_path);
+                // Clean up the temporary file immediately
+                let _ = std::fs::remove_file(&temp_file_path);
 
-            // CRITICAL: `bytes` falls out of scope HERE.
-            // Allocated heap memory drops back down to absolute zero before task returns.
-            Some((hash, extension, storage_id, tags_owned, jobs_owned))
-        })
-        .await
-        .unwrap()
-        .into_iter()
-        .next()?;
+                // CRITICAL: `bytes` falls out of scope HERE.
+                // Allocated heap memory drops back down to absolute zero before task returns.
+                Some((hash, extension, storage_id, tags_owned, jobs_owned))
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .next()?;
 
         file.tag_list = final_tags;
         *jobs = final_jobs;
@@ -1018,7 +1068,7 @@ async fn download_file(
             storage_id,
         })
     }
- /*   async fn download_file(
+    /*   async fn download_file(
         self: Arc<Self>,
         file_url: &str,
         hash: &Option<HashesSupported>,
@@ -1290,8 +1340,8 @@ impl DownloadsManager {
                 if ratelimit.is_none() {
                     info!(
                         "DownloadManager: Creating Ratelimiter with properties: {} tries per: {:?}",
-                        &1,
-                        &Duration::from_secs(1)
+                        1,
+                        Duration::from_secs(1)
                     );
                     ratelimit = Some(
                         Quota::with_period(Duration::from_secs(1))
@@ -1414,7 +1464,7 @@ pub fn hash_bytes(bytes: &Bytes, hash: &HashesSupported) -> (String, bool) {
 
             // let sharedtypes::HashesSupported(hashe, _) => hash;
             if &format!("{:x}", digest) != hash {
-                info!("Parser returned: {} Got: {:?}", &hash, &digest);
+                info!("Parser returned: {} Got: {:?}", hash, digest);
             }
             (format!("{:x}", digest), &format!("{:x}", digest) == hash)
         }
@@ -1424,7 +1474,7 @@ pub fn hash_bytes(bytes: &Bytes, hash: &HashesSupported) -> (String, bool) {
             let hastring = encode_upper(hasher.finalize());
             let dune = &hastring == hash;
             if !dune && !hash.is_empty() {
-                info!("Parser returned: {} Got: {}", &hash, &hastring);
+                info!("Parser returned: {} Got: {}", hash, hastring);
             }
             (hastring, dune)
         }
@@ -1434,7 +1484,7 @@ pub fn hash_bytes(bytes: &Bytes, hash: &HashesSupported) -> (String, bool) {
             let hastring = encode_upper(hasher.finalize());
             let dune = &hastring == hash;
             if !dune && !hash.is_empty() {
-                info!("Parser returned: {} Got: {}", &hash, &hastring);
+                info!("Parser returned: {} Got: {}", hash, hastring);
             }
             (hastring, dune)
         }
@@ -1443,7 +1493,7 @@ pub fn hash_bytes(bytes: &Bytes, hash: &HashesSupported) -> (String, bool) {
             let hastring = encode_upper(hasher);
             let dune = &hastring == hash;
             if !dune && !hash.is_empty() {
-                info!("Parser returned: {} Got: {}", &hash, &hastring);
+                info!("Parser returned: {} Got: {}", hash, hastring);
             }
             (hastring, dune)
         }

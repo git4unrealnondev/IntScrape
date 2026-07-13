@@ -1,14 +1,17 @@
+use bytes::Bytes;
 use log::info;
 use r2d2_sqlite::rusqlite::OptionalExtension;
 use r2d2_sqlite::rusqlite::{self, Connection, Row, params};
-use rusqlite::ToSql;
+use rusqlite::{ToSql, Transaction};
 use shared_types::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use walkdir::WalkDir;
 
 use crate::db::roaring::{InternalCacheType, SearchQuery};
 use crate::db::{CacheType, RelationshipStorage};
+use crate::web::manager::hash_bytes;
 use crate::{db::MainDatabase, helper_functions::get_sys_time_in_secs};
 
 pub trait DbJobsObjExt {
@@ -228,10 +231,10 @@ END;
         result.optional().ok().flatten()
     }
 
-    pub fn search_db_tags_fts(&self, tag: &String, limit: &Option<u64>) -> Vec<TagSearch> {
+    pub fn search_db_tags_fts(&self, tag: &str, limit: &Option<u64>) -> Vec<TagSearch> {
         let conn = self.pool.get().unwrap();
         let cleaned_tag = tag.trim().replace('"', "\"\"");
-        let fts_query = format!("\"{}\"*", cleaned_tag);
+        let fts_query = format!("\"{}\"", cleaned_tag);
         let max_rows = limit.unwrap_or(10);
 
         // Join FTS results back to real tables to hydrate Namespace name
@@ -311,7 +314,7 @@ CREATE VIRTUAL TABLE Tags_Popular_fts USING fts5(
     namespace UNINDEXED,
     content='High_Value_Tags',
     content_rowid='id',
-    tokenize = \"unicode61 separators '_/'\"
+    tokenize = 'trigram' 
 );
 
 -- OPTIMIZATION: Only insert if it meets the threshold
@@ -509,6 +512,28 @@ CREATE INDEX IF NOT EXISTS idx_file_hash ON File (hash);
     }
 
     ///
+    /// Updates a list of files
+    ///
+    pub(in crate::db) fn internal_file_update_batch(
+        tn: Transaction,
+        files: &[FileInternal],
+    ) -> Result<(), rusqlite::Error> {
+        {
+            let mut stmt = tn.prepare(
+                "UPDATE File 
+             SET hash = ?1, extension = ?2, storage_id = ?3 
+             WHERE id = ?4",
+            )?;
+
+            for file in files {
+                stmt.execute((&file.hash, &file.extension, &file.storage_id, &file.id))?;
+            }
+        }
+
+        tn.commit()
+    }
+
+    ///
     /// Creates the default Jobs table
     ///
     pub(in crate::db) fn internal_table_create_jobs_v1(conn: &Connection) {
@@ -654,6 +679,37 @@ ON Jobs (time, reptime, site, param);
             },
         )
     }
+
+    ///
+    /// Gets all files in db
+    ///
+    pub(in crate::db) fn internal_file_get_all(
+        conn: &Connection,
+    ) -> Result<Vec<FileInternal>, rusqlite::Error> {
+        let mut stmt = conn.prepare("select id, hash, extension, storage_id FROM File")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(FileInternal {
+                id: row.get(0)?,
+                hash: row.get(1)?,
+                extension: row.get(2)?,
+                storage_id: row.get(3)?,
+            })
+        })?;
+
+        rows.collect()
+    }
+    ///
+    /// Gets all file storage's in db
+    ///
+    pub(in crate::db) fn internal_file_storage_get_all(
+        conn: &Connection,
+    ) -> Result<HashMap<u64, String>, rusqlite::Error> {
+        let mut stmt = conn.prepare("SELECT id, location FROM FileStorageLocations;")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+
+        rows.collect()
+    }
+
     ///
     /// Checks if we should download a file
     ///
@@ -806,7 +862,7 @@ ON Jobs (time, reptime, site, param);
 
     pub fn tag_id_get_tag_sync(&self, tags: &HashSet<u64>) -> HashMap<u64, Tag> {
         let conn = self.pool.get().unwrap();
-        Self::internal_tag_id_get_tag(&conn, &tags)
+        Self::internal_tag_id_get_tag(&conn, tags)
     }
 
     ///
@@ -1743,6 +1799,153 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     }
 
     ///
+    /// Gets a file location on disk and fixes extension on FS if it doesn't exist
+    ///
+    fn get_file_location(
+        &self,
+        file_internal: &FileInternal,
+        file_map: &HashMap<u64, String>,
+    ) -> Option<PathBuf> {
+        if let Some(base_path) = file_map.get(&file_internal.storage_id) {
+            if file_internal.hash.len() <= 6 {
+                return None;
+            }
+            let mut path = Path::new(base_path).to_path_buf();
+            path.push(&file_internal.hash[0..2]);
+            path.push(&file_internal.hash[2..4]);
+            path.push(&file_internal.hash[4..6]);
+            path.push(&file_internal.hash);
+            let final_path = path.with_added_extension(&file_internal.extension);
+
+            if final_path.exists() {
+                return Some(final_path);
+            }
+            if final_path.with_extension("").exists() {
+                std::fs::rename(final_path.with_extension(""), &final_path).ok()?;
+                return Some(final_path);
+            }
+        }
+
+        None
+    }
+
+    ///
+    /// Fixes all files inside of the file storage location
+    ///
+    pub fn fix_internal_files(&self) -> Result<(), Box<dyn std::error::Error>> {
+        info!("Staring to fix internal files");
+        let mut conn = self.pool.get()?;
+
+        let file_storage_map = Self::internal_file_storage_get_all(&conn)?;
+
+        let files = Self::internal_file_get_all(&conn)?;
+
+        let mut file_storage_to_fix = Vec::new();
+        let mut file_storage_missing = HashSet::new();
+
+        let mut valid_paths = HashSet::new();
+
+        // Fixes storage IDs inside of the db.
+        'fileloop: for file in files.iter() {
+            if let Some(file_path) = self.get_file_location(file, &file_storage_map) {
+                valid_paths.insert(file_path);
+                continue 'fileloop;
+            }
+
+            for storage_id in file_storage_map.keys() {
+                let mut file_temp = file.clone();
+                file_temp.storage_id = *storage_id;
+                if let Some(file_path) = self.get_file_location(&file_temp, &file_storage_map) {
+                    valid_paths.insert(file_path);
+                    file_storage_to_fix.push(file_temp);
+                    continue 'fileloop;
+                }
+            }
+
+            file_storage_missing.insert(file);
+        }
+
+        // updates files
+        if !file_storage_to_fix.is_empty() {
+            info!(
+                "Fixed the extensions of {} files.",
+                file_storage_to_fix.len()
+            );
+            let tn = conn.transaction()?;
+            Self::internal_file_update_batch(tn, &file_storage_to_fix)?;
+        }
+
+        info!("Missing {} files from db.", file_storage_missing.len());
+
+        if !file_storage_missing.is_empty() {
+            info!("Scanning file locations");
+
+            let file_hash: HashMap<String, String> =
+                files.into_iter().map(|e| (e.hash, e.extension)).collect();
+
+            let default_file_location = self.file_download_location_main_sync().unwrap();
+
+            for (storage_id, storage_loc) in file_storage_map.iter() {
+                for entry in WalkDir::new(storage_loc).into_iter().filter_map(|e| e.ok()) {
+                    // Skips existing files
+                    if valid_paths.contains(&entry.path().to_path_buf()) {
+                        continue;
+                    }
+
+                    let file = match std::fs::read(entry.path()) {
+                        Ok(out) => out,
+                        Err(_) => {
+                            continue;
+                        }
+                    };
+                    let bytes = &Bytes::from(file);
+                    let (hash, _) = hash_bytes(bytes, &HashesSupported::Sha512("".into()));
+
+                    dbg!(&entry);
+                    if let Some(file_extension) = file_hash.get(&hash)
+                        && let Some(base_file_path) = file_storage_map.get(storage_id)
+                    {
+                        let mut path_buf = Path::new(base_file_path).to_path_buf();
+                        path_buf.push(&hash[0..2]);
+                        path_buf.push(&hash[2..4]);
+                        path_buf.push(&hash[4..6]);
+                        path_buf.push(hash);
+
+                        dbg!(&entry, &path_buf.with_extension(file_extension));
+
+                        if entry.path().exists()
+                            && !path_buf.with_extension(file_extension).exists()
+                            && std::fs::copy(entry.path(), path_buf.with_extension(file_extension))
+                                .is_ok()
+                            && std::fs::remove_file(entry.path()).is_ok()
+                        {
+                            info!(
+                                "Moved file: {} to: {}",
+                                entry.path().display(),
+                                path_buf.with_extension(file_extension).as_path().display()
+                            );
+                        }
+                    } else {
+                        let mut default_file_location =
+                            default_file_location.0.with_file_name("files_missing");
+
+                        dbg!(&default_file_location);
+                        info!("File {} does not exist in db.", entry.path().display());
+                        default_file_location.push(entry.path());
+                        dbg!(&default_file_location);
+                        std::fs::create_dir_all(&default_file_location.parent().unwrap());
+                        if std::fs::copy(&entry.path(), default_file_location).is_ok() {
+                            std::fs::remove_file(&entry.path());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    ///
     /// Handles all the processing for files and tags and relational items
     ///
     pub async fn process_scraper(
@@ -1771,12 +1974,11 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                 for skip_conditions in scraperdatareturn.skip_conditions {
                     match skip_conditions {
                         SkipIf::ParentsRelate(plugin_tag) => {
-                          if let Ok(status)=  Self::internal_parent_structure_exists(&conn, &plugin_tag) {
-                                if status {
+                          if let Ok(status)=  Self::internal_parent_structure_exists(&conn, &plugin_tag)
+                                && status {
        info!("DB Skipping adding job due to Parent existing {:?}",scraperdatareturn.job);
                                         continue 'ScraperLoop;
                                 }
-                            }
                         }
                         SkipIf::FileHash(_file_hash) => {}
                         SkipIf::FileTagRelationship(tag) => {
@@ -2155,7 +2357,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         use rusqlite::params_from_iter;
         use std::time::Instant;
 
-        let start_time = Instant::now();
+        let _start_time = Instant::now();
 
         // 1. Extract and Categorize Tags
         let mut and_tags = Vec::new();
@@ -2187,7 +2389,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                     break;
                 }
             }
-            let start_time = Instant::now();
+            let _start_time = Instant::now();
             if should_quick_search {
                 let results = SearchQuery::new(roaring)
                     .and_search(&and_tags)
@@ -2274,13 +2476,9 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             params.push(*l);
         }
 
-        let mut stmt = conn
-            .prepare(&sql)
-            .ok()
-            .expect("Unable to prepare a db search");
+        let mut stmt = conn.prepare(&sql).expect("Unable to prepare a db search");
         let results: Vec<u64> = stmt
             .query_map(params_from_iter(params), |row| row.get(0))
-            .ok()
             .expect(" Unable to querymap")
             .filter_map(|r| r.ok())
             .collect();

@@ -440,7 +440,10 @@ pub async fn main(db: Arc<MainDatabase>) {
                     }*/
                 }
             },
-            cli_structs::TasksStruct::Database(_db) => {
+            cli_structs::TasksStruct::Database(db_action) => {
+                if let cli_structs::Database::CheckFiles(_action) = db_action {
+                    db.fix_internal_files().unwrap();
+                }
                 /* let dbstore = data.clone();
                 match db {
                     // Adds extensions back onto files if they dont have them

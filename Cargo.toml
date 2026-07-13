@@ -36,6 +36,8 @@ rand = "0.10.1"
 cfg-if = "1.0.4"
 libc = "0.2.186"
 dhat = "0.3.3"
+tempfile = "3.27.0"
+walkdir = "2.5.0"
 
 [workspace.dependencies]
 shared_types = { path = "./libs/shared_types" }

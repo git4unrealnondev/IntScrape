@@ -99,13 +99,13 @@ impl Scraper {
                         request_builder.header(reqwest::header::USER_AGENT, ua)
                     }
                     DownloadModifiers::Timeout(Some(duration)) => {
-                        request_builder.timeout(duration.clone())
+                        request_builder.timeout(*duration)
                     }
                     DownloadModifiers::Timeout(None) => request_builder,
                     DownloadModifiers::Header((key, value)) => {
                         if let (Ok(h_name), Ok(h_val)) = (
                             HeaderName::from_bytes(key.as_bytes()),
-                            HeaderValue::from_str(&value),
+                            HeaderValue::from_str(value),
                         ) {
                             request_builder.header(h_name, h_val)
                         } else {
@@ -146,7 +146,7 @@ impl Scraper {
         let url_parsed = match Url::parse(&url.url) {
             Ok(out) => out,
             Err(_e) => {
-                log::error!("ScraperDownloading: {} is not a valid URL.", &url.url);
+                log::error!("ScraperDownloading: {} is not a valid URL.", url.url);
                 return None;
             }
         };
@@ -156,9 +156,7 @@ impl Scraper {
             self.ratelimiter.until_ready().await;
             info!(
                 "Worker: {} JobId: {} -- Spawned web reach to: {}",
-                self.plugin.name,
-                self.job.id,
-                &url_parsed.to_string()
+                self.plugin.name, self.job.id, url_parsed
             );
 
             let futureresult = match post_data {
@@ -179,9 +177,9 @@ impl Scraper {
                             tokio::time::sleep(std::time::Duration::from_secs(time_secs)).await;
                             log::error!(
                                 "Worker: {} JobId: {} -- While processing job {:?} was unable to download text. Had err {:?} sleeping for {} seconds.",
-                                &self.plugin.name,
-                                &self.job.id,
-                                &url_parsed,
+                                self.plugin.name,
+                                self.job.id,
+                                url_parsed,
                                 err,
                                 time_secs
                             );
@@ -197,9 +195,9 @@ impl Scraper {
                             Err(err) => {
                                 log::error!(
                                     "Worker: {} JobId: {} -- While processing job {:?} had some error {:?}",
-                                    &self.plugin.name,
-                                    &self.job.id,
-                                    &url_parsed,
+                                    self.plugin.name,
+                                    self.job.id,
+                                    url_parsed,
                                     err
                                 );
                                 cnt += 1;
@@ -214,9 +212,9 @@ impl Scraper {
                         tokio::time::sleep(std::time::Duration::from_secs(time_secs)).await;
                         log::error!(
                             "Worker: {} JobId: {} -- While processing job {:?} was unable to download text. Had err {:?} sleeping for {} seconds.",
-                            &self.plugin.name,
-                            &self.job.id,
-                            &url_parsed,
+                            self.plugin.name,
+                            self.job.id,
+                            url_parsed,
                             err,
                             time_secs
                         );
@@ -226,9 +224,9 @@ impl Scraper {
                     } else {
                         log::error!(
                             "Worker: {} JobId: {} -- While processing job {:?} was unable to download text. Had err {:?} ",
-                            &self.plugin.name,
-                            &self.job.id,
-                            &url_parsed,
+                            self.plugin.name,
+                            self.job.id,
+                            url_parsed,
                             err,
                         );
                     }
