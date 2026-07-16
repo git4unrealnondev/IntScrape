@@ -1921,7 +1921,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                 "Fixed the extensions of {} files.",
                 file_storage_to_fix.len()
             );
-            let tn = conn.transaction()?;
+            let tn = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             Self::internal_file_update_batch(tn, &file_storage_to_fix)?;
         }
 
@@ -2102,7 +2102,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                     panic!();
                 }
             };
-            let conn = conn.transaction().unwrap();
+            let conn = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
 
             'ScraperLoop: for scraperdatareturn in jobs {
                 for skip_conditions in scraperdatareturn.skip_conditions {
@@ -2360,7 +2360,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                     panic!();
                 }
             };
-            let tn = conn.transaction().unwrap();
+            let tn = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
 
             Self::internal_relationship_bulk_add(self, &tn, &rel_list);
             tn.commit().unwrap();
@@ -2386,7 +2386,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                     panic!();
                 }
             };
-            let tn = conn.transaction().unwrap();
+            let tn = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
 
             Self::internal_relationship_bulk_delete(self, &tn, &rel_list);
             tn.commit().unwrap();
@@ -2765,7 +2765,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                     panic!();
                 }
             };
-            let tn = conn.transaction().unwrap();
+            let tn = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
             let out_tags = Self::internal_tag_bulk_add(&tn, &tags_owned);
 
             tn.commit().unwrap();
@@ -2793,7 +2793,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                     panic!();
                 }
             };
-            let tn = conn.transaction().unwrap();
+            let tn = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
             let out_tags = Self::internal_file_bulk_add(&tn, tags_owned);
 
             tn.commit().unwrap();
