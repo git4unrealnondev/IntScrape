@@ -7,6 +7,7 @@ edition = "2024"
 crate-type = ["cdylib"] 
 
 [dependencies]
+html2text = { version = "0.17.1", features = ["css"] }
 json = "0.12.4"
 regex = "1.13.0"
 scraper = "0.27.0"

@@ -155,6 +155,17 @@ impl Scraper {
             let job_list = Arc::new(Mutex::new(Vec::new()));
             let tag_list = Arc::new(Mutex::new(Vec::new()));
 
+            // Should skip processing a job if a skipif exists
+            if self
+                .download_manager
+                .db
+                .clone()
+                .should_skip_processing_job(scrap_data.skip_conditions.clone())
+                .await
+            {
+                continue;
+            }
+
             for param in scrap_data.job.param.iter() {
                 let scraper = self.clone();
                 let param_clone = param.clone();

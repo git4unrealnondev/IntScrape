@@ -2,7 +2,7 @@ use core::{convert::Into, option::Option::Some};
 use parking_lot::RwLock;
 use r2d2::Pool;
 use r2d2_sqlite::{SqliteConnectionManager, rusqlite::Connection};
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, time::Duration};
 
 use crate::{
     Arc, DB_VERSION,
@@ -44,7 +44,7 @@ impl MainDatabase {
             //c.trace(Some(|statement: &str| {
             //    info!("Executing SQL: {}", statement);
             //}));
-
+c.busy_timeout(Duration::from_millis(5000))?;
             c.execute_batch(
                 "
 PRAGMA journal_mode = WAL;

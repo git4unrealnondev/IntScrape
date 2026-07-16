@@ -4,7 +4,7 @@ use std::{collections::HashSet, fmt};
 use shared_types::{
     DEFAULT_PRIORITY, FileObject, FileSource, FileTagAction, GenericNamespaceObj, PluginJob,
     PluginProperties, PluginTag, RelationContext, ScraperDataReturn, ScraperParam, ScraperReturn,
-    Tag, TargetModifier, Url,
+    SkipIf, Tag, TargetModifier, Url,
 };
 
 pub enum Site {
@@ -19,6 +19,7 @@ pub enum NsIdent {
     SeriesType,
     ChapterName,
     ChapterNum,
+    ChapterText,
     PageNum,
     SourceUrl,
 }
@@ -55,35 +56,25 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
 pub fn url_dump(
     scraperdata: &shared_types::ScraperDataReturn,
 ) -> Vec<shared_types::ScraperDataReturn> {
+    let site = Site::DivaScans;
     let mut out = Vec::new();
-    /*  let hardlimit = 50; // Catalog exploration boundary depth
 
-    let mut params = scraperdata.job.param.clone();
-    params.retain(|f| matches!(f, ScraperParam::Login(_)));
-
-    // Generate paginated extraction passes targeting the hidden API index
-    for i in 1..=hardlimit {
-        let mut param = params.clone();
-        param.push(ScraperParam::Url(Url {
-            url: format!("https://divascans.org/api/series?sort=popular&page={}", i),
-            ..Default::default()
-        }));
-
-        out.push(ScraperDataReturn {
-            job: PluginJob {
-                site: scraperdata.job.site.clone(),
-                priority: DEFAULT_PRIORITY - 2,
-                param,
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-    }*/
- 
     // Handles downstream structural URL passthroughs (individual links processing)
     for param in scraperdata.job.param.clone() {
         if let ScraperParam::Url(url) = param {
-// Adds chapter jobs into system
+            let param = vec![ScraperParam::Url(url.clone())];
+            out.push(ScraperDataReturn {
+                job: PluginJob {
+                    site: scraperdata.job.site.clone(),
+                    priority: DEFAULT_PRIORITY,
+                    param,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+            // Adds chapter jobs into system
+            if !url.url.contains("/chapter/") {
                 for i in 1..9999 {
                     out.push(ScraperDataReturn {
                         job: PluginJob {
@@ -95,22 +86,19 @@ pub fn url_dump(
                             })],
                             ..Default::default()
                         },
-                        ..Default::default()
+                        skip_conditions: vec![SkipIf::ParentsRelateLimitto((
+                            Tag {
+                                name: i.to_string(),
+                                namespace: nsobjplg(&NsIdent::ChapterNum, &site),
+                            },
+                            Tag {
+                                namespace: nsobjplg(&NsIdent::SeriesTitle, &site),
+                                name: url.url.rsplit('/').next().unwrap().to_string(),
+                            },
+                        ))],
                     });
                 }
-
-
-            let mut param = Vec::new();
-            param.push(ScraperParam::Url(url));
-            out.push(ScraperDataReturn {
-                job: PluginJob {
-                    site: scraperdata.job.site.clone(),
-                    priority: DEFAULT_PRIORITY - 1,
-                    param,
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
+            }
         }
     }
 
@@ -159,11 +147,37 @@ fn extract_clean_json(input: &str) -> Result<String, Box<dyn std::error::Error>>
     Ok(pretty_json)
 }
 
+fn extract_clean_json_text(input: &str) -> Result<String, Box<dyn std::error::Error>> {
+    // 1. Regex to capture the content inside the quotes of the second argument
+    // Matches the string between the quotes: [1,"..."]
+    let re = Regex::new(r#"self\.__next_f\.push\(\[\d+,"(.*)"\]\)"#)?;
+
+    if let Some(caps) = re.captures(input) {
+        let raw_js_string = &caps[1];
+
+        // 2. The data is a JavaScript-escaped string.
+        // We use serde_json to unescape it properly (handles \u003c, \n, etc.)
+        // We must add quotes around it so it looks like a valid JSON string literal.
+        let json_string = format!("\"{}\"", raw_js_string);
+
+        let text: String = serde_json::from_str(&json_string)?;
+
+        // 3. Now 'unescaped_text' is the HTML content.
+        // If you just want the text content without the HTML tags:
+        //let document = Html::parse_fragment(&unescaped_text);
+        //let text = document.root_element().text().collect::<Vec<_>>().join("\n");
+
+        return Ok(text);
+    }
+
+    Err("Pattern not found".into())
+}
+
 #[unsafe(no_mangle)]
 pub fn parser_call(
     text_input: &str,
     source_url: &str,
-    scraperdata: &shared_types::ScraperDataReturn,
+    _scraperdata: &shared_types::ScraperDataReturn,
 ) -> Vec<shared_types::ScraperReturn> {
     //println!("{}", text_input);
     let site = Site::DivaScans;
@@ -171,26 +185,88 @@ pub fn parser_call(
     let mut jobs = HashSet::new();
     let mut tags = HashSet::new();
 
-    if let Some(_cover_url) = extract_cover_image(text_input) {
-        //dbg!(&cover_url);
+    if let Some(cover_url) = extract_cover_image(text_input) {
+        files.insert(FileObject {
+            source: Some(FileSource::Url(cover_url.to_string())),
+            hash: None,
+            tag_list: vec![FileTagAction {
+                operation: shared_types::TagOperation::Add,
+                tags: vec![PluginTag {
+                    tag: Tag {
+                        namespace: nsobjplg(&NsIdent::SourceUrl, &site),
+                        name: cover_url.to_string(),
+                    },
+                    relates_to: Some(RelationContext {
+                        tag: Tag {
+                            namespace: nsobjplg(&NsIdent::SeriesTitle, &site),
+                            name: source_url.rsplit('/').next().unwrap().to_string(),
+                        },
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+            }],
+            skip_if: vec![],
+        });
     }
 
-    source_url.contains("series") && source_url.contains("comic");
+    //source_url.contains("series") && source_url.contains("comic");
     let document = Html::parse_document(text_input);
 
     let script_selector = Selector::parse("script").unwrap();
 
     let mut chapters = Vec::new();
+    let re = Regex::new(r"\d+:T[a-zA-Z0-9]+").unwrap();
+    let mut should_download_next = false;
 
     // Iterate through found script nodes
     for script_element in document.select(&script_selector) {
         let script_text = script_element.inner_html();
+
+        if script_text.contains("self.__next_f.push") {
+            if source_url.contains("/chapter/") {
+                match extract_clean_json_text(&script_text) {
+                    Ok(cleaned_text) => {
+                        if should_download_next {
+                            let cleaned_text = cleaned_text.replacen("<div>", r#"<div style="overflow: visible; display: flex; flex-direction: column; gap: 1.25em;background:black; color:rgb(205, 200, 194);">"#, 1);
+
+                            tags.insert(PluginTag {
+                            tag: Tag {
+                                namespace: nsobjplg(&NsIdent::ChapterText, &site),
+                                name: format!(r#"<div style="overflow: visible; display: flex; flex-direction: column; gap: 1.25em;background:black; color:rgb(205, 200, 194);"> {} </div>"#, cleaned_text),
+                            },
+                            relates_to: Some(RelationContext {
+                                tag: Tag {
+                                    namespace: nsobjplg(&NsIdent::ChapterNum, &site),
+                                    name: source_url.rsplit('/').next().unwrap().to_string(),
+                                },
+                                limit_to: Some(Tag {
+                                    namespace: nsobjplg(&NsIdent::SeriesTitle, &site),
+                                    name: source_url.rsplit('/').nth(2).unwrap().to_string(),
+                                }),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        });
+                            should_download_next = false;
+                        }
+                        if re.is_match(&cleaned_text) {
+                            should_download_next = true;
+                        }
+                    }
+                    Err(err) => {} //println!("REGEX failed on script {}. ERROR: {}", &script_text, &err)
+                }
+            }
+        }
 
         // Target specifically the scripts containing the Next.js push streaming data
         if script_text.contains("self.__next_f.push")
             && let Ok(cleaned_text) = extract_clean_json(&script_text)
             && let Ok(parsed) = json::parse(&cleaned_text)
         {
+            // println!("{}", &script_text);
+            // dbg!();
+            // dbg!();
             // Main page parsing
             let series = &parsed[3][3]["series"];
             if !series.is_null()
@@ -226,7 +302,7 @@ pub fn parser_call(
                         ..Default::default()
                     });
                 }
-                if let Some(cover_image) = series["coverImage"].as_str() {
+                /*   if let Some(cover_image) = series["coverImage"].as_str() {
                     tags.insert(PluginTag {
                         tag: Tag {
                             name: cover_image.to_string(),
@@ -238,7 +314,7 @@ pub fn parser_call(
                         }),
                         ..Default::default()
                     });
-                }
+                }*/
                 for genre in series["genres"].members() {
                     if let Some(genre_parsed) = genre["slug"].as_str() {
                         tags.insert(PluginTag {
@@ -254,8 +330,7 @@ pub fn parser_call(
                         });
                     }
                 }
-
-                           }
+            }
 
             // Chapter parsing
             for item in parsed.members() {
@@ -345,6 +420,7 @@ fn nsobjplg(name: &NsIdent, site: &Site) -> GenericNamespaceObj {
         ),
         NsIdent::PageNum => ("Page_Number", "A page number as it relates to a chapter."),
         NsIdent::SourceUrl => ("source_url", "A source for a file"),
+        NsIdent::ChapterText => ("Chapter_Text", "A text for a chapter"),
     };
 
     GenericNamespaceObj {

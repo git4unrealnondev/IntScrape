@@ -318,6 +318,8 @@ pub enum SkipIf {
     NoFilesDownloaded,
     // Skips job if plugintag exists EXACTLY as it appears here
     ParentsRelate(PluginTag),
+    // Skips job if a relate_tag_id and limit_to exists
+    ParentsRelateLimitto((Tag, Tag)),
 }
 #[repr(C)]
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Default)]

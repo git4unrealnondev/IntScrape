@@ -404,7 +404,7 @@ CREATE TABLE IF NOT EXISTS Settings (
         conn.execute_batch(
             "
 CREATE TABLE IF NOT EXISTS Parents (
-    id INTEGER PRIMARY KEY ,
+id INTEGER PRIMARY KEY AUTOINCREMENT,
     tag_id INTEGER NOT NULL,
     relate_tag_id INTEGER NOT NULL,
     limit_to INTEGER,
@@ -420,7 +420,9 @@ CREATE TABLE IF NOT EXISTS Parents (
 
 CREATE INDEX IF NOT EXISTS idx_parents_lim ON Parents (limit_to);
 CREATE INDEX IF NOT EXISTS idx_parents_rel ON Parents (relate_tag_id);
-CREATE INDEX IF NOT EXISTS idx_parents ON Parents (tag_id, relate_tag_id, limit_to);
+
+-- Stupid fix so we can have NULL limit_to to match on NULLs
+CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_parents_null_safe ON Parents (tag_id, relate_tag_id, IFNULL(limit_to, -1));
 
 ",
         )
@@ -925,6 +927,50 @@ ON Jobs (time, reptime, site, param);
 
         Ok(structural_link_exists)
     }
+
+    pub(in crate::db) fn internal_parent_relate_limit_exists(
+        conn: &Connection,
+        relate_to: &Tag,
+        limit_to: &Tag,
+    ) -> Result<bool, rusqlite::Error> {
+        // 2️⃣ Helper closure to look up a Tag's database ID using Name and Namespace strings
+        let get_tag_db_id = |tag: &Tag| -> Result<Option<u64>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT t.id FROM Tags t \
+                 JOIN Namespace n ON t.namespace = n.id \
+                 WHERE t.name = ?1 AND n.name = ?2 \
+                 LIMIT 1",
+            )?;
+            stmt.query_row([&tag.name, &tag.namespace.name], |row| row.get(0))
+                .optional()
+        };
+
+        // 3️⃣ Resolve IDs for the base tag and its parent tag
+        let Some(relate_id) = get_tag_db_id(relate_to)? else {
+            return Ok(false);
+        };
+        let Some(limit_id) = get_tag_db_id(limit_to)? else {
+            return Ok(false);
+        };
+
+        // 5️⃣ Verify if this specific layout pattern matches a row in the Parents table
+        let mut stmt = conn.prepare(
+            "SELECT EXISTS (
+                SELECT 1 
+                FROM Parents 
+                  WHERE relate_tag_id = ?1 
+                  AND 
+                    limit_to = ?2
+                  
+            )",
+        )?;
+
+        let structural_link_exists: bool =
+            stmt.query_row(rusqlite::params![relate_id, limit_id], |row| row.get(0))?;
+
+        Ok(structural_link_exists)
+    }
+
     pub(in crate::db) fn internal_tag_id_get_tag(
         conn: &Connection,
         tags: &HashSet<u64>,
@@ -1671,7 +1717,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         let parents_vec: Vec<&shared_types::TagParents> = parents.iter().collect();
 
         let mut query =
-            String::from("INSERT INTO Parents (tag_id, relate_tag_id, limit_to) VALUES ");
+            String::from("INSERT OR IGNORE INTO Parents (tag_id, relate_tag_id, limit_to) VALUES ");
         let mut params_vector: Vec<&dyn rusqlite::types::ToSql> =
             Vec::with_capacity(parents_vec.len() * 3);
 
@@ -1961,6 +2007,79 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     }
 
     ///
+    /// Should we skip doing something
+    ///
+    fn should_skip_item(conn: &Connection, skip_conditions: SkipIf) -> bool {
+        match skip_conditions {
+            SkipIf::ParentsRelateLimitto((relate_to, limit_to)) => {
+                if let Ok(status) =
+                    Self::internal_parent_relate_limit_exists(conn, &relate_to, &limit_to)
+                    && status
+                {
+                    info!(
+                        "DB Skipping adding job due to relate_to and limit_to exists {:?} {:?}",
+                        relate_to, limit_to
+                    );
+                    return true;
+                }
+            }
+            SkipIf::ParentsRelate(plugin_tag) => {
+                if let Ok(status) = Self::internal_parent_structure_exists(conn, &plugin_tag)
+                    && status
+                {
+                    info!(
+                        "DB Skipping adding job due to Parent existing {:?}",
+                        plugin_tag
+                    );
+                    return true;
+                }
+            }
+            SkipIf::FileHash(_file_hash) => {}
+            SkipIf::FileTagRelationship(tag) => {
+                if let Some(ns_id) = Self::internal_namespace_get_id(conn, &tag.namespace.name)
+                    && let Some(tag_id) = Self::internal_tag_get_id(conn, &tag.name, ns_id)
+                    && Self::internal_tag_has_files(conn, tag_id)
+                {
+                    info!(
+                        "DB Skipping adding job due to FileTagRelationship tag_id: {} having files.",
+                        tag_id
+                    );
+                    return true;
+                }
+            }
+            SkipIf::FileNamespaceNumber((_tag, _namespace, _id)) => {}
+            SkipIf::NoFilesDownloaded => {}
+        }
+        false
+    }
+
+    ///
+    /// Should x be skipped
+    ///
+    pub async fn should_skip_processing_job(self: Arc<Self>, skip_conditions: Vec<SkipIf>) -> bool {
+        if skip_conditions.is_empty() {
+            return false;
+        }
+        let pool = self.pool.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let conn = match pool.get() {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("Failed to acquire DB connection from pool: {:?}", e);
+                    panic!();
+                }
+            };
+            for skip_condition in skip_conditions {
+                if Self::should_skip_item(&conn, skip_condition) {
+                    return true;
+                }
+            }
+            false
+        });
+        result.await.unwrap_or(false)
+    }
+
+    ///
     /// Handles all the processing for files and tags and relational items
     ///
     pub async fn process_scraper(
@@ -1987,27 +2106,8 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
 
             'ScraperLoop: for scraperdatareturn in jobs {
                 for skip_conditions in scraperdatareturn.skip_conditions {
-                    match skip_conditions {
-                        SkipIf::ParentsRelate(plugin_tag) => {
-                          if let Ok(status)=  Self::internal_parent_structure_exists(&conn, &plugin_tag)
-                                && status {
-       info!("DB Skipping adding job due to Parent existing {:?}",scraperdatareturn.job);
-                                        continue 'ScraperLoop;
-                                }
-                        }
-                        SkipIf::FileHash(_file_hash) => {}
-                        SkipIf::FileTagRelationship(tag) => {
-                            if let Some(ns_id) =
-                                Self::internal_namespace_get_id(&conn, &tag.namespace.name)
-                                && let Some(tag_id) =
-                                    Self::internal_tag_get_id(&conn, &tag.name, ns_id)
-                                    && Self::internal_tag_has_files(&conn, tag_id) {
-                                        info!("DB Skipping adding job due to FileTagRelationship tag_id: {} having files.", tag_id);
-                                        continue 'ScraperLoop;
-                                    }
-                        }
-                        SkipIf::FileNamespaceNumber((_tag, _namespace, _id)) => {}
-                        SkipIf::NoFilesDownloaded => {}
+                    if Self::should_skip_item(&conn, skip_conditions) {
+                        continue 'ScraperLoop;
                     }
                 }
 
@@ -2079,18 +2179,20 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                         TagOperation::Add => {
                             for tag in &tag_action.tags {
                                 if matches!(tag.tag_type, TagType::Normal | TagType::NormalNoRegex)
-                                    && let Some(&tag_id) = tag_cache.get(&tag.tag) {
-                                        rels_to_add.insert((file_id, tag_id));
-                                        explicit_adds.insert(tag_id);
-                                    }
+                                    && let Some(&tag_id) = tag_cache.get(&tag.tag)
+                                {
+                                    rels_to_add.insert((file_id, tag_id));
+                                    explicit_adds.insert(tag_id);
+                                }
                             }
                         }
                         TagOperation::Del => {
                             for tag in &tag_action.tags {
                                 if matches!(tag.tag_type, TagType::Normal | TagType::NormalNoRegex)
-                                    && let Some(&tag_id) = tag_cache.get(&tag.tag) {
-                                        rels_to_del.insert((file_id, tag_id));
-                                    }
+                                    && let Some(&tag_id) = tag_cache.get(&tag.tag)
+                                {
+                                    rels_to_del.insert((file_id, tag_id));
+                                }
                             }
                         }
                         TagOperation::Set => {
