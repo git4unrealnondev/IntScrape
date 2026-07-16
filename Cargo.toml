@@ -25,7 +25,7 @@ sha1 = "0.11.0"
 md5 = "0.8.0"
 hex = "0.4.3"
 rayon = "1.12.0"
-rusqlite = { version = "*",default-features=false, features = ["trace"] }
+rusqlite = { version = "0.37.0", default-features=false, features = ["trace"] }
 serde = { version = "1.0.228", features = ["derive"] }
 interprocess = { version = "2.4.2", features = ["tokio"] }
 bitcode = { version = "0.6.9", features = ["serde"] }
