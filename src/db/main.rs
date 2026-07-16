@@ -1,3 +1,4 @@
+use crate::cli::cli_structs::CheckFilesEnum;
 use bytes::Bytes;
 use log::info;
 use r2d2_sqlite::rusqlite::OptionalExtension;
@@ -1832,7 +1833,10 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     ///
     /// Fixes all files inside of the file storage location
     ///
-    pub fn fix_internal_files(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn fix_internal_files(
+        &self,
+        action: &crate::cli::cli_structs::CheckFilesEnum,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         info!("Staring to fix internal files");
         let mut conn = self.pool.get()?;
 
@@ -1885,63 +1889,74 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
 
             let default_file_location = self.file_download_location_main_sync().unwrap();
 
-            for (storage_id, storage_loc) in file_storage_map.iter() {
-                for entry in WalkDir::new(storage_loc).into_iter().filter_map(|e| e.ok()) {
-                    // Skips existing files
-                    if valid_paths.contains(&entry.path().to_path_buf()) {
-                        continue;
-                    }
-
-                    let file = match std::fs::read(entry.path()) {
-                        Ok(out) => out,
-                        Err(_) => {
+            if CheckFilesEnum::Print == *action {
+                for (hash, _) in file_hash {
+                    info!("Just printing the missing file: {}", hash);
+                }
+            } else if CheckFilesEnum::StorageCheck == *action {
+                for (storage_id, storage_loc) in file_storage_map.iter() {
+                    for entry in WalkDir::new(storage_loc).into_iter().filter_map(|e| e.ok()) {
+                        // Skips existing files
+                        if valid_paths.contains(&entry.path().to_path_buf()) {
                             continue;
                         }
-                    };
-                    let bytes = &Bytes::from(file);
-                    let (hash, _) = hash_bytes(bytes, &HashesSupported::Sha512("".into()));
 
-                    dbg!(&entry);
-                    if let Some(file_extension) = file_hash.get(&hash)
-                        && let Some(base_file_path) = file_storage_map.get(storage_id)
-                    {
-                        let mut path_buf = Path::new(base_file_path).to_path_buf();
-                        path_buf.push(&hash[0..2]);
-                        path_buf.push(&hash[2..4]);
-                        path_buf.push(&hash[4..6]);
-                        path_buf.push(hash);
+                        let file = match std::fs::read(entry.path()) {
+                            Ok(out) => out,
+                            Err(_) => {
+                                continue;
+                            }
+                        };
+                        let bytes = &Bytes::from(file);
+                        let (hash, _) = hash_bytes(bytes, &HashesSupported::Sha512("".into()));
 
-                        dbg!(&entry, &path_buf.with_extension(file_extension));
-
-                        if entry.path().exists()
-                            && !path_buf.with_extension(file_extension).exists()
-                            && std::fs::copy(entry.path(), path_buf.with_extension(file_extension))
-                                .is_ok()
-                            && std::fs::remove_file(entry.path()).is_ok()
+                        if let Some(file_extension) = file_hash.get(&hash)
+                            && let Some(base_file_path) = file_storage_map.get(storage_id)
                         {
-                            info!(
-                                "Moved file: {} to: {}",
-                                entry.path().display(),
-                                path_buf.with_extension(file_extension).as_path().display()
-                            );
-                        }
-                    } else {
-                        let mut default_file_location =
-                            default_file_location.0.with_file_name("files_missing");
+                            let mut path_buf = Path::new(base_file_path).to_path_buf();
+                            path_buf.push(&hash[0..2]);
+                            path_buf.push(&hash[2..4]);
+                            path_buf.push(&hash[4..6]);
+                            path_buf.push(hash);
 
-                        dbg!(&default_file_location);
-                        info!("File {} does not exist in db.", entry.path().display());
-                        default_file_location.push(entry.path());
-                        dbg!(&default_file_location);
-                        std::fs::create_dir_all(&default_file_location.parent().unwrap());
-                        if std::fs::copy(&entry.path(), default_file_location).is_ok() {
-                            std::fs::remove_file(&entry.path());
+                            if entry.path().exists()
+                                && !path_buf.with_extension(file_extension).exists()
+                                && std::fs::copy(
+                                    entry.path(),
+                                    path_buf.with_extension(file_extension),
+                                )
+                                .is_ok()
+                                && std::fs::remove_file(entry.path()).is_ok()
+                            {
+                                info!(
+                                    "Moved file: {} to: {}",
+                                    entry.path().display(),
+                                    path_buf.with_extension(file_extension).as_path().display()
+                                );
+                            }
+                        } else {
+                            let mut default_file_location =
+                                default_file_location.0.with_file_name("files_missing");
+
+                            info!("File {} does not exist in db.", entry.path().display());
+
+                            default_file_location.push(entry.path());
+                            if std::fs::create_dir_all(default_file_location.parent().unwrap())
+                                .is_ok()
+                                && std::fs::copy(entry.path(), &default_file_location).is_ok()
+                                && std::fs::remove_file(entry.path()).is_ok()
+                            {
+                                info!(
+                                    "Moved file: {} to: {}",
+                                    entry.path().display(),
+                                    default_file_location.display()
+                                );
+                            }
                         }
                     }
                 }
             }
         }
-
         Ok(())
     }
 

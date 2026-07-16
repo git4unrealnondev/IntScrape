@@ -259,18 +259,18 @@ impl RelationshipStorage {
             .unwrap();
 
         for (tagid, fileid_bitmap) in rows.flatten() {
-            if let Ok(bitmap) =
+            if let Ok(mut bitmap) =
                 RoaringTreemap::deserialize_unchecked_from(Cursor::new(fileid_bitmap))
             {
+                bitmap.optimize();
                 self.tag_id.insert(tagid, bitmap);
             }
         }
-
-        //logging::info_log("Finished storing tag_id maps for roaring");
         if let InternalCacheType::Popular(_) = self.internal_cache {
             return;
         }
 
+        /*
         let mut stmt = conn
             .prepare("SELECT fileid, tagid_bitmap FROM RelationshipRoaringFileid")
             .unwrap();
@@ -283,13 +283,14 @@ impl RelationshipStorage {
             })
             .unwrap();
 
+
         for (fileid, tagid_bitmap) in rows.flatten() {
             if let Ok(bitmap) =
                 RoaringTreemap::deserialize_unchecked_from(Cursor::new(tagid_bitmap))
             {
-                self.file_id.insert(fileid, bitmap);
+                //self.file_id.insert(fileid, bitmap);
             }
-        }
+        }*/
     }
 
     /// Checks if a relationship exists
@@ -505,7 +506,7 @@ impl RelationshipStorage {
                     None => {
                         let mut bitmap = RoaringTreemap::new();
                         bitmap.insert(tag_id);
-                        self.file_id.insert(file_id, bitmap);
+                        //self.file_id.insert(file_id, bitmap);
                     }
                     Some(bitmap) => {
                         bitmap.insert(tag_id);

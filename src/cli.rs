@@ -9,7 +9,7 @@ use url::Url;
 use clap::Parser;
 use std::sync::Arc;
 
-mod cli_structs;
+pub mod cli_structs;
 
 ///
 /// Parses strings into NORMAL inputs as scraperparam
@@ -441,8 +441,8 @@ pub async fn main(db: Arc<MainDatabase>) {
                 }
             },
             cli_structs::TasksStruct::Database(db_action) => {
-                if let cli_structs::Database::CheckFiles(_action) = db_action {
-                    db.fix_internal_files().unwrap();
+                if let cli_structs::Database::CheckFiles(action) = db_action {
+                    db.fix_internal_files(action).unwrap();
                 }
                 /* let dbstore = data.clone();
                 match db {

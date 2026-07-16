@@ -5,8 +5,6 @@ use std::time::Duration;
 
 pub const DEFAULT_PRIORITY: u64 = 10;
 
-use std::slice;
-
 /// FFI-safe alternative to String
 #[repr(C)]
 pub struct CVec<T> {

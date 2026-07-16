@@ -108,7 +108,7 @@ pub enum Reimport {
     DirectoryLocation(DirectoryLocation),
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Subcommand, PartialEq)]
 pub enum CheckFilesEnum {
     /// Just print the missing files
     Print,

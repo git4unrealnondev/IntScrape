@@ -239,7 +239,7 @@ impl PluginManager {
     ///
     /// Returns a list of jobs that a plugin can support
     ///
-    pub fn match_plugin(&self, jobs: &Vec<DbJobsObj>) -> HashMap<Plugin, Vec<DbJobsObj>> {
+    pub fn match_plugin(&self, jobs: &[DbJobsObj]) -> HashMap<Plugin, Vec<DbJobsObj>> {
         let mut out: HashMap<Plugin, Vec<DbJobsObj>> = HashMap::new();
 
         for job in jobs.iter() {
