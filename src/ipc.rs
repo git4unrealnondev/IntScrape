@@ -64,8 +64,11 @@ impl IpcServer {
     /// Starts up the api
     pub fn startup(self: Arc<Self>) -> Result<(), Box<dyn std::error::Error>> {
         let name = 
-            "/tmp/rusthydrus.sock".to_fs_name::<GenericFilePath>().unwrap()
+            "/tmp/rusthydrus/rusthydrus.sock".to_fs_name::<GenericFilePath>().unwrap()
         ;
+        std::fs::create_dir("/tmp/rusthydrus");
+
+        std::fs::remove_file("/tmp/rusthydrus/rusthydrus.sock");
 
         let listener = ListenerOptions::new()
             .name(name)
