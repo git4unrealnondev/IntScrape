@@ -1,6 +1,6 @@
 use core::{convert::Into, option::Option::Some};
-use parking_lot::RwLock;
-use r2d2::Pool;
+use parking_lot::{Mutex, RwLock};
+use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::{SqliteConnectionManager, rusqlite::Connection};
 use std::{collections::HashMap, path::Path, time::Duration};
 
@@ -21,6 +21,7 @@ pub enum CacheType {
 
 pub struct MainDatabase {
     pool: Pool<SqliteConnectionManager>,
+    writer_conn: Arc<Mutex<PooledConnection<SqliteConnectionManager>>>,
     namespace_cache: Arc<RwLock<HashMap<String, u64>>>,
     cache_type: RwLock<CacheType>,
     relationship_roaring_storage: RwLock<Option<RelationshipStorage>>,
@@ -42,15 +43,15 @@ impl MainDatabase {
     pub fn new(db_path: &Path) -> Arc<Self> {
         let manager = SqliteConnectionManager::file(db_path).with_init(|c| {
             //c.trace(Some(|statement: &str| {
-            //    info!("Executing SQL: {}", statement);
+            //    log::info!("Executing SQL: {}", statement);
             //}));
-c.busy_timeout(Duration::from_millis(5000))?;
+            c.busy_timeout(Duration::from_millis(1000))?;
             c.execute_batch(
                 "
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
-PRAGMA busy_timeout = 5000;
+PRAGMA busy_timeout = 1000;
 PRAGMA cache_size = -64000;
 ",
             )
@@ -62,11 +63,15 @@ PRAGMA cache_size = -64000;
             .build(manager)
             .expect("Failed to create pool");
 
+        // Reserved writer thread to do all work on
+        let writer_conn = Arc::new(Mutex::new(pool.get().unwrap()));
+
         let main_db: Arc<MainDatabase> = MainDatabase {
             pool,
             namespace_cache: Arc::new(RwLock::new(HashMap::new())),
             cache_type: CacheType::Bare.into(),
             relationship_roaring_storage: None.into(),
+            writer_conn,
         }
         .into();
 

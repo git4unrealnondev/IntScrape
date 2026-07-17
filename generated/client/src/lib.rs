@@ -1,4 +1,4 @@
-use interprocess::local_socket::ToNsName;
+use interprocess::local_socket::{GenericFilePath, ToNsName};
 use interprocess::local_socket::{GenericNamespaced, prelude::*};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -142,7 +142,7 @@ pub fn data_size_to_b<T: bitcode::Encode + ?Sized>(data_object: &T) -> Vec<u8> {
 fn init_data_request<T: bitcode::Encode + for<'de> bitcode::Decode<'de>>(
     requesttype: &SupportedDBRequests,
 ) -> T {
-    let name = SOCKET_NAME.to_ns_name::<GenericNamespaced>().unwrap();
+    let name = "/tmp/rusthydrus.sock".to_fs_name::<GenericFilePath>().unwrap();
     let conn;
     loop {
         // Wait indefinitely for this to get a connection. shit way of doing it will

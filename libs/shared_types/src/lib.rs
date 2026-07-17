@@ -350,7 +350,7 @@ pub enum PluginProperties {
     Ratelimit(u32, Duration),
     /// Sets the sites that are supported by the plugin
     Sites(Vec<String>),
-    /// Sets the number of concurrent access the sites
+    /// Sets the number of concurrent downloads for text and file
     ThreadNum(u64),
     /// Changes the text or file downloading
     Modifier(TargetModifier),

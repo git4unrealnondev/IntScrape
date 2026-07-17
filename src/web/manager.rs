@@ -25,6 +25,8 @@ use tokio::{
     task::JoinSet,
 };
 
+const MAX_CONCURRENT_DOWNLOADS: usize = 5;
+
 use crate::{
     db::MainDatabase,
     helper_functions::{get_sys_time_in_secs, memory_manage},
@@ -147,7 +149,18 @@ impl Scraper {
 
         let should_remove_job = Arc::new(AtomicBool::new(true));
 
-        let max_concurrent_downloads = 5;
+        // Sets the max number of concurrent downloads
+        let mut max_concurrent_downloads = MAX_CONCURRENT_DOWNLOADS;
+
+        for property in self.plugin.properties.iter() {
+            if let PluginProperties::ThreadNum(thread_num) = property {
+                max_concurrent_downloads = (*thread_num)
+                    .try_into()
+                    .unwrap_or(MAX_CONCURRENT_DOWNLOADS);
+                break;
+            }
+        }
+
         let semaphore = Arc::new(Semaphore::new(max_concurrent_downloads));
 
         'scraperloop: for scrap_data in scraper_data_return.iter() {

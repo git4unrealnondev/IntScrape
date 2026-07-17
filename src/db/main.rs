@@ -320,7 +320,7 @@ CREATE VIRTUAL TABLE Tags_Popular_fts USING fts5(
 
 -- OPTIMIZATION: Only insert if it meets the threshold
 CREATE TRIGGER IF NOT EXISTS tags_ai AFTER INSERT ON Tags 
-WHEN new.count >= 5
+WHEN new.count = 5
 BEGIN
     INSERT INTO Tags_Popular_fts(rowid, name, namespace) 
     VALUES (new.id, new.name, new.namespace);
@@ -332,32 +332,6 @@ WHEN old.count >= 5
 BEGIN
     INSERT INTO Tags_Popular_fts(Tags_Popular_fts, rowid, name, namespace) 
     VALUES('delete', old.id, old.name, old.namespace);
-END;
-
--- OPTIMIZATION: Divided into precise conditional logic to prevent unnecessary 
--- FTS virtual table thrashing during standard increments.
-CREATE TRIGGER IF NOT EXISTS tags_au_upgrade AFTER UPDATE ON Tags
-WHEN old.count < 5 AND new.count >= 5
-BEGIN
-    INSERT INTO Tags_Popular_fts(rowid, name, namespace) 
-    VALUES (new.id, new.name, new.namespace);
-END;
-
-CREATE TRIGGER IF NOT EXISTS tags_au_downgrade AFTER UPDATE ON Tags
-WHEN old.count >= 5 AND new.count < 5
-BEGIN
-    INSERT INTO Tags_Popular_fts(Tags_Popular_fts, rowid, name, namespace) 
-    VALUES('delete', old.id, old.name, old.namespace);
-END;
-
-CREATE TRIGGER IF NOT EXISTS tags_au_maintain AFTER UPDATE ON Tags
-WHEN old.count >= 5 AND new.count >= 5 AND (old.name != new.name OR old.namespace != new.namespace)
-BEGIN
-    INSERT INTO Tags_Popular_fts(Tags_Popular_fts, rowid, name, namespace) 
-    VALUES('delete', old.id, old.name, old.namespace);
-    
-    INSERT INTO Tags_Popular_fts(rowid, name, namespace) 
-    VALUES (new.id, new.name, new.namespace);
 END;
 ",
         )
@@ -2092,17 +2066,14 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             return;
         }
 
-        let pool = self.pool.clone();
+        let writer_conn = self.writer_conn.clone();
 
         tokio::task::spawn_blocking(move || {
-            let mut conn = match pool.get() {
-                Ok(c) => c,
-                Err(e) => {
-                    log::error!("Failed to acquire DB connection from pool: {:?}", e);
-                    panic!();
-                }
-            };
-            let conn = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+            let mut writer_lock_guard = writer_conn.lock();
+
+            let conn = writer_lock_guard
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
 
             'ScraperLoop: for scraperdatareturn in jobs {
                 for skip_conditions in scraperdatareturn.skip_conditions {
@@ -2360,7 +2331,9 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                     panic!();
                 }
             };
-            let tn = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+            let tn = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
 
             Self::internal_relationship_bulk_add(self, &tn, &rel_list);
             tn.commit().unwrap();
@@ -2386,7 +2359,9 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                     panic!();
                 }
             };
-            let tn = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+            let tn = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
 
             Self::internal_relationship_bulk_delete(self, &tn, &rel_list);
             tn.commit().unwrap();
@@ -2643,12 +2618,18 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     /// Sets a job to be running inside of the db
     ///
     pub async fn job_set_is_running(&self, job: &DbJobsObj) {
-        let pool = self.pool.clone();
-
         let job_id = job.id;
+        let writer_conn = self.writer_conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = pool.get().ok().unwrap();
-            Self::internal_jobs_set_isrunning(&conn, job_id).is_ok()
+            let mut writer_lock_guard = writer_conn.lock();
+            let tn = writer_lock_guard
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            let status = Self::internal_jobs_set_isrunning(&tn, job_id).is_ok();
+
+            tn.commit().unwrap();
+
+            status
         })
         .await
         .unwrap();
@@ -2658,12 +2639,17 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     /// Sets a job to be running inside of the db
     ///
     pub async fn job_remove(&self, job: &DbJobsObj) {
-        let pool = self.pool.clone();
-
         let job_id = job.id;
+        let writer_conn = self.writer_conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = pool.get().ok().unwrap();
-            Self::internal_job_remove(&conn, job_id).is_ok()
+            let mut writer_lock_guard = writer_conn.lock();
+            let tn = writer_lock_guard
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            let status = Self::internal_job_remove(&tn, job_id).is_ok();
+
+            tn.commit().unwrap();
+            status
         })
         .await
         .unwrap();
@@ -2753,22 +2739,21 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         if tags.is_empty() {
             return HashMap::new();
         }
-        let pool = self.pool.clone();
 
         let tags_owned = tags.to_vec();
+        let writer_conn = self.writer_conn.clone();
 
         tokio::task::spawn_blocking(move || {
-            let mut conn = match pool.get() {
-                Ok(c) => c,
-                Err(e) => {
-                    log::error!("Failed to acquire DB connection from pool: {:?}", e);
-                    panic!();
-                }
-            };
-            let tn = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
-            let out_tags = Self::internal_tag_bulk_add(&tn, &tags_owned);
+            let out_tags;
+            {
+                let mut writer_lock_guard = writer_conn.lock();
+                let tn = writer_lock_guard
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .unwrap();
+                out_tags = Self::internal_tag_bulk_add(&tn, &tags_owned);
 
-            tn.commit().unwrap();
+                tn.commit().unwrap();
+            }
             out_tags
         })
         .await
@@ -2782,18 +2767,15 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         if tags.is_empty() {
             return HashSet::new();
         }
-        let pool = self.pool.clone();
+        let writer_conn = self.writer_conn.clone();
 
         let tags_owned = tags.clone();
         tokio::task::spawn_blocking(move || {
-            let mut conn = match pool.get() {
-                Ok(c) => c,
-                Err(e) => {
-                    log::error!("Failed to acquire DB connection from pool: {:?}", e);
-                    panic!();
-                }
-            };
-            let tn = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+            let mut writer_lock_guard = writer_conn.lock();
+
+            let tn = writer_lock_guard
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
             let out_tags = Self::internal_file_bulk_add(&tn, tags_owned);
 
             tn.commit().unwrap();

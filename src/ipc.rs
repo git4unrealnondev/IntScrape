@@ -63,13 +63,9 @@ impl IpcServer {
 
     /// Starts up the api
     pub fn startup(self: Arc<Self>) -> Result<(), Box<dyn std::error::Error>> {
-        let name = if GenericNamespaced::is_supported() {
-            client::SOCKET_NAME
-                .to_ns_name::<GenericNamespaced>()
-                .unwrap()
-        } else {
-            "/tmp/example.sock".to_fs_name::<GenericFilePath>().unwrap()
-        };
+        let name = 
+            "/tmp/rusthydrus.sock".to_fs_name::<GenericFilePath>().unwrap()
+        ;
 
         let listener = ListenerOptions::new()
             .name(name)
