@@ -154,9 +154,8 @@ impl Scraper {
 
         for property in self.plugin.properties.iter() {
             if let PluginProperties::ThreadNum(thread_num) = property {
-                max_concurrent_downloads = (*thread_num)
-                    .try_into()
-                    .unwrap_or(MAX_CONCURRENT_DOWNLOADS);
+                max_concurrent_downloads =
+                    (*thread_num).try_into().unwrap_or(MAX_CONCURRENT_DOWNLOADS);
                 break;
             }
         }
