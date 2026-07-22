@@ -1,4 +1,4 @@
-use shared_types::{GlobalCallbacks, SearchHolder, SearchObj};
+use shared_types::GlobalCallbacks;
 
 #[unsafe(no_mangle)]
 fn get_plugin_info() -> Vec<shared_types::Plugin> {

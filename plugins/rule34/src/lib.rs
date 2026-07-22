@@ -117,7 +117,7 @@ pub fn parser_call(
         .job
         .user_data
         .get("recursion")
-        .map_or(true, |f| f != &"false");
+        .is_none_or(|f| f != "false");
 
     let site = Site::R34;
     let mut files = HashSet::new();
@@ -173,7 +173,7 @@ pub fn parser_call(
                             let mut params = scraperdata.job.param.clone();
                             params.retain(|f| matches!(f, ScraperParam::Login(_)));
 
-                            params.push(ScraperParam::Normal(format!("&id={}", &parent)));
+                            params.push(ScraperParam::Normal(format!("&id={}", parent)));
 
                             let parse_url = build_url(&params, 1, true);
 
@@ -406,7 +406,7 @@ fn build_url(
     }
 
     if should_skip_tag {
-        url += &format!("{}", tags.join("+"));
+        url += &tags.join("+").to_string();
     } else {
         url += &format!("&tags={}", tags.join("+"));
     }

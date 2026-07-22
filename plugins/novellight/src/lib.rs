@@ -1,5 +1,5 @@
 use regex::Regex;
-use std::{collections::HashSet, default};
+use std::collections::HashSet;
 
 use scraper::{Html, Selector};
 use shared_types::{
@@ -26,7 +26,7 @@ pub fn url_dump(
     let mut out = Vec::new();
 
     for param in scraperdata.job.param.iter() {
-        let mut scraperdata = scraperdata.clone();
+        let scraperdata = scraperdata.clone();
         match param {
             ScraperParam::Url(url) => {
                 if let Ok(url) = url::Url::parse(&url.url)
@@ -40,26 +40,25 @@ pub fn url_dump(
                         out.push(scraperdata);
                     }
                     // Passes book through but adds other data
-                    else if first_item == Some("book") {
-                        if let Some(book_name) = scraperdata
+                    else if first_item == Some("book")
+                        && let Some(book_name) = scraperdata
                             .job
                             .user_data
                             .clone()
                             .get("book_name")
                             .map_or(path_segments.next(), |v| Some(v))
-                        {
-                            let fixed_book_name = book_name.replace('-', " ");
-                            scraperdata
-                                .job
-                                .user_data
-                                .insert("book_name".into(), fixed_book_name);
-                            scraperdata
-                                .job
-                                .user_data
-                                .insert("book_name_unclean".into(), book_name.to_string());
+                    {
+                        let fixed_book_name = book_name.replace('-', " ");
+                        scraperdata
+                            .job
+                            .user_data
+                            .insert("book_name".into(), fixed_book_name);
+                        scraperdata
+                            .job
+                            .user_data
+                            .insert("book_name_unclean".into(), book_name.to_string());
 
-                            out.push(scraperdata);
-                        }
+                        out.push(scraperdata);
                     }
                 }
             }
@@ -285,7 +284,7 @@ pub fn parser_call(
         .unwrap_or(1);
 
     // Track total maximum available chapters by parsing the dropdown layout container
-    let mut max_chapters = scraperdata
+    let max_chapters = scraperdata
         .job
         .user_data
         .get(&format!("page_{}", current_page))
@@ -365,7 +364,13 @@ pub fn parser_call(
         let option_selector = Selector::parse("select option").unwrap();
 
         for (index, option) in base_html_doc.select(&option_selector).enumerate() {
-            if let Some(last_num) = option.text().collect::<Vec<_>>().concat().split('-').last() {
+            if let Some(last_num) = option
+                .text()
+                .collect::<Vec<_>>()
+                .concat()
+                .split('-')
+                .next_back()
+            {
                 scraperdata
                     .job
                     .user_data

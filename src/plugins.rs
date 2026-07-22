@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::{Write, stdin, stdout},
+    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicBool},
     thread::JoinHandle,
