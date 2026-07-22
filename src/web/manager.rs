@@ -5,7 +5,7 @@ use sha2::Digest;
 use std::{
     collections::{HashMap, HashSet},
     env::temp_dir,
-    io::Write,
+    io::{Write, stdin, stdout},
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
@@ -1091,146 +1091,6 @@ impl Scraper {
             storage_id,
         })
     }
-    /*   async fn download_file(
-        self: Arc<Self>,
-        file_url: &str,
-        hash: &Option<HashesSupported>,
-    ) -> Option<Bytes> {
-        let mut cnt = 0;
-        let mut hash_cnt = 0;
-
-        let url = match Url::parse(file_url) {
-            Ok(u) => u,
-            Err(err) => {
-                log::error!("Error while parsing url {} {:?}", file_url, err);
-                return None;
-            }
-        };
-
-        loop {
-            // Rate limiting
-            while self.ratelimiter.check().is_err() {
-                let jitter = rand::random::<u64>() % 50;
-                tokio::time::sleep(Duration::from_millis(100 + jitter)).await;
-            }
-
-            info!(
-                "Scraper: {} JobId: {} -- Downloading url: {}",
-                self.plugin.name, self.job.id, file_url
-            );
-
-            let mut response = match self.file_client.get(url.clone()).send().await {
-                Ok(res) => res,
-                Err(err) => {
-                    log::error!(
-                        "Scraper: {} JobId: {} While processing url: {} found err {:?}",
-                        self.plugin.name,
-                        self.job.id,
-                        file_url,
-                        err
-                    );
-                    cnt += 1;
-                    if cnt >= 3 {
-                        break;
-                    }
-                    continue;
-                }
-            };
-
-            // Track if content-length header was actually sent by server
-            let content_length_header = response.content_length().map(|l| l as usize);
-            let initial_capacity = content_length_header.unwrap_or(1024);
-
-            let mut collected_bytes = BytesMut::with_capacity(initial_capacity);
-            let mut stream_failed = false;
-
-            // Explicitly handle stream errors
-            loop {
-                match response.chunk().await {
-                    Ok(Some(chunk)) => {
-                        collected_bytes.extend_from_slice(&chunk);
-                        // UI progress updates can be derived safely here from collected_bytes.len()
-                    }
-                    Ok(None) => break, // End of stream reached successfully
-                    Err(err) => {
-                        log::error!(
-                            "Scraper: {} JobId: {} Stream chunk error: {:?}",
-                            self.plugin.name,
-                            self.job.id,
-                            err
-                        );
-                        stream_failed = true;
-                        break;
-                    }
-                }
-            }
-
-            // If the stream dropped mid-way, skip validation and retry
-            if stream_failed {
-                cnt += 1;
-                if cnt >= 3 {
-                    break;
-                }
-                continue;
-            }
-
-            // Validate size only if the server explicitly gave us a Content-Length
-            let size_matches = match content_length_header {
-                Some(expected) => collected_bytes.len() == expected,
-                None => true, // Trust the stream end if no header was provided
-            };
-
-            if size_matches {
-                let collected_bytes = collected_bytes.freeze();
-                let collected_bytes_clone = collected_bytes.clone();
-                let hash_clone = hash.clone();
-
-                // 1. Run heavy CPU hash matching on blocking thread pool
-                let hash_matches = if let Some(hash) = hash_clone {
-                    tokio::task::spawn_blocking(move || hash_bytes(&collected_bytes_clone, &hash).1)
-                        .await
-                        .ok()
-                        .unwrap_or(false)
-                } else {
-                    true
-                };
-
-                // 2. Evaluate hash validation or failure override rules
-                if hash_matches || hash_cnt >= 2 {
-                    if hash.is_some() && hash_matches {
-                        hash_cnt += 1;
-                    }
-                    if hash_cnt >= 2 {
-                        info!("Overriding downloaded md5 with downloaded one.");
-                    }
-                    return Some(collected_bytes);
-                } else {
-                    log::warn!(
-                        "Scraper: {} JobId: {} Hash mismatch detected. Retrying download. Hash attempt: {}",
-                        self.plugin.name,
-                        self.job.id,
-                        hash_cnt + 1
-                    );
-                    hash_cnt += 1; // Increment hash failures across download attempts
-                }
-            } else {
-                log::error!(
-                    "Scraper: {} JobId: {} File downloading had mismatched download length. Downloaded {} Expected {:?}",
-                    self.plugin.name,
-                    self.job.id,
-                    collected_bytes.len(),
-                    content_length_header
-                );
-            }
-
-            cnt += 1;
-            if cnt >= 3 {
-                break;
-            }
-        }
-
-        None
-    }*/
 }
 
 impl DownloadsManager {
@@ -1373,6 +1233,9 @@ impl DownloadsManager {
                     )
                 }
 
+                // Check if we need to load login data
+                self.handle_login_db(plugin);
+
                 // Loads login parameters from db into job
                 let mut job_storage = job_storage.clone();
                 for job in job_storage.iter_mut() {
@@ -1397,6 +1260,77 @@ impl DownloadsManager {
                 tokio::task::spawn(async move {
                     manager_clone.spawn_scraper(scraper_name).await;
                 });
+            }
+        }
+    }
+
+    ///
+    /// Handles loading in login information into the db
+    ///
+    fn handle_login_db(self: &Arc<Self>, plugin: &Plugin) {
+        for property in plugin.properties.iter() {
+            if let PluginProperties::Login((login_need, login_type)) = property
+                && login_need == &LoginNeed::Required
+            {
+                match login_type {
+                    LoginType::Api(key, api) => {
+                        if self
+                            .db
+                            .setting_get_sync(&format!("PLUGIN_{}_{}", plugin.name, "API_KEY"))
+                            .is_none()
+                        {
+                            dbg!(&plugin.name, &key, &api);
+                            let mut user_name = String::new();
+                            print!("Api Key: ");
+                            let _ = stdout().flush();
+                            stdin()
+                                .read_line(&mut user_name)
+                                .expect("Did not enter a correct string");
+                            if let Some('\n') = user_name.chars().next_back() {
+                                user_name.pop();
+                            }
+                            if let Some('\r') = user_name.chars().next_back() {
+                                user_name.pop();
+                            }
+                            let mut user_pass = String::new();
+                            print!("Password: ");
+                            let _ = stdout().flush();
+                            stdin()
+                                .read_line(&mut user_pass)
+                                .expect("Did not enter a correct string");
+                            if let Some('\n') = user_pass.chars().next_back() {
+                                user_pass.pop();
+                            }
+                            if let Some('\r') = user_pass.chars().next_back() {
+                                user_pass.pop();
+                            }
+                            self.db.setting_set_sync(&DbSettingsObj {
+                                name: format!("PLUGIN_{}_API_KEY", plugin.name),
+                                description: Some("API Login for site.".into()),
+                                num: None,
+                                param: Some(user_name),
+                            });
+                            self.db.setting_set_sync(&DbSettingsObj {
+                                name: format!("PLUGIN_{}_API_PASS", plugin.name),
+                                description: Some("API Login for site.".into()),
+                                num: None,
+                                param: Some(user_pass),
+                            });
+                        }
+                    }
+                    LoginType::ApiNamespaced(ns, key, api)
+                        if self
+                            .db
+                            .setting_get_sync(&format!(
+                                "PLUGIN_{}_{}_{}",
+                                plugin.name, ns, "API_NS"
+                            ))
+                            .is_none() =>
+                    {
+                        dbg!(&key, &api);
+                    }
+                    _ => {}
+                }
             }
         }
     }

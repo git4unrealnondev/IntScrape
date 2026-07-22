@@ -72,46 +72,9 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
     }]
 }
 
-/*
-#[unsafe(no_mangle)]
-pub fn file_thumbnailer_generate_thumbnail_fid(
-    callback: &CallbackInfoInput,
-) -> HashMap<String, CallbackCustomDataReturning> {
-    let index = callback.data_name.iter().position(|x| x == "file_id");
-    if let Some(index) = index {
-        if callback.data.len() >= index {
-            if let Some(custom_data) = callback.data.get(index) {
-                if let CallbackCustomDataReturning::U64(inp) = custom_data {
-                    let _counter = &AtomicUsize::new(0);
-                    if let Some(location) = &setup_thumbnail_location() {
-                        // Gets namespace id if it doesn't exist then recreate
-                        let utable;
-                        {
-                            utable = match client::namespace_get(PLUGIN_NAME.to_string()) {
-                                None => client::namespace_cwput(
-                                    PLUGIN_NAME.to_string(),
-                                    Some(PLUGIN_DESCRIPTION.to_string()),
-                                ),
-                                Some(id) => id,
-                            }
-                        }
-
-                        if let Some(file_thumb_hash) =
-                            process_fid(inp, location, &utable.try_into().unwrap())
-                        {
-                            client::relationship_file_tag_add(*inp, file_thumb_hash, utable, None);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    HashMap::new()
-}*/
-
 fn process_thumb_location() -> Result<PathBuf, Box<dyn Error>> {
-    if client::setting_get("PLUGIN_thumbnail_location".into()).is_none_or(|f| f.param.is_none())
-        && let Some(local_file_setting) = client::setting_get("SYSTEM_file_location".into())
+    if client::setting_get("PLUGIN_thumbnail_location".into())?.is_none_or(|f| f.param.is_none())
+        && let Ok(Some(local_file_setting)) = client::setting_get("SYSTEM_file_location".into())
     {
         let good_param = local_file_setting
             .param
@@ -129,14 +92,14 @@ fn process_thumb_location() -> Result<PathBuf, Box<dyn Error>> {
         // Makes the dir
         create_dir_all(&path_final)?;
 
-        client::setting_set(shared_types::DbSettingsObj {
+        let _ = client::setting_set(shared_types::DbSettingsObj {
             name: "PLUGIN_thumbnail_location".into(),
             description: Some("Where thumbnails get stored".into()),
             num: None,
             param: Some(path_final.to_string_lossy().to_string()),
         });
     } else {
-        if let Some(setting) = client::setting_get("PLUGIN_thumbnail_location".into()) {
+        if let Ok(Some(setting)) = client::setting_get("PLUGIN_thumbnail_location".into()) {
             let good_param = setting.param.ok_or("Cannot get param from sytem")?;
 
             return Ok(Path::new(&good_param).to_path_buf());

@@ -18,25 +18,13 @@ pub enum CacheType {
     // New cache method for relationships
     RelationshipRoaring(InternalCacheType),
 }
-
+#[derive(Clone)]
 pub struct MainDatabase {
     pool: Pool<SqliteConnectionManager>,
     writer_conn: Arc<Mutex<PooledConnection<SqliteConnectionManager>>>,
     namespace_cache: Arc<RwLock<HashMap<String, u64>>>,
-    cache_type: RwLock<CacheType>,
-    relationship_roaring_storage: RwLock<Option<RelationshipStorage>>,
-}
-
-impl Drop for MainDatabase {
-    fn drop(&mut self) {
-        if let Ok(conn) = self.pool.get() {
-            if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
-                log::error!("Failed to checkpoint WAL file during drop: {:?}", e);
-            }
-        } else {
-            log::error!("Failed to get a DB connection in time. Very Weird...")
-        }
-    }
+    cache_type: Arc<RwLock<CacheType>>,
+    relationship_roaring_storage: Arc<RwLock<Option<RelationshipStorage>>>,
 }
 
 impl MainDatabase {
@@ -69,8 +57,8 @@ PRAGMA cache_size = -64000;
         let main_db: Arc<MainDatabase> = MainDatabase {
             pool,
             namespace_cache: Arc::new(RwLock::new(HashMap::new())),
-            cache_type: CacheType::Bare.into(),
-            relationship_roaring_storage: None.into(),
+            cache_type: Arc::new(RwLock::new(CacheType::Bare)),
+            relationship_roaring_storage: Arc::new(RwLock::new(None)),
             writer_conn,
         }
         .into();
@@ -80,6 +68,17 @@ PRAGMA cache_size = -64000;
         main_db.load_cache();
 
         main_db
+    }
+
+    ///
+    /// Manages the DB shutdown
+    ///
+    pub fn shutdown(&self) {
+        let guard = self.writer_conn.lock();
+
+        if let Err(e) = guard.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+            log::error!("Failed to checkpoint WAL file during drop: {:?}", e);
+        }
     }
 
     ///

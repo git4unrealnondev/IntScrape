@@ -212,14 +212,36 @@ pub struct CallbackReturn {
 ///
 /// What to do for a list of tags when they come in
 ///
-#[derive(Default, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Debug,
+    Serialize,
+    Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
 pub enum TagOperation {
     #[default]
     Add,
     Del,
     Set,
 }
-#[derive(Default, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Debug,
+    Serialize,
+    Deserialize,
+    bitcode::Decode,
+    bitcode::Encode,
+)]
 pub struct FileTagAction {
     pub operation: TagOperation,
     pub tags: Vec<PluginTag>,
@@ -587,7 +609,19 @@ pub struct NamespaceProperty {
     pub description: Option<String>,
 }
 
-#[derive(Default, Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(
+    Default,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Debug,
+    Serialize,
+    Deserialize,
+    bitcode::Decode,
+    bitcode::Encode,
+)]
 pub enum TagType {
     #[default]
     Normal,
@@ -612,7 +646,18 @@ pub struct Tag {
     pub namespace: GenericNamespaceObj,
 }
 
-#[derive(Default, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Debug,
+    Serialize,
+    Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
 pub struct PluginTag {
     /// Use composition: A TagObject *has* a fundamental Tag definition
     pub tag: Tag,
@@ -620,7 +665,18 @@ pub struct PluginTag {
     pub relates_to: Option<RelationContext>,
 }
 
-#[derive(Default, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Debug,
+    Serialize,
+    Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
 pub struct RelationContext {
     pub tag: Tag,
     pub tag_type: TagType,

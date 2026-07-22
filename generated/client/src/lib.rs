@@ -10,17 +10,13 @@ use shared_types::*;
 
 pub const SOCKET_NAME: &str = "RustHydrus.sock";
 
-pub fn test() -> bool {
-    init_data_request(&SupportedDBRequests::Test)
-}
-
 #[derive(Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub enum SupportedDBRequests {
     GetTagId(u64),
     GetTagIds(HashSet<u64>),
     GetTag(String, u64),
     PutTag(String, u64, Option<u64>),
-    PutTagRelationship(u64, String, u64, Option<u64>),
+    PutTagsRelationship(u64, Vec<FileTagAction>),
     GetTagName((String, u64)),
     RelationshipAdd(u64, u64),
     RelationshipRemove(u64, u64),
@@ -31,8 +27,9 @@ pub enum SupportedDBRequests {
     GetFileHash(String),
     GetFileLocation(u64),
     GetNamespace(String),
-    CreateNamespace(String, Option<String>),
+    SetNamespace(GenericNamespaceObj),
     GetNamespaceTagIDs(u64),
+    GetNamespaceFileIDs(u64),
     GetNamespaceTagIdsFiltered(u64, u64),
     GetNamespaceIds(),
     GetNamespaceString(u64),
@@ -63,6 +60,7 @@ pub enum SupportedDBRequests {
     SearchTags(String, Option<u64>),
     ParentsRel(u64),
     ExternalPluginCall(String, CallbackInfoInput),
+    ShouldExit,
 }
 
 macro_rules! define_db_requests {
@@ -88,49 +86,61 @@ macro_rules! define_db_requests {
 
 define_db_requests! {
     /// Gets a setting by name
-    setting_get(name: String) -> Option<DbSettingsObj> => SupportedDBRequests::SettingsGetName(name);
+    setting_get(name: String) -> Result<Option<DbSettingsObj>, Box<dyn std::error::Error>> => SupportedDBRequests::SettingsGetName(name);
 
     /// Searches the DB from tags -> file ids
-    search_db_files(search: SearchObj, limit: Option<u64>) -> Vec<u64> => SupportedDBRequests::SearchFiles(search, limit);
+    search_db_files(search: SearchObj, limit: Option<u64>) -> Result<Vec<u64>, Box<dyn std::error::Error>> => SupportedDBRequests::SearchFiles(search, limit);
 
     /// Sets a setting by setting
-    setting_set(setting: DbSettingsObj) -> bool => SupportedDBRequests::SettingsSet(setting);
+    setting_set(setting: DbSettingsObj) -> Result<bool, Box<dyn std::error::Error>> => SupportedDBRequests::SettingsSet(setting);
 
-    relationship_get_fileid(tag_id: u64) -> Vec<u64> => SupportedDBRequests::RelationshipGetFileid(tag_id);
+    relationship_get_fileid(tag_id: u64) -> Result<Vec<u64>, Box<dyn std::error::Error>> => SupportedDBRequests::RelationshipGetFileid(tag_id);
 
     /// Logs to fast_log without printing
-    log_silent(log: String) -> bool => SupportedDBRequests::LoggingNoPrint(log);
+    log_silent(log: String) -> Result<bool, Box<dyn std::error::Error>> => SupportedDBRequests::LoggingNoPrint(log);
 
     /// Gets a tag
-    get_tag_id(id: u64) -> Option<Tag> => SupportedDBRequests::GetTagId(id);
-    get_tag_id_bulk(id: HashSet<u64>) -> HashMap<u64, Tag> => SupportedDBRequests::GetTagIds(id);
+    get_tag_id(id: u64) -> Result<Option<Tag>, Box<dyn std::error::Error>> => SupportedDBRequests::GetTagId(id);
+    get_tag_id_bulk(id: HashSet<u64>) -> Result<HashMap<u64, Tag>, Box<dyn std::error::Error>> => SupportedDBRequests::GetTagIds(id);
 
-    get_tag(name: String, namespace: u64) -> Option<u64> => SupportedDBRequests::GetTag(name, namespace) ;
+    get_tag(name: String, namespace: u64) -> Result<Option<u64>, Box<dyn std::error::Error>> => SupportedDBRequests::GetTag(name, namespace) ;
 
-    /// Puts a tag into the db
-    put_tag(name: String, id: u64, parent: Option<u64>) -> bool => SupportedDBRequests::PutTag(name, id, parent);
+    /// Adds a tag to a fileid
+    put_tags_to_file(file_id: u64, tags: Vec<FileTagAction>) -> Result<bool, Box<dyn std::error::Error>> => SupportedDBRequests::PutTagsRelationship(file_id, tags);
 
-        /// Adds a relationship to the db
-    relationship_add(id1: u64, id2: u64) -> bool => SupportedDBRequests::RelationshipAdd(id1, id2);
+    /// Adds a relationship to the db
+    relationship_add(id1: u64, id2: u64) -> Result<bool, Box<dyn std::error::Error>> => SupportedDBRequests::RelationshipAdd(id1, id2);
 
     /// Gets tag_id where namespace id is x
-    get_namespace_tag_ids(id: u64) -> Vec<u64> => SupportedDBRequests::GetNamespaceTagIDs(id);
+    get_namespace_tag_ids(id: u64) -> Result<Vec<u64>, Box<dyn std::error::Error>> => SupportedDBRequests::GetNamespaceTagIDs(id);
+    /// Gets file_ids where a tag with a namespace is joined with it
+    get_namespace_file_ids(id: u64) -> Result<Vec<u64>, Box<dyn std::error::Error>> => SupportedDBRequests::GetNamespaceFileIDs(id);
 
-    // Gets a namespace if it exists
-    namespace_get(name: String) -> Option<u64> => SupportedDBRequests::GetNamespace(name);
+    /// Gets a namespace if it exists
+    namespace_get(name: String) -> Result<Option<u64>, Box<dyn std::error::Error>> => SupportedDBRequests::GetNamespace(name);
+    /// Adds a namespace into the db
+    namespace_set(namespace: GenericNamespaceObj) -> Result<u64, Box<dyn std::error::Error>> => SupportedDBRequests::SetNamespace(namespace);
 
     /// Gets all namespace ids in the db
-    namespace_all() -> Vec<GenericNamespaceObj> => SupportedDBRequests::GetNamespaceIds();
+    namespace_all() -> Result<Vec<GenericNamespaceObj>, Box<dyn std::error::Error>> => SupportedDBRequests::GetNamespaceIds();
 
     /// Gets a file object if its id exists
-    get_file(file_id: u64) -> Option<FileInternal> => SupportedDBRequests::GetFile(file_id);
+    get_file(file_id: u64) -> Result<Option<FileInternal>, Box<dyn std::error::Error>> => SupportedDBRequests::GetFile(file_id);
 
-    get_file_path(file_id: u64) -> Option<String> => SupportedDBRequests::GetFileLocation(file_id);
+    get_file_path(file_id: u64) -> Result<Option<String>, Box<dyn std::error::Error>> => SupportedDBRequests::GetFileLocation(file_id);
 
-    search_tag_fts(search: String, limit: Option<u64>) -> Vec<TagSearch> => SupportedDBRequests::SearchTags(search, limit);
+    search_tag_fts(search: String, limit: Option<u64>) -> Result<Vec<TagSearch>, Box<dyn std::error::Error>> => SupportedDBRequests::SearchTags(search, limit);
 
-    parents_rel_get(id: u64) -> Vec<TagParents> => SupportedDBRequests::ParentsRel(id);
-    get_tags_filtered(file_id: u64, namespace_id: u64) -> HashSet<u64> => SupportedDBRequests::GetNamespaceTagIdsFiltered(file_id, namespace_id);
+    parents_rel_get(id: u64) -> Result<Vec<TagParents>, Box<dyn std::error::Error>> => SupportedDBRequests::ParentsRel(id);
+
+        /// Gets all tags that are of namespace_id and are associated with a fileid
+    get_tags_filtered(file_id: u64, namespace_id: u64) -> Result<HashSet<u64>, Box<dyn std::error::Error>> => SupportedDBRequests::GetNamespaceTagIdsFiltered(file_id, namespace_id);
+
+        /// A basic check to see if we should exit
+    should_exit() -> Result<bool, Box<dyn std::error::Error>> => SupportedDBRequests::ShouldExit;
+
+    /// Returns all fileids in the db
+    get_file_ids_all() -> Result<Vec<u64>, Box<dyn std::error::Error>> => SupportedDBRequests::GetFileListId();
 
 
 }
@@ -141,20 +151,20 @@ pub fn data_size_to_b<T: bitcode::Encode + ?Sized>(data_object: &T) -> Vec<u8> {
 }
 fn init_data_request<T: bitcode::Encode + for<'de> bitcode::Decode<'de>>(
     requesttype: &SupportedDBRequests,
-) -> T {
+) -> Result<T, Box<dyn std::error::Error>> {
     let name = "/tmp/rusthydrus/rusthydrus.sock"
         .to_fs_name::<GenericFilePath>()
         .unwrap();
-    let conn;
-    loop {
-        // Wait indefinitely for this to get a connection. shit way of doing it will
-        // likely add a wait or something this will likely block the CPU or something.
+    let conn = LocalSocketStream::connect(name)?;
+    //loop {
+    // Wait indefinitely for this to get a connection. shit way of doing it will
+    // likely add a wait or something this will likely block the CPU or something.
 
-        if let Ok(conn_out) = LocalSocketStream::connect(name.clone()) {
-            conn = conn_out;
-            break;
-        }
-    }
+    //if let Ok(conn_out) = LocalSocketStream::connect(name.clone()) {
+    //    conn = conn_out;
+    //    break;
+    //}
+    //}
     // Wrap it into a buffered reader right away so that we could read a single line
     // out of it.
     let mut conn = BufReader::new(conn);
@@ -163,13 +173,7 @@ fn init_data_request<T: bitcode::Encode + for<'de> bitcode::Decode<'de>>(
     send(requesttype, &mut conn);
 
     // Recieving size Data from server
-    match recieve(&mut conn) {
-        Ok(out) => out,
-        Err(err) => {
-            dbg!(err, requesttype);
-            panic!();
-        }
-    }
+    recieve(&mut conn)
 }
 
 pub fn send<T: Sized + bitcode::Encode>(inp: &T, conn: &mut BufReader<LocalSocketStream>) {
@@ -192,13 +196,13 @@ pub fn send_preserialize(inp: &Vec<u8>, conn: &mut BufReader<LocalSocketStream>)
 /// Returns a vec of bytes that represent an object
 pub fn recieve<T: for<'de> bitcode::Decode<'de>>(
     conn: &mut BufReader<LocalSocketStream>,
-) -> Result<T, bitcode::Error> {
+) -> Result<T, Box<dyn std::error::Error>> {
     let mut u64_b = [0u8; 8];
-    conn.read_exact(&mut u64_b).unwrap();
+    conn.read_exact(&mut u64_b)?;
     let size_of_data = u64::from_ne_bytes(u64_b);
 
     let mut data_b = vec![0; size_of_data as usize];
     conn.read_exact(&mut data_b).unwrap();
 
-    bitcode::decode(&data_b)
+    Ok(bitcode::decode(&data_b)?)
 }

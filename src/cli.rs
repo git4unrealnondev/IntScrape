@@ -1,10 +1,18 @@
 extern crate clap;
 
-use crate::db::MainDatabase;
 use crate::helper_functions;
+use crate::{db::MainDatabase, web::manager::hash_bytes};
+use bytes::Bytes;
+use memmap2::Mmap;
+use rayon::iter::IntoParallelRefIterator;
 use shared_types::DbJobRecreation;
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    fs::File,
+    path::Path,
+};
 use url::Url;
+use walkdir::WalkDir;
 // use std::str::pattern::Searcher;
 use clap::Parser;
 use std::sync::Arc;
@@ -276,7 +284,50 @@ pub async fn main(db: Arc<MainDatabase>) {
             }
         },
         cli_structs::Test::Tasks(taskstruct) => match taskstruct {
-            cli_structs::TasksStruct::Import(_directory) => {
+            cli_structs::TasksStruct::Import(directory) => {
+                let mut files = HashSet::new();
+                let mut sidecars = HashMap::new();
+
+                for location in directory.location.iter() {
+                    for file in WalkDir::new(location).into_iter().filter_map(|e| e.ok()) {
+                        if file.file_type().is_file() {
+                            files.insert(file.path().to_path_buf());
+                        }
+                    }
+                }
+
+                for file in files.clone() {
+                    for ext in ["txt", "json"] {
+                        let test_path =
+                            Path::new(&format!("{}.{}", file.to_string_lossy(), ext)).to_path_buf();
+                        if files.contains(&test_path) {
+                            files.remove(&test_path);
+                            sidecars.insert(file.clone(), test_path);
+                        }
+                    }
+                }
+
+                for file in files.iter() {
+                    if let Ok(file) = File::open(file) {
+                        // Reads file into memory
+                        let mmap = unsafe { Mmap::map(&file) };
+
+                        if let Ok(mmap) = mmap {
+                            let (hash, _) = hash_bytes(
+                                &Bytes::from(mmap.to_vec()),
+                                &shared_types::HashesSupported::Sha512("".into()),
+                            );
+                            dbg!(&hash);
+
+                            // Perform inital copy or hardlink action
+                            match directory.file_action {
+                                cli_structs::FileAction::Copy | cli_structs::FileAction::Move => {}
+                                cli_structs::FileAction::HardLink => {}
+                            }
+                        }
+                    }
+                }
+
                 /*  {
                     data.enclave_create_default_file_import();
                 }
