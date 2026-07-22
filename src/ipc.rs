@@ -13,7 +13,7 @@ use std::thread::JoinHandle;
 use std::{sync::Arc, sync::Mutex};
 pub struct IpcServer {
     local_server: Mutex<Option<JoinHandle<()>>>,
-    shutdown_signal: Arc<AtomicBool>,
+    should_exit: Arc<AtomicBool>,
     db: Arc<MainDatabase>,
 }
 
@@ -39,7 +39,7 @@ macro_rules! register_db_requests {
 
 impl Drop for IpcServer {
     fn drop(&mut self) {
-        self.shutdown_signal
+        self.should_exit
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let mut local_server = self.local_server.lock().unwrap();
@@ -50,10 +50,10 @@ impl Drop for IpcServer {
 }
 
 impl IpcServer {
-    pub fn new(db: Arc<MainDatabase>) -> Arc<Self> {
+    pub fn new(db: Arc<MainDatabase>, should_exit: Arc<AtomicBool>) -> Arc<Self> {
         let out = Arc::new(IpcServer {
             local_server: Mutex::new(None),
-            shutdown_signal: Arc::new(AtomicBool::new(false)),
+            should_exit,
             db,
         });
 
@@ -78,7 +78,7 @@ impl IpcServer {
         let self_clone = self.clone();
 
         let handle = thread::spawn(move || {
-            while !self_clone.shutdown_signal.load(Ordering::Relaxed) {
+            while !self_clone.should_exit.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok(conn) => {
                         let mut reader = BufReader::new(conn);
@@ -107,27 +107,36 @@ impl IpcServer {
     /// Converts the functions to the u8 outputs
     ///
     fn conn_to_function(&self, action: client::SupportedDBRequests) -> Vec<u8> {
-        if let client::SupportedDBRequests::LoggingNoPrint(data) = &action {
-            info!("IPC LOG: {}", data);
-            return client::data_size_to_b(&false);
+        match action {
+            client::SupportedDBRequests::LoggingNoPrint(data) => {
+                info!("IPC LOG: {}", data);
+                client::data_size_to_b(&false)
+            }
+            client::SupportedDBRequests::ShouldExit => {
+                client::data_size_to_b(&self.should_exit.load(Ordering::SeqCst))
+            }
+            _ => {
+                register_db_requests! {
+                    self, action;
+
+                    // Enum Variant         =>  Database Synchronous Method
+                    SettingsGetName(name)   =>  setting_get_sync,
+                    SettingsSet(settings)   =>  setting_set_sync,
+                    SearchFiles(search, limit) => search_db_files_sync,
+                    GetTagIds(tag_ids) => tag_id_get_tag_sync,
+                    SearchTags(tag, limit) => search_db_tags_fts,
+                    GetNamespace(name) => search_db_namespace_sync,
+                    SetNamespace(namespace) => namespace_add_sync,
+                    GetNamespaceTagIdsFiltered(file_id, namespace_id) => internal_file_id_get_tag_ids_where_namespace_id_sync,
+                    GetFileLocation(file_id) => file_get_physical_path_sync,
+                    GetNamespaceFileIDs(namespace_id) => file_id_get_namespace_id_sync,
+                    GetFileListId() => file_id_get_all_sync,
+                    PutTagsRelationship(file_id, tags) => file_relationship_tags_add_sync,
+
+                }
+            }
         }
 
         // db calls go here
-        register_db_requests! {
-            self, action;
-
-            // Enum Variant         =>  Database Synchronous Method
-            SettingsGetName(name)   =>  setting_get_sync,
-            SettingsSet(settings)   =>  setting_set_sync,
-            SearchFiles(search, limit) => search_db_files_sync,
-            GetTagIds(tag_ids) => tag_id_get_tag_sync,
-            SearchTags(tag, limit) => search_db_tags_fts,
-            GetNamespace(name) => search_db_namespace_sync,
-            GetNamespaceTagIdsFiltered(file_id, namespace_id) => internal_file_id_get_tag_ids_where_namespace_id_sync,
-            GetFileLocation(file_id) => file_get_physical_path_sync,
-            //GetTagId(id)            =>  get_tag_id_sync,
-            //GetFile(id)             =>  get_file_sync,
-            //RelationshipAdd(u1, u2) =>  relationship_add_sync,
-        }
     }
 }

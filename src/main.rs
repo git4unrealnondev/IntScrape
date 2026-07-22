@@ -1,4 +1,8 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::Path,
+    sync::{Arc, atomic::AtomicBool},
+    time::Duration,
+};
 
 use crate::{
     db::MainDatabase, ipc::IpcServer, plugins::PluginManager, web::manager::DownloadsManager,
@@ -43,10 +47,11 @@ fn setup_log() {
 
 #[tokio::main]
 async fn main() {
+    // ctrl C handler
+    let should_exit = Arc::new(AtomicBool::new(false));
+
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
-
-    //console_subscriber::init();
 
     setup_log();
 
@@ -54,7 +59,8 @@ async fn main() {
 
     let db = MainDatabase::new(Path::new(DB_PATH));
 
-    let plugin_manager = PluginManager::new(Path::new(PLUGINS_PATH), db.clone());
+    let plugin_manager =
+        PluginManager::new(Path::new(PLUGINS_PATH), db.clone(), should_exit.clone());
 
     let download_manager = DownloadsManager::new(
         db.clone(),
@@ -62,7 +68,18 @@ async fn main() {
         heavy_processing_pool.clone(),
     );
 
-    let ipc_server = IpcServer::new(db.clone());
+    let ipc_server = IpcServer::new(db.clone(), should_exit.clone());
+
+    // handler for ctrl c
+    {
+        let should_exit_clone = should_exit.clone();
+        ctrlc::set_handler(move || {
+            println!("received Ctrl+C!");
+            log::info!("received Ctrl+C!");
+            should_exit_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .expect("Error setting Ctrl-C handler");
+    }
 
     plugin_manager.callback_on_start();
 
@@ -75,6 +92,9 @@ async fn main() {
     let db_spawn = db.clone();
     let spawner = tokio::task::spawn(async move {
         loop {
+            if should_exit.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
             let sites = plugin_manager_clone.get_storage_sites();
             let jobs_to_run = db_spawn.jobs_get_torun(sites).await;
 
@@ -97,9 +117,16 @@ async fn main() {
     spawner.await.unwrap();
 
     // Ensures that everything gets dropped properly
+    drop(plugin_manager);
     drop(heavy_processing_pool);
     drop(ipc_server);
     drop(download_manager);
-    drop(plugin_manager);
+
+    // Call shutdown before db exit
+    db.shutdown();
     drop(db);
+
+    // Cleans up temp db files
+    let _ = std::fs::remove_file("./main.db-wal");
+    let _ = std::fs::remove_file("./main.db-shm");
 }

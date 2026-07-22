@@ -220,6 +220,9 @@ END;
         .unwrap();
     }
 
+    ///
+    /// Gets namespace id if it exists
+    ///
     pub fn search_db_namespace_sync(&self, name: &String) -> Option<u64> {
         let conn = self.pool.get().unwrap();
 
@@ -232,6 +235,9 @@ END;
         result.optional().ok().flatten()
     }
 
+    ///
+    /// Gets a list of tags where the tag and limits the number of returnees
+    ///
     pub fn search_db_tags_fts(&self, tag: &str, limit: &Option<u64>) -> Vec<TagSearch> {
         let conn = self.pool.get().unwrap();
         let cleaned_tag = tag.trim().replace('"', "\"\"");
@@ -658,6 +664,25 @@ ON Jobs (time, reptime, site, param);
     }
 
     ///
+    /// Gets all file_ids associated with a tag with namespace id x
+    ///
+    pub(in crate::db) fn internal_file_id_get_namespace_id_sync(
+        conn: &Connection,
+        namespace_id: &u64,
+    ) -> Result<Vec<u64>, rusqlite::Error> {
+        let mut stmt = conn.prepare(
+            "
+SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
+    SELECT id FROM Tags WHERE namespace = ?1
+); 
+",
+        )?;
+        let rows = stmt.query_map(params![namespace_id], |row| Ok(row.get(0)?))?;
+
+        rows.collect()
+    }
+
+    ///
     /// Gets all files in db
     ///
     pub(in crate::db) fn internal_file_get_all(
@@ -762,6 +787,26 @@ ON Jobs (time, reptime, site, param);
         Ok(out)
     }
 
+    ///
+    /// Gets all file ids inside of the db
+    ///
+    pub(in crate::db) fn internal_file_id_get_all(
+        conn: &Connection,
+    ) -> Result<Vec<u64>, rusqlite::Error> {
+        let mut stmt = conn.prepare("SELECT id FROM File;").unwrap();
+        let out = stmt.query_map([], |row| Ok(row.get(0)?))?;
+
+        out.collect()
+    }
+
+    ///
+    /// Gets all file_ids with tags that have namespace id
+    ///
+    pub fn file_id_get_namespace_id_sync(&self, namespace_id: &u64) -> Vec<u64> {
+        let conn = self.pool.get().unwrap();
+        Self::internal_file_id_get_namespace_id_sync(&conn, namespace_id).unwrap_or_default()
+    }
+
     pub fn internal_file_id_get_tag_ids_where_namespace_id_sync(
         &self,
         file_id: &u64,
@@ -771,6 +816,36 @@ ON Jobs (time, reptime, site, param);
 
         Self::internal_file_id_get_tag_ids_where_namespace_id(&conn, file_id, namespace_id)
             .unwrap_or_default()
+    }
+
+    ///
+    /// Adds a relationship between a file_id and tag_id
+    ///
+    pub fn file_relationship_tags_add_sync(&self, file_id: &u64, tag: &[FileTagAction]) -> bool {
+        let mut guard = self.writer_conn.lock();
+        let conn = guard.transaction().unwrap();
+
+        let tag_map = Self::internal_tag_bulk_add(&conn, tag);
+        let relationships: HashSet<(u64, u64)> = tag_map
+            .values()
+            .into_iter()
+            .map(|f| (*file_id, *f))
+            .collect();
+        Self::internal_relationship_bulk_add(Arc::new(self.clone()), &conn, &relationships);
+
+        conn.commit().unwrap();
+
+        false
+    }
+
+    ///
+    /// Gets all file ids inside of the db.
+    /// #Safety Returns None if an error occurs
+    ///
+    pub fn file_id_get_all_sync(&self) -> Vec<u64> {
+        let conn = self.pool.get().unwrap();
+
+        Self::internal_file_id_get_all(&conn).unwrap_or_default()
     }
 
     ///
@@ -2385,10 +2460,23 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         .ok()
         .flatten()
     }
+
+    ///
+    /// Gets the location we should download to
+    ///
     pub fn file_download_location_main_sync(&self) -> Option<(PathBuf, u64)> {
         let pool = self.pool.clone();
         let conn = pool.get().ok()?;
         Self::internal_file_download_location_get(&conn).ok()
+    }
+
+    ///
+    /// Adds a namespace into the db
+    ///
+    pub fn namespace_add_sync(&self, namespace: &GenericNamespaceObj) -> u64 {
+        let conn = self.pool.get().unwrap();
+
+        Self::internal_namespace_get_or_create(&conn, namespace)
     }
 
     ///
