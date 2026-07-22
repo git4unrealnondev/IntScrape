@@ -966,16 +966,6 @@ impl Scraper {
                             return self.download_manager.db.file_id_get(file_id).await;
                         }
                         None => {
-                            for skip in file.skip_if.iter() {
-                                if let SkipIf::FileTagRelationship(tag) = skip
-                                    && let Some(file_id) =
-                                        self.download_manager.db.tag_get_file_id(tag).await
-                                    && let Some(file_internal) =
-                                        self.download_manager.db.file_id_get(file_id).await
-                                {
-                                    return Some(file_internal);
-                                }
-                            }
 
                             file.tag_list.push(FileTagAction {
                                 operation: TagOperation::Add,
@@ -991,6 +981,18 @@ impl Scraper {
                                 }],
                             });
 
+                            for skip in file.skip_if.iter() {
+                                if let SkipIf::FileTagRelationship(tag) = skip
+                                    && let Some(file_id) =
+                                        self.download_manager.db.tag_get_file_id(tag).await
+                                    && let Some(file_internal) =
+                                        self.download_manager.db.file_id_get(file_id).await
+                                {
+                                    return Some(file_internal);
+                                }
+                            }
+
+                          
                             if self.should_download_file(file_url).await {
                                 // Calls disk streaming download helper
                                 if let Some(path_out) = self_clone
