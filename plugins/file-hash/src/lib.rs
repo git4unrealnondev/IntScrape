@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
-    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -9,7 +8,7 @@ use std::{
     },
 };
 
-use client::{setting_get, should_exit};
+use client::setting_get;
 use shared_types::{
     CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks, PluginTag, Tag,
 };

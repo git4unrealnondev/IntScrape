@@ -1,14 +1,13 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     error::Error,
     fs::create_dir_all,
     path::{Path, PathBuf},
-    sync::atomic::AtomicUsize,
 };
 
 use shared_types::{
-    CallbackCustomData, CallbackCustomDataReturning, CallbackInfoInput, CallbackReturn,
-    FileTagAction, GenericNamespaceObj, GlobalCallbacks, PluginTag, Tag,
+    CallbackCustomData, CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks,
+    PluginTag, Tag,
 };
 use webp_animation::EncodingConfig;
 
@@ -43,14 +42,10 @@ pub enum VideoSpacing {
 #[unsafe(no_mangle)]
 fn on_start() {
     if let Ok(thumbnail_path) = process_thumb_location() {
-        client::log_silent(format!(
+        let _ = client::log_silent(format!(
             "File-Thumbnailer: Will download thumbnails to: {}",
             thumbnail_path.to_string_lossy()
         ));
-    }
-
-    if let Err(err) = process_thumb_location() {
-        client::log_silent(format!("File-Thumbnailer: ERROR: {:?}", err));
     }
 }
 
@@ -123,8 +118,8 @@ fn on_download(bytes: &[u8]) -> CallbackReturn {
         let pa = thpath.to_string_lossy().to_string();
 
         if std::fs::write(&pa, thumb).is_ok() {
-            client::log_silent(format!("File-Thumbnailer: Thumbnail put at: {}", &pa));
-            tags.insert(FileTagAction {
+            let _ = client::log_silent(format!("File-Thumbnailer: Thumbnail put at: {}", pa));
+            let _ = tags.insert(FileTagAction {
                 operation: shared_types::TagOperation::Set,
                 tags: vec![PluginTag {
                     tag: Tag {
@@ -133,7 +128,6 @@ fn on_download(bytes: &[u8]) -> CallbackReturn {
                             name: "file_thumbnail".to_string(),
                             description: Some("A thumbnail hash.".into()),
                         },
-                        ..Default::default()
                     },
                     ..Default::default()
                 }],
@@ -219,11 +213,12 @@ fn make_animated_img(
     };
     match res {
         Ok(mut ve) => {
-            if ve.is_empty() && fileformat.extension() == "gif" {
-                if let Ok(frames) = extract_gif_frames(cursor) {
-                    for frame in frames {
-                        ve.push(frame);
-                    }
+            if ve.is_empty()
+                && fileformat.extension() == "gif"
+                && let Ok(frames) = extract_gif_frames(cursor)
+            {
+                for frame in frames {
+                    ve.push(frame);
                 }
             }
 
@@ -288,10 +283,10 @@ fn make_thumbnail_path(dbloc: &PathBuf, imgdata: &Vec<u8>) -> (PathBuf, String) 
         .join(&hash[0..2])
         .join(&hash[2..4])
         .join(&hash[4..6]);
-    if let Ok(path) = std::fs::exists(folderpath.clone()) {
-        if path {
-            return (folderpath, hash);
-        }
+    if let Ok(path) = std::fs::exists(folderpath.clone())
+        && path
+    {
+        return (folderpath, hash);
     }
 
     if let Err(err) = create_dir_all(folderpath.clone()) {
@@ -304,7 +299,7 @@ fn make_thumbnail_path(dbloc: &PathBuf, imgdata: &Vec<u8>) -> (PathBuf, String) 
 fn generate_thumbnail_u8(inp: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     use file_format::{FileFormat, Kind};
     use std::io::{Error, ErrorKind};
-    let thumbvec = match load_image(&inp) {
+    let thumbvec = match load_image(inp) {
         Ok(t) => t,
         Err(err) => match err {
             ThumbError::Unsupported(fformat) => {

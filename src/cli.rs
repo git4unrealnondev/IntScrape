@@ -4,7 +4,6 @@ use crate::helper_functions;
 use crate::{db::MainDatabase, web::manager::hash_bytes};
 use bytes::Bytes;
 use memmap2::Mmap;
-use rayon::iter::IntoParallelRefIterator;
 use shared_types::DbJobRecreation;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},

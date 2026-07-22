@@ -677,7 +677,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
 ); 
 ",
         )?;
-        let rows = stmt.query_map(params![namespace_id], |row| Ok(row.get(0)?))?;
+        let rows = stmt.query_map(params![namespace_id], |row| row.get(0))?;
 
         rows.collect()
     }
@@ -794,7 +794,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
         conn: &Connection,
     ) -> Result<Vec<u64>, rusqlite::Error> {
         let mut stmt = conn.prepare("SELECT id FROM File;").unwrap();
-        let out = stmt.query_map([], |row| Ok(row.get(0)?))?;
+        let out = stmt.query_map([], |row| row.get(0))?;
 
         out.collect()
     }
@@ -826,11 +826,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
         let conn = guard.transaction().unwrap();
 
         let tag_map = Self::internal_tag_bulk_add(&conn, tag);
-        let relationships: HashSet<(u64, u64)> = tag_map
-            .values()
-            .into_iter()
-            .map(|f| (*file_id, *f))
-            .collect();
+        let relationships: HashSet<(u64, u64)> = tag_map.values().map(|f| (*file_id, *f)).collect();
         Self::internal_relationship_bulk_add(Arc::new(self.clone()), &conn, &relationships);
 
         conn.commit().unwrap();

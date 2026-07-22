@@ -1,9 +1,7 @@
 use crate::db::MainDatabase;
-use interprocess::local_socket::NameType;
 use interprocess::local_socket::ToFsName;
-use interprocess::local_socket::ToNsName;
 use interprocess::local_socket::traits::Listener;
-use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ListenerOptions};
+use interprocess::local_socket::{GenericFilePath, ListenerOptions};
 use log::info;
 use std::io::BufReader;
 use std::sync::atomic::AtomicBool;

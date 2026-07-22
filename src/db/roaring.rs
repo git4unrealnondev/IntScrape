@@ -266,9 +266,7 @@ impl RelationshipStorage {
                 self.tag_id.insert(tagid, bitmap);
             }
         }
-        if let InternalCacheType::Popular(_) = self.internal_cache {
-            return;
-        }
+        if let InternalCacheType::Popular(_) = self.internal_cache {}
 
         /*
         let mut stmt = conn

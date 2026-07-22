@@ -134,7 +134,7 @@ pub fn parser_call(
         .job
         .user_data
         .get("recursion")
-        .map_or(true, |f| f != &"false");
+        .is_none_or(|f| f != "false");
 
     let site = if ["e6", "e621", "e621.com"].contains(&scraperdata.job.site.to_lowercase().as_str())
     {
@@ -185,7 +185,7 @@ pub fn parser_call(
                             let parse_url = format!(
                                 "https://{}.net/posts.json?tags=id:{}",
                                 site.to_string().to_lowercase(),
-                                &parent
+                                parent
                             );
                             jobs.insert(ScraperDataReturn {
                                 job: PluginJob {
@@ -225,7 +225,7 @@ pub fn parser_call(
                                 let parse_url = format!(
                                     "https://{}.net/posts.json?tags=id:{}",
                                     site.to_string().to_lowercase(),
-                                    &child
+                                    child
                                 );
                                 jobs.insert(ScraperDataReturn {
                                     job: PluginJob {
@@ -285,23 +285,23 @@ pub fn parser_call(
                 }
 
                 for pool in post["pools"].members() {
-                    if let Some(pool_id) = pool.as_u64() {
-                        if recursion {
-                            let parse_url =
-                                format!("https://{}.net/pools.json?search[id]={}", site, pool_id);
-                            jobs.insert(ScraperDataReturn {
-                                job: PluginJob {
-                                    site: scraperdata.job.site.clone(),
-                                    param: vec![ScraperParam::Url(shared_types::Url {
-                                        url: parse_url,
-                                        ..Default::default()
-                                    })],
-                                    priority: DEFAULT_PRIORITY - 2,
+                    if let Some(pool_id) = pool.as_u64()
+                        && recursion
+                    {
+                        let parse_url =
+                            format!("https://{}.net/pools.json?search[id]={}", site, pool_id);
+                        jobs.insert(ScraperDataReturn {
+                            job: PluginJob {
+                                site: scraperdata.job.site.clone(),
+                                param: vec![ScraperParam::Url(shared_types::Url {
+                                    url: parse_url,
                                     ..Default::default()
-                                },
+                                })],
+                                priority: DEFAULT_PRIORITY - 2,
                                 ..Default::default()
-                            });
-                        }
+                            },
+                            ..Default::default()
+                        });
                     }
                 }
 
@@ -395,31 +395,31 @@ pub fn parser_call(
                     });
 
                     // Adds pool name
-                    if let Some(pool_name) = item["name"].as_str() {
-                        if !pool_name.is_empty() {
-                            tags.insert(PluginTag {
-                                tag: Tag {
-                                    name: pool_name.to_string(),
-                                    namespace: nsobjplg(&NsIdent::PoolName, &site),
-                                },
-                                relates_to: pool_id_relate.clone(),
-                                ..Default::default()
-                            });
-                        }
+                    if let Some(pool_name) = item["name"].as_str()
+                        && !pool_name.is_empty()
+                    {
+                        tags.insert(PluginTag {
+                            tag: Tag {
+                                name: pool_name.to_string(),
+                                namespace: nsobjplg(&NsIdent::PoolName, &site),
+                            },
+                            relates_to: pool_id_relate.clone(),
+                            ..Default::default()
+                        });
                     }
 
                     // Adds pool description
-                    if let Some(pool_name) = item["description"].as_str() {
-                        if !pool_name.is_empty() {
-                            tags.insert(PluginTag {
-                                tag: Tag {
-                                    name: pool_name.to_string(),
-                                    namespace: nsobjplg(&NsIdent::PoolDescription, &site),
-                                },
-                                relates_to: pool_id_relate.clone(),
-                                ..Default::default()
-                            });
-                        }
+                    if let Some(pool_name) = item["description"].as_str()
+                        && !pool_name.is_empty()
+                    {
+                        tags.insert(PluginTag {
+                            tag: Tag {
+                                name: pool_name.to_string(),
+                                namespace: nsobjplg(&NsIdent::PoolDescription, &site),
+                            },
+                            relates_to: pool_id_relate.clone(),
+                            ..Default::default()
+                        });
                     }
 
                     // Adds Pool Creation time
@@ -446,7 +446,7 @@ pub fn parser_call(
                                 let parse_url = format!(
                                     "https://{}.net/posts.json?tags=id:{}",
                                     site.to_string().to_lowercase(),
-                                    &post_id
+                                    post_id
                                 );
                                 jobs.insert(ScraperDataReturn {
                                     job: PluginJob {

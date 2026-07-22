@@ -1,5 +1,5 @@
-use interprocess::local_socket::{GenericFilePath, ToNsName};
-use interprocess::local_socket::{GenericNamespaced, prelude::*};
+use interprocess::local_socket::GenericFilePath;
+use interprocess::local_socket::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::BufReader;

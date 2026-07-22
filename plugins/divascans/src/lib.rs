@@ -182,7 +182,7 @@ pub fn parser_call(
     //println!("{}", text_input);
     let site = Site::DivaScans;
     let mut files = HashSet::new();
-    let mut jobs = HashSet::new();
+    let jobs = HashSet::new();
     let mut tags = HashSet::new();
 
     if let Some(cover_url) = extract_cover_image(text_input) {
@@ -223,14 +223,13 @@ pub fn parser_call(
     for script_element in document.select(&script_selector) {
         let script_text = script_element.inner_html();
 
-        if script_text.contains("self.__next_f.push") {
-            if source_url.contains("/chapter/") {
-                match extract_clean_json_text(&script_text) {
-                    Ok(cleaned_text) => {
-                        if should_download_next {
-                            let cleaned_text = cleaned_text.replacen("<div>", r#"<div style="overflow: visible; display: flex; flex-direction: column; gap: 1.25em;background:black; color:rgb(205, 200, 194);">"#, 1);
+        if script_text.contains("self.__next_f.push") && source_url.contains("/chapter/") {
+            match extract_clean_json_text(&script_text) {
+                Ok(cleaned_text) => {
+                    if should_download_next {
+                        let cleaned_text = cleaned_text.replacen("<div>", r#"<div style="overflow: visible; display: flex; flex-direction: column; gap: 1.25em;background:black; color:rgb(205, 200, 194);">"#, 1);
 
-                            tags.insert(PluginTag {
+                        tags.insert(PluginTag {
                             tag: Tag {
                                 namespace: nsobjplg(&NsIdent::ChapterText, &site),
                                 name: format!(r#"<div style="overflow: visible; display: flex; flex-direction: column; gap: 1.25em;background:black; color:rgb(205, 200, 194);"> {} </div>"#, cleaned_text),
@@ -248,14 +247,13 @@ pub fn parser_call(
                             }),
                             ..Default::default()
                         });
-                            should_download_next = false;
-                        }
-                        if re.is_match(&cleaned_text) {
-                            should_download_next = true;
-                        }
+                        should_download_next = false;
                     }
-                    Err(err) => {} //println!("REGEX failed on script {}. ERROR: {}", &script_text, &err)
+                    if re.is_match(&cleaned_text) {
+                        should_download_next = true;
+                    }
                 }
+                Err(_err) => {} //println!("REGEX failed on script {}. ERROR: {}", &script_text, &err)
             }
         }
 
