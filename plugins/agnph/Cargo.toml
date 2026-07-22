@@ -1,0 +1,14 @@
+[package]
+name = "agnph"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"] 
+
+[dependencies]
+chrono = "0.4.45"
+#json = "0.12.4"
+scraper = "0.27.0"
+shared_types = { workspace = true }
+

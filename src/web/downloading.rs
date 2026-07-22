@@ -38,6 +38,11 @@ impl Scraper {
                 DownloadModifiers::Timeout(timeout) => {
                     client = client.timeout(timeout.unwrap_or(Duration::from_secs(0)));
                 }
+                DownloadModifiers::Cookie((url, cookie)) => {
+                    let jar = reqwest::cookie::Jar::default();
+                    jar.add_cookie_str(&cookie, &url.parse::<Url>().unwrap());
+                    client = client.cookie_provider(jar.into());
+                }
             }
         }
         client
@@ -111,6 +116,9 @@ impl Scraper {
                         } else {
                             request_builder
                         }
+                    }
+                    DownloadModifiers::Cookie((_, cookie)) => {
+                        request_builder.header(reqwest::header::COOKIE, cookie)
                     }
                 };
             }

@@ -400,6 +400,10 @@ pub enum DownloadModifiers {
     Timeout(Option<Duration>),
     //,Adds a header to a download
     Header((String, String)),
+    // Adds a cookie into the request (url, cookie)
+    // Cookie for everything must be formatted like: "foo=bar; Domain=yolo.local"
+    // Cookie for individual requests must be formatted like: "foo=bar; yeet=bong"
+    Cookie((String, String)),
 }
 
 ///
