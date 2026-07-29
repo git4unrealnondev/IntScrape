@@ -6,6 +6,7 @@ use r2d2_sqlite::rusqlite::{self, Connection, Row, params};
 use rusqlite::{ToSql, Transaction};
 use shared_types::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use walkdir::WalkDir;
@@ -14,6 +15,11 @@ use crate::db::roaring::{InternalCacheType, SearchQuery};
 use crate::db::{CacheType, RelationshipStorage};
 use crate::web::manager::hash_bytes;
 use crate::{db::MainDatabase, helper_functions::get_sys_time_in_secs};
+
+// How many entries should we do total.
+// Max is 1000 vs 800
+// https://sqlite.org/limits.html
+const SQL_CHUNK_SIZE: usize = 800;
 
 pub trait DbJobsObjExt {
     fn from_row(row: &Row) -> rusqlite::Result<Self>
@@ -1560,34 +1566,34 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             return out;
         }
 
-        // Build an query like: INSERT INTO Tags (name, namespace) VALUES (?, ?), (?, ?)...
-        let mut query = String::from("INSERT INTO Tags (name, namespace) VALUES ");
-        let mut params_vector: Vec<&dyn ToSql> = Vec::with_capacity(pending_tags.len() * 2); // Adjust type to your driver's dynamic param type (e.g. rusqlite::types::ToSql / deadpool)
+        for chunk in pending_tags.chunks(SQL_CHUNK_SIZE) {
+            let mut query = String::from("INSERT INTO Tags (name, namespace) VALUES ");
+            let mut params_vector: Vec<&dyn ToSql> = Vec::with_capacity(chunk.len() * 2);
 
-        for (i, (tag_obj, ns_id)) in pending_tags.iter().enumerate() {
-            if i > 0 {
-                query.push_str(", ");
+            for (i, (tag_obj, ns_id)) in chunk.iter().enumerate() {
+                if i > 0 {
+                    query.push_str(", ");
+                }
+                query.push_str(&format!("(?{}, ?{})", i * 2 + 1, i * 2 + 2));
+                params_vector.push(&tag_obj.name);
+                params_vector.push(ns_id);
             }
-            query.push_str(&format!("(?{}, ?{})", i * 2 + 1, i * 2 + 2));
-            params_vector.push(&tag_obj.name);
-            params_vector.push(ns_id);
-        }
-        query.push_str(
-            " ON CONFLICT(name, namespace) DO UPDATE SET name = excluded.name RETURNING id",
-        );
+            query.push_str(
+                " ON CONFLICT(name, namespace) DO UPDATE SET name = excluded.name RETURNING id",
+            );
 
-        // Prepare and collect IDs back in exact sequence
-        let mut stmt = conn.prepare(&query).unwrap();
-        let mut rows = stmt
-            .query(rusqlite::params_from_iter(params_vector))
-            .unwrap();
+            let mut stmt = conn.prepare(&query).unwrap();
+            let mut rows = stmt
+                .query(rusqlite::params_from_iter(params_vector))
+                .unwrap();
 
-        let mut idx = 0;
-        while let Some(row) = rows.next().unwrap() {
-            let tag_id: u64 = row.get(0).unwrap();
-            let (tag_obj, _) = &pending_tags[idx];
-            out.insert(tag_obj.clone(), tag_id);
-            idx += 1;
+            let mut idx = 0;
+            while let Some(row) = rows.next().unwrap() {
+                let tag_id: u64 = row.get(0).unwrap();
+                let (tag_obj, _) = &chunk[idx];
+                out.insert(tag_obj.clone(), tag_id);
+                idx += 1;
+            }
         }
 
         // 4️⃣ SECOND PASS: Resolve structural parent hierarchies from memory map instantly
@@ -1718,7 +1724,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         conn.execute(&query, &*params_vector).unwrap();
     }
     ///
-    /// Bulk adds relationship into DB
+    /// Bulk adds relationship into DB with chunking to prevent parameter limit overflow
     ///
     pub(in crate::db) fn internal_relationship_bulk_add(
         self: Arc<Self>,
@@ -1741,22 +1747,36 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
 
         let relationships_vec: Vec<&(u64, u64)> = relationships.iter().collect();
 
-        let mut query =
-            String::from("INSERT OR IGNORE INTO Relationship (file_id, tag_id) VALUES ");
-        let mut params_vector: Vec<&dyn rusqlite::types::ToSql> =
-            Vec::with_capacity(relationships_vec.len() * 2);
 
-        // String building
-        for (i, relationship) in relationships_vec.iter().enumerate() {
-            if i > 0 {
-                query.push_str(", ");
+        for chunk in relationships_vec.chunks(SQL_CHUNK_SIZE) {
+            let mut query =
+                String::from("INSERT OR IGNORE INTO Relationship (file_id, tag_id) VALUES ");
+            let mut params_vector: Vec<&dyn rusqlite::types::ToSql> =
+                Vec::with_capacity(chunk.len() * 2);
+
+            for (i, relationship) in chunk.iter().enumerate() {
+                if i > 0 {
+                    query.push_str(", ");
+                }
+                query.push_str(&format!("(?{}, ?{})", i * 2 + 1, i * 2 + 2));
+                params_vector.push(&relationship.0);
+                params_vector.push(&relationship.1);
             }
-            query.push_str(&format!("(?{}, ?{})", i * 2 + 1, i * 2 + 2));
-            params_vector.push(&relationship.0);
-            params_vector.push(&relationship.1);
-        }
 
-        conn.execute(&query, &*params_vector).unwrap();
+            if let Err(e) = conn.execute(&query, &*params_vector) {
+                log::error!("Failed to bulk insert relationships: {}", e);
+                return;
+            }
+        }
+    }
+
+    ///
+    /// Updates the fts sqlite table 
+    ///
+    pub(in crate::db) fn internal_update_fts_table(self: Arc<Self>, conn: &Connection) -> Result<(), Box<dyn Error>> {
+        conn.execute("INSERT INTO Tags_Popular_fts(rowid, name, namespace) 
+SELECT id, name, namespace FROM High_Value_Tags;", [])?;
+        Ok(())
     }
 
     ///
@@ -2306,8 +2326,12 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             }
 
             if !rels_to_add.is_empty() {
-                Self::internal_relationship_bulk_add(self, &conn, &rels_to_add);
+                Self::internal_relationship_bulk_add(self.clone(), &conn, &rels_to_add);
             }
+
+            // Updaring fts table
+            let _ = Self::internal_update_fts_table(self, &conn);
+            
 
             conn.commit().unwrap();
         })
@@ -2318,11 +2342,11 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     /// Checks if we should download the file or not
     ///
     pub async fn jobs_update(&self, job: &DbJobsObj) {
-        let pool = self.pool.clone();
-
         let job = job.clone();
+        let writer_conn = self.writer_conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = match pool.get() {
+            let mut pool = writer_conn.lock();
+            let conn = match pool.transaction() {
                 Ok(c) => c,
                 Err(e) => {
                     log::error!("Failed to acquire DB connection from pool: {:?}", e);
@@ -2330,7 +2354,8 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                 }
             };
 
-            Self::internal_jobs_update(&conn, &job)
+            Self::internal_jobs_update(&conn, &job);
+            conn.commit().unwrap();
         })
         .await
         .unwrap();

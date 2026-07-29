@@ -175,7 +175,7 @@ impl Scraper {
                 .should_skip_processing_job(scrap_data.skip_conditions.clone())
                 .await
             {
-                continue;
+                continue 'scraperloop;
             }
 
             for param in scrap_data.job.param.iter() {
