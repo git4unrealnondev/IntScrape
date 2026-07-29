@@ -337,6 +337,11 @@ pub fn parser_call(
                     }
                 }
                 let source = if post["file"]["url"].is_empty() {
+                    let site_prefix = match site {
+               Site::E6 =>  "e621.net",
+                Site::E6AI => "e6ai.net"
+            };
+//                    post["file"]["md5"].as_str().map(|u| FileSource::Url(format!("https://static1.{site_prefix}/data/{}/{}/{}.{}", u[0..2], u[2..4], u,  )))
                     None
                 } else {
                     post["file"]["url"]

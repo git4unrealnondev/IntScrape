@@ -290,6 +290,9 @@ impl Scraper {
                             _ => {}
                         }
                     }
+                    // If we have an error downloading text then we shouldn't remove job
+                } else {
+                    should_remove_job.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
             } // Do all our happy db stuff down here :D
             let file_id_tag_map = Arc::try_unwrap(file_id_tag_map)
@@ -390,380 +393,6 @@ impl Scraper {
         // Fallback or handle if internal_storage doesn't exist
         false
     }
-
-    ///
-    /// Checks if a file needs to be downloaded and parsed
-    ///
-    /*async fn file_download_logic(
-        self: Arc<Self>,
-        file: &mut FileObject,
-        jobs: &mut Vec<ScraperDataReturn>,
-        download_issue: &mut bool,
-    ) -> Option<FileInternal> {
-        let plugin_manager = self.download_manager.plugin_manager.clone();
-        let self_clone = self.clone();
-
-        let bytes = match file.source {
-            None => {
-                // Will update the UI here later
-                return None;
-            }
-            Some(ref url_source) => match url_source {
-                FileSource::Url(file_url) => {
-                    match self
-                        .download_manager
-                        .db
-                        .tag_get_file_id(&Tag {
-                            name: file_url.clone(),
-                            namespace: GenericNamespaceObj {
-                                name: "source_url".into(),
-                                description: None,
-                            },
-                        })
-                        .await
-                    {
-                        Some(file_id) => {
-                            info!(
-                                "Scraper: {} JobId: {} Skipping file because already in db. {} file_id: {}",
-                                self.plugin.name, self.job.id, &file_url, &file_id
-                            );
-
-                            return self.download_manager.db.file_id_get(file_id).await;
-                        }
-                        None => {
-                            for skip in file.skip_if.iter() {
-                                match skip {
-                                    SkipIf::FileTagRelationship(tag) => {
-                                        if let Some(file_id) =
-                                            self.download_manager.db.tag_get_file_id(&tag).await
-                                        {
-                                            if let Some(file_internal) =
-                                                self.download_manager.db.file_id_get(file_id).await
-                                            {
-                                                info!(
-                                                    "Scraper: {} JobId: {} Skipping file because skip_tag has file: {:?}",
-                                                    self.plugin.name, self.job.id, &tag
-                                                );
-                                                return Some(file_internal);
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-
-                            file.tag_list.push(FileTagAction {
-                                operation: TagOperation::Add,
-                                tags: vec![PluginTag {
-                                    tag: Tag {
-                                        name: file_url.to_string(),
-                                        namespace: GenericNamespaceObj {
-                                            name: "source_url".into(),
-                                            description: Some("A source for a file".into()),
-                                        },
-                                    },
-                                    ..Default::default()
-                                }],
-                            });
-                            if self.should_download_file(file_url).await {
-                                if let Some(bytes_out) =
-                                    self_clone.download_file(file_url, &file.hash).await
-                                {
-                                    info!(
-                                        "Scraper: {} JobId: {} Successfully downloaded {}",
-                                        self.plugin.name, self.job.id, &file_url
-                                    );
-                                    bytes_out
-                                } else {
-                                    *download_issue = true;
-                                    return None;
-                                }
-                            } else {
-                                info!(
-                                    "Scraper: {} JobId: {} Skipping file because internal file_urls already contains object. {}",
-                                    self.plugin.name, self.job.id, &file_url
-                                );
-
-                                return None;
-                            }
-                        }
-                    }
-                }
-                FileSource::Bytes(file_bytes) => bytes::Bytes::copy_from_slice(file_bytes),
-            },
-        };
-
-        // After we have our bytes will do our processing here
-        let bytes_clone = bytes.clone();
-        let (tx, rx) = oneshot::channel();
-        let mut tags_owned = file.tag_list.clone();
-        let mut jobs_owned = jobs.clone();
-        self.download_manager.heavy_processing_pool.spawn(move || {
-            plugin_manager.callback_on_download(&bytes_clone, &mut tags_owned, &mut jobs_owned);
-            let _ = tx.send((tags_owned, jobs_owned));
-        });
-
-        (file.tag_list, *jobs) = rx.await.unwrap();
-
-        // 1. We have the temp_file from download_file
-        let temp_file = downloaded_temp_path;
-
-        // 2. Move the file handling completely into spawn_blocking
-        let (hash, extension, storage_id_result) = tokio::task::spawn_blocking(move || {
-            // Load the bytes into memory sequentially right here
-            let bytes = Bytes::from(std::fs::read(&temp_file).ok().unwrap());
-
-            let hash = hash_bytes(&bytes, &HashesSupported::Sha512("".into())).0;
-            let extension = FileFormat::from_bytes(&bytes).extension().to_string();
-
-            // Execute your .so plugin callback using the raw byte slice reference
-            plugin_manager.callback_on_download(&bytes, &mut tags_owned, &mut jobs_owned);
-
-            // Copy the file to its permanent storage location synchronously
-            let mut storage_id = None;
-            if let Some((file_storage_path, storage_id_db)) = file_download_location
-                && let Some(parent_dir) = file_storage_path.parent()
-            {
-                if std::fs::create_dir_all(parent_dir).is_ok()
-                    && std::fs::write(&file_storage_path, &bytes).is_ok()
-                {
-                    storage_id = Some(storage_id_db);
-                }
-            }
-
-            // Cleanup the temporary downloaded file
-            let _ = std::fs::remove_file(&temp_file);
-
-            // CRITICAL: `bytes` falls out of scope here and is dropped IMMEDIATELY.
-            // The memory is reclaimed before the async context even wakes up.
-            (hash, extension, storage_id)
-        })
-        .await
-        .unwrap();
-
-        Some(FileInternal {
-            id: None,
-            hash,
-            extension,
-            storage_id,
-        })
-
-        /* (file.tag_list, *jobs) = rx.await.unwrap();
-
-        let bytes_clone = bytes.clone();
-        let (hash, extension) = tokio::task::spawn_blocking(move || {
-            (
-                hash_bytes(&bytes_clone, &HashesSupported::Sha512("".into())).0,
-                FileFormat::from_bytes(&bytes_clone).extension().to_string(),
-            )
-        })
-        .await
-        .unwrap();
-
-        let bytes_clone = bytes.clone();
-        let storage_id;
-        if let Some((file_storage_path, storage_id_db)) = self
-            .download_manager
-            .db
-            .file_download_location_get(&hash, &extension)
-            .await
-            && let Some(parent_dir) = file_storage_path.parent()
-        {
-            let mut cnt = 0;
-
-            loop {
-                if create_dir_all(parent_dir).is_ok()
-                    && tokio::fs::write(&file_storage_path, &bytes_clone).await.is_ok()
-                {
-                    storage_id = storage_id_db;
-                    break;
-                }
-
-                cnt += 1;
-                if cnt >= 3 {
-                    log::error!(
-                        "Failed to save file after 3 attempts: {:?}",
-                        file_storage_path
-                    );
-                    return None;
-                }
-
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        } else {
-            return None;
-        }
-        Some(FileInternal {
-            id: None,
-            hash,
-            extension,
-            storage_id,
-        })*/
-    }*/
-    /* async fn file_download_logic(
-        self: Arc<Self>,
-        file: &mut FileObject,
-        jobs: &mut Vec<ScraperDataReturn>,
-        download_issue: &mut bool,
-    ) -> Option<FileInternal> {
-        let plugin_manager = self.download_manager.plugin_manager.clone();
-        let self_clone = self.clone();
-
-        let bytes = match file.source {
-            None => {
-                // Will update the UI here later
-
-                return None;
-            }
-            Some(ref url_source) => match url_source {
-                FileSource::Url(file_url) => {
-                    match self
-                        .download_manager
-                        .db
-                        .tag_get_file_id(&Tag {
-                            name: file_url.clone(),
-                            namespace: GenericNamespaceObj {
-                                name: "source_url".into(),
-                                description: None,
-                            },
-                        })
-                        .await
-                    {
-                        Some(file_id) => {
-                            info!(
-                                "Scraper: {} JobId: {} Skipping file because already in db. {} file_id: {}",
-                                self.plugin.name, self.job.id, &file_url, &file_id
-                            );
-
-                            return self.download_manager.db.file_id_get(file_id).await;
-                        }
-                        None => {
-                            for skip in file.skip_if.iter() {
-                                match skip {
-                                    SkipIf::FileTagRelationship(tag) => {
-                                        if let Some(file_id) =
-                                            self.download_manager.db.tag_get_file_id(&tag).await
-                                        {
-                                            if let Some(file_internal) =
-                                                self.download_manager.db.file_id_get(file_id).await
-                                            {
-                                                info!(
-                                                    "Scraper: {} JobId: {} Skipping file because skip_tag has file: {:?}",
-                                                    self.plugin.name, self.job.id, &tag
-                                                );
-                                                return Some(file_internal);
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-
-                            file.tag_list.push(FileTagAction {
-                                operation: TagOperation::Add,
-                                tags: vec![PluginTag {
-                                    tag: Tag {
-                                        name: file_url.to_string(),
-                                        namespace: GenericNamespaceObj {
-                                            name: "source_url".into(),
-                                            description: Some("A source for a file".into()),
-                                        },
-                                    },
-
-                                    ..Default::default()
-                                }],
-                            });
-                            if self.should_download_file(file_url).await {
-                                if let Some(bytes_out) =
-                                    self_clone.download_file(file_url, &file.hash).await
-                                {
-                                    info!(
-                                        "Scraper: {} JobId: {} Successfully downloaded {}",
-                                        self.plugin.name, self.job.id, &file_url
-                                    );
-                                    bytes_out
-                                } else {
-                                    *download_issue = true;
-                                    return None;
-                                }
-                            } else {
-                                info!(
-                                    "Scraper: {} JobId: {} Skipping file because internal file_urls already contains object. {}",
-                                    self.plugin.name, self.job.id, &file_url
-                                );
-
-                                return None;
-                            }
-                        }
-                    }
-                }
-                FileSource::Bytes(file_bytes) => bytes::Bytes::from(file_bytes.clone()),
-            },
-        };
-
-        // After we have our bytes will do our processing here
-        let bytes_clone = bytes.clone();
-        let (tx, rx) = oneshot::channel();
-        let mut tags_owned = file.tag_list.clone();
-        let mut jobs_owned = jobs.clone();
-        self.download_manager.heavy_processing_pool.spawn(move || {
-            plugin_manager.callback_on_download(&bytes_clone, &mut tags_owned, &mut jobs_owned);
-            let _ = tx.send((tags_owned, jobs_owned));
-        });
-
-        (file.tag_list, *jobs) = rx.await.unwrap();
-
-        let bytes_hash = bytes.clone();
-        let (hash, extension) = tokio::task::spawn_blocking(move || {
-            (
-                hash_bytes(&bytes_hash, &HashesSupported::Sha512("".into())).0,
-                FileFormat::from_bytes(&*bytes_hash).extension().to_string(),
-            )
-        })
-        .await
-        .unwrap();
-
-        let storage_id;
-        if let Some((file_storage_path, storage_id_db)) = self
-            .download_manager
-            .db
-            .file_download_location_get(&hash, &extension)
-            .await
-            && let Some(parent_dir) = file_storage_path.parent()
-        {
-            let mut cnt = 0;
-
-            loop {
-                if create_dir_all(parent_dir).is_ok()
-                    && tokio::fs::write(&file_storage_path, &bytes)
-                        .await
-                        .is_ok()
-                {
-                    storage_id = storage_id_db;
-                    break;
-                }
-
-                cnt += 1;
-                if cnt >= 3 {
-                    log::error!(
-                        "Failed to save file after 3 attempts: {:?}",
-                        file_storage_path
-                    );
-                    return None;
-                }
-
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        } else {
-            return None;
-        }
-        Some(FileInternal {
-            id: None,
-            hash,
-            extension,
-            storage_id,
-        })
-    }*/
 
     async fn download_file(
         self: Arc<Self>,
@@ -966,7 +595,6 @@ impl Scraper {
                             return self.download_manager.db.file_id_get(file_id).await;
                         }
                         None => {
-
                             file.tag_list.push(FileTagAction {
                                 operation: TagOperation::Add,
                                 tags: vec![PluginTag {
@@ -992,7 +620,6 @@ impl Scraper {
                                 }
                             }
 
-                          
                             if self.should_download_file(file_url).await {
                                 // Calls disk streaming download helper
                                 if let Some(path_out) = self_clone
@@ -1116,6 +743,26 @@ impl DownloadsManager {
     ///
     fn load_logins(&self, plugin: &Plugin) -> Vec<ScraperParam> {
         let mut out = Vec::new();
+
+        for property in plugin.properties.iter() {
+            if let PluginProperties::Login((loginneed, logintype)) = property {
+                match logintype {
+                    LoginType::Cookie(name, _) => {
+                        if let Some(api_key) = self
+                            .db
+                            .setting_get_sync(&format!("PLUGIN_{}_{}_COOKIE", plugin.name, name))
+                        {
+                            out.push(ScraperParam::Login(LoginType::Cookie(
+                                name.to_string(),
+                                Some(api_key.param.unwrap()),
+                            )));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         if let Some(api_key) = self
             .db
             .setting_get_sync(&format!("PLUGIN_{}_API_KEY", plugin.name))
@@ -1330,6 +977,42 @@ impl DownloadsManager {
                             .is_none() =>
                     {
                         dbg!(&key, &api);
+                    }
+                    LoginType::Cookie(cookie_name, help_text) => {
+                        if self
+                            .db
+                            .setting_get_sync(&format!(
+                                "PLUGIN_{}_{}_{}",
+                                plugin.name, cookie_name, "COOKIE"
+                            ))
+                            .is_none()
+                        {
+                            let mut user_name = String::new();
+                            if let Some(help_text) = help_text {
+                                println!("{}", help_text);
+                            }
+                            print!("Cookie: ");
+                            let _ = stdout().flush();
+                            stdin()
+                                .read_line(&mut user_name)
+                                .expect("Did not enter a correct string");
+                            if let Some('\n') = user_name.chars().next_back() {
+                                user_name.pop();
+                            }
+                            if let Some('\r') = user_name.chars().next_back() {
+                                user_name.pop();
+                            }
+
+                            self.db.setting_set_sync(&DbSettingsObj {
+                                name: format!(
+                                    "PLUGIN_{}_{}_{}",
+                                    plugin.name, cookie_name, "COOKIE"
+                                ),
+                                description: Some("Cookie for site..".into()),
+                                num: None,
+                                param: Some(user_name),
+                            });
+                        }
                     }
                     _ => {}
                 }
