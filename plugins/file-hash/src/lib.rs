@@ -164,6 +164,7 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
         callbacks: vec![
             GlobalCallbacks::Start(shared_types::StartupThreadType::SpawnInline),
             GlobalCallbacks::Download,
+            GlobalCallbacks::Import,
         ],
         ..Default::default()
     }]

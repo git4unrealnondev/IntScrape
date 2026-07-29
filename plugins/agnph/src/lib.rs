@@ -1,14 +1,10 @@
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    fmt,
-};
+use std::{collections::HashSet, fmt};
 
 use scraper::{Element, Html, Selector};
 use shared_types::{
-    DEFAULT_PRIORITY, DownloadModifiers, FileObject, FileSource, FileTagAction,
-    GenericNamespaceObj, HashesSupported, LoginNeed, LoginType, PluginJob, PluginProperties,
-    PluginTag, RelationContext, ScraperDataReturn, ScraperParam, ScraperReturn, SkipIf, Tag,
-    TargetModifier, Url,
+    DownloadModifiers, FileObject, FileSource, FileTagAction, GenericNamespaceObj, HashesSupported,
+    PluginProperties, PluginTag, RelationContext, ScraperDataReturn, ScraperParam, ScraperReturn,
+    SkipIf, Tag, TargetModifier, Url,
 };
 
 pub enum Site {
@@ -27,6 +23,8 @@ pub enum NsIdent {
     Timestamp,
     Sources,
     Species,
+    PoolPosition,
+    PoolTitle,
 }
 
 impl fmt::Display for Site {
@@ -43,7 +41,7 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
     vec![shared_types::Plugin {
         name: "agn.ph".into(),
         properties: vec![
-            PluginProperties::Ratelimit(1, std::time::Duration::from_secs(1)),
+            PluginProperties::Ratelimit(4, std::time::Duration::from_secs(1)),
             PluginProperties::Sites(vec!["agn.ph".into(), "agn".into()]),
             PluginProperties::Modifier(TargetModifier {
                 target: shared_types::ModifierTarget::Text,
@@ -93,14 +91,13 @@ pub fn url_dump(
                     site: scraperdata.job.site.clone(),
                     priority: shared_types::DEFAULT_PRIORITY - 2,
                     param,
+                    user_data: scraperdata.job.user_data.clone(),
                     ..Default::default()
                 },
                 ..Default::default()
             });
         }
     }
-
-    dbg!(&out);
 
     out
 }
@@ -135,7 +132,7 @@ pub fn parser_call(
         && let Some(last_page_string) = last_page.text().next()
         && let Ok(last_page_number) = last_page_string.parse::<u64>()
     {
-        /*    for pagenum in 2..last_page_number {
+        for pagenum in 2..last_page_number {
             if let Some(url) = build_url(&scraperdata.job.param, pagenum) {
                 jobs.insert(ScraperDataReturn {
                     job: shared_types::PluginJob {
@@ -145,21 +142,42 @@ pub fn parser_call(
                             url,
                             ..Default::default()
                         })],
+                        user_data: scraperdata.job.user_data.clone(),
                         ..Default::default()
                     },
                     ..Default::default()
                 });
             }
-        }*/
+        }
     }
 
+    let mut user_data = scraperdata.job.user_data.clone();
     // Extracts the posts from a page
     let selector = Selector::parse("a.postlink").unwrap();
-    for element in doc.select(&selector) {
+    let elements: Vec<_> = doc.select(&selector).collect();
+    for (idx, element) in elements.iter().enumerate() {
         if let Some(raw_link) = element.attr("href")
             && let Some(post_id) = raw_link.trim_end_matches('/').rsplit('/').next()
         {
-            let mut user_data = BTreeMap::new();
+            if source_url.contains("search=pool")
+                && let Some(pool_name) = source_url.rsplit("%3A").next()
+            {
+                user_data.insert("pool_position".into(), idx.to_string());
+                user_data.insert("pool_title".into(), pool_name.to_string());
+            }
+
+            // Always run the last item in a pool to grab it
+            let skip_conditions =
+                if (elements.len() - 1) == idx && source_url.contains("search=pool") && recursion {
+                    vec![]
+                } else {
+                    user_data.insert("recursion".into(), "false".into());
+                    vec![SkipIf::FileTagRelationship(Tag {
+                        name: post_id.to_string(),
+                        namespace: nsobjplg(&NsIdent::PostId, site),
+                    })]
+                };
+
             user_data.insert("post_id".into(), post_id.to_string());
             jobs.insert(ScraperDataReturn {
                 job: shared_types::PluginJob {
@@ -169,23 +187,65 @@ pub fn parser_call(
                         url: format!("https://agn.ph/gallery/post/show/{}", post_id),
                         ..Default::default()
                     })],
-                    user_data,
+                    user_data: user_data.clone(),
                     ..Default::default()
                 },
-                skip_conditions: vec![SkipIf::FileTagRelationship(Tag {
-                    name: post_id.to_string(),
-                    namespace: nsobjplg(&NsIdent::PostId, site),
-                })],
+                skip_conditions,
             });
         }
     }
 
-    // Extracts data from a post
+    // Gets next item in pool if it exists
+    let selector = Selector::parse("a[id=nextinpool]").unwrap();
+    let mut next_pool_page = doc.select(&selector);
 
+    if let Some(next_pool_page) = next_pool_page.next()
+        && let Some(next_page_link) = next_pool_page.attr("href")
+    {
+        let selector = Selector::parse("a[id=previnpool]").unwrap();
+        let elements: Vec<_> = doc.select(&selector).collect();
+        if elements.is_empty() {
+            user_data.insert("pool_position".into(), 1.to_string());
+            if let Some(pool_p) = next_pool_page.parent_element()
+                && let Some(gallery_link) = pool_p.first_element_child()
+                && let Some(gallery_text) = gallery_link.text().next()
+            {
+                user_data.insert("pool_title".into(), gallery_text.to_string());
+            }
+        } else {
+            // Updates the pool position
+            if let Some(pool_pos_text) = user_data.get_mut("pool_position")
+                && let Ok(mut pool_pos) = pool_pos_text.parse::<u64>()
+            {
+                pool_pos += 1;
+
+                *pool_pos_text = pool_pos.to_string();
+            }
+        }
+
+        jobs.insert(ScraperDataReturn {
+            job: shared_types::PluginJob {
+                site: scraperdata.job.site.clone(),
+                priority: shared_types::DEFAULT_PRIORITY - 3,
+                param: vec![ScraperParam::Url(Url {
+                    url: format!("https://agn.ph/{}", next_page_link),
+                    ..Default::default()
+                })],
+                user_data: user_data.clone(),
+                ..Default::default()
+            },
+            skip_conditions: vec![],
+        });
+        if elements.is_empty() {
+            user_data.insert("pool_position".into(), 0.to_string());
+        }
+    }
+
+    // Extracts data from a post
     let selector = Selector::parse("a[id=download-link]").unwrap();
 
     for download_link in doc.select(&selector) {
-        let mut tags = Vec::new();
+        let mut file_tags = Vec::new();
 
         // Gets tags from the site
         for (selector_text, namespace) in [
@@ -197,7 +257,7 @@ pub fn parser_call(
             let selector = Selector::parse(selector_text).unwrap();
             for element in doc.select(&selector) {
                 if let Some(tag_text) = element.text().next() {
-                    tags.push(PluginTag {
+                    file_tags.push(PluginTag {
                         tag: Tag {
                             name: tag_text.to_string(),
                             namespace: namespace.clone(),
@@ -218,19 +278,49 @@ pub fn parser_call(
                 && let Some(id_text) = element.text().next()
                 && let Some(id_text_cleaned) = id_text.rsplit(':').next()
             {
-                tags.push(PluginTag {
+                user_data.insert("post_id".into(), id_text_cleaned.into());
+                file_tags.push(PluginTag {
                     tag: Tag {
                         name: id_text_cleaned.to_string(),
                         namespace: nsobjplg(&NsIdent::PostId, site),
                     },
                     ..Default::default()
                 });
+
+                if let Some(pool_position_unparsed) = user_data.get("pool_position")
+                    && let Ok(pool_position) = pool_position_unparsed.parse::<u64>()
+                    && let Some(pool_title) = user_data.clone().get("pool_title")
+                {
+                    let mut local_pool_position = pool_position.clone();
+                    local_pool_position += 1;
+
+                    user_data.insert("pool_position".into(), local_pool_position.to_string());
+
+                    tags.insert(PluginTag {
+                        tag: Tag {
+                            name: pool_position.to_string(),
+                            namespace: nsobjplg(&NsIdent::PoolPosition, site),
+                        },
+                        relates_to: Some(RelationContext {
+                            tag: Tag {
+                                name: id_text_cleaned.to_string(),
+                                namespace: nsobjplg(&NsIdent::PostId, site),
+                            },
+                            limit_to: Some(Tag {
+                                name: pool_title.to_string(),
+                                namespace: nsobjplg(&NsIdent::PoolTitle, site),
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    });
+                }
             }
             if let Some(element) = stat_children.next()
                 && let Some(source) = element.first_element_child()
                 && let Some(source_text) = source.attr("href")
             {
-                tags.push(PluginTag {
+                file_tags.push(PluginTag {
                     tag: Tag {
                         name: source_text.to_string(),
                         namespace: nsobjplg(&NsIdent::Sources, site),
@@ -243,7 +333,7 @@ pub fn parser_call(
                 && let Some(rating) = element.first_element_child()
                 && let Some(rating_text) = rating.text().next()
             {
-                tags.push(PluginTag {
+                file_tags.push(PluginTag {
                     tag: Tag {
                         name: rating_text.to_string(),
                         namespace: nsobjplg(&NsIdent::Rating, site),
@@ -257,7 +347,7 @@ pub fn parser_call(
         if let Some(url) = download_link.attr("href") {
             let tag_list = vec![FileTagAction {
                 operation: shared_types::TagOperation::Set,
-                tags,
+                tags: file_tags,
             }];
 
             if let Some(md5_text_dirty) = url.rsplit('/').next()
@@ -289,7 +379,6 @@ pub fn parser_call(
         files,
         jobs,
         tags,
-        ..Default::default()
     })]
 }
 
@@ -324,6 +413,11 @@ fn nsobjplg(name: &NsIdent, site: &Site) -> GenericNamespaceObj {
             Desc::Static("Alternative sources for a file. Can also be general links."),
         ),
         NsIdent::Rating => ("Rating", Desc::Static("Content classification indicators.")),
+        NsIdent::PoolPosition => (
+            "PoolPosition",
+            Desc::Static("A position of a post in a pool"),
+        ),
+        NsIdent::PoolTitle => ("PoolTitle", Desc::Static("The title of a pool")),
         NsIdent::PostId => (
             "Id",
             Desc::Dynamic(format!(

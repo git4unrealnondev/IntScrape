@@ -221,6 +221,19 @@ END;
     }
 
     ///
+    /// Recaches db internally
+    ///
+    pub fn recache_roaring_db(&self) {
+        let mut roaring_guard = self.relationship_roaring_storage.write();
+        let mut write_guard = self.writer_conn.lock();
+        if let Some(roaring) = roaring_guard.as_mut() {
+            let conn = write_guard.transaction().unwrap();
+            roaring.recache_roaring(&conn).unwrap();
+            conn.commit().unwrap();
+        }
+    }
+
+    ///
     /// Gets namespace id if it exists
     ///
     pub fn search_db_namespace_sync(&self, name: &String) -> Option<u64> {
@@ -2704,7 +2717,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     pub async fn job_set_is_running(&self, job: &DbJobsObj) {
         let job_id = job.id;
         let writer_conn = self.writer_conn.clone();
-        tokio::task::spawn_blocking(move || {
+        let _ = tokio::task::spawn_blocking(move || {
             let mut writer_lock_guard = writer_conn.lock();
             let tn = writer_lock_guard
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -2715,8 +2728,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
 
             status
         })
-        .await
-        .unwrap();
+        .await;
     }
 
     ///

@@ -1,5 +1,6 @@
 extern crate clap;
 
+use crate::cli::cli_structs::Database;
 use crate::helper_functions;
 use crate::{db::MainDatabase, web::manager::hash_bytes};
 use bytes::Bytes;
@@ -491,8 +492,14 @@ pub async fn main(db: Arc<MainDatabase>) {
                 }
             },
             cli_structs::TasksStruct::Database(db_action) => {
-                if let cli_structs::Database::CheckFiles(action) = db_action {
-                    db.fix_internal_files(action).unwrap();
+                match db_action {
+                    Database::CheckFiles(action) => {
+                        db.fix_internal_files(action).unwrap();
+                    }
+                    Database::RecacheRoaring => {
+                        db.recache_roaring_db();
+                    }
+                    _ => {}
                 }
                 /* let dbstore = data.clone();
                 match db {

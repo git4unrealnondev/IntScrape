@@ -103,7 +103,7 @@ pub struct DbSearchObject {
 pub struct UrlPost {
     pub url: String,
     // Any goofball request modifiers
-    pub modifiers: Vec<DownloadModifiers>,
+    pub local_modifiers: Vec<TargetModifier>,
     // any post data to send if needed
     pub post_data: String,
 }

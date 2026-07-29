@@ -80,6 +80,7 @@ impl Scraper {
 
     fn prepare_request(
         &self,
+        method: reqwest::Method,
         input: &shared_types::Url,
         default_target: ModifierTarget,
     ) -> RequestBuilder {
@@ -92,8 +93,8 @@ impl Scraper {
 
         // 2. Initialize the GET request builder from the appropriate client
         let mut request_builder = match target_type {
-            ModifierTarget::Text => self.text_client.get(&input.url),
-            ModifierTarget::Media => self.file_client.get(&input.url),
+            ModifierTarget::Text => self.text_client.request(method.clone(), &input.url),
+            ModifierTarget::Media => self.file_client.request(method, &input.url),
         };
 
         // 3. Iterate and apply modifiers matching the determined target
@@ -133,18 +134,21 @@ impl Scraper {
         let url;
         let post_data;
         let mut cnt = 0;
+        let method;
 
         match input_url {
             ScraperParam::Url(out) => {
                 url = out;
                 post_data = None;
+                method = reqwest::Method::GET;
             }
             ScraperParam::UrlPost(url_post) => {
                 url = shared_types::Url {
                     url: url_post.url,
-                    ..Default::default()
+                    local_modifiers: url_post.local_modifiers,
                 };
                 post_data = Some(url_post.post_data);
+                method = reqwest::Method::POST;
             }
             _ => {
                 return None;
@@ -167,13 +171,15 @@ impl Scraper {
                 self.plugin.name, self.job.id, url_parsed
             );
 
+            let request = self.prepare_request(method.clone(), &url, ModifierTarget::Text);
+
             let futureresult = match post_data {
-                None => self.prepare_request(&url, ModifierTarget::Text).send(),
-                Some(ref post_data_string) => self
-                    .text_client
-                    .post(url_parsed.clone())
-                    .body(post_data_string.clone())
-                    .send(),
+                None => request.send(),
+                Some(ref post_data_string) => {
+                    let request = request.body(post_data_string.to_string());
+
+                    request.send()
+                }
             }
             .await;
 
