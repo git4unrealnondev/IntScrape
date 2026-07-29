@@ -149,6 +149,9 @@ pub fn parser_call(
     let mut files = HashSet::new();
     let mut jobs = HashSet::new();
     let mut tags = HashSet::new();
+
+    let mut posts_to_search = Vec::new();
+
     if let Ok(payload) = json::parse(text_input) {
         if !payload["posts"].is_empty() {
             for post in payload["posts"].members() {
@@ -167,7 +170,7 @@ pub fn parser_call(
                     });
 
                     // Gets the parent object
-                    if let Some(parent) = post["relationships"]["parent_id"].as_str() {
+                    if let Some(parent) = post["relationships"]["parent_id"].as_u64() {
                         tags.insert(PluginTag {
                             tag: Tag {
                                 name: parent.to_string(),
@@ -182,6 +185,7 @@ pub fn parser_call(
 
                         // Adds job to get parent
                         if recursion {
+                            posts_to_search.push(parent);
                             let parse_url = format!(
                                 "https://{}.net/posts.json?tags=id:{}",
                                 site.to_string().to_lowercase(),
@@ -195,6 +199,7 @@ pub fn parser_call(
                                         ..Default::default()
                                     })],
                                     priority: DEFAULT_PRIORITY - 2,
+
                                     ..Default::default()
                                 },
                                 skip_conditions: vec![SkipIf::FileTagRelationship(Tag {
@@ -338,10 +343,10 @@ pub fn parser_call(
                 }
                 let source = if post["file"]["url"].is_empty() {
                     let site_prefix = match site {
-               Site::E6 =>  "e621.net",
-                Site::E6AI => "e6ai.net"
-            };
-//                    post["file"]["md5"].as_str().map(|u| FileSource::Url(format!("https://static1.{site_prefix}/data/{}/{}/{}.{}", u[0..2], u[2..4], u,  )))
+                        Site::E6 => "e621.net",
+                        Site::E6AI => "e6ai.net",
+                    };
+                    //                    post["file"]["md5"].as_str().map(|u| FileSource::Url(format!("https://static1.{site_prefix}/data/{}/{}/{}.{}", u[0..2], u[2..4], u,  )))
                     None
                 } else {
                     post["file"]["url"]
@@ -351,19 +356,26 @@ pub fn parser_call(
 
                 // Adds file into db
 
-                let hash = post["file"]["md5"]
-                    .as_str()
-                    .map(|hash| HashesSupported::Md5(hash.to_string()));
-
-                files.insert(FileObject {
-                    source,
-                    hash,
-                    tag_list: vec![FileTagAction {
-                        tags: tag_vec,
-                        ..Default::default()
-                    }],
-                    skip_if: Vec::new(),
-                });
+                if let Some(hash) = post["file"]["md5"].as_str() {
+                    files.insert(FileObject {
+                        source,
+                        hash: Some(HashesSupported::Md5(hash.to_string())),
+                        tag_list: vec![FileTagAction {
+                            tags: tag_vec,
+                            ..Default::default()
+                        }],
+                        // Skip file if we have the md5 hash inside the db
+                        skip_if: vec![SkipIf::FileTagRelationship(Tag {
+                            name: hash.to_string(),
+                            namespace: GenericNamespaceObj {
+                                name: "FileHash-MD5".to_string(),
+                                description: Some(
+                                    "From plugin FileHash. MD5 hash of the file.".to_string(),
+                                ),
+                            },
+                        })],
+                    });
+                }
             }
         // Used for pools parsing
         } else if payload["posts"].is_empty() {
@@ -453,6 +465,7 @@ pub fn parser_call(
                                     site.to_string().to_lowercase(),
                                     post_id
                                 );
+                                //posts_to_search.push(post_id);
                                 jobs.insert(ScraperDataReturn {
                                     job: PluginJob {
                                         site: scraperdata.job.site.clone(),
@@ -469,7 +482,6 @@ pub fn parser_call(
                                     })],
                                 });
                             }
-
                             tags.insert(PluginTag {
                                 tag: Tag {
                                     name: cnt.to_string(),
@@ -491,6 +503,26 @@ pub fn parser_call(
             }
         }
     }
+
+    /* // Adds posts to search for individually
+    if !posts_to_search.is_empty() {
+        let site_lower = site.to_string().to_lowercase();
+
+        for chunk in posts_to_search.chunks(10) {
+            let mut search_string = format!("https://{}.net/posts.json?tags=", site_lower);
+
+            // Append each post ID in the chunk with the '~id:' prefix
+            for (i, post_id) in chunk.iter().enumerate() {
+                if i > 0 {
+                    search_string.push(' ');
+                }
+                search_string.push_str(&format!("~id:{}", post_id));
+            }
+
+            dbg!(&search_string);
+
+        }
+    }*/
 
     if files.is_empty() && jobs.is_empty() && tags.is_empty() {
         return vec![ScraperReturn::Nothing];
