@@ -1,4 +1,5 @@
 use crate::db::MainDatabase;
+use crate::plugins::PluginManager;
 use interprocess::local_socket::ToFsName;
 use interprocess::local_socket::traits::Listener;
 use interprocess::local_socket::{GenericFilePath, ListenerOptions};
@@ -13,6 +14,7 @@ pub struct IpcServer {
     local_server: Mutex<Option<JoinHandle<()>>>,
     should_exit: Arc<AtomicBool>,
     db: Arc<MainDatabase>,
+    plugin_manager: Arc<PluginManager>
 }
 
 macro_rules! register_db_requests {
@@ -48,11 +50,12 @@ impl Drop for IpcServer {
 }
 
 impl IpcServer {
-    pub fn new(db: Arc<MainDatabase>, should_exit: Arc<AtomicBool>) -> Arc<Self> {
+    pub fn new(db: Arc<MainDatabase>, should_exit: Arc<AtomicBool>, plugin_manager: Arc<PluginManager>) -> Arc<Self> {
         let out = Arc::new(IpcServer {
             local_server: Mutex::new(None),
             should_exit,
             db,
+            plugin_manager
         });
 
         out.clone().startup().unwrap();
@@ -112,6 +115,11 @@ impl IpcServer {
             }
             client::SupportedDBRequests::ShouldExit => {
                 client::data_size_to_b(&self.should_exit.load(Ordering::SeqCst))
+            }
+            client::SupportedDBRequests::ExternalPluginCall(key, callback_info ) => {
+                let out = self.plugin_manager.external_plugin_call(&key, &callback_info);
+
+                client::data_size_to_b(&out)
             }
             _ => {
                 register_db_requests! {

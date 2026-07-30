@@ -270,6 +270,66 @@ impl PluginManager {
         }
     }
 
+    pub fn external_plugin_call(
+        &self,
+        func_name: &String,
+        callback_info: &CallbackInfoInput,
+    ) -> HashMap<String, CallbackCustomDataReturning> {
+        let mut out = HashMap::new();
+
+        let callback_item_clean = CallbackInfo {
+            func: func_name.clone(),
+            vers: callback_info.vers,
+            data_name: callback_info.data_name.clone(),
+            data: callback_info.data.iter().map(|f| match f {
+                CallbackCustomDataReturning::U8(_) => CallbackCustomData::U8,
+                CallbackCustomDataReturning::U64(_) => CallbackCustomData::U64,
+                CallbackCustomDataReturning::VU8(_) => CallbackCustomData::VU8,
+                CallbackCustomDataReturning::Vu64(_) => CallbackCustomData::Vu64,
+                CallbackCustomDataReturning::String(_) => CallbackCustomData::String,
+                CallbackCustomDataReturning::VString(_) => CallbackCustomData::VString
+            }).collect()
+        };
+
+        if let Some(plugin_name_list) = self
+            .storage_callbacks
+            .read()
+            .get(&GlobalCallbacks::Callback(callback_item_clean))
+        {
+            for plugin_name in plugin_name_list {
+                if let Some(lib) = self.storage_libs.read().get(plugin_name) {
+                    let temp: libloading::Symbol<
+                        unsafe extern "C" fn(
+                            &CallbackInfoInput,
+                        )
+                            -> HashMap<String, CallbackCustomDataReturning>,
+                    > = {
+                        unsafe {
+                            match lib.get(func_name) {
+                                Err(err) => {
+                                    error!(
+                                        "Plugins: {} could not call {func_name} got error: {:?}",
+                                        plugin_name, err
+                                    );
+                                    continue;
+                                }
+                                Ok(out) => out,
+                            }
+                        }
+                    };
+
+                    let return_data = unsafe { temp(callback_info) };
+                    out.extend(return_data);
+                }
+            }
+        }
+
+        out
+    }
+
+    ///
+    /// Runs callback on_start
+    ///
     pub fn callback_on_start(&self) {
         // Spawns each plugin and waits till its finished before the next plugin gets called
         if let Some(plugin_name_list) = self

@@ -85,6 +85,7 @@ macro_rules! define_db_requests {
 }
 
 define_db_requests! {
+    external_plugin_call(key: String, callbackinfo: CallbackInfoInput) -> Result<HashMap<String, CallbackCustomDataReturning>, Box<dyn std::error::Error>> => SupportedDBRequests::ExternalPluginCall(key, callbackinfo);
     /// Gets a setting by name
     setting_get(name: String) -> Result<Option<DbSettingsObj>, Box<dyn std::error::Error>> => SupportedDBRequests::SettingsGetName(name);
 

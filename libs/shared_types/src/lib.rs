@@ -520,7 +520,9 @@ pub enum GlobalCallbacks {
     Tag((Option<SearchType>, Vec<String>, Vec<String>)),
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[derive(
+    Debug, PartialEq, Eq, Hash, Clone, bitcode::Encode, bitcode::Decode, Serialize, Deserialize,
+)]
 pub struct CallbackInfo {
     // Name of plugin's function
     pub func: String,
@@ -556,7 +558,9 @@ pub enum CallbackCustomDataReturning {
     Vu64(Vec<u64>),
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[derive(
+    Debug, PartialEq, Eq, Hash, Clone, bitcode::Encode, bitcode::Decode, Serialize, Deserialize,
+)]
 pub enum CallbackCustomData {
     String,
     U8,
