@@ -1,8 +1,9 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     error::Error,
     fs::create_dir_all,
     path::{Path, PathBuf},
+    sync::atomic::AtomicUsize,
 };
 
 use shared_types::{
@@ -47,6 +48,51 @@ fn on_start() {
             thumbnail_path.to_string_lossy()
         ));
     }
+}
+
+#[unsafe(no_mangle)]
+fn file_thumbnail_generate_thumbnail_fid(
+    callback: &shared_types::CallbackInfoInput,
+) -> HashMap<String, shared_types::CallbackCustomDataReturning> {
+    let mut out = HashMap::new();
+    let index = callback.data_name.iter().position(|x| x == "file_id");
+    if let Some(index) = index {
+        if callback.data.len() >= index {
+            if let Some(custom_data) = callback.data.get(index) {
+                if let shared_types::CallbackCustomDataReturning::U64(file_id) = custom_data {
+                    if let Ok(Some(file_path)) = client::get_file_path(*file_id) {
+                        if let Ok(bytes) = std::fs::read(&file_path) {
+                            let tags = on_download(&bytes).tags;
+                            let tags: Vec<FileTagAction> = tags.iter().cloned().collect();
+
+                            for tag_action in tags.iter() {
+                                for (idx, tag) in tag_action.tags.iter().enumerate() {
+                                    if let Ok(mut thumbpath) = process_thumb_location() {
+                                        let thumb_hash = tag.tag.name.as_str();
+                                        thumbpath.push(&thumb_hash[0..2]);
+                                        thumbpath.push(&thumb_hash[2..4]);
+                                        thumbpath.push(&thumb_hash[4..6]);
+                                        let thpath = thumbpath
+                                            .join(thumb_hash.clone())
+                                            .with_added_extension("webp");
+                                        let pa = thpath.to_string_lossy().to_string();
+
+                                        dbg!(&pa);
+                                        out.insert(
+                                            format!("ReturnPath_{}", idx),
+                                            shared_types::CallbackCustomDataReturning::String(pa),
+                                        );
+                                    }
+                                }
+                            }
+                            client::put_tags_to_file(*file_id, tags);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 #[unsafe(no_mangle)]

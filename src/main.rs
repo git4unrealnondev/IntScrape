@@ -68,7 +68,7 @@ async fn main() {
         heavy_processing_pool.clone(),
     );
 
-    let ipc_server = IpcServer::new(db.clone(), should_exit.clone());
+    let ipc_server = IpcServer::new(db.clone(), should_exit.clone(), plugin_manager.clone());
 
     // handler for ctrl c
     {

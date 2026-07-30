@@ -1747,7 +1747,6 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
 
         let relationships_vec: Vec<&(u64, u64)> = relationships.iter().collect();
 
-
         for chunk in relationships_vec.chunks(SQL_CHUNK_SIZE) {
             let mut query =
                 String::from("INSERT OR IGNORE INTO Relationship (file_id, tag_id) VALUES ");
@@ -1771,11 +1770,17 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     }
 
     ///
-    /// Updates the fts sqlite table 
+    /// Updates the fts sqlite table
     ///
-    pub(in crate::db) fn internal_update_fts_table(self: Arc<Self>, conn: &Connection) -> Result<(), Box<dyn Error>> {
-        conn.execute("INSERT INTO Tags_Popular_fts(rowid, name, namespace) 
-SELECT id, name, namespace FROM High_Value_Tags;", [])?;
+    pub(in crate::db) fn internal_update_fts_table(
+        self: Arc<Self>,
+        conn: &Connection,
+    ) -> Result<(), Box<dyn Error>> {
+        conn.execute(
+            "INSERT INTO Tags_Popular_fts(rowid, name, namespace) 
+SELECT id, name, namespace FROM High_Value_Tags;",
+            [],
+        )?;
         Ok(())
     }
 
@@ -2331,7 +2336,6 @@ SELECT id, name, namespace FROM High_Value_Tags;", [])?;
 
             // Updaring fts table
             let _ = Self::internal_update_fts_table(self, &conn);
-            
 
             conn.commit().unwrap();
         })
