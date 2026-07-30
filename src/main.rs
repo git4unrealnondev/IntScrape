@@ -66,6 +66,7 @@ async fn main() {
         db.clone(),
         plugin_manager.clone(),
         heavy_processing_pool.clone(),
+        should_exit.clone(),
     );
 
     let ipc_server = IpcServer::new(db.clone(), should_exit.clone(), plugin_manager.clone());

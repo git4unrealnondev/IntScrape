@@ -74,6 +74,7 @@ pub struct DownloadsManager {
     jobs: RwLock<HashMap<String, InternalStorage>>,
     heavy_processing_pool: Arc<ThreadPool>,
     job_limiter: Arc<Semaphore>,
+    should_exit: Arc<AtomicBool>,
 }
 
 impl Scraper {
@@ -166,6 +167,14 @@ impl Scraper {
             let file_id_tag_map = Arc::new(Mutex::new(HashMap::new()));
             let job_list = Arc::new(Mutex::new(Vec::new()));
             let tag_list = Arc::new(Mutex::new(Vec::new()));
+
+            if self
+                .download_manager
+                .should_exit
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                break;
+            }
 
             // Should skip processing a job if a skipif exists
             if self
@@ -412,6 +421,13 @@ impl Scraper {
         };
 
         loop {
+            if self
+                .download_manager
+                .should_exit
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                break;
+            }
             // Rate limiting
             while self.ratelimiter.check().is_err() {
                 let jitter = rand::random::<u64>() % 50;
@@ -727,6 +743,7 @@ impl DownloadsManager {
         db: Arc<MainDatabase>,
         plugin_manager: Arc<PluginManager>,
         heavy_processing_pool: Arc<ThreadPool>,
+        should_exit: Arc<AtomicBool>,
     ) -> Arc<Self> {
         let dm = DownloadsManager {
             db,
@@ -734,6 +751,7 @@ impl DownloadsManager {
             jobs: HashMap::new().into(),
             heavy_processing_pool,
             job_limiter: Arc::new(Semaphore::new(3)),
+            should_exit,
         };
 
         dm.into()
