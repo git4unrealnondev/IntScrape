@@ -281,14 +281,18 @@ impl PluginManager {
             func: func_name.clone(),
             vers: callback_info.vers,
             data_name: callback_info.data_name.clone(),
-            data: callback_info.data.iter().map(|f| match f {
-                CallbackCustomDataReturning::U8(_) => CallbackCustomData::U8,
-                CallbackCustomDataReturning::U64(_) => CallbackCustomData::U64,
-                CallbackCustomDataReturning::VU8(_) => CallbackCustomData::VU8,
-                CallbackCustomDataReturning::Vu64(_) => CallbackCustomData::Vu64,
-                CallbackCustomDataReturning::String(_) => CallbackCustomData::String,
-                CallbackCustomDataReturning::VString(_) => CallbackCustomData::VString
-            }).collect()
+            data: callback_info
+                .data
+                .iter()
+                .map(|f| match f {
+                    CallbackCustomDataReturning::U8(_) => CallbackCustomData::U8,
+                    CallbackCustomDataReturning::U64(_) => CallbackCustomData::U64,
+                    CallbackCustomDataReturning::VU8(_) => CallbackCustomData::VU8,
+                    CallbackCustomDataReturning::Vu64(_) => CallbackCustomData::Vu64,
+                    CallbackCustomDataReturning::String(_) => CallbackCustomData::String,
+                    CallbackCustomDataReturning::VString(_) => CallbackCustomData::VString,
+                })
+                .collect(),
         };
 
         if let Some(plugin_name_list) = self

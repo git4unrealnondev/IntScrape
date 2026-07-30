@@ -14,7 +14,7 @@ pub struct IpcServer {
     local_server: Mutex<Option<JoinHandle<()>>>,
     should_exit: Arc<AtomicBool>,
     db: Arc<MainDatabase>,
-    plugin_manager: Arc<PluginManager>
+    plugin_manager: Arc<PluginManager>,
 }
 
 macro_rules! register_db_requests {
@@ -50,12 +50,16 @@ impl Drop for IpcServer {
 }
 
 impl IpcServer {
-    pub fn new(db: Arc<MainDatabase>, should_exit: Arc<AtomicBool>, plugin_manager: Arc<PluginManager>) -> Arc<Self> {
+    pub fn new(
+        db: Arc<MainDatabase>,
+        should_exit: Arc<AtomicBool>,
+        plugin_manager: Arc<PluginManager>,
+    ) -> Arc<Self> {
         let out = Arc::new(IpcServer {
             local_server: Mutex::new(None),
             should_exit,
             db,
-            plugin_manager
+            plugin_manager,
         });
 
         out.clone().startup().unwrap();
@@ -82,11 +86,17 @@ impl IpcServer {
             while !self_clone.should_exit.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok(conn) => {
-                        let mut reader = BufReader::new(conn);
-                        if let Ok(recieved_data) = client::recieve(&mut reader) {
-                            let response = self_clone.conn_to_function(recieved_data);
-                            client::send_preserialize(&response, &mut reader);
-                        }
+                        // Clone the Arc for the new connection thread
+                        let self_for_conn = self_clone.clone();
+
+                        // Spawn a dedicated thread for each client connection
+                        thread::spawn(move || {
+                            let mut reader = BufReader::new(conn);
+                            if let Ok(recieved_data) = client::recieve(&mut reader) {
+                                let response = self_for_conn.conn_to_function(recieved_data);
+                                client::send_preserialize(&response, &mut reader);
+                            }
+                        });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(std::time::Duration::from_millis(50));
@@ -116,8 +126,10 @@ impl IpcServer {
             client::SupportedDBRequests::ShouldExit => {
                 client::data_size_to_b(&self.should_exit.load(Ordering::SeqCst))
             }
-            client::SupportedDBRequests::ExternalPluginCall(key, callback_info ) => {
-                let out = self.plugin_manager.external_plugin_call(&key, &callback_info);
+            client::SupportedDBRequests::ExternalPluginCall(key, callback_info) => {
+                let out = self
+                    .plugin_manager
+                    .external_plugin_call(&key, &callback_info);
 
                 client::data_size_to_b(&out)
             }
