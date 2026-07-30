@@ -141,6 +141,7 @@ impl IpcServer {
                     SettingsGetName(name)   =>  setting_get_sync,
                     SettingsSet(settings)   =>  setting_set_sync,
                     SearchFiles(search, limit) => search_db_files_sync,
+                    GetTagFile(tag) => tag_get_file_sync,
                     GetTagIds(tag_ids) => tag_id_get_tag_sync,
                     SearchTags(tag, limit) => search_db_tags_fts,
                     GetNamespace(name) => search_db_namespace_sync,

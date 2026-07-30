@@ -150,6 +150,7 @@ pub fn parser_call(
     let mut jobs = HashSet::new();
     let mut tags = HashSet::new();
 
+    // Parents and children parsing
     let mut posts_to_search = Vec::new();
 
     if let Ok(payload) = json::parse(text_input) {
@@ -186,7 +187,7 @@ pub fn parser_call(
                         // Adds job to get parent
                         if recursion {
                             posts_to_search.push(parent);
-                            let parse_url = format!(
+                            /* let parse_url = format!(
                                 "https://{}.net/posts.json?tags=id:{}",
                                 site.to_string().to_lowercase(),
                                 parent
@@ -206,13 +207,16 @@ pub fn parser_call(
                                     name: parent.to_string(),
                                     namespace: nsobjplg(&NsIdent::PostId, &site),
                                 })],
-                            });
+                            });*/
                         }
                     }
 
                     // Gets children and puts them into the db
                     for child in post["relationships"]["children"].members() {
                         if let Some(child) = child.as_u64() {
+                            if recursion {
+                                posts_to_search.push(child);
+                            }
                             tags.insert(PluginTag {
                                 tag: Tag {
                                     name: child.to_string(),
@@ -225,7 +229,7 @@ pub fn parser_call(
                                 ..Default::default()
                             });
 
-                            // Adds job to get child
+                            /*  // Adds job to get child
                             if recursion {
                                 let parse_url = format!(
                                     "https://{}.net/posts.json?tags=id:{}",
@@ -247,7 +251,7 @@ pub fn parser_call(
                                         namespace: nsobjplg(&NsIdent::PostId, &site),
                                     })],
                                 });
-                            }
+                            }*/
                         }
                     }
                 }
@@ -346,8 +350,19 @@ pub fn parser_call(
                         Site::E6 => "e621.net",
                         Site::E6AI => "e6ai.net",
                     };
-                    //                    post["file"]["md5"].as_str().map(|u| FileSource::Url(format!("https://static1.{site_prefix}/data/{}/{}/{}.{}", u[0..2], u[2..4], u,  )))
-                    None
+                    if let Some(ext) = post["file"]["ext"].as_str() {
+                        post["file"]["md5"].as_str().map(|u| {
+                            FileSource::Url(format!(
+                                "https://static1.{site_prefix}/data/{}/{}/{}.{}",
+                                &u[0..2],
+                                &u[2..4],
+                                u,
+                                ext
+                            ))
+                        })
+                    } else {
+                        None
+                    }
                 } else {
                     post["file"]["url"]
                         .as_str()
@@ -355,7 +370,6 @@ pub fn parser_call(
                 };
 
                 // Adds file into db
-
                 if let Some(hash) = post["file"]["md5"].as_str() {
                     files.insert(FileObject {
                         source,
@@ -504,7 +518,17 @@ pub fn parser_call(
         }
     }
 
-    /* // Adds posts to search for individually
+    // Gets only posts that dont have a file attached to it
+    posts_to_search.retain(|post_id| {
+        client::get_tag_file(Tag {
+            name: post_id.to_string(),
+            namespace: nsobjplg(&NsIdent::PostId, &site),
+        })
+        .ok()
+        .is_some_and(|f| f.is_none())
+    });
+
+    // Adds posts to search for individually
     if !posts_to_search.is_empty() {
         let site_lower = site.to_string().to_lowercase();
 
@@ -514,15 +538,29 @@ pub fn parser_call(
             // Append each post ID in the chunk with the '~id:' prefix
             for (i, post_id) in chunk.iter().enumerate() {
                 if i > 0 {
-                    search_string.push(' ');
+                    search_string.push('+');
                 }
                 search_string.push_str(&format!("~id:{}", post_id));
             }
 
             dbg!(&search_string);
+            if recursion {
+                jobs.insert(ScraperDataReturn {
+                    job: PluginJob {
+                        site: scraperdata.job.site.clone(),
+                        param: vec![ScraperParam::Url(shared_types::Url {
+                            url: search_string,
+                            ..Default::default()
+                        })],
+                        priority: DEFAULT_PRIORITY - 2,
 
+                        ..Default::default()
+                    },
+                    skip_conditions: vec![],
+                });
+            }
         }
-    }*/
+    }
 
     if files.is_empty() && jobs.is_empty() && tags.is_empty() {
         return vec![ScraperReturn::Nothing];

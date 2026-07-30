@@ -4,7 +4,6 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc,
     },
 };
 
@@ -64,36 +63,34 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
     }
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = mpsc::channel();
     let pool = threadpool::ThreadPool::new(NUMOFJOBS);
 
     for (file_id, tables) in total_file_ids {
         // Stop scheduling new work immediately if exit is requested
-        if client::should_exit()? {
-            cancel_flag.store(true, Ordering::Relaxed);
-            break;
+        if cancel_flag.clone().load(Ordering::Relaxed) {
+            return Ok(());
         }
 
         if !tables.is_empty()
             && let Some(file_path) = client::get_file_path(file_id)?
             && let Ok(file_data) = std::fs::read(file_path)
         {
-            let tx = tx.clone();
-            let cancel_flag = Arc::clone(&cancel_flag);
+            if let Ok(result) = client::should_exit()
+                && result
+            {
+                cancel_flag.store(true, Ordering::Relaxed);
+                return Ok(());
+            }
 
+            let cancel_flag = cancel_flag.clone();
             pool.execute(move || {
                 // Check immediately when worker picks up the job
-                if cancel_flag.load(Ordering::Relaxed) {
+                if cancel_flag.clone().load(Ordering::Relaxed) {
                     return;
                 }
 
                 let mut tags = Vec::with_capacity(tables.len());
                 for table in tables {
-                    // Cooperative check: skips remaining tables instantly on Ctrl+C
-                    if cancel_flag.load(Ordering::Relaxed) {
-                        return;
-                    }
-
                     if let Some(file_hash) = hash_file(&table, &file_data) {
                         tags.push(PluginTag {
                             tag: Tag {
@@ -111,32 +108,19 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
                         ));
                     }
                 }
-
-                // Send completed results back to the main thread via channel
-                if !cancel_flag.load(Ordering::Relaxed) && !tags.is_empty() {
-                    let _ = tx.send((file_id, tags));
+                if client::put_tags_to_file(
+                    file_id,
+                    vec![FileTagAction {
+                        operation: shared_types::TagOperation::Set,
+                        tags,
+                    }],
+                )
+                .is_err()
+                {
+                    cancel_flag.store(true, Ordering::Relaxed);
                 }
             });
         }
-    }
-
-    // Drop original sender so the receiver loop exits cleanly once workers finish
-    drop(tx);
-
-    // Main thread handles ALL IPC communication safely in one place
-    for (file_id, tags) in rx {
-        if client::should_exit()? {
-            cancel_flag.store(true, Ordering::Relaxed);
-            break;
-        }
-
-        let _ = client::put_tags_to_file(
-            file_id,
-            vec![FileTagAction {
-                operation: shared_types::TagOperation::Set,
-                tags,
-            }],
-        );
     }
 
     if !client::should_exit()? {
@@ -162,7 +146,7 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
     vec![shared_types::Plugin {
         name: "file_hash".into(),
         callbacks: vec![
-            GlobalCallbacks::Start(shared_types::StartupThreadType::SpawnInline),
+            GlobalCallbacks::Start(shared_types::StartupThreadType::Spawn),
             GlobalCallbacks::Download,
             GlobalCallbacks::Import,
         ],
