@@ -40,6 +40,49 @@ pub enum VideoSpacing {
     Duration(usize), // Number of ms before attempting to take a frame
 }
 
+fn handle_on_start() -> Result<(), Box<dyn Error>> {
+    let should_run = match client::setting_get("PLUGIN_Thumbnail_ShouldRun".into())? {
+        None => true,
+        Some(setting) => setting.param.map(|param| param != "False").unwrap_or(true),
+    };
+
+    if !should_run {
+        return Ok(());
+    }
+
+    // Filters by file id
+    let mut total_file_ids = client::get_file_ids_all()?;
+    if let Ok(Some(ns_id)) = client::namespace_get("file_thumbnail".to_string())
+        && let Ok(namespace_file_ids) = client::get_namespace_file_ids(ns_id)
+    {
+        total_file_ids.retain_mut(|f| !namespace_file_ids.contains(f));
+    }
+
+    for file_id in total_file_ids {
+        // Early stop if we should exit
+        if client::should_exit()? {
+            return Ok(());
+        }
+
+        if let Ok(Some(file_path)) = client::get_file_path(file_id)
+            && let Ok(file_data) = std::fs::read(file_path)
+        {
+            let callback = on_download(&file_data);
+            let tags: Vec<_> = callback.tags.into_iter().collect();
+            client::put_tags_to_file(file_id, tags)?;
+        }
+    }
+
+    let _ = client::setting_set(shared_types::DbSettingsObj {
+        name: "PLUGIN_Thumbnail_ShouldRun".into(),
+        description: Some("Should the plugin thumbnail run on_start".into()),
+        num: None,
+        param: Some("False".into()),
+    });
+
+    Ok(())
+}
+
 #[unsafe(no_mangle)]
 fn on_start() {
     if let Ok(thumbnail_path) = process_thumb_location() {
@@ -48,6 +91,8 @@ fn on_start() {
             thumbnail_path.to_string_lossy()
         ));
     }
+
+    let _ = handle_on_start();
 }
 
 #[unsafe(no_mangle)]
@@ -94,7 +139,7 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
     vec![shared_types::Plugin {
         name: "file_thumbnail".into(),
         callbacks: vec![
-            GlobalCallbacks::Start(shared_types::StartupThreadType::SpawnInline),
+            GlobalCallbacks::Start(shared_types::StartupThreadType::Spawn),
             GlobalCallbacks::Download,
             GlobalCallbacks::Callback(shared_types::CallbackInfo {
                 func: "file_thumbnail_generate_thumbnail_fid".to_string(),

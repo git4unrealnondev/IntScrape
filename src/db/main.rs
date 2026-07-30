@@ -818,6 +818,11 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
         out.collect()
     }
 
+    pub fn tag_get_file_sync(&self, tag: &Tag) -> Option<FileInternal> {
+        let conn = self.pool.get().unwrap();
+        Self::internal_tag_get_fileinternal(&conn, tag)
+    }
+
     ///
     /// Gets all file_ids with tags that have namespace id
     ///

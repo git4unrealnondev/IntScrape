@@ -2,6 +2,7 @@ use core::{convert::Into, option::Option::Some};
 use parking_lot::{Mutex, RwLock};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::{SqliteConnectionManager, rusqlite::Connection};
+use rusqlite::trace::TraceEvent;
 use std::{collections::HashMap, path::Path, time::Duration};
 
 use crate::{
@@ -30,9 +31,9 @@ pub struct MainDatabase {
 impl MainDatabase {
     pub fn new(db_path: &Path) -> Arc<Self> {
         let manager = SqliteConnectionManager::file(db_path).with_init(|c| {
-            //c.trace(Some(|statement: &str| {
-            //    log::info!("Executing SQL: {}", statement);
-            //}));
+           /* c.trace(Some(|statement: &str| {
+                log::info!("Executing SQL: {}", statement);
+            }));*/
             c.busy_timeout(Duration::from_millis(1000))?;
             c.execute_batch(
                 "

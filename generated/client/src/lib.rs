@@ -13,6 +13,7 @@ pub const SOCKET_NAME: &str = "RustHydrus.sock";
 #[derive(Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub enum SupportedDBRequests {
     GetTagId(u64),
+    GetTagFile(Tag),
     GetTagIds(HashSet<u64>),
     GetTag(String, u64),
     PutTag(String, u64, Option<u64>),
@@ -100,11 +101,12 @@ define_db_requests! {
     /// Logs to fast_log without printing
     log_silent(log: String) -> Result<bool, Box<dyn std::error::Error>> => SupportedDBRequests::LoggingNoPrint(log);
 
-    /// Gets a tag
-    get_tag_id(id: u64) -> Result<Option<Tag>, Box<dyn std::error::Error>> => SupportedDBRequests::GetTagId(id);
+    /// Gets tags
     get_tag_id_bulk(id: HashSet<u64>) -> Result<HashMap<u64, Tag>, Box<dyn std::error::Error>> => SupportedDBRequests::GetTagIds(id);
 
     get_tag(name: String, namespace: u64) -> Result<Option<u64>, Box<dyn std::error::Error>> => SupportedDBRequests::GetTag(name, namespace) ;
+
+    get_tag_file(tag: Tag) -> Result<Option<FileInternal>, Box<dyn std::error::Error>> => SupportedDBRequests::GetTagFile(tag);
 
     /// Adds a tag to a fileid
     put_tags_to_file(file_id: u64, tags: Vec<FileTagAction>) -> Result<bool, Box<dyn std::error::Error>> => SupportedDBRequests::PutTagsRelationship(file_id, tags);
