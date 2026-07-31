@@ -566,43 +566,31 @@ ON Jobs (time, reptime, site, param);
         .unwrap();
     }
 
+    ///
+    /// Gets the file path of a fileid
+    ///
     #[must_use]
     pub fn file_get_physical_path_sync(&self, file_id: &u64) -> Option<String> {
         let conn = self.pool.get().unwrap();
         Self::internal_file_get_physical_path(&conn, file_id).ok()?
     }
 
+    ///
+    /// Gets the physical path for a file
+    ///
     pub(in crate::db) fn internal_file_get_physical_path(
         conn: &Connection,
         file_id: &u64,
     ) -> Result<Option<String>, Box<dyn Error>> {
-        let file = Self::internal_file_id_get(&conn, file_id)?;
+        let file = Self::internal_file_id_get(conn, file_id)?;
 
-        let file_storage_map = Self::internal_file_storage_get_all(&conn)?;
+        let file_storage_map = Self::internal_file_storage_get_all(conn)?;
 
-        // 3. Iterate through locations and check if the file physically exists
         for (_, base_path) in file_storage_map {
             if let Some(good_path) = Self::get_file_location(&file, &base_path) {
                 let final_path = good_path.canonicalize()?;
                 return Ok(Some(final_path.to_string_lossy().to_string()));
             }
-            /* let base_location = location_res?;
-
-            // Construct the full path (e.g., "/path/to/storage/abcdef123456.png")
-            let mut path = PathBuf::from(base_location);
-            path.push(&hash[0..2]);
-            path.push(&hash[2..4]);
-            path.push(&hash[4..6]);
-            path.push(&hash);
-            let path = path.with_extension(&extension);
-
-            // Check the actual filesystem
-            if path.exists() {
-                // Return the successful path as a lossy UTF-8 String
-                return Ok(Some(
-                    path.canonicalize().unwrap().to_string_lossy().into_owned(),
-                ));
-            }*/
         }
 
         // File not found in any of the physical directories
