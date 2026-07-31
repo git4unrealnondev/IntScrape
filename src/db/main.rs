@@ -575,28 +575,18 @@ ON Jobs (time, reptime, site, param);
     pub(in crate::db) fn internal_file_get_physical_path(
         conn: &Connection,
         file_id: &u64,
-    ) -> Result<Option<String>, rusqlite::Error> {
-        // 1. Get the file's hash and extension from the File table
-        let file_info: Option<(String, String)> = conn
-            .query_row(
-                "SELECT hash, extension FROM File WHERE id = ?1",
-                params![file_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?;
-        // If the file doesn't exist in the DB, or hash/extension are NULL, we can't find it on disk
-        let (hash, extension) = match file_info {
-            Some((h, e)) if !h.is_empty() && !e.is_empty() => (h, e),
-            _ => return Ok(None),
-        };
+    ) -> Result<Option<String>, Box<dyn Error>> {
+        let file = Self::internal_file_id_get(&conn, file_id)?;
 
-        // 2. Fetch all possible base storage locations
-        let mut stmt = conn.prepare("SELECT location FROM FileStorageLocations")?;
-        let locations = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let file_storage_map = Self::internal_file_storage_get_all(&conn)?;
 
         // 3. Iterate through locations and check if the file physically exists
-        for location_res in locations {
-            let base_location = location_res?;
+        for (_, base_path) in file_storage_map {
+            if let Some(good_path) = Self::get_file_location(&file, &base_path) {
+                let final_path = good_path.canonicalize()?;
+                return Ok(Some(final_path.to_string_lossy().to_string()));
+            }
+            /* let base_location = location_res?;
 
             // Construct the full path (e.g., "/path/to/storage/abcdef123456.png")
             let mut path = PathBuf::from(base_location);
@@ -612,7 +602,7 @@ ON Jobs (time, reptime, site, param);
                 return Ok(Some(
                     path.canonicalize().unwrap().to_string_lossy().into_owned(),
                 ));
-            }
+            }*/
         }
 
         // File not found in any of the physical directories
@@ -1948,29 +1938,26 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     ///
     /// Gets a file location on disk and fixes extension on FS if it doesn't exist
     ///
-    fn get_file_location(
-        &self,
+    pub(in crate::db) fn get_file_location(
         file_internal: &FileInternal,
-        file_map: &HashMap<u64, String>,
+        base_path: &String,
     ) -> Option<PathBuf> {
-        if let Some(base_path) = file_map.get(&file_internal.storage_id) {
-            if file_internal.hash.len() <= 6 {
-                return None;
-            }
-            let mut path = Path::new(base_path).to_path_buf();
-            path.push(&file_internal.hash[0..2]);
-            path.push(&file_internal.hash[2..4]);
-            path.push(&file_internal.hash[4..6]);
-            path.push(&file_internal.hash);
-            let final_path = path.with_added_extension(&file_internal.extension);
+        if file_internal.hash.len() <= 6 {
+            return None;
+        }
+        let mut path = Path::new(base_path).to_path_buf();
+        path.push(&file_internal.hash[0..2]);
+        path.push(&file_internal.hash[2..4]);
+        path.push(&file_internal.hash[4..6]);
+        path.push(&file_internal.hash);
+        let final_path = path.with_added_extension(&file_internal.extension);
 
-            if final_path.exists() {
-                return Some(final_path);
-            }
-            if final_path.with_extension("").exists() {
-                std::fs::rename(final_path.with_extension(""), &final_path).ok()?;
-                return Some(final_path);
-            }
+        if final_path.exists() {
+            return Some(final_path);
+        }
+        if final_path.with_extension("").exists() {
+            std::fs::rename(final_path.with_extension(""), &final_path).ok()?;
+            return Some(final_path);
         }
 
         None
@@ -1997,22 +1984,24 @@ SELECT id, name, namespace FROM High_Value_Tags;",
 
         // Fixes storage IDs inside of the db.
         'fileloop: for file in &files {
-            if let Some(file_path) = self.get_file_location(file, &file_storage_map) {
-                valid_paths.insert(file_path);
-                continue 'fileloop;
-            }
-
-            for storage_id in file_storage_map.keys() {
-                let mut file_temp = file.clone();
-                file_temp.storage_id = *storage_id;
-                if let Some(file_path) = self.get_file_location(&file_temp, &file_storage_map) {
+            for (_idx, file_base_path) in file_storage_map.iter() {
+                if let Some(file_path) = Self::get_file_location(file, file_base_path) {
                     valid_paths.insert(file_path);
-                    file_storage_to_fix.push(file_temp);
                     continue 'fileloop;
                 }
-            }
 
-            file_storage_missing.insert(file);
+                for storage_id in file_storage_map.keys() {
+                    let mut file_temp = file.clone();
+                    file_temp.storage_id = *storage_id;
+                    if let Some(file_path) = Self::get_file_location(&file_temp, file_base_path) {
+                        valid_paths.insert(file_path);
+                        file_storage_to_fix.push(file_temp);
+                        continue 'fileloop;
+                    }
+                }
+
+                file_storage_missing.insert(file);
+            }
         }
 
         // updates files
