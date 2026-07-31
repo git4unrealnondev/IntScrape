@@ -543,7 +543,8 @@ pub fn parser_call(
                 search_string.push_str(&format!("~id:{}", post_id));
             }
 
-            dbg!(&search_string);
+            search_string.push_str("+status:any");
+
             if recursion {
                 jobs.insert(ScraperDataReturn {
                     job: PluginJob {

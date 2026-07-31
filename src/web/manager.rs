@@ -15,7 +15,7 @@ use url::Url;
 use bytes::Bytes;
 use governor::{DefaultDirectRateLimiter, Quota};
 use log::info;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use sha2::{Sha256, Sha512};
 use shared_types::{
     DbJobRecreation, DbJobsObj, DbSettingsObj, FileInternal, FileObject, FileSource, FileTagAction,
@@ -427,7 +427,7 @@ impl Scraper {
             }
         };
 
-        loop {
+        'main_loop: loop {
             if self
                 .download_manager
                 .should_exit
@@ -463,6 +463,16 @@ impl Scraper {
                     continue;
                 }
             };
+            if let Err(err) = response.error_for_status_ref() {
+                log::error!(
+                    "Scraper: {} JobId: {} Got error {:?}",
+                    self.plugin.name,
+                    self.job.id,
+                    err
+                );
+                
+                break 'main_loop;
+            }
 
             let content_length_header = response.content_length();
 
