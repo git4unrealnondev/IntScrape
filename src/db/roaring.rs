@@ -464,9 +464,7 @@ impl RelationshipStorage {
         let mut bytes = vec![];
         file_bitmap.serialize_into(&mut bytes).unwrap();
         tn.execute(
-            "INSERT INTO RelationshipRoaringTagid (tagid, fileid_bitmap)
-     VALUES (?, ?)
-     ON CONFLICT(tagid) DO UPDATE SET fileid_bitmap = excluded.fileid_bitmap",
+            "INSERT INTO RelationshipRoaringTagid (tagid, fileid_bitmap) VALUES (?, ?) ON CONFLICT(tagid) DO UPDATE SET fileid_bitmap = excluded.fileid_bitmap",
             params![tag_id, bytes],
         )
         .unwrap();
