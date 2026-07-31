@@ -2,10 +2,12 @@ use std::{
     collections::{HashMap, HashSet},
     error::Error,
     fs::create_dir_all,
+    ops::ControlFlow,
     path::{Path, PathBuf},
     sync::atomic::AtomicUsize,
 };
 
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use shared_types::{
     CallbackCustomData, CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks,
     PluginTag, Tag,
@@ -40,6 +42,7 @@ pub enum VideoSpacing {
     Duration(usize), // Number of ms before attempting to take a frame
 }
 
+/// Runs the on_start code
 fn handle_on_start() -> Result<(), Box<dyn Error>> {
     let should_run = match client::setting_get("PLUGIN_Thumbnail_ShouldRun".into())? {
         None => true,
@@ -58,27 +61,32 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
         total_file_ids.retain_mut(|f| !namespace_file_ids.contains(f));
     }
 
-    for file_id in total_file_ids {
+    // runs the processing multi threaded
+    let res = total_file_ids.par_iter().try_for_each(|file_id| {
         // Early stop if we should exit
-        if client::should_exit()? {
-            return Ok(());
-        }
-
-        if let Ok(Some(file_path)) = client::get_file_path(file_id)
+        let should_stop = client::should_exit();
+        if should_stop.is_err() || should_stop.is_ok_and(|f| f) {
+            ControlFlow::Break(0)
+        } else if let Ok(Some(file_path)) = client::get_file_path(*file_id)
             && let Ok(file_data) = std::fs::read(file_path)
         {
             let callback = on_download(&file_data);
             let tags: Vec<_> = callback.tags.into_iter().collect();
-            client::put_tags_to_file(file_id, tags)?;
+            let _ = client::put_tags_to_file(*file_id, tags);
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Continue(())
         }
-    }
-
-    let _ = client::setting_set(shared_types::DbSettingsObj {
-        name: "PLUGIN_Thumbnail_ShouldRun".into(),
-        description: Some("Should the plugin thumbnail run on_start".into()),
-        num: None,
-        param: Some("False".into()),
     });
+
+    if let ControlFlow::Continue(_) = res {
+        let _ = client::setting_set(shared_types::DbSettingsObj {
+            name: "PLUGIN_Thumbnail_ShouldRun".into(),
+            description: Some("Should the plugin thumbnail run on_start".into()),
+            num: None,
+            param: Some("False".into()),
+        });
+    }
 
     Ok(())
 }
