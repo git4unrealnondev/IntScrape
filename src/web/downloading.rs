@@ -5,7 +5,7 @@ use reqwest::{
     Client, ClientBuilder, RequestBuilder,
     header::{HeaderMap, HeaderName, HeaderValue},
 };
-use shared_types::*;
+use shared_types::{DownloadModifiers, ModifierTarget, ScraperParam, TargetModifier};
 use url::Url;
 
 use crate::web::manager::Scraper;
@@ -63,7 +63,7 @@ impl Scraper {
                 .gzip(true)
                 .deflate(true)
                 .connect_timeout(std::time::Duration::from_secs(15))
-                .timeout(std::time::Duration::from_secs(120));
+                .timeout(std::time::Duration::from_mins(2));
 
             client = Self::process_modifiers(client, modifers.clone(), is_text_download);
 
@@ -88,12 +88,11 @@ impl Scraper {
         let target_type = input
             .local_modifiers
             .first()
-            .map(|m| m.target.clone())
-            .unwrap_or(default_target);
+            .map_or(default_target, |m| m.target.clone());
 
         // 2. Initialize the GET request builder from the appropriate client
         let mut request_builder = match target_type {
-            ModifierTarget::Text => self.text_client.request(method.clone(), &input.url),
+            ModifierTarget::Text => self.text_client.request(method, &input.url),
             ModifierTarget::Media => self.file_client.request(method, &input.url),
         };
 
@@ -176,7 +175,7 @@ impl Scraper {
             let futureresult = match post_data {
                 None => request.send(),
                 Some(ref post_data_string) => {
-                    let request = request.body(post_data_string.to_string());
+                    let request = request.body(post_data_string.clone());
 
                     request.send()
                 }
@@ -235,15 +234,14 @@ impl Scraper {
 
                         cnt += 1;
                         continue;
-                    } else {
-                        log::error!(
-                            "Worker: {} JobId: {} -- While processing job {:?} was unable to download text. Had err {:?} ",
-                            self.plugin.name,
-                            self.job.id,
-                            url_parsed,
-                            err,
-                        );
                     }
+                    log::error!(
+                        "Worker: {} JobId: {} -- While processing job {:?} was unable to download text. Had err {:?} ",
+                        self.plugin.name,
+                        self.job.id,
+                        url_parsed,
+                        err,
+                    );
                 }
             }
 

@@ -1,4 +1,5 @@
 use std::{
+    error::Error,
     path::Path,
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
@@ -27,35 +28,39 @@ const DB_VERSION: u64 = 1;
 ///
 /// Sets up logging in the environment
 ///
-fn setup_log() {
+fn setup_log() -> Result<(), Box<dyn Error>> {
     let log_path = Path::new(LOG_PATH);
 
     // Clears log
-    if std::fs::exists(log_path).unwrap() {
-        std::fs::remove_file(log_path).expect("Unable to remove log.txt");
+    if std::fs::exists(log_path)? {
+        std::fs::remove_file(log_path)?;
     }
 
     // Sets up log
     fast_log::init(
         fast_log::Config::new()
             .level(log::LevelFilter::Info)
-            .file(log_path.to_str().unwrap())
+            .file(
+                log_path
+                    .to_str()
+                    .ok_or("Failed to convert log_path to string")?,
+            )
             .chan_len(None),
-    )
-    .unwrap();
+    )?;
+    Ok(())
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn Error>> {
     // ctrl C handler
     let should_exit = Arc::new(AtomicBool::new(false));
 
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
-    setup_log();
+    setup_log()?;
 
-    let heavy_processing_pool = Arc::new(rayon::ThreadPoolBuilder::new().build().unwrap());
+    let heavy_processing_pool = Arc::new(rayon::ThreadPoolBuilder::new().build()?);
 
     let db = MainDatabase::new(Path::new(DB_PATH));
 
@@ -78,8 +83,8 @@ async fn main() {
             println!("received Ctrl+C!");
             log::info!("received Ctrl+C!");
             should_exit_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-        })
-        .expect("Error setting Ctrl-C handler");
+        })?;
+        //.expect("Error setting Ctrl-C handler");
     }
 
     plugin_manager.callback_on_start();
@@ -115,7 +120,7 @@ async fn main() {
         }
     });
 
-    spawner.await.unwrap();
+    spawner.await?;
 
     // Ensures that everything gets dropped properly
     drop(plugin_manager);
@@ -130,4 +135,6 @@ async fn main() {
     // Cleans up temp db files
     let _ = std::fs::remove_file("./main.db-wal");
     let _ = std::fs::remove_file("./main.db-shm");
+
+    Ok(())
 }

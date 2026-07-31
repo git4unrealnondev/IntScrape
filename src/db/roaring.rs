@@ -7,7 +7,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use crate::db::MainDatabase;
-use shared_types::*;
+use shared_types::DbSearchTypeEnum;
 
 /// Gets the cache type
 #[derive(Clone, Debug)]
@@ -30,7 +30,8 @@ pub struct SearchQuery<'a> {
 }
 
 impl<'a> SearchQuery<'a> {
-    pub fn new(engine: &'a RelationshipStorage) -> Self {
+    #[must_use]
+    pub const fn new(engine: &'a RelationshipStorage) -> Self {
         Self {
             engine,
             offset: None,
@@ -40,32 +41,38 @@ impl<'a> SearchQuery<'a> {
             sort: false,
         }
     }
-    pub fn sort(mut self) -> Self {
+    #[must_use]
+    pub const fn sort(mut self) -> Self {
         self.sort = true;
         self
     }
 
-    pub fn limit(mut self, limit: Option<u64>) -> Self {
+    #[must_use]
+    pub const fn limit(mut self, limit: Option<u64>) -> Self {
         self.limit = limit;
         self
     }
-    pub fn offset(mut self, offset: u64) -> Self {
+    #[must_use]
+    pub const fn offset(mut self, offset: u64) -> Self {
         self.offset = Some(offset);
         self
     }
 
-    pub fn and_search(mut self, tag_ids: &'a [u64]) -> Self {
+    #[must_use]
+    pub const fn and_search(mut self, tag_ids: &'a [u64]) -> Self {
         self.and_search = Some((DbSearchTypeEnum::And, tag_ids));
 
         self
     }
-    pub fn or_search(mut self, tag_ids: &'a [u64]) -> Self {
+    #[must_use]
+    pub const fn or_search(mut self, tag_ids: &'a [u64]) -> Self {
         self.or_search = Some((DbSearchTypeEnum::Or, tag_ids));
 
         self
     }
 
     /// Finalizes the search returns applicable fileids
+    #[must_use]
     pub fn build(self) -> Vec<u64> {
         if let Some((searchtype, tag_id_list)) = self.and_search
             && let Some(bitmap) = self.engine.internal_search_item(tag_id_list, searchtype)
@@ -90,7 +97,7 @@ pub(in crate::db) struct RelationshipStorage {
 }
 impl RelationshipStorage {
     pub fn new(db: Arc<MainDatabase>, internal_cache: InternalCacheType) -> Self {
-        RelationshipStorage {
+        Self {
             file_id: IntMap::default(),
             tag_id: IntMap::default(),
             internal_cache,
@@ -173,7 +180,7 @@ impl RelationshipStorage {
                     self.relationship_cache_add_fileid_sql(tn, prev_fileid, &bitmap);
                     processed += 1;
                     if processed.is_multiple_of(10_000) {
-                        println!("Processed {} fileids...", processed);
+                        println!("Processed {processed} fileids...");
                     }
                 }
                 bitmap.clear();
@@ -204,7 +211,7 @@ impl RelationshipStorage {
                     self.relationship_cache_add_tagid_sql(tn, prev_tagid, &bitmap);
                     processed += 1;
                     if processed.is_multiple_of(10_000) {
-                        println!("Processed {} tagids...", processed);
+                        println!("Processed {processed} tagids...");
                     }
                 }
                 bitmap.clear();
@@ -232,20 +239,17 @@ impl RelationshipStorage {
             self.internal_cache
         );
         // No need to load this
-        if let InternalCacheType::Table = self.internal_cache {
+        if matches!(self.internal_cache, InternalCacheType::Table) {
             return;
         }
 
         let params;
-        let sql = match self.internal_cache {
-            InternalCacheType::Popular(ref popular_count) => {
-                params = vec![popular_count];
-                "SELECT tagid, fileid_bitmap FROM RelationshipRoaringTagid WHERE tagid IN (SELECT id FROM Tags WHERE count >= ?)"
-            }
-            _ => {
-                params = vec![];
-                "SELECT tagid, fileid_bitmap FROM RelationshipRoaringTagid"
-            }
+        let sql = if let InternalCacheType::Popular(ref popular_count) = self.internal_cache {
+            params = vec![popular_count];
+            "SELECT tagid, fileid_bitmap FROM RelationshipRoaringTagid WHERE tagid IN (SELECT id FROM Tags WHERE count >= ?)"
+        } else {
+            params = vec![];
+            "SELECT tagid, fileid_bitmap FROM RelationshipRoaringTagid"
         };
 
         let mut stmt = conn.prepare(sql).unwrap();
@@ -326,7 +330,7 @@ impl RelationshipStorage {
     }
 
     ///
-    /// Returns a list of all file_id's associated with a tag
+    /// Returns a list of all `file_id`'s associated with a tag
     ///
     pub(in crate::db) fn relationship_search_fileid_roaring(
         &self,

@@ -42,6 +42,7 @@ fn parse_string_to_scraperparam(input: &str) -> Vec<shared_types::ScraperParam> 
     out
 }
 
+#[must_use]
 pub fn time_conv(inp: &str) -> u64 {
     if inp.to_lowercase() == *"now" {
         return 0;
@@ -288,8 +289,11 @@ pub async fn main(db: Arc<MainDatabase>) {
                 let mut files = HashSet::new();
                 let mut sidecars = HashMap::new();
 
-                for location in directory.location.iter() {
-                    for file in WalkDir::new(location).into_iter().filter_map(|e| e.ok()) {
+                for location in &directory.location {
+                    for file in WalkDir::new(location)
+                        .into_iter()
+                        .filter_map(std::result::Result::ok)
+                    {
                         if file.file_type().is_file() {
                             files.insert(file.path().to_path_buf());
                         }
@@ -307,7 +311,7 @@ pub async fn main(db: Arc<MainDatabase>) {
                     }
                 }
 
-                for file in files.iter() {
+                for file in &files {
                     if let Ok(file) = File::open(file) {
                         // Reads file into memory
                         let mmap = unsafe { Mmap::map(&file) };
@@ -315,7 +319,7 @@ pub async fn main(db: Arc<MainDatabase>) {
                         if let Ok(mmap) = mmap {
                             let (hash, _) = hash_bytes(
                                 &Bytes::from(mmap.to_vec()),
-                                &shared_types::HashesSupported::Sha512("".into()),
+                                &shared_types::HashesSupported::Sha512(String::new()),
                             );
                             dbg!(&hash);
 

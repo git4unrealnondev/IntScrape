@@ -17,7 +17,12 @@ use governor::{DefaultDirectRateLimiter, Quota};
 use log::info;
 use reqwest::Client;
 use sha2::{Sha256, Sha512};
-use shared_types::*;
+use shared_types::{
+    DbJobRecreation, DbJobsObj, DbSettingsObj, FileInternal, FileObject, FileSource, FileTagAction,
+    GenericNamespaceObj, HashesSupported, LoginNeed, LoginType, Plugin, PluginProperties,
+    PluginTag, ScraperDataReturn, ScraperParam, ScraperReturn, SkipIf, Tag, TagOperation,
+};
+use std::error::Error;
 use tokio::{
     fs::File,
     io::AsyncWriteExt,
@@ -42,8 +47,8 @@ impl TrackedFile {
     // A helper method to easily extract the path reference
     fn path(&self) -> &std::path::Path {
         match self {
-            TrackedFile::Temp(f) => f.path(),
-            TrackedFile::Manual(p) => p,
+            Self::Temp(f) => f.path(),
+            Self::Manual(p) => p,
         }
     }
 }
@@ -87,15 +92,13 @@ impl Scraper {
     ) -> Arc<Self> {
         let mut modifiers = Vec::new();
 
-        for modifier in plugin.properties.iter() {
+        for modifier in &plugin.properties {
             if let PluginProperties::Modifier(target) = modifier {
                 modifiers.push(target.clone());
             }
         }
 
-        let job = job.clone();
-
-        let scraper = Scraper {
+        let scraper = Self {
             job,
             ratelimiter,
             plugin_manager,
@@ -111,7 +114,7 @@ impl Scraper {
     ///
     /// Handles scraping logic
     ///
-    pub async fn run_scraper(self: Arc<Self>) {
+    pub async fn run_scraper(self: Arc<Self>) -> Result<(), Box<dyn Error>> {
         let plugin_manager = self.plugin_manager.clone();
         let job = self.job.config.clone();
         let plugin = self.plugin.clone();
@@ -123,12 +126,12 @@ impl Scraper {
             skip_conditions: vec![],
         };
 
-        if let Ok(scrap_data) = tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             plugin_manager.url_dump(&default_scraper_data, &plugin)
         })
         .await
         {
-            match scrap_data {
+            Ok(scrap_data) => match scrap_data {
                 Ok(good_data) => {
                     scraper_data_return = Arc::new(good_data);
                 }
@@ -141,11 +144,12 @@ impl Scraper {
                     self.download_manager
                         .remove_job(&self.plugin, &self.job)
                         .await;
-                    return;
+                    return Err("Scrap data had an error. Check logs".into());
                 }
+            },
+            Err(e) => {
+                return Err(format!("Url Dump had error: {e}").into());
             }
-        } else {
-            return;
         }
 
         let should_remove_job = Arc::new(AtomicBool::new(true));
@@ -153,7 +157,7 @@ impl Scraper {
         // Sets the max number of concurrent downloads
         let mut max_concurrent_downloads = MAX_CONCURRENT_DOWNLOADS;
 
-        for property in self.plugin.properties.iter() {
+        for property in &self.plugin.properties {
             if let PluginProperties::ThreadNum(thread_num) = property {
                 max_concurrent_downloads =
                     (*thread_num).try_into().unwrap_or(MAX_CONCURRENT_DOWNLOADS);
@@ -187,7 +191,7 @@ impl Scraper {
                 continue 'scraperloop;
             }
 
-            for param in scrap_data.job.param.iter() {
+            for param in &scrap_data.job.param {
                 let scraper = self.clone();
                 let param_clone = param.clone();
                 if let Ok(Some((text, source_url))) =
@@ -238,7 +242,7 @@ impl Scraper {
                                     let should_remove_job_clone = should_remove_job.clone();
                                     let job_list_clone = job_list.clone();
                                     let semaphore_clone = semaphore.clone();
-                                    let permit = semaphore_clone.acquire_owned().await.unwrap();
+                                    let permit = semaphore_clone.acquire_owned().await?;
                                     set.spawn(async move {
                                         let mut download_issue = false;
                                         let mut jobs = Vec::new();
@@ -272,7 +276,7 @@ impl Scraper {
                                         memory_manage();
                                     });
 
-                                    while let Some(Ok(_)) = set.try_join_next() {
+                                    while matches!(set.try_join_next(), Some(Ok(()))) {
                                         // Explicitly drains finished tasks to release internal tracking heap allocations
                                     }
                                 }
@@ -303,7 +307,9 @@ impl Scraper {
                 } else {
                     should_remove_job.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
-            } // Do all our happy db stuff down here :D
+            }
+
+            // Do all our happy db stuff down here :D
             let file_id_tag_map = Arc::try_unwrap(file_id_tag_map)
                 .expect("Arc reference leak")
                 .into_inner();
@@ -364,6 +370,7 @@ impl Scraper {
 
         // Cleans up memory
         memory_manage();
+        Ok(())
     }
 
     async fn manage_recreation(&self) -> bool {
@@ -415,7 +422,7 @@ impl Scraper {
         let url = match Url::parse(file_url) {
             Ok(u) => u,
             Err(err) => {
-                log::error!("Error while parsing url {} {:?}", file_url, err);
+                log::error!("Error while parsing url {file_url} {err:?}");
                 return None;
             }
         };
@@ -466,7 +473,7 @@ impl Scraper {
             let mut file = match File::create(&temp_file_path).await {
                 Ok(f) => f,
                 Err(err) => {
-                    log::error!("Failed to create temporary file: {:?}", err);
+                    log::error!("Failed to create temporary file: {err:?}");
                     return None;
                 }
             };
@@ -480,7 +487,7 @@ impl Scraper {
                     Ok(Some(chunk)) => {
                         downloaded_bytes_count += chunk.len();
                         if let Err(err) = file.write_all(&chunk).await {
-                            log::error!("Failed to write chunk to disk: {:?}", err);
+                            log::error!("Failed to write chunk to disk: {err:?}");
                             stream_failed = true;
                             break;
                         }
@@ -591,7 +598,7 @@ impl Scraper {
             None => return None,
             Some(ref url_source) => match url_source {
                 FileSource::Url(file_url) => {
-                    match self
+                    if let Some(file_id) = self
                         .download_manager
                         .db
                         .tag_get_file_id(&Tag {
@@ -603,53 +610,50 @@ impl Scraper {
                         })
                         .await
                     {
-                        Some(file_id) => {
-                            info!(
-                                "Scraper: {} JobId: {} Skipping file because already in db.",
-                                self.plugin.name, self.job.id
-                            );
-                            return self.download_manager.db.file_id_get(file_id).await;
-                        }
-                        None => {
-                            file.tag_list.push(FileTagAction {
-                                operation: TagOperation::Add,
-                                tags: vec![PluginTag {
-                                    tag: Tag {
-                                        name: file_url.to_string(),
-                                        namespace: GenericNamespaceObj {
-                                            name: "source_url".into(),
-                                            description: Some("A source for a file".into()),
-                                        },
+                        info!(
+                            "Scraper: {} JobId: {} Skipping file because already in db.",
+                            self.plugin.name, self.job.id
+                        );
+                        return self.download_manager.db.file_id_get(file_id).await;
+                    } else {
+                        file.tag_list.push(FileTagAction {
+                            operation: TagOperation::Add,
+                            tags: vec![PluginTag {
+                                tag: Tag {
+                                    name: file_url.clone(),
+                                    namespace: GenericNamespaceObj {
+                                        name: "source_url".into(),
+                                        description: Some("A source for a file".into()),
                                     },
-                                    ..Default::default()
-                                }],
-                            });
+                                },
+                                ..Default::default()
+                            }],
+                        });
 
-                            for skip in file.skip_if.iter() {
-                                if let SkipIf::FileTagRelationship(tag) = skip
-                                    && let Some(file_id) =
-                                        self.download_manager.db.tag_get_file_id(tag).await
-                                    && let Some(file_internal) =
-                                        self.download_manager.db.file_id_get(file_id).await
-                                {
-                                    return Some(file_internal);
-                                }
+                        for skip in &file.skip_if {
+                            if let SkipIf::FileTagRelationship(tag) = skip
+                                && let Some(file_id) =
+                                    self.download_manager.db.tag_get_file_id(tag).await
+                                && let Some(file_internal) =
+                                    self.download_manager.db.file_id_get(file_id).await
+                            {
+                                return Some(file_internal);
                             }
+                        }
 
-                            if self.should_download_file(file_url).await {
-                                // Calls disk streaming download helper
-                                if let Some(path_out) = self_clone
-                                    .download_file(file_url, &file.hash, temp_dir)
-                                    .await
-                                {
-                                    TrackedFile::Temp(path_out)
-                                } else {
-                                    *download_issue = true;
-                                    return None;
-                                }
+                        if self.should_download_file(file_url).await {
+                            // Calls disk streaming download helper
+                            if let Some(path_out) = self_clone
+                                .download_file(file_url, &file.hash, temp_dir)
+                                .await
+                            {
+                                TrackedFile::Temp(path_out)
                             } else {
+                                *download_issue = true;
                                 return None;
                             }
+                        } else {
+                            return None;
                         }
                     }
                 }
@@ -677,7 +681,7 @@ impl Scraper {
                 let bytes = Bytes::from(std::fs::read(&temp_file_path).ok().unwrap());
 
                 // 2. Compute format and layout
-                let hash = hash_bytes(&bytes, &HashesSupported::Sha512("".into())).0;
+                let hash = hash_bytes(&bytes, &HashesSupported::Sha512(String::new())).0;
                 let extension = FileFormat::from_bytes(&bytes).extension().to_string();
 
                 let file_download_location = self
@@ -745,7 +749,7 @@ impl DownloadsManager {
         heavy_processing_pool: Arc<ThreadPool>,
         should_exit: Arc<AtomicBool>,
     ) -> Arc<Self> {
-        let dm = DownloadsManager {
+        let dm = Self {
             db,
             plugin_manager,
             jobs: HashMap::new().into(),
@@ -762,21 +766,18 @@ impl DownloadsManager {
     fn load_logins(&self, plugin: &Plugin) -> Vec<ScraperParam> {
         let mut out = Vec::new();
 
-        for property in plugin.properties.iter() {
-            if let PluginProperties::Login((loginneed, logintype)) = property {
-                match logintype {
-                    LoginType::Cookie(name, _) => {
-                        if let Some(api_key) = self
-                            .db
-                            .setting_get_sync(&format!("PLUGIN_{}_{}_COOKIE", plugin.name, name))
-                        {
-                            out.push(ScraperParam::Login(LoginType::Cookie(
-                                name.to_string(),
-                                Some(api_key.param.unwrap()),
-                            )));
-                        }
+        for property in &plugin.properties {
+            if let PluginProperties::Login((_loginneed, logintype)) = property {
+                if let LoginType::Cookie(name, _) = logintype {
+                    if let Some(api_key) = self
+                        .db
+                        .setting_get_sync(&format!("PLUGIN_{}_{}_COOKIE", plugin.name, name))
+                    {
+                        out.push(ScraperParam::Login(LoginType::Cookie(
+                            name.clone(),
+                            Some(api_key.param.unwrap()),
+                        )));
                     }
-                    _ => {}
                 }
             }
         }
@@ -833,7 +834,7 @@ impl DownloadsManager {
     ) {
         let mut jobs_guard = self.jobs.write().await;
 
-        for (plugin, job_storage) in jobs.iter() {
+        for (plugin, job_storage) in &jobs {
             if let Some(internal_storage) = jobs_guard.get_mut(&plugin.name) {
                 // Check if the worker loop had previously died/retired by verifying if storage was empty
                 let needs_resurrection = internal_storage.job_storage.is_empty();
@@ -863,14 +864,13 @@ impl DownloadsManager {
             } else {
                 // Sets up ratelimit for job
                 let mut ratelimit = None;
-                for properties in plugin.properties.iter() {
+                for properties in &plugin.properties {
                     if let PluginProperties::Ratelimit(num, duration) = properties {
                         let hits = *num;
                         let total_duration = *duration;
 
                         info!(
-                            "DownloadManager: Creating Ratelimiter with properties: {} tries per: {:?}",
-                            hits, total_duration
+                            "DownloadManager: Creating Ratelimiter with properties: {hits} tries per: {total_duration:?}"
                         );
 
                         // Guard against division by zero just in case
@@ -897,7 +897,7 @@ impl DownloadsManager {
                         Quota::with_period(Duration::from_secs(1))
                             .unwrap()
                             .allow_burst(std::num::NonZeroU32::new(1).unwrap()),
-                    )
+                    );
                 }
 
                 // Check if we need to load login data
@@ -905,7 +905,7 @@ impl DownloadsManager {
 
                 // Loads login parameters from db into job
                 let mut job_storage = job_storage.clone();
-                for job in job_storage.iter_mut() {
+                for job in &mut job_storage {
                     for login in self.load_logins(plugin) {
                         job.config.param.push(login);
                     }
@@ -915,7 +915,7 @@ impl DownloadsManager {
                     plugin.name.clone(),
                     InternalStorage {
                         plugin: plugin.clone(),
-                        job_storage: job_storage.to_vec(),
+                        job_storage: job_storage.clone(),
                         ratelimiter: Arc::new(governor::RateLimiter::direct(ratelimit.unwrap())),
                         completed_job_storage: vec![],
                         file_urls: HashSet::new(),
@@ -934,8 +934,8 @@ impl DownloadsManager {
     ///
     /// Handles loading in login information into the db
     ///
-    fn handle_login_db(self: &Arc<Self>, plugin: &Plugin) {
-        for property in plugin.properties.iter() {
+    fn handle_login_db(self: &Arc<Self>, plugin: &Plugin) -> Result<(), Box<dyn Error>> {
+        for property in &plugin.properties {
             if let PluginProperties::Login((login_need, login_type)) = property
                 && login_need == &LoginNeed::Required
             {
@@ -950,25 +950,21 @@ impl DownloadsManager {
                             let mut user_name = String::new();
                             print!("Api Key: ");
                             let _ = stdout().flush();
-                            stdin()
-                                .read_line(&mut user_name)
-                                .expect("Did not enter a correct string");
-                            if let Some('\n') = user_name.chars().next_back() {
+                            stdin().read_line(&mut user_name)?;
+                            if user_name.ends_with('\n') {
                                 user_name.pop();
                             }
-                            if let Some('\r') = user_name.chars().next_back() {
+                            if user_name.ends_with('\r') {
                                 user_name.pop();
                             }
                             let mut user_pass = String::new();
                             print!("Password: ");
                             let _ = stdout().flush();
-                            stdin()
-                                .read_line(&mut user_pass)
-                                .expect("Did not enter a correct string");
-                            if let Some('\n') = user_pass.chars().next_back() {
+                            stdin().read_line(&mut user_pass)?;
+                            if user_pass.ends_with('\n') {
                                 user_pass.pop();
                             }
-                            if let Some('\r') = user_pass.chars().next_back() {
+                            if user_pass.ends_with('\r') {
                                 user_pass.pop();
                             }
                             self.db.setting_set_sync(&DbSettingsObj {
@@ -996,46 +992,42 @@ impl DownloadsManager {
                     {
                         dbg!(&key, &api);
                     }
-                    LoginType::Cookie(cookie_name, help_text) => {
+                    LoginType::Cookie(cookie_name, help_text)
                         if self
                             .db
                             .setting_get_sync(&format!(
                                 "PLUGIN_{}_{}_{}",
                                 plugin.name, cookie_name, "COOKIE"
                             ))
-                            .is_none()
-                        {
-                            let mut user_name = String::new();
-                            if let Some(help_text) = help_text {
-                                println!("{}", help_text);
-                            }
-                            print!("Cookie: ");
-                            let _ = stdout().flush();
-                            stdin()
-                                .read_line(&mut user_name)
-                                .expect("Did not enter a correct string");
-                            if let Some('\n') = user_name.chars().next_back() {
-                                user_name.pop();
-                            }
-                            if let Some('\r') = user_name.chars().next_back() {
-                                user_name.pop();
-                            }
-
-                            self.db.setting_set_sync(&DbSettingsObj {
-                                name: format!(
-                                    "PLUGIN_{}_{}_{}",
-                                    plugin.name, cookie_name, "COOKIE"
-                                ),
-                                description: Some("Cookie for site..".into()),
-                                num: None,
-                                param: Some(user_name),
-                            });
+                            .is_none() =>
+                    {
+                        let mut user_name = String::new();
+                        if let Some(help_text) = help_text {
+                            println!("{help_text}");
                         }
+                        print!("Cookie: ");
+                        let _ = stdout().flush();
+                        stdin().read_line(&mut user_name)?;
+                        if user_name.ends_with('\n') {
+                            user_name.pop();
+                        }
+                        if user_name.ends_with('\r') {
+                            user_name.pop();
+                        }
+
+                        self.db.setting_set_sync(&DbSettingsObj {
+                            name: format!("PLUGIN_{}_{}_{}", plugin.name, cookie_name, "COOKIE"),
+                            description: Some("Cookie for site..".into()),
+                            num: None,
+                            param: Some(user_name),
+                        });
                     }
                     _ => {}
                 }
             }
         }
+
+        Ok(())
     }
 
     ///
@@ -1048,8 +1040,7 @@ impl DownloadsManager {
             let Some(scraper_internal) = guard.get_mut(&scraper_name) else {
                 // The storage for this site was deleted entirely. Kill this worker task.
                 info!(
-                    "DownloadManager: Internal storage for {} removed. Killing worker loop.",
-                    scraper_name
+                    "DownloadManager: Internal storage for {scraper_name} removed. Killing worker loop."
                 );
                 break;
             };
@@ -1057,19 +1048,17 @@ impl DownloadsManager {
             // 1. If there are literally no jobs tracked in memory, kill this thread.
             if scraper_internal.job_storage.is_empty() {
                 info!(
-                    "DownloadManager: No jobs remaining in memory for {}. Retiring worker loop.",
-                    scraper_name
+                    "DownloadManager: No jobs remaining in memory for {scraper_name}. Retiring worker loop."
                 );
                 break;
             }
 
-            let permit = match self.job_limiter.clone().try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => {
-                    drop(guard);
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    continue;
-                }
+            let permit = if let Ok(p) = self.job_limiter.clone().try_acquire_owned() {
+                p
+            } else {
+                drop(guard);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
             };
 
             // 2. Look for an idle job
@@ -1106,7 +1095,7 @@ impl DownloadsManager {
 
                 tokio::task::spawn(async move {
                     let _permit = permit;
-                    scraper.run_scraper().await
+                    scraper.run_scraper().await;
                 });
             } else {
                 // All jobs are currently actively running. Wait a bit for them to finish.
@@ -1123,10 +1112,10 @@ pub fn hash_bytes(bytes: &Bytes, hash: &HashesSupported) -> (String, bool) {
             let digest = md5::compute(bytes);
 
             // let sharedtypes::HashesSupported(hashe, _) => hash;
-            if &format!("{:x}", digest) != hash {
-                info!("Parser returned: {} Got: {:?}", hash, digest);
+            if &format!("{digest:x}") != hash {
+                info!("Parser returned: {hash} Got: {digest:?}");
             }
-            (format!("{:x}", digest), &format!("{:x}", digest) == hash)
+            (format!("{digest:x}"), &format!("{digest:x}") == hash)
         }
         HashesSupported::Sha1(hash) => {
             let mut hasher = sha1::Sha1::new();
@@ -1134,7 +1123,7 @@ pub fn hash_bytes(bytes: &Bytes, hash: &HashesSupported) -> (String, bool) {
             let hastring = encode_upper(hasher.finalize());
             let dune = &hastring == hash;
             if !dune && !hash.is_empty() {
-                info!("Parser returned: {} Got: {}", hash, hastring);
+                info!("Parser returned: {hash} Got: {hastring}");
             }
             (hastring, dune)
         }
@@ -1144,7 +1133,7 @@ pub fn hash_bytes(bytes: &Bytes, hash: &HashesSupported) -> (String, bool) {
             let hastring = encode_upper(hasher.finalize());
             let dune = &hastring == hash;
             if !dune && !hash.is_empty() {
-                info!("Parser returned: {} Got: {}", hash, hastring);
+                info!("Parser returned: {hash} Got: {hastring}");
             }
             (hastring, dune)
         }
@@ -1153,7 +1142,7 @@ pub fn hash_bytes(bytes: &Bytes, hash: &HashesSupported) -> (String, bool) {
             let hastring = encode_upper(hasher);
             let dune = &hastring == hash;
             if !dune && !hash.is_empty() {
-                info!("Parser returned: {} Got: {}", hash, hastring);
+                info!("Parser returned: {hash} Got: {hastring}");
             }
             (hastring, dune)
         }

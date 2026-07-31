@@ -10,9 +10,13 @@ use std::{
 use bytes::Bytes;
 use libloading::Library;
 
-use log::*;
+use log::{error, info};
 use parking_lot::RwLock;
-use shared_types::*;
+use shared_types::{
+    CallbackCustomData, CallbackCustomDataReturning, CallbackInfo, CallbackInfoInput,
+    CallbackReturn, DbJobsObj, FileTagAction, GlobalCallbacks, Plugin, PluginProperties,
+    ScraperDataReturn, StartupThreadType,
+};
 
 use crate::db::MainDatabase;
 
@@ -34,7 +38,7 @@ impl Drop for PluginManager {
         for thread in threads_to_join {
             // Now we own the handle and can safely call .join()
             if let Err(err) = thread.join() {
-                log::error!("PluginManager thread had error {:?}", err);
+                log::error!("PluginManager thread had error {err:?}");
             }
         }
     }
@@ -42,7 +46,7 @@ impl Drop for PluginManager {
 
 impl PluginManager {
     pub fn new(path: &Path, db: Arc<MainDatabase>, should_exit: Arc<AtomicBool>) -> Arc<Self> {
-        let plugin_manager = PluginManager {
+        let plugin_manager = Self {
             storage: HashMap::new().into(),
             storage_libs: HashMap::new().into(),
             storage_site: HashMap::new().into(),
@@ -85,7 +89,7 @@ impl PluginManager {
 
             let extension = path.extension().and_then(|s| s.to_str());
             match extension {
-                Some("so") | Some("dll") | Some("dylib") => {
+                Some("so" | "dll" | "dylib") => {
                     info!("🚚 Found plugin candidate: {:?}", path.file_name().unwrap());
 
                     unsafe {
@@ -99,7 +103,7 @@ impl PluginManager {
                                     .insert(plugin.name.clone(), lib.clone());
 
                                 // Loads sites into storage
-                                for property in plugin.properties.iter() {
+                                for property in &plugin.properties {
                                     if let PluginProperties::Sites(site_list) = property {
                                         for site in site_list {
                                             self.storage_site
@@ -109,14 +113,14 @@ impl PluginManager {
                                     }
                                 }
 
-                                for callback in plugin.callbacks.iter() {
+                                for callback in &plugin.callbacks {
                                     if let Some(site_list) =
                                         self.storage_callbacks.write().get_mut(callback)
                                     {
-                                        site_list.insert(plugin.name.to_string());
+                                        site_list.insert(plugin.name.clone());
                                     } else {
                                         let mut list = HashSet::new();
-                                        list.insert(plugin.name.to_string());
+                                        list.insert(plugin.name.clone());
                                         self.storage_callbacks
                                             .write()
                                             .insert(callback.clone(), list);
@@ -159,7 +163,7 @@ impl PluginManager {
     pub fn match_plugin(&self, jobs: &[DbJobsObj]) -> HashMap<Plugin, Vec<DbJobsObj>> {
         let mut out: HashMap<Plugin, Vec<DbJobsObj>> = HashMap::new();
 
-        for job in jobs.iter() {
+        for job in jobs {
             if let Some(job_name_mapping) = self.storage_site.read().get(&job.config.site)
                 && let Some(plugin) = self.storage.read().get(job_name_mapping)
             {
@@ -233,7 +237,7 @@ impl PluginManager {
     }
 
     ///
-    /// After file downloading run callbacks for on_download
+    /// After file downloading run callbacks for `on_download`
     ///
     pub fn callback_on_download(
         &self,
@@ -253,8 +257,7 @@ impl PluginManager {
                             match lib.get(b"on_download") {
                                 Err(err) => {
                                     error!(
-                                        "Plugins: {} could not call 'on_download' got error: {:?}",
-                                        plugin_name, err
+                                        "Plugins: {plugin_name} could not call 'on_download' got error: {err:?}"
                                     );
                                     continue;
                                 }
@@ -312,8 +315,7 @@ impl PluginManager {
                             match lib.get(func_name) {
                                 Err(err) => {
                                     error!(
-                                        "Plugins: {} could not call {func_name} got error: {:?}",
-                                        plugin_name, err
+                                        "Plugins: {plugin_name} could not call {func_name} got error: {err:?}"
                                     );
                                     continue;
                                 }
@@ -332,7 +334,7 @@ impl PluginManager {
     }
 
     ///
-    /// Runs callback on_start
+    /// Runs callback `on_start`
     ///
     pub fn callback_on_start(&self) {
         // Spawns each plugin and waits till its finished before the next plugin gets called
@@ -348,8 +350,7 @@ impl PluginManager {
                             match lib.get(b"on_start") {
                                 Err(err) => {
                                     error!(
-                                        "Plugins: {} could not call 'on_download' got error: {:?}",
-                                        plugin_name, err
+                                        "Plugins: {plugin_name} could not call 'on_download' got error: {err:?}"
                                     );
                                     continue;
                                 }
@@ -380,7 +381,7 @@ impl PluginManager {
                                     temp();
                                 }
                                 Err(err) => {
-                                    error!("Plugins: background execution for '{}' failed to load symbol: {:?}", name_log, err);
+                                    error!("Plugins: background execution for '{name_log}' failed to load symbol: {err:?}");
                                 }
                             }
                         }
@@ -408,7 +409,7 @@ impl PluginManager {
                                     temp();
                                 }
                                 Err(err) => {
-                                    error!("Plugins: background execution for '{}' failed to load symbol: {:?}", name_log, err);
+                                    error!("Plugins: background execution for '{name_log}' failed to load symbol: {err:?}");
                                 }
                             }
                         }
