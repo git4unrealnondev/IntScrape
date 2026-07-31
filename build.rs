@@ -1,11 +1,12 @@
 use std::env;
+use std::error::Error;
 use std::fs::{self, create_dir_all};
 use std::path::Path;
 use std::process::Command;
 
-fn main() {
+fn main() -> Result<(), Box<dyn Error>> {
     if Ok("debug".to_owned()) == env::var("PROFILE") {
-        return;
+        return Ok(());
     }
 
     let plugins_dir = Path::new("plugins");
@@ -15,27 +16,29 @@ fn main() {
 
     if !plugins_dir.exists() {
         println!(
-            "cargo:warning=Plugins directory not found at {:?}",
-            plugins_dir
+            "cargo:warning=Plugins directory not found at {}",
+            plugins_dir.to_string_lossy()
         );
-        return;
+        return Err("Missing plugins directory".into());
     }
 
     // Create our clean final output directory
     let final_output_dir = Path::new("compiled_plugins");
-    create_dir_all(final_output_dir).expect("Failed to create final output dir");
+    create_dir_all(final_output_dir)?;
 
     // Use a hidden or separate target folder for cargo's messy build cache
     let intermediate_target_dir = "target/plugins_intermediate";
-    create_dir_all(intermediate_target_dir).expect("Failed to create intermediate target dir");
+    create_dir_all(intermediate_target_dir)?;
 
-    let entries = fs::read_dir(plugins_dir)
-        .expect("Failed to read plugins directory")
-        .filter_map(|e| e.ok())
+    let entries = fs::read_dir(plugins_dir)?
+        .filter_map(std::result::Result::ok)
         .filter(|e| e.path().is_dir());
 
     for entry in entries {
-        let plugin_name = entry.file_name().into_string().unwrap();
+        let plugin_name: String = match entry.file_name().into_string() {
+            Ok(out) => out,
+            Err(_) => continue,
+        };
 
         if plugin_name.starts_with('.') {
             continue;
@@ -51,10 +54,7 @@ fn main() {
             );
         }
 
-        println!(
-            "cargo:warning=Building plugin workspace member: {}",
-            plugin_name
-        );
+        println!("cargo:warning=Building plugin workspace member: {plugin_name}");
 
         // 1. Build the plugin into the intermediate directory
         let status = Command::new("cargo")
@@ -68,23 +68,22 @@ fn main() {
                 "--target-dir",
                 intermediate_target_dir,
             ])
-            .status()
-            .expect("Failed to run cargo build for plugin");
+            .status()?;
 
         if !status.success() {
-            panic!("Failed to compile plugin: {}", plugin_name);
+            return Err(format!("Failed to compile plugin: {plugin_name}").into());
         }
 
         // 2. Locate the compiled artifact
         // Adjust these filenames if your plugins are dynamic libraries (.so / .dll / .dylib)
         // instead of standard binary executables!
-        let plugin_name = plugin_name.replace("-", "_");
+        let plugin_name = plugin_name.replace('-', "_");
         let binary_name = if cfg!(windows) {
-            format!("{}.dll", plugin_name)
+            format!("{plugin_name}.dll")
         } else if cfg!(target_os = "macos") {
-            format!("lib{}.dylib", plugin_name)
+            format!("lib{plugin_name}.dylib")
         } else {
-            format!("lib{}.so", plugin_name)
+            format!("lib{plugin_name}.so")
         };
 
         let built_binary_path = Path::new(intermediate_target_dir)
@@ -95,25 +94,26 @@ fn main() {
 
         if built_binary_path.exists() {
             // 3. Copy the fresh binary to your clean `compiled_plugins` folder
-            fs::copy(&built_binary_path, &destination_path)
-                .expect("Failed to copy compiled plugin to final destination");
+            fs::copy(&built_binary_path, &destination_path)?;
+            // .expect("Failed to copy compiled plugin to final destination");
 
             // 4. Strip symbols out of the copied binary to minimize file size
-            println!("cargo:warning=Stripping symbols from {}", binary_name);
+            println!("cargo:warning=Stripping symbols from {binary_name}");
 
             let strip_status = Command::new("strip").arg(&destination_path).status();
 
             // If the system doesn't have 'strip' (like a bare Windows machine), log a warning instead of crashing
-            if strip_status.is_err() || !strip_status.unwrap().success() {
+            if strip_status.is_err() || !strip_status.is_ok_and(|f| f.success()) {
                 println!(
                     "cargo:warning=Could not strip binary (unsupported OS or missing 'strip' utility). File copied un-stripped."
                 );
             }
         } else {
             println!(
-                "cargo:warning=Expected binary missing at {:?}",
-                built_binary_path
+                "cargo:warning=Expected binary missing at {}",
+                built_binary_path.to_string_lossy()
             );
         }
     }
+    Ok(())
 }

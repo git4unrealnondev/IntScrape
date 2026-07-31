@@ -4,7 +4,11 @@ use log::info;
 use r2d2_sqlite::rusqlite::OptionalExtension;
 use r2d2_sqlite::rusqlite::{self, Connection, Row, params};
 use rusqlite::{ToSql, Transaction};
-use shared_types::*;
+use shared_types::{
+    DbJobRecreation, DbJobsObj, DbSettingsObj, FileInternal, FileTagAction, GenericNamespaceObj,
+    HashesSupported, PluginJob, PluginTag, ScraperDataReturn, ScraperParam, SearchHolder,
+    SearchObj, SkipIf, Tag, TagOperation, TagSearch, TagType,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -72,7 +76,7 @@ impl DbJobsObjExt for DbJobsObj {
         };
 
         // Reconstruct the master database object
-        Ok(DbJobsObj {
+        Ok(Self {
             id: row.get::<_, i64>("id")? as u64,
             isrunning: row.get::<_, bool>("is_running")?,
             config,
@@ -242,6 +246,7 @@ END;
     ///
     /// Gets namespace id if it exists
     ///
+    #[must_use]
     pub fn search_db_namespace_sync(&self, name: &String) -> Option<u64> {
         let conn = self.pool.get().unwrap();
 
@@ -257,10 +262,11 @@ END;
     ///
     /// Gets a list of tags where the tag and limits the number of returnees
     ///
+    #[must_use]
     pub fn search_db_tags_fts(&self, tag: &str, limit: &Option<u64>) -> Vec<TagSearch> {
         let conn = self.pool.get().unwrap();
         let cleaned_tag = tag.trim().replace('"', "\"\"");
-        let fts_query = format!("\"{}\"", cleaned_tag);
+        let fts_query = format!("\"{cleaned_tag}\"");
         let max_rows = limit.unwrap_or(10);
 
         // Join FTS results back to real tables to hydrate Namespace name
@@ -560,6 +566,7 @@ ON Jobs (time, reptime, site, param);
         .unwrap();
     }
 
+    #[must_use]
     pub fn file_get_physical_path_sync(&self, file_id: &u64) -> Option<String> {
         let conn = self.pool.get().unwrap();
         Self::internal_file_get_physical_path(&conn, file_id).ok()?
@@ -683,7 +690,7 @@ ON Jobs (time, reptime, site, param);
     }
 
     ///
-    /// Gets all file_ids associated with a tag with namespace id x
+    /// Gets all `file_ids` associated with a tag with namespace id x
     ///
     pub(in crate::db) fn internal_file_id_get_namespace_id_sync(
         conn: &Connection,
@@ -745,7 +752,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     }
 
     ///
-    /// Gets a single file_id from a tag
+    /// Gets a single `file_id` from a tag
     ///
     pub(in crate::db) fn internal_tag_get_file_id(conn: &Connection, tag: &Tag) -> Option<u64> {
         if let Some(ns_id) = Self::internal_namespace_get_id(conn, &tag.namespace.name)
@@ -758,7 +765,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     }
 
     ///
-    /// Gets a single file_internal from a tag
+    /// Gets a single `file_internal` from a tag
     ///
     pub(in crate::db) fn internal_tag_get_fileinternal(
         conn: &Connection,
@@ -775,7 +782,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     }
 
     ///
-    /// Gets a file_id from a tag_id
+    /// Gets a `file_id` from a `tag_id`
     ///
     pub(in crate::db) fn internal_tag_id_get_file_id(
         conn: &Connection,
@@ -789,7 +796,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     }
 
     ///
-    /// Gets tag_ids for file_ids
+    /// Gets `tag_ids` for `file_ids`
     ///
     pub(in crate::db) fn internal_file_id_get_tag_ids(
         conn: &Connection,
@@ -818,19 +825,22 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
         out.collect()
     }
 
+    #[must_use]
     pub fn tag_get_file_sync(&self, tag: &Tag) -> Option<FileInternal> {
         let conn = self.pool.get().unwrap();
         Self::internal_tag_get_fileinternal(&conn, tag)
     }
 
     ///
-    /// Gets all file_ids with tags that have namespace id
+    /// Gets all `file_ids` with tags that have namespace id
     ///
+    #[must_use]
     pub fn file_id_get_namespace_id_sync(&self, namespace_id: &u64) -> Vec<u64> {
         let conn = self.pool.get().unwrap();
         Self::internal_file_id_get_namespace_id_sync(&conn, namespace_id).unwrap_or_default()
     }
 
+    #[must_use]
     pub fn internal_file_id_get_tag_ids_where_namespace_id_sync(
         &self,
         file_id: &u64,
@@ -843,8 +853,9 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     }
 
     ///
-    /// Adds a relationship between a file_id and tag_id
+    /// Adds a relationship between a `file_id` and `tag_id`
     ///
+    #[must_use]
     pub fn file_relationship_tags_add_sync(&self, file_id: &u64, tag: &[FileTagAction]) -> bool {
         let mut guard = self.writer_conn.lock();
         let conn = guard.transaction().unwrap();
@@ -862,6 +873,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     /// Gets all file ids inside of the db.
     /// #Safety Returns None if an error occurs
     ///
+    #[must_use]
     pub fn file_id_get_all_sync(&self) -> Vec<u64> {
         let conn = self.pool.get().unwrap();
 
@@ -869,7 +881,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     }
 
     ///
-    /// Gets filtered tag_ids for a fileid filters by nsid
+    /// Gets filtered `tag_ids` for a fileid filters by nsid
     ///
     pub(in crate::db) fn internal_file_id_get_tag_ids_where_namespace_id(
         conn: &Connection,
@@ -896,7 +908,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     }
 
     ///
-    /// Builds a list of file -> tag_id maps
+    /// Builds a list of file -> `tag_id` maps
     ///
     pub(in crate::db) fn internal_file_id_get_tag_ids_bulk(
         conn: &Connection,
@@ -932,13 +944,14 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
         Ok(out)
     }
 
+    #[must_use]
     pub fn tag_id_get_tag_sync(&self, tags: &HashSet<u64>) -> HashMap<u64, Tag> {
         let conn = self.pool.get().unwrap();
         Self::internal_tag_id_get_tag(&conn, tags)
     }
 
     ///
-    /// Checks if the relationship structure defined inside a single PluginTag exists.
+    /// Checks if the relationship structure defined inside a single `PluginTag` exists.
     ///
     pub(in crate::db) fn internal_parent_structure_exists(
         conn: &Connection,
@@ -1099,7 +1112,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     }
 
     ///
-    /// Gets tags for file_ids
+    /// Gets tags for `file_ids`
     ///
     pub(in crate::db) fn internal_file_ids_get_tags(
         conn: &Connection,
@@ -1313,7 +1326,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
         conn: &Connection,
         job_id: u64,
     ) -> Result<(), rusqlite::Error> {
-        info!("JobId: {} Is being removed.", job_id);
+        info!("JobId: {job_id} Is being removed.");
         conn.execute("DELETE FROM Jobs WHERE id IS ?1;", params![job_id])
             .unwrap();
 
@@ -1406,17 +1419,17 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     pub(in crate::db) fn internal_file_download_location_get(
         conn: &Connection,
     ) -> Result<(PathBuf, u64), rusqlite::Error> {
-        let target_location = match Self::internal_setting_get(conn, "SYSTEM_file_location")? {
-            Some(setting) => match setting.param {
-                Some(param) => param,
-                None => "files".to_string(), // Fallback if param is null
-            },
-            None => {
+        let target_location =
+            if let Some(setting) = Self::internal_setting_get(conn, "SYSTEM_file_location")? {
+                match setting.param {
+                    Some(param) => param,
+                    None => "files".to_string(), // Fallback if param is null
+                }
+            } else {
                 // No setting found at all; initialize the system defaults
                 Self::internal_file_download_location_set_default(conn)?;
                 "files".to_string()
-            }
-        };
+            };
 
         let path_id = Self::internal_file_storage_location_get_or_create(conn, &target_location)?;
 
@@ -1707,7 +1720,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         {
             let mut guard = self.relationship_roaring_storage.write();
             if let Some(roaring) = guard.as_mut() {
-                for (file_id, tag_id) in relationships.iter() {
+                for (file_id, tag_id) in relationships {
                     roaring.remove_roaring(conn, *tag_id, *file_id);
                 }
             }
@@ -1744,7 +1757,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         {
             let mut guard = self.relationship_roaring_storage.write();
             if let Some(roaring) = guard.as_mut() {
-                for (file_id, tag_id) in relationships.iter() {
+                for (file_id, tag_id) in relationships {
                     roaring.relationship_roaring_add(conn, *file_id, *tag_id);
                 }
             }
@@ -1768,7 +1781,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             }
 
             if let Err(e) = conn.execute(&query, &*params_vector) {
-                log::error!("Failed to bulk insert relationships: {}", e);
+                log::error!("Failed to bulk insert relationships: {e}");
                 return;
             }
         }
@@ -1920,12 +1933,11 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             match limit_to {
                 Some(limit_id) => {
                     println!(
-                        "Tag ID: {} -> Relate Tag ID: {} (Limited To: {})",
-                        tag_id, relate_tag_id, limit_id
+                        "Tag ID: {tag_id} -> Relate Tag ID: {relate_tag_id} (Limited To: {limit_id})"
                     );
                 }
                 None => {
-                    println!("Tag ID: {} -> Relate Tag ID: {}", tag_id, relate_tag_id);
+                    println!("Tag ID: {tag_id} -> Relate Tag ID: {relate_tag_id}");
                 }
             }
         }
@@ -1984,7 +1996,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         let mut valid_paths = HashSet::new();
 
         // Fixes storage IDs inside of the db.
-        'fileloop: for file in files.iter() {
+        'fileloop: for file in &files {
             if let Some(file_path) = self.get_file_location(file, &file_storage_map) {
                 valid_paths.insert(file_path);
                 continue 'fileloop;
@@ -2025,11 +2037,14 @@ SELECT id, name, namespace FROM High_Value_Tags;",
 
             if CheckFilesEnum::Print == *action {
                 for (hash, _) in file_hash {
-                    info!("Just printing the missing file: {}", hash);
+                    info!("Just printing the missing file: {hash}");
                 }
             } else if CheckFilesEnum::StorageCheck == *action {
-                for (storage_id, storage_loc) in file_storage_map.iter() {
-                    for entry in WalkDir::new(storage_loc).into_iter().filter_map(|e| e.ok()) {
+                for (storage_id, storage_loc) in &file_storage_map {
+                    for entry in WalkDir::new(storage_loc)
+                        .into_iter()
+                        .filter_map(std::result::Result::ok)
+                    {
                         // Skips existing files
                         if valid_paths.contains(&entry.path().to_path_buf()) {
                             continue;
@@ -2042,7 +2057,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                             }
                         };
                         let bytes = &Bytes::from(file);
-                        let (hash, _) = hash_bytes(bytes, &HashesSupported::Sha512("".into()));
+                        let (hash, _) = hash_bytes(bytes, &HashesSupported::Sha512(String::new()));
 
                         if let Some(file_extension) = file_hash.get(&hash)
                             && let Some(base_file_path) = file_storage_map.get(storage_id)
@@ -2105,8 +2120,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                     && status
                 {
                     info!(
-                        "DB Skipping adding job due to relate_to and limit_to exists {:?} {:?}",
-                        relate_to, limit_to
+                        "DB Skipping adding job due to relate_to and limit_to exists {relate_to:?} {limit_to:?}"
                     );
                     return true;
                 }
@@ -2115,10 +2129,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 if let Ok(status) = Self::internal_parent_structure_exists(conn, &plugin_tag)
                     && status
                 {
-                    info!(
-                        "DB Skipping adding job due to Parent existing {:?}",
-                        plugin_tag
-                    );
+                    info!("DB Skipping adding job due to Parent existing {plugin_tag:?}");
                     return true;
                 }
             }
@@ -2129,8 +2140,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                     && Self::internal_tag_has_files(conn, tag_id)
                 {
                     info!(
-                        "DB Skipping adding job due to FileTagRelationship tag_id: {} having files.",
-                        tag_id
+                        "DB Skipping adding job due to FileTagRelationship tag_id: {tag_id} having files."
                     );
                     return true;
                 }
@@ -2153,7 +2163,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             let conn = match pool.get() {
                 Ok(c) => c,
                 Err(e) => {
-                    log::error!("Failed to acquire DB connection from pool: {:?}", e);
+                    log::error!("Failed to acquire DB connection from pool: {e:?}");
                     panic!();
                 }
             };
@@ -2232,7 +2242,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 tag_id_to_obj.insert(tag_id, tag_obj);
             }
 
-            for (file_internal, tag_list) in map.iter() {
+            for (file_internal, tag_list) in &map {
                 let file_id = match file_cache.get(&file_internal.hash) {
                     Some(&id) => id,
                     None => continue,
@@ -2345,7 +2355,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             conn.commit().unwrap();
         })
         .await
-        .unwrap()
+        .unwrap();
     }
     ///
     /// Checks if we should download the file or not
@@ -2358,7 +2368,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             let conn = match pool.transaction() {
                 Ok(c) => c,
                 Err(e) => {
-                    log::error!("Failed to acquire DB connection from pool: {:?}", e);
+                    log::error!("Failed to acquire DB connection from pool: {e:?}");
                     panic!();
                 }
             };
@@ -2379,7 +2389,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             let conn = match pool.get() {
                 Ok(c) => c,
                 Err(e) => {
-                    log::error!("Failed to acquire DB connection from pool: {:?}", e);
+                    log::error!("Failed to acquire DB connection from pool: {e:?}");
                     panic!();
                 }
             };
@@ -2391,7 +2401,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     }
 
     ///
-    /// Gets a single file_id from a tag
+    /// Gets a single `file_id` from a tag
     ///
     pub async fn tag_get_file_id(&self, tag: &Tag) -> Option<u64> {
         let pool = self.pool.clone();
@@ -2401,7 +2411,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             let conn = match pool.get() {
                 Ok(c) => c,
                 Err(e) => {
-                    log::error!("Failed to acquire DB connection from pool: {:?}", e);
+                    log::error!("Failed to acquire DB connection from pool: {e:?}");
                     panic!();
                 }
             };
@@ -2421,7 +2431,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             let conn = match pool.get() {
                 Ok(c) => c,
                 Err(e) => {
-                    log::error!("Failed to acquire DB connection from pool: {:?}", e);
+                    log::error!("Failed to acquire DB connection from pool: {e:?}");
                     panic!();
                 }
             };
@@ -2445,7 +2455,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             let mut conn = match pool.get() {
                 Ok(c) => c,
                 Err(e) => {
-                    log::error!("Failed to acquire DB connection from pool: {:?}", e);
+                    log::error!("Failed to acquire DB connection from pool: {e:?}");
                     panic!();
                 }
             };
@@ -2457,7 +2467,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             tn.commit().unwrap();
         })
         .await
-        .unwrap()
+        .unwrap();
     }
     ///
     /// Deletes relationship into db
@@ -2473,7 +2483,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             let mut conn = match pool.get() {
                 Ok(c) => c,
                 Err(e) => {
-                    log::error!("Failed to acquire DB connection from pool: {:?}", e);
+                    log::error!("Failed to acquire DB connection from pool: {e:?}");
                     panic!();
                 }
             };
@@ -2485,7 +2495,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             tn.commit().unwrap();
         })
         .await
-        .unwrap()
+        .unwrap();
     }
 
     ///
@@ -2507,6 +2517,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     ///
     /// Gets the location we should download to
     ///
+    #[must_use]
     pub fn file_download_location_main_sync(&self) -> Option<(PathBuf, u64)> {
         let pool = self.pool.clone();
         let conn = pool.get().ok()?;
@@ -2516,6 +2527,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     ///
     /// Adds a namespace into the db
     ///
+    #[must_use]
     pub fn namespace_add_sync(&self, namespace: &GenericNamespaceObj) -> u64 {
         let conn = self.pool.get().unwrap();
 
@@ -2543,6 +2555,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             (path_buf.with_extension(ext), path.1)
         })
     }
+    #[must_use]
     pub fn file_download_location_get_sync(&self, hash: &str, ext: &str) -> Option<(PathBuf, u64)> {
         if hash.len() <= 6 {
             return None;
@@ -2576,6 +2589,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         .unwrap()
     }
 
+    #[must_use]
     pub fn search_db_files_sync(&self, search: &SearchObj, limit: &Option<u64>) -> Vec<u64> {
         use rusqlite::params_from_iter;
         use std::time::Instant;
@@ -2606,7 +2620,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         if let Some(ref roaring) = *read_guard {
             let mut should_quick_search = true;
 
-            for and_tag in and_tags.iter() {
+            for and_tag in &and_tags {
                 if !roaring.relationship_cache_tagid_exists(&conn, *and_tag) {
                     should_quick_search = false;
                     break;
@@ -2631,15 +2645,13 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         let mut sorted_and = and_tags;
         if sorted_and.len() > 1 {
             let placeholders = vec!["?"; sorted_and.len()].join(",");
-            let count_sql = format!(
-                "SELECT id FROM Tags WHERE id IN ({}) ORDER BY count ASC",
-                placeholders
-            );
+            let count_sql =
+                format!("SELECT id FROM Tags WHERE id IN ({placeholders}) ORDER BY count ASC");
             if let Ok(mut stmt) = conn.prepare(&count_sql) {
                 let ids: Vec<u64> = stmt
                     .query_map(params_from_iter(&sorted_and), |r| r.get(0))
                     .unwrap()
-                    .filter_map(|r| r.ok())
+                    .filter_map(std::result::Result::ok)
                     .collect();
                 if !ids.is_empty() {
                     sorted_and = ids;
@@ -2657,8 +2669,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         for (i, tag) in sorted_and.iter().skip(1).enumerate() {
             let alias = format!("r{}", i + 1);
             sql.push_str(&format!(
-                " JOIN Relationship {0} ON r0.file_id = {0}.fileid AND {0}.tag_id = ?",
-                alias
+                " JOIN Relationship {alias} ON r0.file_id = {alias}.fileid AND {alias}.tag_id = ?"
             ));
             params.push(*tag);
         }
@@ -2671,8 +2682,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         for (i, group) in or_groups.iter().enumerate() {
             let placeholders = vec!["?"; group.len()].join(",");
             sql.push_str(&format!(
-        " AND EXISTS (SELECT 1 FROM Relationship or{} WHERE or{}.file_id = r0.fileid AND or{}.tag_id IN ({}))", 
-        i, i, i, placeholders
+        " AND EXISTS (SELECT 1 FROM Relationship or{i} WHERE or{i}.file_id = r0.fileid AND or{i}.tag_id IN ({placeholders}))"
     ));
             for &tag_id in group {
                 params.push(tag_id);
@@ -2683,8 +2693,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         for (i, group) in not_groups.iter().enumerate() {
             let placeholders = vec!["?"; group.len()].join(",");
             sql.push_str(&format!(
-        " AND NOT EXISTS (SELECT 1 FROM Relationship not{} WHERE not{}.file_id = r0.fileid AND not{}.tag_id IN ({}))", 
-        i, i, i, placeholders
+        " AND NOT EXISTS (SELECT 1 FROM Relationship not{i} WHERE not{i}.file_id = r0.fileid AND not{i}.tag_id IN ({placeholders}))"
     ));
             for &tag_id in group {
                 params.push(tag_id);
@@ -2703,13 +2712,14 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         let results: Vec<u64> = stmt
             .query_map(params_from_iter(params), |row| row.get(0))
             .expect(" Unable to querymap")
-            .filter_map(|r| r.ok())
+            .filter_map(std::result::Result::ok)
             .collect();
 
         results
     }
 
     /// A sync function to get a function
+    #[must_use]
     pub fn setting_get_sync(&self, name: &str) -> Option<DbSettingsObj> {
         let pool = self.pool.clone();
         let conn = pool.get().ok()?;
@@ -2728,10 +2738,13 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             .flatten() // Flattens the JoinError wrapper Option as well
     }
 
+    #[must_use]
     pub fn setting_set_sync(&self, obj: &DbSettingsObj) -> bool {
         let pool = self.pool.clone();
-        let conn = pool.get().ok().unwrap();
-        Self::internal_setting_set(&conn, obj).ok().is_some()
+        if let Ok(conn) = pool.get() {
+            let _ = Self::internal_setting_set(&conn, obj);
+        }
+        false
     }
 
     ///
@@ -2796,18 +2809,14 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             let conn = match pool.get() {
                 Ok(c) => c,
                 Err(e) => {
-                    log::error!("Failed to acquire DB connection from pool: {:?}", e);
+                    log::error!("Failed to acquire DB connection from pool: {e:?}");
                     return Vec::new();
                 }
             };
             match Self::internal_jobs_get_site(&conn, &site_owned) {
                 Ok(jobs) => jobs,
                 Err(e) => {
-                    log::error!(
-                        "Database error fetching jobs for site '{}': {:?}",
-                        site_owned,
-                        e
-                    );
+                    log::error!("Database error fetching jobs for site '{site_owned}': {e:?}");
                     Vec::new()
                 }
             }
@@ -2826,14 +2835,14 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             let conn = match pool.get() {
                 Ok(c) => c,
                 Err(e) => {
-                    log::error!("Failed to acquire DB connection from pool: {:?}", e);
+                    log::error!("Failed to acquire DB connection from pool: {e:?}");
                     return Vec::new();
                 }
             };
             match Self::internal_jobs_get_torun(&conn, sites) {
                 Ok(jobs) => jobs,
                 Err(e) => {
-                    log::error!("Database error fetching jobs: {:?}", e);
+                    log::error!("Database error fetching jobs: {e:?}");
                     Vec::new()
                 }
             }
@@ -2852,7 +2861,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             let conn = match pool.get() {
                 Ok(c) => c,
                 Err(e) => {
-                    log::error!("Failed to acquire DB connection from pool: {:?}", e);
+                    log::error!("Failed to acquire DB connection from pool: {e:?}");
                     panic!();
                 }
             };

@@ -48,7 +48,7 @@ pub enum DbJobType {
     Params,
     /// Runs a plugin directly (don't use plz).
     Plugin,
-    /// Signifies that this is a FileUrl.
+    /// Signifies that this is a `FileUrl`.
     FileUrl,
     /// Something else sends to scraper.
     Scraper,
@@ -108,7 +108,7 @@ pub enum Reimport {
     DirectoryLocation(DirectoryLocation),
 }
 
-#[derive(Debug, Subcommand, PartialEq)]
+#[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum CheckFilesEnum {
     /// Just print the missing files
     Print,

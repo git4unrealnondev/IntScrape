@@ -55,7 +55,7 @@ impl IpcServer {
         should_exit: Arc<AtomicBool>,
         plugin_manager: Arc<PluginManager>,
     ) -> Arc<Self> {
-        let out = Arc::new(IpcServer {
+        let out = Arc::new(Self {
             local_server: Mutex::new(None),
             should_exit,
             db,
@@ -120,7 +120,7 @@ impl IpcServer {
     fn conn_to_function(&self, action: client::SupportedDBRequests) -> Vec<u8> {
         match action {
             client::SupportedDBRequests::LoggingNoPrint(data) => {
-                info!("IPC LOG: {}", data);
+                info!("IPC LOG: {data}");
                 client::data_size_to_b(&false)
             }
             client::SupportedDBRequests::ShouldExit => {

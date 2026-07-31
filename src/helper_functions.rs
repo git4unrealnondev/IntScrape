@@ -1,5 +1,6 @@
 use cfg_if::cfg_if;
 
+#[must_use]
 pub fn get_sys_time_in_secs() -> u64 {
     use std::time::SystemTime;
     match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {

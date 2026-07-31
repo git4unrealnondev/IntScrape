@@ -28,12 +28,13 @@ pub struct MainDatabase {
 }
 
 impl MainDatabase {
+    #[must_use]
     pub fn new(db_path: &Path) -> Arc<Self> {
         let manager = SqliteConnectionManager::file(db_path).with_init(|c| {
             /* c.trace(Some(|statement: &str| {
                 log::info!("Executing SQL: {}", statement);
             }));*/
-            c.busy_timeout(Duration::from_millis(1000))?;
+            c.busy_timeout(Duration::from_secs(1))?;
             c.execute_batch(
                 "
 PRAGMA journal_mode = WAL;
@@ -54,7 +55,7 @@ PRAGMA cache_size = -64000;
         // Reserved writer thread to do all work on
         let writer_conn = Arc::new(Mutex::new(pool.get().unwrap()));
 
-        let main_db: Arc<MainDatabase> = MainDatabase {
+        let main_db: Arc<Self> = Self {
             pool,
             namespace_cache: Arc::new(RwLock::new(HashMap::new())),
             cache_type: Arc::new(RwLock::new(CacheType::Bare)),
@@ -77,7 +78,7 @@ PRAGMA cache_size = -64000;
         let guard = self.writer_conn.lock();
 
         if let Err(e) = guard.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
-            log::error!("Failed to checkpoint WAL file during drop: {:?}", e);
+            log::error!("Failed to checkpoint WAL file during drop: {e:?}");
         }
     }
 
@@ -114,7 +115,7 @@ PRAGMA cache_size = -64000;
         // Resetting is_running to false
         Self::internal_jobs_reset_isrunning(&conn).unwrap();
 
-        Self::internal_load_caching(self.clone(), &conn);
+        Self::internal_load_caching(self, &conn);
 
         conn.commit().unwrap();
 
