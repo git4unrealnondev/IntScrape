@@ -803,6 +803,47 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
         out.collect()
     }
 
+    ///
+    /// Checks to see if the db contains a file hash
+    /// TODO need to pull this data dynamically
+    ///
+    pub fn contains_hash_sync(&self, hash: &HashesSupported) -> Option<FileInternal> {
+        let tag = match hash {
+            HashesSupported::Md5(name) => Tag {
+                name: name.to_string(),
+                namespace: GenericNamespaceObj {
+                    name: "FileHash-MD5".into(),
+                    description: None,
+                },
+            },
+            HashesSupported::Sha1(name) => Tag {
+                name: name.to_string(),
+                namespace: GenericNamespaceObj {
+                    name: "FileHash-SHA1".into(),
+                    description: None,
+                },
+            },
+            HashesSupported::Sha256(name) => Tag {
+                name: name.to_string(),
+                namespace: GenericNamespaceObj {
+                    name: "FileHash-SHA256".into(),
+                    description: None,
+                },
+            },
+            HashesSupported::Sha512(name) => Tag {
+                name: name.to_string(),
+                namespace: GenericNamespaceObj {
+                    name: "FileHash-SHA512".into(),
+                    description: None,
+                },
+            },
+            _ => return None,
+        };
+
+        let conn = self.pool.get().unwrap();
+        Self::internal_tag_get_fileinternal(&conn, &tag)
+    }
+
     #[must_use]
     pub fn tag_get_file_sync(&self, tag: &Tag) -> Option<FileInternal> {
         let conn = self.pool.get().unwrap();
@@ -2506,9 +2547,11 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     ///
     #[must_use]
     pub fn namespace_add_sync(&self, namespace: &GenericNamespaceObj) -> u64 {
-        let conn = self.pool.get().unwrap();
-
-        Self::internal_namespace_get_or_create(&conn, namespace)
+        let mut guard = self.writer_conn.lock();
+        let conn = guard.transaction().unwrap();
+        let out = Self::internal_namespace_get_or_create(&conn, namespace);
+        conn.commit().unwrap();
+        out
     }
 
     ///

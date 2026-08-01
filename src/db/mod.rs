@@ -31,7 +31,7 @@ impl MainDatabase {
     #[must_use]
     pub fn new(db_path: &Path) -> Arc<Self> {
         let manager = SqliteConnectionManager::file(db_path).with_init(|c| {
-            /* c.trace(Some(|statement: &str| {
+            /*c.trace(Some(|statement: &str| {
                 log::info!("Executing SQL: {}", statement);
             }));*/
             c.busy_timeout(Duration::from_secs(1))?;
