@@ -118,6 +118,8 @@ impl Scraper {
         let plugin_manager = self.plugin_manager.clone();
         let job = self.job.config.clone();
         let plugin = self.plugin.clone();
+        let plugin_name = self.plugin.name.clone();
+        let job_id = self.job.id.clone();
 
         let scraper_data_return;
 
@@ -138,11 +140,11 @@ impl Scraper {
                 Err(e) => {
                     log::error!(
                         "DownloadManager: While getting a dump of URL's to do {} had an error {:?}",
-                        self.plugin.name,
+                        plugin_name,
                         e
                     );
                     self.download_manager
-                        .remove_job(&self.plugin, &self.job)
+                        .remove_job(&self.plugin, &self.job, false)
                         .await;
                     return Err("Scrap data had an error. Check logs".into());
                 }
@@ -173,6 +175,7 @@ impl Scraper {
             let tag_list = Arc::new(Mutex::new(Vec::new()));
 
             if self
+                .clone()
                 .download_manager
                 .should_exit
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -191,7 +194,7 @@ impl Scraper {
                 continue 'scraperloop;
             }
 
-            for param in &scrap_data.job.param {
+            for param in scrap_data.job.param.iter() {
                 let scraper = self.clone();
                 let param_clone = param.clone();
                 if let Ok(Some((text, source_url))) =
@@ -224,8 +227,8 @@ impl Scraper {
                                 {
                                     log::info!(
                                         "Worker: {} JobId: {} -- STOPPING JOB due to files, tags & jobs being empty inside of a valid scraperreturn data object.",
-                                        self.plugin.name,
-                                        self.job.id,
+                                        plugin_name,
+                                        job_id,
                                     );
 
                                     break 'scraperloop;
@@ -242,6 +245,7 @@ impl Scraper {
                                     let should_remove_job_clone = should_remove_job.clone();
                                     let job_list_clone = job_list.clone();
                                     let semaphore_clone = semaphore.clone();
+                                    let plugin_name = plugin_name.clone();
                                     let permit = semaphore_clone.acquire_owned().await?;
                                     set.spawn(async move {
                                         let mut download_issue = false;
@@ -250,23 +254,42 @@ impl Scraper {
                                         // Implements concurent ratelimit protection
                                         let _permit = permit;
 
-                                        if let Some(fileinternal) = scraper
+                                        let file_result = scraper
                                             .file_download_logic(
                                                 &mut file,
                                                 &mut jobs,
                                                 &mut download_issue,
-                                                temp_dir().as_path(),
                                             )
-                                            .await
+                                            .await.map_err(|err| err.to_string());
+                                        match file_result
                                         {
-                                            // Adds jobs from the on_download callback
-                                            job_list_clone.lock().await.extend(jobs);
+                                            Ok(Some(fileinternal)) => {
+                                                // Adds jobs from the on_download callback
+                                                job_list_clone.lock().await.extend(jobs);
 
-                                            // Adds tag data from the file
-                                            file_id_tag_map_clone
-                                                .lock()
-                                                .await
-                                                .insert(fileinternal, file.tag_list);
+                                                // Adds tag data from the file
+                                                file_id_tag_map_clone
+                                                    .lock()
+                                                    .await
+                                                    .insert(fileinternal, file.tag_list);
+                                            }
+                                            Ok(None) => {
+                                                log::error!(
+                                                    "Worker: {} JobId: {} -- File: {:?} had None?? This shouldn't happen unless an error or bad data got in.",
+                                                    plugin_name,
+                                                    job_id,
+                                                    file,
+                                                );
+                                            }
+                                            Err(err) => {
+                                                log::error!(
+                                                    "Worker: {} JobId: {} -- File: {:?} had err {}",
+                                                    plugin_name,
+                                                    job_id,
+                                                    file,
+                                                    err
+                                                );
+                                            }
                                         }
 
                                         if download_issue {
@@ -286,16 +309,16 @@ impl Scraper {
                             ScraperReturn::Nothing => {
                                 log::info!(
                                     "Worker: {} JobId: {} -- STOPPING JOB due to getting NOTHNG",
-                                    self.plugin.name,
-                                    self.job.id,
+                                    plugin_name,
+                                    job_id,
                                 );
                                 break 'scraperloop;
                             }
                             ScraperReturn::Stop(stop_reason) => {
                                 log::error!(
                                     "Worker: {} JobId: {} -- STOPPING JOB {}",
-                                    self.plugin.name,
-                                    self.job.id,
+                                    plugin_name,
+                                    job_id,
                                     stop_reason
                                 );
                                 break 'scraperloop;
@@ -349,8 +372,17 @@ impl Scraper {
             }
         }
 
-        if should_remove_job.load(std::sync::atomic::Ordering::Relaxed) {
-            // Updates internal jobs cache
+        // Removes job if we need to
+        self.download_manager
+            .remove_job(
+                &self.plugin,
+                &self.job,
+                should_remove_job.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .await;
+
+        /* if  {
+          /*  // Updates internal jobs cache
             if let Some(_internal_storage) = self
                 .download_manager
                 .jobs
@@ -361,12 +393,10 @@ impl Scraper {
                 // internal_storage
                 //     .completed_job_storage
                 //     .push(self.job.clone());
-            }
+            }*/
 
-            self.download_manager
-                .remove_job(&self.plugin, &self.job)
-                .await;
-        }
+
+        }*/
 
         // Cleans up memory
         memory_manage();
@@ -470,7 +500,7 @@ impl Scraper {
                     self.job.id,
                     err
                 );
-                
+
                 break 'main_loop;
             }
 
@@ -598,14 +628,44 @@ impl Scraper {
         file: &mut FileObject,
         jobs: &mut Vec<ScraperDataReturn>,
         download_issue: &mut bool,
-        temp_dir: &std::path::Path, // Added to provide path context to download_file
-    ) -> Option<FileInternal> {
+    ) -> Result<Option<FileInternal>, Box<dyn Error>> {
         let plugin_manager = self.download_manager.plugin_manager.clone();
         let self_clone = self.clone();
 
+        // Skips downloading file IF we have tag x associated with file_id
+        for skip in &file.skip_if {
+            if let SkipIf::FileTagRelationship(tag) = skip
+                && let Some(file_id) = self.download_manager.db.tag_get_file_id(tag).await
+                && let Some(file_internal) = self.download_manager.db.file_id_get(file_id).await
+            {
+                info!(
+                    "Scraper: {} JobId: {} Skipping file_id {} because TAG: {:?} already in db.",
+                    self.plugin.name,
+                    self.job.id,
+                    file_internal.id.unwrap_or(0),
+                    tag
+                );
+                return Ok(Some(file_internal));
+            }
+        }
+
+        // Associates file hashes with a file object
+        if let Some(ref hash) = file.hash
+            && let Some(file_internal) = self.download_manager.db.contains_hash_sync(hash)
+        {
+            info!(
+                "Scraper: {} JobId: {} Skipping file_id {} because hash: {:?} already in db.",
+                self.plugin.name,
+                self.job.id,
+                file_internal.id.unwrap_or(0),
+                hash
+            );
+            return Ok(Some(file_internal));
+        }
+
         // Download or fetch file via its disk path reference
         let temp_file = match file.source {
-            None => return None,
+            None => return Ok(None),
             Some(ref url_source) => match url_source {
                 FileSource::Url(file_url) => {
                     if let Some(file_id) = self
@@ -621,10 +681,10 @@ impl Scraper {
                         .await
                     {
                         info!(
-                            "Scraper: {} JobId: {} Skipping file because already in db.",
-                            self.plugin.name, self.job.id
+                            "Scraper: {} JobId: {} Skipping file_id {} because URL: {} already in db.",
+                            self.plugin.name, self.job.id, file_id, file_url
                         );
-                        return self.download_manager.db.file_id_get(file_id).await;
+                        return Ok(self.download_manager.db.file_id_get(file_id).await);
                     } else {
                         file.tag_list.push(FileTagAction {
                             operation: TagOperation::Add,
@@ -640,39 +700,30 @@ impl Scraper {
                             }],
                         });
 
-                        for skip in &file.skip_if {
-                            if let SkipIf::FileTagRelationship(tag) = skip
-                                && let Some(file_id) =
-                                    self.download_manager.db.tag_get_file_id(tag).await
-                                && let Some(file_internal) =
-                                    self.download_manager.db.file_id_get(file_id).await
-                            {
-                                return Some(file_internal);
-                            }
-                        }
-
                         if self.should_download_file(file_url).await {
                             // Calls disk streaming download helper
                             if let Some(path_out) = self_clone
-                                .download_file(file_url, &file.hash, temp_dir)
+                                .download_file(file_url, &file.hash, temp_dir().as_path())
                                 .await
                             {
                                 TrackedFile::Temp(path_out)
                             } else {
                                 *download_issue = true;
-                                return None;
+                                return Ok(None);
                             }
                         } else {
-                            return None;
+                            return Ok(None);
                         }
                     }
                 }
                 // If bytes are fed instantly, spill them out to a temporary file right away
                 // to maintain identical architectural tracking shapes.
                 FileSource::Bytes(file_bytes) => {
-                    let path = temp_dir.join(format!("direct_bytes_{}.tmp", rand::random::<u32>()));
+                    let path = temp_dir()
+                        .as_path()
+                        .join(format!("direct_bytes_{}.tmp", rand::random::<u32>()));
                     if std::fs::write(&path, file_bytes).is_err() {
-                        return None;
+                        return Ok(None);
                     }
                     TrackedFile::Manual(path)
                 }
@@ -733,22 +784,23 @@ impl Scraper {
             .await
             .unwrap()
             .into_iter()
-            .next()?;
+            .next()
+            .ok_or("No hash data from hashdata")?;
 
         file.tag_list = final_tags;
         *jobs = final_jobs;
 
         let storage_id = match storage_id_result {
             Some(id) => id,
-            None => return None,
+            None => return Ok(None),
         };
 
-        Some(FileInternal {
+        Ok(Some(FileInternal {
             id: None,
             hash,
             extension,
             storage_id,
-        })
+        }))
     }
 }
 
@@ -811,13 +863,15 @@ impl DownloadsManager {
     ///
     /// Clears a job from the system
     ///
-    async fn remove_job(&self, plugin: &Plugin, job: &DbJobsObj) {
+    pub async fn remove_job(&self, plugin: &Plugin, job: &DbJobsObj, should_remove_db: bool) {
         // If all jobs are finished then remove plugin from db
         let mut remove_plugin = false;
 
         if let Some(internal_storage) = self.jobs.write().await.get_mut(&plugin.name) {
             internal_storage.job_storage.retain(|f| f != job);
-            self.db.job_remove(job).await;
+            if should_remove_db {
+                self.db.job_remove(job).await;
+            }
             if internal_storage.job_storage.is_empty() {
                 remove_plugin = true;
             }
@@ -1095,6 +1149,9 @@ impl DownloadsManager {
                 info!("DownloadManager: Setting job {} to running status.", job.id);
                 self.db.job_set_is_running(&job).await;
 
+                let job_id = job.id;
+                let scraper_name = scraper_name.clone();
+
                 let scraper = Scraper::new(
                     job,
                     ratelimiter,
@@ -1105,7 +1162,14 @@ impl DownloadsManager {
 
                 tokio::task::spawn(async move {
                     let _permit = permit;
-                    scraper.run_scraper().await;
+                    if let Err(err) = scraper.run_scraper().await {
+                        log::error!(
+                            "Worker: {} JobId: {} scraper had err: {}",
+                            scraper_name,
+                            job_id,
+                            err
+                        );
+                    }
                 });
             } else {
                 // All jobs are currently actively running. Wait a bit for them to finish.

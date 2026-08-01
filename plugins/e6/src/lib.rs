@@ -345,29 +345,10 @@ pub fn parser_call(
                         }
                     }
                 }
-                let source = if post["file"]["url"].is_empty() {
-                    let site_prefix = match site {
-                        Site::E6 => "e621.net",
-                        Site::E6AI => "e6ai.net",
-                    };
-                    if let Some(ext) = post["file"]["ext"].as_str() {
-                        post["file"]["md5"].as_str().map(|u| {
-                            FileSource::Url(format!(
-                                "https://static1.{site_prefix}/data/{}/{}/{}.{}",
-                                &u[0..2],
-                                &u[2..4],
-                                u,
-                                ext
-                            ))
-                        })
-                    } else {
-                        None
-                    }
-                } else {
-                    post["file"]["url"]
-                        .as_str()
-                        .map(|u| FileSource::Url(u.to_string()))
-                };
+
+                let source = post["file"]["url"]
+                    .as_str()
+                    .map(|u| FileSource::Url(u.to_string()));
 
                 // Adds file into db
                 if let Some(hash) = post["file"]["md5"].as_str() {
@@ -379,7 +360,7 @@ pub fn parser_call(
                             ..Default::default()
                         }],
                         // Skip file if we have the md5 hash inside the db
-                        skip_if: vec![SkipIf::FileTagRelationship(Tag {
+                        skip_if: vec![/*SkipIf::FileTagRelationship(Tag {
                             name: hash.to_string(),
                             namespace: GenericNamespaceObj {
                                 name: "FileHash-MD5".to_string(),
@@ -387,7 +368,7 @@ pub fn parser_call(
                                     "From plugin FileHash. MD5 hash of the file.".to_string(),
                                 ),
                             },
-                        })],
+                        })*/],
                     });
                 }
             }
