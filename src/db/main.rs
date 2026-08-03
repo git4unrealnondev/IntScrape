@@ -850,7 +850,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     }
 
     ///
-    /// Gets a file assoicated with a tag if it exists
+    /// Gets a file if a tag is associated with it
     ///
     #[must_use]
     #[ipc(name = "get_tag_file", request = "GetTagFile")]
@@ -869,6 +869,9 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
         Self::internal_file_id_get_namespace_id_sync(&conn, namespace_id).unwrap_or_default()
     }
 
+    ///
+    /// Gets tag ids with a namespace_id associated with a file_id 
+    ///
     #[must_use]
     #[ipc(name = "get_tags_filtered", request = "GetNamespaceTagIdsFiltered")]
     pub fn internal_file_id_get_tag_ids_where_namespace_id_sync(
