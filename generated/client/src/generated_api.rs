@@ -26,7 +26,7 @@ pub fn get_file_path(
     crate::init_data_request(&crate::SupportedDBRequests::GetFileLocation(file_id))
 }
 ///
-/// Gets a file assoicated with a tag if it exists
+/// Gets a file if a tag is associated with it
 ///
 pub fn get_tag_file(
     tag: Tag,
@@ -43,6 +43,9 @@ pub fn get_namespace_file_ids(
         &crate::SupportedDBRequests::GetNamespaceFileIDs(namespace_id),
     )
 }
+///
+/// Gets tag ids with a namespace_id associated with a file_id
+///
 pub fn get_tags_filtered(
     file_id: u64,
     namespace_id: u64,
