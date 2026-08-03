@@ -19,6 +19,7 @@ use crate::db::roaring::{InternalCacheType, SearchQuery};
 use crate::db::{CacheType, RelationshipStorage};
 use crate::web::manager::hash_bytes;
 use crate::{db::MainDatabase, helper_functions::get_sys_time_in_secs};
+use ipc_macro::export_ipc;
 
 // How many entries should we do total.
 // Max is 1000 vs 800
@@ -84,6 +85,7 @@ impl DbJobsObjExt for DbJobsObj {
     }
 }
 
+#[export_ipc(client_path = "generated/client/src/generated_api.rs")]
 impl MainDatabase {
     ///
     /// Creates the relationship table for the db
@@ -247,6 +249,7 @@ END;
     /// Gets namespace id if it exists
     ///
     #[must_use]
+    #[ipc(name = "namespace_get", request = "GetNamespace")]
     pub fn search_db_namespace_sync(&self, name: &String) -> Option<u64> {
         let conn = self.pool.get().unwrap();
 
@@ -263,6 +266,7 @@ END;
     /// Gets a list of tags where the tag and limits the number of returnees
     ///
     #[must_use]
+    #[ipc(name = "search_tag_fts", request = "SearchTags")]
     pub fn search_db_tags_fts(&self, tag: &str, limit: &Option<u64>) -> Vec<TagSearch> {
         let conn = self.pool.get().unwrap();
         let cleaned_tag = tag.trim().replace('"', "\"\"");
@@ -570,6 +574,7 @@ ON Jobs (time, reptime, site, param);
     /// Gets the file path of a fileid
     ///
     #[must_use]
+    #[ipc(name = "get_file_path", request = "GetFileLocation")]
     pub fn file_get_physical_path_sync(&self, file_id: &u64) -> Option<String> {
         let conn = self.pool.get().unwrap();
         Self::internal_file_get_physical_path(&conn, file_id).ok()?
@@ -844,7 +849,11 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
         Self::internal_tag_get_fileinternal(&conn, &tag)
     }
 
+    ///
+    /// Gets a file assoicated with a tag if it exists
+    ///
     #[must_use]
+    #[ipc(name = "get_tag_file", request = "GetTagFile")]
     pub fn tag_get_file_sync(&self, tag: &Tag) -> Option<FileInternal> {
         let conn = self.pool.get().unwrap();
         Self::internal_tag_get_fileinternal(&conn, tag)
@@ -854,12 +863,14 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     /// Gets all `file_ids` with tags that have namespace id
     ///
     #[must_use]
+    #[ipc(name = "get_namespace_file_ids", request = "GetNamespaceFileIDs")]
     pub fn file_id_get_namespace_id_sync(&self, namespace_id: &u64) -> Vec<u64> {
         let conn = self.pool.get().unwrap();
         Self::internal_file_id_get_namespace_id_sync(&conn, namespace_id).unwrap_or_default()
     }
 
     #[must_use]
+    #[ipc(name = "get_tags_filtered", request = "GetNamespaceTagIdsFiltered")]
     pub fn internal_file_id_get_tag_ids_where_namespace_id_sync(
         &self,
         file_id: &u64,
@@ -875,6 +886,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     /// Adds a relationship between a `file_id` and `tag_id`
     ///
     #[must_use]
+    #[ipc(name = "put_tags_to_file", request = "PutTagsRelationship")]
     pub fn file_relationship_tags_add_sync(&self, file_id: &u64, tag: &[FileTagAction]) -> bool {
         let mut guard = self.writer_conn.lock();
         let conn = guard.transaction().unwrap();
@@ -885,7 +897,43 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
 
         conn.commit().unwrap();
 
-        false
+        true
+    }
+
+    /// Adds tags to multiple files in one SQLite transaction.
+    #[must_use]
+    #[ipc(name = "put_tags_to_files", request = "PutTagsRelationships")]
+    pub fn file_relationship_tags_add_bulk_sync(
+        &self,
+        tags_by_file: &HashMap<u64, Vec<FileTagAction>>,
+    ) -> bool {
+        if tags_by_file.is_empty() {
+            return true;
+        }
+
+        let mut guard = self.writer_conn.lock();
+        let conn = match guard.transaction() {
+            Ok(conn) => conn,
+            Err(error) => {
+                log::error!("Failed to begin bulk tag transaction: {error}");
+                return false;
+            }
+        };
+
+        for (file_id, tags) in tags_by_file {
+            let tag_map = Self::internal_tag_bulk_add(&conn, tags);
+            let relationships: HashSet<(u64, u64)> =
+                tag_map.values().map(|tag_id| (*file_id, *tag_id)).collect();
+            Self::internal_relationship_bulk_add(Arc::new(self.clone()), &conn, &relationships);
+        }
+
+        match conn.commit() {
+            Ok(()) => true,
+            Err(error) => {
+                log::error!("Failed to commit bulk tag transaction: {error}");
+                false
+            }
+        }
     }
 
     ///
@@ -893,6 +941,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     /// #Safety Returns None if an error occurs
     ///
     #[must_use]
+    #[ipc(name = "get_file_ids_all", request = "GetFileListId")]
     pub fn file_id_get_all_sync(&self) -> Vec<u64> {
         let conn = self.pool.get().unwrap();
 
@@ -964,6 +1013,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     }
 
     #[must_use]
+    #[ipc(name = "get_tag_id_bulk", request = "GetTagIds")]
     pub fn tag_id_get_tag_sync(&self, tags: &HashSet<u64>) -> HashMap<u64, Tag> {
         let conn = self.pool.get().unwrap();
         Self::internal_tag_id_get_tag(&conn, tags)
@@ -2546,6 +2596,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     /// Adds a namespace into the db
     ///
     #[must_use]
+    #[ipc(name = "namespace_set", request = "SetNamespace")]
     pub fn namespace_add_sync(&self, namespace: &GenericNamespaceObj) -> u64 {
         let mut guard = self.writer_conn.lock();
         let conn = guard.transaction().unwrap();
@@ -2610,6 +2661,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     }
 
     #[must_use]
+    #[ipc(name = "search_db_files", request = "SearchFiles")]
     pub fn search_db_files_sync(&self, search: &SearchObj, limit: &Option<u64>) -> Vec<u64> {
         use rusqlite::params_from_iter;
         use std::time::Instant;
@@ -2740,6 +2792,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
 
     /// A sync function to get a function
     #[must_use]
+    #[ipc(name = "setting_get", request = "SettingsGetName")]
     pub fn setting_get_sync(&self, name: &str) -> Option<DbSettingsObj> {
         let pool = self.pool.clone();
         let conn = pool.get().ok()?;
@@ -2759,6 +2812,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     }
 
     #[must_use]
+    #[ipc(name = "setting_set", request = "SettingsSet")]
     pub fn setting_set_sync(&self, obj: &DbSettingsObj) -> bool {
         let pool = self.pool.clone();
         if let Ok(conn) = pool.get() {

@@ -151,6 +151,7 @@ impl IpcServer {
                     GetNamespaceFileIDs(namespace_id) => file_id_get_namespace_id_sync,
                     GetFileListId() => file_id_get_all_sync,
                     PutTagsRelationship(file_id, tags) => file_relationship_tags_add_sync,
+                    PutTagsRelationships(tags_by_file) => file_relationship_tags_add_bulk_sync,
 
                 }
             }
