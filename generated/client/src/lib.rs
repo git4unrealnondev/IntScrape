@@ -8,6 +8,17 @@ use std::io::Write;
 
 use shared_types::*;
 
+mod generated_api;
+pub use generated_api::*;
+
+/// Returns whether the server is shutting down.
+///
+/// This is a host lifecycle request rather than a database method, so it is
+/// kept alongside the generated database client API.
+pub fn should_exit() -> Result<bool, Box<dyn std::error::Error>> {
+    init_data_request(&SupportedDBRequests::ShouldExit)
+}
+
 pub const SOCKET_NAME: &str = "RustHydrus.sock";
 
 #[derive(Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
@@ -18,6 +29,7 @@ pub enum SupportedDBRequests {
     GetTag(String, u64),
     PutTag(String, u64, Option<u64>),
     PutTagsRelationship(u64, Vec<FileTagAction>),
+    PutTagsRelationships(HashMap<u64, Vec<FileTagAction>>),
     GetTagName((String, u64)),
     RelationshipAdd(u64, u64),
     RelationshipRemove(u64, u64),
@@ -87,42 +99,20 @@ macro_rules! define_db_requests {
 
 define_db_requests! {
     external_plugin_call(key: String, callbackinfo: CallbackInfoInput) -> Result<HashMap<String, CallbackCustomDataReturning>, Box<dyn std::error::Error>> => SupportedDBRequests::ExternalPluginCall(key, callbackinfo);
-    /// Gets a setting by name
-    setting_get(name: String) -> Result<Option<DbSettingsObj>, Box<dyn std::error::Error>> => SupportedDBRequests::SettingsGetName(name);
-
-    /// Searches the DB from tags -> file ids
-    search_db_files(search: SearchObj, limit: Option<u64>) -> Result<Vec<u64>, Box<dyn std::error::Error>> => SupportedDBRequests::SearchFiles(search, limit);
-
-    /// Sets a setting by setting
-    setting_set(setting: DbSettingsObj) -> Result<bool, Box<dyn std::error::Error>> => SupportedDBRequests::SettingsSet(setting);
 
     relationship_get_fileid(tag_id: u64) -> Result<Vec<u64>, Box<dyn std::error::Error>> => SupportedDBRequests::RelationshipGetFileid(tag_id);
 
     /// Logs to fast_log without printing
     log_silent(log: String) -> Result<bool, Box<dyn std::error::Error>> => SupportedDBRequests::LoggingNoPrint(log);
 
-    /// Gets tags
-    get_tag_id_bulk(id: HashSet<u64>) -> Result<HashMap<u64, Tag>, Box<dyn std::error::Error>> => SupportedDBRequests::GetTagIds(id);
 
     get_tag(name: String, namespace: u64) -> Result<Option<u64>, Box<dyn std::error::Error>> => SupportedDBRequests::GetTag(name, namespace) ;
 
-    get_tag_file(tag: Tag) -> Result<Option<FileInternal>, Box<dyn std::error::Error>> => SupportedDBRequests::GetTagFile(tag);
 
-    /// Adds a tag to a fileid
-    put_tags_to_file(file_id: u64, tags: Vec<FileTagAction>) -> Result<bool, Box<dyn std::error::Error>> => SupportedDBRequests::PutTagsRelationship(file_id, tags);
 
     /// Adds a relationship to the db
     relationship_add(id1: u64, id2: u64) -> Result<bool, Box<dyn std::error::Error>> => SupportedDBRequests::RelationshipAdd(id1, id2);
 
-    /// Gets tag_id where namespace id is x
-    get_namespace_tag_ids(id: u64) -> Result<Vec<u64>, Box<dyn std::error::Error>> => SupportedDBRequests::GetNamespaceTagIDs(id);
-    /// Gets file_ids where a tag with a namespace is joined with it
-    get_namespace_file_ids(id: u64) -> Result<Vec<u64>, Box<dyn std::error::Error>> => SupportedDBRequests::GetNamespaceFileIDs(id);
-
-    /// Gets a namespace if it exists
-    namespace_get(name: String) -> Result<Option<u64>, Box<dyn std::error::Error>> => SupportedDBRequests::GetNamespace(name);
-    /// Adds a namespace into the db
-    namespace_set(namespace: GenericNamespaceObj) -> Result<u64, Box<dyn std::error::Error>> => SupportedDBRequests::SetNamespace(namespace);
 
     /// Gets all namespace ids in the db
     namespace_all() -> Result<Vec<GenericNamespaceObj>, Box<dyn std::error::Error>> => SupportedDBRequests::GetNamespaceIds();
@@ -130,23 +120,9 @@ define_db_requests! {
     /// Gets a file object if its id exists
     get_file(file_id: u64) -> Result<Option<FileInternal>, Box<dyn std::error::Error>> => SupportedDBRequests::GetFile(file_id);
 
-    get_file_path(file_id: u64) -> Result<Option<String>, Box<dyn std::error::Error>> => SupportedDBRequests::GetFileLocation(file_id);
-
-    search_tag_fts(search: String, limit: Option<u64>) -> Result<Vec<TagSearch>, Box<dyn std::error::Error>> => SupportedDBRequests::SearchTags(search, limit);
-
-    parents_rel_get(id: u64) -> Result<Vec<TagParents>, Box<dyn std::error::Error>> => SupportedDBRequests::ParentsRel(id);
-
-        /// Gets all tags that are of namespace_id and are associated with a fileid
-    get_tags_filtered(file_id: u64, namespace_id: u64) -> Result<HashSet<u64>, Box<dyn std::error::Error>> => SupportedDBRequests::GetNamespaceTagIdsFiltered(file_id, namespace_id);
-
-        /// A basic check to see if we should exit
-    should_exit() -> Result<bool, Box<dyn std::error::Error>> => SupportedDBRequests::ShouldExit;
-
-    /// Returns all fileids in the db
-    get_file_ids_all() -> Result<Vec<u64>, Box<dyn std::error::Error>> => SupportedDBRequests::GetFileListId();
-
-
 }
+
+pub use generated_api::*;
 
 pub fn data_size_to_b<T: bitcode::Encode + ?Sized>(data_object: &T) -> Vec<u8> {
     // let bytd = types::x_to_bytes(tmp).to_vec();

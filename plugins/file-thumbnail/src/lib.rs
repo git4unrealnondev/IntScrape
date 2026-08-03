@@ -2,9 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     error::Error,
     fs::create_dir_all,
-    ops::ControlFlow,
     path::{Path, PathBuf},
-    sync::atomic::AtomicUsize,
 };
 
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -61,25 +59,51 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
         total_file_ids.retain_mut(|f| !namespace_file_ids.contains(f));
     }
 
-    // runs the processing multi threaded
-    let res = total_file_ids.par_iter().try_for_each(|file_id| {
-        // Early stop if we should exit
-        let should_stop = client::should_exit();
-        if should_stop.is_err() || should_stop.is_ok_and(|f| f) {
-            ControlFlow::Break(0)
-        } else if let Ok(Some(file_path)) = client::get_file_path(*file_id)
-            && let Ok(file_data) = std::fs::read(file_path)
-        {
-            let callback = on_download(&file_data);
-            let tags: Vec<_> = callback.tags.into_iter().collect();
-            let _ = client::put_tags_to_file(*file_id, tags);
-            ControlFlow::Continue(())
-        } else {
-            ControlFlow::Continue(())
-        }
-    });
+    const BATCH_SIZE: usize = 100;
+    let mut completed = true;
 
-    if let ControlFlow::Continue(_) = res {
+    for batch in total_file_ids.chunks(BATCH_SIZE) {
+        let processed = batch
+            .par_iter()
+            .try_fold(Vec::new, |mut pending, file_id| {
+                let should_stop = client::should_exit();
+                if should_stop.is_err() || should_stop.is_ok_and(|stop| stop) {
+                    return Err(());
+                }
+
+                if let Ok(Some(file_path)) = client::get_file_path(*file_id)
+                    && let Ok(file_data) = std::fs::read(file_path)
+                {
+                    let callback = on_download(&file_data);
+                    let tags: Vec<_> = callback.tags.into_iter().collect();
+                    pending.push((*file_id, tags));
+                }
+
+                Ok(pending)
+            })
+            .try_reduce(Vec::new, |mut left, mut right| {
+                left.append(&mut right);
+                Ok(left)
+            });
+
+        let pending = match processed {
+            Ok(pending) => pending,
+            Err(()) => {
+                completed = false;
+                break;
+            }
+        };
+
+        if !pending.is_empty() {
+            let tags_by_file = pending.into_iter().collect();
+            if client::put_tags_to_files(tags_by_file).is_err() {
+                completed = false;
+                break;
+            }
+        }
+    }
+
+    if completed {
         let _ = client::setting_set(shared_types::DbSettingsObj {
             name: "PLUGIN_Thumbnail_ShouldRun".into(),
             description: Some("Should the plugin thumbnail run on_start".into()),

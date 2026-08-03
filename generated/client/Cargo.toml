@@ -2,9 +2,16 @@
 name = "client"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 shared_types = {workspace=true}
 bitcode = { workspace = true }
 interprocess = { workspace = true }
 serde = { workspace = true }
+
+[build-dependencies]
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0.118", features = ["full"] }
+prettyplease = "0.2.37"
