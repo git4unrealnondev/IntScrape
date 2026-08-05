@@ -203,7 +203,7 @@ impl Scraper {
                             // download it
                             if cnt >= MAX_URL_RETRY - 1 {
                                 log::warn!(
-                                    "Worker: {} JobId: {} -- While processing job {:?} was unable to download text. Had a 404 error. Telling db to kill job and add dead_url.",
+                                    "Worker: {} JobId: {} -- While processing job {:?} was unable to download text. Had a 404 error. Telling db to kill job.",
                                     self.plugin.name,
                                     self.job.id,
                                     url_parsed,
