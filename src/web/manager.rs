@@ -74,7 +74,7 @@ struct InternalStorage {
 }
 
 pub struct DownloadsManager {
-    db: Arc<MainDatabase>,
+    pub db: Arc<MainDatabase>,
     plugin_manager: Arc<PluginManager>,
     jobs: RwLock<HashMap<String, InternalStorage>>,
     heavy_processing_pool: Arc<ThreadPool>,
@@ -519,12 +519,23 @@ impl Scraper {
                 }
             };
             if let Err(err) = response.error_for_status_ref() {
-                log::error!(
-                    "Scraper: {} JobId: {} Got error {:?}",
-                    self.plugin.name,
-                    self.job.id,
-                    err
-                );
+                if err.status() == Some(StatusCode::NOT_FOUND) {
+                    log::error!(
+                        "Scraper: {} JobId: {} While processing url: {} got a 404 error adding dead_url to db.",
+                        self.plugin.name,
+                        self.job.id,
+                        file_url,
+                    );
+                    let db = self.download_manager.db.clone();
+                    db.dead_url_add(file_url.to_string()).await;
+                } else {
+                    log::error!(
+                        "Scraper: {} JobId: {} Got error {:?}",
+                        self.plugin.name,
+                        self.job.id,
+                        err
+                    );
+                }
 
                 break 'main_loop;
             }

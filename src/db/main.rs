@@ -504,9 +504,10 @@ CREATE TABLE IF NOT EXISTS FileStorageLocations (id INTEGER PRIMARY KEY , locati
     ///
     /// Creates a dead url table
     ///
-    pub(in crate::db) fn internal_table_create_dead_urls_v1(conn: &Connection)-> Result<(), r2d2_sqlite::rusqlite::Error> {
+    pub(in crate::db) fn internal_table_create_dead_urls_v1(
+        conn: &Connection,
+    ) -> Result<(), r2d2_sqlite::rusqlite::Error> {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS dead_urls (url TEXT PRIMARY KEY);")
-           
     }
 
     ///
@@ -529,7 +530,7 @@ CREATE TABLE IF NOT EXISTS FileStorageLocations (id INTEGER PRIMARY KEY , locati
     pub(in crate::db) fn internal_dead_url_exist(
         conn: &Connection,
         potential_dead_urls: &[String],
-    ) -> Result<Vec<bool>, r2d2_sqlite::rusqlite::Error> {
+    ) -> Result<HashMap<String, bool>, r2d2_sqlite::rusqlite::Error> {
         let mut dead_urls = HashSet::<String>::new();
 
         for chunk in potential_dead_urls.chunks(SQL_CHUNK_SIZE) {
@@ -561,7 +562,7 @@ CREATE TABLE IF NOT EXISTS FileStorageLocations (id INTEGER PRIMARY KEY , locati
         // Preserve the same order and length as the input.
         Ok(potential_dead_urls
             .iter()
-            .map(|url| dead_urls.contains(url))
+            .map(|url| (url.to_string(), dead_urls.contains(url)))
             .collect())
     }
 
@@ -2302,6 +2303,37 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             SkipIf::NoFilesDownloaded => {}
         }
         false
+    }
+
+    ///
+    /// Adds dead url into db
+    ///
+    pub async fn dead_url_add(self: Arc<Self>, dead_url: String) {
+        let result = tokio::task::spawn_blocking(move || {
+            let mut writer_conn = self.writer_conn.lock();
+            let conn = writer_conn.transaction().unwrap();
+            let _ = Self::internal_dead_url_add(&conn, &dead_url);
+            let _ = conn.commit();
+        });
+        let _ = result.await;
+    }
+
+    pub async fn dead_url_exist(self: Arc<Self>, dead_url: Vec<String>) -> HashMap<String, bool> {
+        let pool = self.pool.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let conn = match pool.get() {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("Failed to acquire DB connection from pool: {e:?}");
+                    panic!();
+                }
+            };
+            if let Ok(res) = Self::internal_dead_url_exist(&conn, &dead_url) {
+                return res;
+            }
+            HashMap::new()
+        });
+        result.await.unwrap_or(HashMap::new())
     }
 
     ///
