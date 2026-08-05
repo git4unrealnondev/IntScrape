@@ -36,6 +36,7 @@ use crate::{
     db::MainDatabase,
     helper_functions::{self, get_sys_time_in_secs, memory_manage},
     plugins::PluginManager,
+    web::FileReturn,
 };
 
 enum TrackedFile {
@@ -269,15 +270,23 @@ impl Scraper {
                                             .await.map_err(|err| err.to_string());
                                         match file_result
                                         {
-                                            Ok(Some(fileinternal)) => {
+                                            Ok(Some(filereturn)) => {
                                                 // Adds jobs from the on_download callback
                                                 job_list_clone.lock().await.extend(jobs);
 
+                                                match filereturn {
+                                                    FileReturn::File(fileinternal) => {
                                                 // Adds tag data from the file
                                                 file_id_tag_map_clone
                                                     .lock()
                                                     .await
                                                     .insert(fileinternal, file.tag_list);
+                                                    },
+                                                    FileReturn::InDownloadQueue => {
+
+                                                    }
+                                                }
+
                                             }
                                             Ok(None) => {
                                                 log::error!(
@@ -664,7 +673,7 @@ impl Scraper {
         file: &mut FileObject,
         jobs: &mut Vec<ScraperDataReturn>,
         download_issue: &mut bool,
-    ) -> Result<Option<FileInternal>, Box<dyn Error>> {
+    ) -> Result<Option<FileReturn>, Box<dyn Error>> {
         let plugin_manager = self.download_manager.plugin_manager.clone();
         let self_clone = self.clone();
 
@@ -681,7 +690,7 @@ impl Scraper {
                     file_internal.id.unwrap_or(0),
                     tag
                 );
-                return Ok(Some(file_internal));
+                return Ok(Some(FileReturn::File(file_internal)));
             }
         }
 
@@ -696,7 +705,7 @@ impl Scraper {
                 file_internal.id.unwrap_or(0),
                 hash
             );
-            return Ok(Some(file_internal));
+            return Ok(Some(FileReturn::File(file_internal)));
         }
 
         // Download or fetch file via its disk path reference
@@ -720,7 +729,12 @@ impl Scraper {
                             "Scraper: {} JobId: {} Skipping file_id {} because URL: {} already in db.",
                             self.plugin.name, self.job.id, file_id, file_url
                         );
-                        return Ok(self.download_manager.db.file_id_get(file_id).await);
+                        return Ok(self
+                            .download_manager
+                            .db
+                            .file_id_get(file_id)
+                            .await
+                            .map(|f| FileReturn::File(f)));
                     } else {
                         file.tag_list.push(FileTagAction {
                             operation: TagOperation::Add,
@@ -748,7 +762,13 @@ impl Scraper {
                                 return Ok(None);
                             }
                         } else {
-                            return Ok(None);
+                            log::info!(
+                                "Worker: {} JobId: {} -- Skipping file download of url: {} due to already being in download queue.",
+                                self.plugin.name,
+                                self.job.id,
+                                file_url
+                            );
+                            return Ok(Some(FileReturn::InDownloadQueue));
                         }
                     }
                 }
@@ -831,12 +851,12 @@ impl Scraper {
             None => return Ok(None),
         };
 
-        Ok(Some(FileInternal {
+        Ok(Some(FileReturn::File(FileInternal {
             id: None,
             hash,
             extension,
             storage_id,
-        }))
+        })))
     }
 }
 
