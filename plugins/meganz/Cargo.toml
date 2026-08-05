@@ -9,8 +9,10 @@ crate-type = ["cdylib"]
 [dependencies]
 chrono = "0.4.45"
 futures = "0.3.31"
-mega = "0.8.0"
-reqwest = { version = "0.12.22", default-features = false, features = ["rustls-tls"] }
+mega = {path="mega"}
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 shared_types = { workspace = true }
 client = { workspace = true }
 tokio = { version = "1.52.3", features = ["rt", "time"] }
+
+

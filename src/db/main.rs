@@ -502,6 +502,70 @@ CREATE TABLE IF NOT EXISTS FileStorageLocations (id INTEGER PRIMARY KEY , locati
     }
 
     ///
+    /// Creates a dead url table
+    ///
+    pub(in crate::db) fn internal_table_create_dead_urls_v1(conn: &Connection)-> Result<(), r2d2_sqlite::rusqlite::Error> {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS dead_urls (url TEXT PRIMARY KEY);")
+           
+    }
+
+    ///
+    /// Adds dead url into db
+    ///
+    pub(in crate::db) fn internal_dead_url_add(
+        conn: &Connection,
+        dead_url: &String,
+    ) -> Result<(), r2d2_sqlite::rusqlite::Error> {
+        conn.execute(
+            "INSERT OR IGNORE INTO dead_urls (url) VALUES (?1);",
+            params![dead_url],
+        )?;
+        Ok(())
+    }
+
+    ///
+    /// Checks if a list of urls are dead or not
+    ///
+    pub(in crate::db) fn internal_dead_url_exist(
+        conn: &Connection,
+        potential_dead_urls: &[String],
+    ) -> Result<Vec<bool>, r2d2_sqlite::rusqlite::Error> {
+        let mut dead_urls = HashSet::<String>::new();
+
+        for chunk in potential_dead_urls.chunks(SQL_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let sql = format!(
+                "SELECT url
+             FROM dead_urls
+             WHERE url IN ({placeholders})"
+            );
+
+            let mut statement = conn.prepare(&sql)?;
+
+            let rows = statement.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                row.get::<_, String>(0)
+            })?;
+
+            for row in rows {
+                dead_urls.insert(row?);
+            }
+        }
+
+        // Preserve the same order and length as the input.
+        Ok(potential_dead_urls
+            .iter()
+            .map(|url| dead_urls.contains(url))
+            .collect())
+    }
+
+    ///
     /// Creates the default File table
     ///
     pub(in crate::db) fn internal_table_create_file_v1(conn: &Connection) {
@@ -870,7 +934,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     }
 
     ///
-    /// Gets tag ids with a namespace_id associated with a file_id 
+    /// Gets tag ids with a namespace_id associated with a file_id
     ///
     #[must_use]
     #[ipc(name = "get_tags_filtered", request = "GetNamespaceTagIdsFiltered")]
@@ -1556,6 +1620,24 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         ])?;
 
         Ok(())
+    }
+
+    ///
+    /// Convience function to set db version
+    ///
+    pub(in crate::db) fn internal_db_version_set(
+        conn: &Connection,
+        version: u64,
+    ) -> Result<(), r2d2_sqlite::rusqlite::Error> {
+        Self::internal_setting_set(
+            conn,
+            &DbSettingsObj {
+                name: "SYSTEM_VERSION".into(),
+                description: Some("Current version that the DB is on.".into()),
+                num: Some(version),
+                param: None,
+            },
+        )
     }
 
     ///
@@ -2429,7 +2511,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         .unwrap();
     }
     ///
-    /// Checks if we should download the file or not
+    /// Updates a job inside the db.
     ///
     pub async fn jobs_update(&self, job: &DbJobsObj) {
         let job = job.clone();

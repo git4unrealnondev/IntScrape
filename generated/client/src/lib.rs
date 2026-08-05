@@ -122,7 +122,6 @@ define_db_requests! {
 
 }
 
-
 pub fn data_size_to_b<T: bitcode::Encode + ?Sized>(data_object: &T) -> Vec<u8> {
     // let bytd = types::x_to_bytes(tmp).to_vec();
     bitcode::encode(data_object)

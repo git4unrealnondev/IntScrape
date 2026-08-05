@@ -10,6 +10,7 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use mega::{Client, Node, Nodes};
+use reqwest::header::HeaderMap;
 use shared_types::{
     FileObject, FileSource, FileTagAction, GenericNamespaceObj, GlobalCallbacks, PluginProperties,
     PluginTag, RelationContext, ScraperDataReturn, ScraperParam, ScraperReturn, SkipIf, Tag,
@@ -24,7 +25,8 @@ const NS_CREATED: &str = "MEGA_created_at";
 const NS_MODIFIED: &str = "MEGA_modified_at";
 const NS_PATH: &str = "MEGA_path";
 const NS_PARENT: &str = "MEGA_parent_handle";
-const NS_FOLDER_MODIFIED: &str = "MEGA_folder_last_modified";
+const NS_SOURCE_URL: &str = "MEGA_source_url";
+const NS_SNAPSHOT: &str = "MEGA_system_timestamp";
 
 fn namespace(name: &str) -> GenericNamespaceObj {
     GenericNamespaceObj {
@@ -55,21 +57,10 @@ fn newest(first: Option<DateTime<Utc>>, second: Option<DateTime<Utc>>) -> Option
     }
 }
 
-/// Returns the most recent timestamp on a node's containing folder chain.
-fn folder_last_modified(nodes: &Nodes, node: &Node) -> Option<DateTime<Utc>> {
-    let mut latest = None;
-    let mut parent = node
-        .parent()
-        .and_then(|handle| nodes.get_node_by_handle(handle));
-
-    while let Some(folder) = parent {
-        latest = newest(latest, newest(folder.modified_at(), folder.created_at()));
-        parent = folder
-            .parent()
-            .and_then(|handle| nodes.get_node_by_handle(handle));
-    }
-
-    latest
+fn latest_system_timestamp(nodes: &Nodes) -> Option<DateTime<Utc>> {
+    nodes.iter().fold(None, |latest, node| {
+        newest(latest, newest(node.modified_at(), node.created_at()))
+    })
 }
 
 fn node_path(nodes: &Nodes, node: &Node) -> String {
@@ -88,63 +79,61 @@ fn node_path(nodes: &Nodes, node: &Node) -> String {
     names.join("/")
 }
 
-fn metadata_tags(nodes: &Nodes, node: &Node) -> (Vec<FileTagAction>, Tag) {
-    let revision = timestamp(folder_last_modified(nodes, node)).unwrap_or_else(|| "unknown".into());
-    let revision_tag = tag(NS_FOLDER_MODIFIED, revision);
+fn metadata_tags(
+    nodes: &Nodes,
+    node: &Node,
+    source_url: &str,
+    system_timestamp: Option<DateTime<Utc>>,
+) -> (Vec<FileTagAction>, Tag) {
+    let snapshot_value = timestamp(system_timestamp).unwrap_or_else(|| "unknown".to_owned());
+
+    let snapshot_tag = tag(NS_SNAPSHOT, snapshot_value.clone());
     let handle_tag = tag(NS_HANDLE, node.handle());
 
-    let mut tags = vec![
-        PluginTag {
+    let handle_plugin_tag = PluginTag {
+        tag: handle_tag.clone(),
+        relates_to: Some(RelationContext {
+            tag: snapshot_tag.clone(),
+            limit_to: Some(snapshot_tag.clone()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let metadata_tag = |value: Tag| PluginTag {
+        tag: value,
+        relates_to: Some(RelationContext {
             tag: handle_tag.clone(),
-            relates_to: Some(RelationContext {
-                tag: revision_tag.clone(),
-                // The limit is deliberately the last modified timestamp of
-                // the containing folder, not the file timestamp.
-                limit_to: Some(revision_tag.clone()),
-                ..Default::default()
-            }),
+            limit_to: Some(snapshot_tag.clone()),
             ..Default::default()
-        },
-        PluginTag {
-            tag: tag(NS_NAME, node.name()),
-            ..Default::default()
-        },
-        PluginTag {
-            tag: tag(NS_SIZE, node.size().to_string()),
-            ..Default::default()
-        },
-        PluginTag {
-            tag: tag(NS_PATH, node_path(nodes, node)),
-            ..Default::default()
-        },
-        PluginTag {
-            tag: revision_tag,
-            ..Default::default()
-        },
+        }),
+        ..Default::default()
+    };
+
+    let mut tags = vec![
+        handle_plugin_tag,
+        metadata_tag(tag(NS_SOURCE_URL, source_url)),
+        metadata_tag(tag(NS_NAME, node.name())),
+        metadata_tag(tag(NS_SIZE, node.size().to_string())),
+        metadata_tag(tag(NS_PATH, node_path(nodes, node))),
+        metadata_tag(tag(NS_SNAPSHOT, snapshot_value)),
     ];
 
     if let Some(value) = timestamp(node.created_at()) {
-        tags.push(PluginTag {
-            tag: tag(NS_CREATED, value),
-            ..Default::default()
-        });
+        tags.push(metadata_tag(tag(NS_CREATED, value)));
     }
+
     if let Some(value) = timestamp(node.modified_at()) {
-        tags.push(PluginTag {
-            tag: tag(NS_MODIFIED, value),
-            ..Default::default()
-        });
+        tags.push(metadata_tag(tag(NS_MODIFIED, value)));
     }
+
     if let Some(parent) = node.parent() {
-        tags.push(PluginTag {
-            tag: tag(NS_PARENT, parent),
-            ..Default::default()
-        });
+        tags.push(metadata_tag(tag(NS_PARENT, parent)));
     }
 
     (
         vec![FileTagAction {
-            operation: TagOperation::Set,
+            operation: TagOperation::Add,
             tags,
         }],
         handle_tag,
@@ -169,6 +158,7 @@ fn password(params: &[ScraperParam]) -> Option<String> {
 fn collect_file_nodes(nodes: &Nodes, node: &Node, output: &mut Vec<String>) {
     if node.kind().is_file() {
         output.push(node.handle().to_owned());
+        //let _ = client::log_silent(format!("MEGA: Found file handle {}", node.handle()));
         return;
     }
     if !node.kind().is_folder() && !node.kind().is_root() {
@@ -187,57 +177,111 @@ async fn collect_files(
     client: &Client,
     nodes: &Nodes,
     handles: &[String],
+    source_url: &str,
+    system_timestamp: Option<DateTime<Utc>>,
     output: &mut Vec<FileObject>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    errors: &mut Vec<String>,
+) {
     for handle in handles {
         let Some(node) = nodes.get_node_by_handle(handle) else {
+            errors.push(format!(
+                "MEGA handle {handle}: node was not found in the fetched node set"
+            ));
             continue;
         };
-        let (tag_list, handle_tag) = metadata_tags(nodes, node);
 
-        // Query the database before downloading. The handle is stable across
-        // renames and path changes, unlike the node name or path. Log the
-        // decision with enough context to identify the skipped folder/file.
-        if let Some(existing_file) = client::get_tag_file(handle_tag.clone())? {
-            let file_path = node_path(nodes, node);
-            let folder_path = node
-                .parent()
-                .and_then(|parent| nodes.get_node_by_handle(parent))
-                .map(|parent| node_path(nodes, parent))
-                .unwrap_or_else(|| "<root>".to_owned());
+        let file_path = node_path(nodes, node);
+        let folder_path = node
+            .parent()
+            .and_then(|parent| nodes.get_node_by_handle(parent))
+            .map(|parent| node_path(nodes, parent))
+            .unwrap_or_else(|| "<root>".to_owned());
 
-            if let Some(file_id) = existing_file.id {
-                client::put_tags_to_file(file_id, tag_list)?;
-            } else {
-                client::log_silent(format!(
-                    "MEGA: handle {} exists but has no file ID; cannot update tags for path '{}' in folder '{}'",
-                    node.handle(),
-                    file_path,
-                    folder_path,
-                ))?;
+        let (tag_list, handle_tag) = metadata_tags(nodes, node, source_url, system_timestamp);
+
+        // Existing files are not downloaded again. Their metadata is still
+        // updated using the current snapshot relation graph.
+        match client::get_tag_file(handle_tag.clone()) {
+            Ok(Some(existing_file)) => {
+                match existing_file.id {
+                    Some(file_id) => {
+                        if let Err(error) = client::put_tags_to_file(file_id, tag_list) {
+                            errors.push(format!(
+                                "MEGA handle {handle}, path '{file_path}', \
+                                 folder '{folder_path}': failed to update \
+                                 metadata: {error}"
+                            ));
+                            continue;
+                        }
+
+                        let _ = client::log_silent(format!(
+                            "MEGA: skipping handle {handle} because it exists \
+                             in the database; updated metadata for path \
+                             '{file_path}' in folder '{folder_path}'"
+                        ));
+                    }
+
+                    None => {
+                        errors.push(format!(
+                            "MEGA handle {handle}, path '{file_path}', \
+                             folder '{folder_path}': existing database record \
+                             has no file ID"
+                        ));
+                    }
+                }
+
+                continue;
             }
 
-            client::log_silent(format!(
-                "MEGA: skipping handle {} because it exists in the database; updated tags and ignored file path '{}' for folder '{}'",
-                node.handle(),
-                file_path,
-                folder_path,
-            ))?;
+            Ok(None) => {}
 
-            continue;
+            Err(error) => {
+                errors.push(format!(
+                    "MEGA handle {handle}, path '{file_path}', \
+                     folder '{folder_path}': database lookup failed: {error}"
+                ));
+                continue;
+            }
         }
 
-        let mut bytes = Vec::new();
-        client.download_node(node, &mut bytes).await?;
+        let _ = client::log_silent(format!(
+            "MEGA: attempting download of handle {handle} with file path \
+             '{file_path}'"
+        ));
 
-        output.push(FileObject {
-            source: Some(FileSource::Bytes(bytes)),
-            tag_list,
-            skip_if: vec![SkipIf::FileTagRelationship(handle_tag)],
-            ..Default::default()
-        });
+        let mut bytes = Vec::new();
+
+        match client.download_node(node, &mut bytes).await {
+            Ok(()) => {
+                let downloaded_size = bytes.len();
+
+                let _ = client::log_silent(format!(
+                    "MEGA: downloaded handle {handle} with size \
+                     {downloaded_size}"
+                ));
+
+                output.push(FileObject {
+                    source: Some(FileSource::Bytes(bytes)),
+                    tag_list,
+                    skip_if: vec![SkipIf::FileTagRelationship(handle_tag)],
+                    ..Default::default()
+                });
+            }
+
+            Err(error) => {
+                errors.push(format!(
+                    "MEGA handle {handle}, path '{file_path}', \
+                     folder '{folder_path}': download failed: {error}"
+                ));
+
+                let _ = client::log_silent(format!(
+                    "MEGA: failed to download handle {handle} with path \
+                     '{file_path}': {error}"
+                ));
+                break;
+            }
+        }
     }
-    Ok(())
 }
 
 #[unsafe(no_mangle)]
@@ -266,41 +310,89 @@ pub fn url_dump(data: &ScraperDataReturn) -> Vec<ScraperDataReturn> {
 }
 
 #[unsafe(no_mangle)]
-pub fn parser_call(_text: &str, _source_url: &str, data: &ScraperDataReturn) -> Vec<ScraperReturn> {
+pub fn parser_call(_text: &str, source_url: &str, data: &ScraperDataReturn) -> Vec<ScraperReturn> {
     let Some(url) = public_url(&data.job.param) else {
         return vec![ScraperReturn::Nothing];
     };
 
-    let result = (|| -> Result<Vec<FileObject>, Box<dyn std::error::Error>> {
+    let result = (|| -> Result<(Vec<FileObject>, Vec<String>), Box<dyn std::error::Error>> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
+
         runtime.block_on(async {
-            let mega = Client::builder()
-                .https(true)
-                .max_retries(3)
-                .build(reqwest::Client::new())?;
+            let http = reqwest::Client::builder()
+                .use_rustls_tls()
+                .user_agent(
+                    "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0",
+                )
+                .build()?;
+
+            let mega = Client::builder().build(http)?;
+
             let nodes = if let Some(password) = password(&data.job.param) {
                 mega.fetch_protected_nodes(&url, &password).await?
             } else {
                 mega.fetch_public_nodes(&url).await?
             };
+
             let mut handles = Vec::new();
+
             for root in nodes.roots() {
                 collect_file_nodes(&nodes, root, &mut handles);
             }
+
+            let system_timestamp = latest_system_timestamp(&nodes);
             let mut files = Vec::new();
-            collect_files(&mega, &nodes, &handles, &mut files).await?;
-            Ok(files)
+            let mut errors = Vec::new();
+
+            collect_files(
+                &mega,
+                &nodes,
+                &handles,
+                source_url,
+                system_timestamp,
+                &mut files,
+                &mut errors,
+            )
+            .await;
+
+            Ok((files, errors))
         })
     })();
 
     match result {
-        Ok(files) if files.is_empty() => vec![ScraperReturn::Nothing],
-        Ok(files) => vec![ScraperReturn::Data(shared_types::ScraperObject {
-            files: files.into_iter().collect::<HashSet<_>>(),
-            ..Default::default()
-        })],
-        Err(error) => vec![ScraperReturn::Stop(format!("MEGA scan failed: {error}"))],
+        Err(error) => {
+            vec![ScraperReturn::Stop(format!(
+                "MEGA: STOPPING due to error {:?}",
+                error
+            ))]
+        }
+
+        Ok((files, errors)) => {
+            let mut output = Vec::new();
+
+            if !files.is_empty() {
+                output.push(ScraperReturn::Data(shared_types::ScraperObject {
+                    files: files.into_iter().collect::<HashSet<_>>(),
+                    ..Default::default()
+                }));
+            }
+
+            if !errors.is_empty() {
+                let backoff = 3600;
+                let _ = client::log_silent(format!(
+                    "MEGA: Got error(s) {:?} while processing {source_url} will retry this job in seconds: {backoff}.",
+                    errors
+                ));
+                output.push(ScraperReturn::RetryLater(backoff));
+            }
+
+            if output.is_empty() {
+                output.push(ScraperReturn::Nothing);
+            }
+
+            output
+        }
     }
 }

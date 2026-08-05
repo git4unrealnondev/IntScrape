@@ -1,14 +1,20 @@
-use std::{str::FromStr, time::Duration};
+use std::{
+    str::FromStr,
+    sync::{Arc, atomic::AtomicBool},
+    time::Duration,
+};
 
 use log::info;
 use reqwest::{
-    Client, ClientBuilder, RequestBuilder,
+    Client, ClientBuilder, RequestBuilder, StatusCode,
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 use shared_types::{DownloadModifiers, ModifierTarget, ScraperParam, TargetModifier};
 use url::Url;
 
 use crate::web::manager::Scraper;
+
+const MAX_URL_RETRY: u8 = 3;
 
 impl Scraper {
     fn process_modifiers(
@@ -129,7 +135,11 @@ impl Scraper {
     ///
     /// Downloads text into the client
     ///
-    pub(in crate::web) async fn dltext(&self, input_url: ScraperParam) -> Option<(String, String)> {
+    pub(in crate::web) async fn dltext(
+        &self,
+        input_url: ScraperParam,
+        should_remove_job: Arc<AtomicBool>,
+    ) -> Option<(String, String)> {
         let url;
         let post_data;
         let mut cnt = 0;
@@ -185,9 +195,36 @@ impl Scraper {
             match futureresult {
                 Ok(res) => {
                     if let Err(err) = res.error_for_status_ref() {
-                        if err.is_timeout() {
-                            let time_secs = 5;
+                        let time_secs = 5;
+                        if let Some(status) = err.status()
+                            && status == StatusCode::NOT_FOUND
+                        {
+                            // IE on 2nd go through this is definitely a deadurl and we shouldnt
+                            // download it
+                            if cnt >= MAX_URL_RETRY - 1 {
+                                log::warn!(
+                                    "Worker: {} JobId: {} -- While processing job {:?} was unable to download text. Had a 404 error. Telling db to kill job and add dead_url.",
+                                    self.plugin.name,
+                                    self.job.id,
+                                    url_parsed,
+                                );
+                                should_remove_job.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            } else {
+                                log::warn!(
+                                    "Worker: {} JobId: {} -- While processing job {:?} was unable to download text. Had a 404 error. Retrying in {} seconds.",
+                                    self.plugin.name,
+                                    self.job.id,
+                                    url_parsed,
+                                    time_secs
+                                );
+                            }
+
                             tokio::time::sleep(std::time::Duration::from_secs(time_secs)).await;
+                            cnt += 1;
+                            continue;
+                        }
+                        if err.is_timeout() {
                             log::error!(
                                 "Worker: {} JobId: {} -- While processing job {:?} was unable to download text. Had err {:?} sleeping for {} seconds.",
                                 self.plugin.name,
@@ -196,6 +233,7 @@ impl Scraper {
                                 err,
                                 time_secs
                             );
+                            tokio::time::sleep(std::time::Duration::from_secs(time_secs)).await;
 
                             cnt += 1;
                             continue;
@@ -245,7 +283,10 @@ impl Scraper {
                 }
             }
 
-            if cnt >= 3 {
+            if cnt >= MAX_URL_RETRY {
+                // If we have an error downloading text and its something goofy then we should
+                // NOT remove the job
+                should_remove_job.store(false, std::sync::atomic::Ordering::Relaxed);
                 break;
             }
 
