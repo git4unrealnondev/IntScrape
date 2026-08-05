@@ -189,10 +189,8 @@ pub enum ScraperReturn {
     Nothing,
     // Stop current job, Record issue Move to next.
     Stop(String),
-    // Wait X seconds before retrying.
-    Timeout(u64),
-    // Sends job back into queue with x waiting time
-    RetryLater(Duration),
+    // Sends job back into queue with x waiting time in seconds
+    RetryLater(u64),
 }
 #[derive(Default, Clone, PartialEq, Debug)]
 pub struct ScraperObject {

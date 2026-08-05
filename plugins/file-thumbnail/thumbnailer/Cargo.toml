@@ -12,11 +12,18 @@ repository = "https://github.com/Trivernis/thumbnailer"
 
 [dependencies]
 webp = "*"
-rayon = "*"
+#rayon = "*"
 tempfile = "*"
 image = { version = "*", default-features = false, features=["jpeg", "png", "gif"]}
 lazy_static = "*"
 file-format = { workspace = true }
+#video-rs = { version = "0.11.0", features = ["ndarray"] }
+#ndarray = "0.17.2"
+webp-animation = "0.10.0"
+#sha2 = "0.11.0"
+#ffmpeg-next = "8.1.0"
+avio = {git = "https://github.com/git4unrealnondev/avio", default-features = false, features=["decode"]}
+#ff-format = "0.15.0"
 [features]
 default = ["webp"]
 webp = ["image/webp"]

@@ -72,9 +72,7 @@ fn main() {
     };
     let parsed = syn::parse2(tokens).expect("generated client is invalid Rust");
     let output = prettyplease::unparse(&parsed);
-    let output_path =
-    PathBuf::from(std::env::var_os("OUT_DIR").unwrap())
-        .join("generated_api.rs");
+    let output_path = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("generated_api.rs");
     let unchanged = fs::read_to_string(&output_path)
         .map(|existing| existing == output)
         .unwrap_or(false);

@@ -34,7 +34,7 @@ const MAX_CONCURRENT_DOWNLOADS: usize = 5;
 
 use crate::{
     db::MainDatabase,
-    helper_functions::{get_sys_time_in_secs, memory_manage},
+    helper_functions::{self, get_sys_time_in_secs, memory_manage},
     plugins::PluginManager,
 };
 
@@ -197,8 +197,13 @@ impl Scraper {
             for param in scrap_data.job.param.iter() {
                 let scraper = self.clone();
                 let param_clone = param.clone();
-                if let Ok(Some((text, source_url))) =
-                    tokio::spawn(async move { scraper.dltext(param_clone).await }).await
+                let should_remove_job_clone = should_remove_job.clone();
+                if let Ok(Some((text, source_url))) = tokio::spawn(async move {
+                    scraper
+                        .dltext(param_clone, should_remove_job_clone.clone())
+                        .await
+                })
+                .await
                 {
                     let local_scrap_data = scrap_data.clone();
                     let scraper = self.clone();
@@ -220,6 +225,7 @@ impl Scraper {
 
                     for data in data_all {
                         match data {
+                            // File data thats actionable
                             ScraperReturn::Data(scraper_object) => {
                                 if scraper_object.files.is_empty()
                                     && scraper_object.tags.is_empty()
@@ -306,6 +312,7 @@ impl Scraper {
                                 //set.join_all().await;
                                 while set.join_next().await.is_some() {}
                             }
+                            // No objects were returned. IE no files
                             ScraperReturn::Nothing => {
                                 log::info!(
                                     "Worker: {} JobId: {} -- STOPPING JOB due to getting NOTHNG",
@@ -314,21 +321,39 @@ impl Scraper {
                                 );
                                 break 'scraperloop;
                             }
+                            // Some sort of site issue. Will retry on next db boot
                             ScraperReturn::Stop(stop_reason) => {
                                 log::error!(
-                                    "Worker: {} JobId: {} -- STOPPING JOB {}",
+                                    "Worker: {} JobId: {} -- STOPPING JOB {} will retry next boot.",
                                     plugin_name,
                                     job_id,
                                     stop_reason
                                 );
+                                should_remove_job
+                                    .store(false, std::sync::atomic::Ordering::Relaxed);
                                 break 'scraperloop;
                             }
-                            _ => {}
+                            ScraperReturn::Fatal(fatal_error) => {
+                                log::error!(
+                                    "Worker: {} JobId: {} -- Encountered fatal error: {}",
+                                    plugin_name,
+                                    job_id,
+                                    fatal_error
+                                );
+                                todo!("Need to implement check logs for data");
+                            }
+                            ScraperReturn::RetryLater(later_duration) => {
+                                let mut job = self.job.clone();
+                                job.isrunning = false;
+                                job.config.time = helper_functions::get_sys_time_in_secs();
+                                job.config.reptime = later_duration;
+                                self.download_manager.db.jobs_update(&job).await;
+                                should_remove_job
+                                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                                break 'scraperloop;
+                            }
                         }
                     }
-                    // If we have an error downloading text then we shouldn't remove job
-                } else {
-                    should_remove_job.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
             }
 

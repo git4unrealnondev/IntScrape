@@ -15,4 +15,5 @@ sha2 = "0.11.0"
 file-format = { workspace = true }
 webp-animation = "0.10.0"
 rayon = "1.12.0"
+webp = "0.3.1"
 

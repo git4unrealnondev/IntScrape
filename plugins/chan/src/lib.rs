@@ -80,10 +80,10 @@ pub fn parser_call(
                     name: format!("{}_{}_4chan", thread_id, board),
                     namespace: nsout(&Nsid::ThreadId),
                 }),
-
                 ..Default::default()
             };
 
+            extract_post_file(first_post, board, rel_context.clone(), &mut files);
             extract_post_info(first_post, &mut tags, rel_context);
 
             for post in post_list {
@@ -97,54 +97,10 @@ pub fn parser_call(
                             name: format!("{}_{}_4chan", thread_id, board),
                             namespace: nsout(&Nsid::ThreadId),
                         }),
-
                         ..Default::default()
                     };
 
-                    if let Some(file_name) = post["filename"].as_str()
-                        && let Some(file_ext) = post["ext"].as_str()
-                        && let Some(file_hash) = post["md5"].as_str()
-                        && let Some(file_url) = post["tim"].as_u64()
-                    {
-                        let attachment_md5 = hex::encode(
-                            base64::prelude::BASE64_STANDARD.decode(file_hash).unwrap(),
-                        );
-
-                        let tag_list = vec![FileTagAction {
-                            operation: TagOperation::Add,
-                            tags: vec![
-                                PluginTag {
-                                    tag: Tag {
-                                        name: format!("{}{}", file_name, file_ext),
-                                        namespace: nsout(&Nsid::AttachmentName),
-                                    },
-                                    ..Default::default()
-                                },
-                                PluginTag {
-                                    tag: Tag {
-                                        name: attachment_md5.to_string(),
-                                        namespace: nsout(&Nsid::OriginalMD5),
-                                    },
-                                    relates_to: Some(rel_context.clone()),
-                                    ..Default::default()
-                                },
-                            ],
-                        }];
-                        files.insert(FileObject {
-                            source: Some(FileSource::Url(format!(
-                                "https://i.4cdn.org/{}/{}{}",
-                                board, file_url, file_ext
-                            ))),
-                            skip_if: vec![SkipIf::FileTagRelationship(Tag {
-                                name: attachment_md5.to_string(),
-                                namespace: nsout(&Nsid::OriginalMD5),
-                            })],
-                            hash: Some(HashesSupported::Md5(attachment_md5)),
-                            tag_list,
-
-                            ..Default::default()
-                        });
-                    }
+                    extract_post_file(post, board, rel_context.clone(), &mut files);
                     extract_post_info(post, &mut tags, rel_context);
                 }
             }
@@ -245,7 +201,64 @@ fn nsout(inp: &Nsid) -> GenericNamespaceObj {
 
     }
 }
+fn extract_post_file(
+    post: &json::JsonValue,
+    board: &str,
+    rel_context: RelationContext,
+    files: &mut HashSet<FileObject>,
+) {
+    let Some(file_name) = post["filename"].as_str() else {
+        return;
+    };
+    let Some(file_ext) = post["ext"].as_str() else {
+        return;
+    };
+    let Some(file_hash) = post["md5"].as_str() else {
+        return;
+    };
+    let Some(file_url) = post["tim"].as_u64() else {
+        return;
+    };
 
+    let Ok(decoded_md5) = base64::prelude::BASE64_STANDARD.decode(file_hash) else {
+        //log::warn!("Invalid 4chan MD5 for attachment tim={file_url}");
+        return;
+    };
+
+    let attachment_md5 = hex::encode(decoded_md5);
+
+    files.insert(FileObject {
+        source: Some(FileSource::Url(format!(
+            "https://i.4cdn.org/{board}/{file_url}{file_ext}"
+        ))),
+        skip_if: vec![SkipIf::FileTagRelationship(Tag {
+            name: attachment_md5.clone(),
+            namespace: nsout(&Nsid::OriginalMD5),
+        })],
+        hash: Some(HashesSupported::Md5(attachment_md5.clone())),
+        tag_list: vec![FileTagAction {
+            operation: TagOperation::Add,
+            tags: vec![
+                PluginTag {
+                    tag: Tag {
+                        name: format!("{file_name}{file_ext}"),
+                        namespace: nsout(&Nsid::AttachmentName),
+                    },
+                    ..Default::default()
+                },
+                PluginTag {
+                    tag: Tag {
+                        name: attachment_md5,
+                        namespace: nsout(&Nsid::OriginalMD5),
+                    },
+                    relates_to: Some(rel_context),
+                    ..Default::default()
+                },
+            ],
+        }],
+        ..Default::default()
+    });
+}
 /// Gets info from a post
 fn extract_post_info(
     post_json: &json::JsonValue,

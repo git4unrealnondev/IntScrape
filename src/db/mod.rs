@@ -10,7 +10,9 @@ use crate::{
 };
 
 pub mod main;
+mod old_code;
 pub mod roaring;
+mod update_handler;
 
 pub enum CacheType {
     // Will be use to query the DB directly. No caching. DEFAULT OPTION
@@ -105,9 +107,27 @@ PRAGMA cache_size = -64000;
         let mut conn = self.pool.get()?;
         let conn = conn.transaction().unwrap();
 
-        if let Ok(Some(_)) = Self::internal_setting_get(&conn, "SYSTEM_VERSION") {
-        } else {
-            self.create_initial_db(&conn);
+        loop {
+            if let Ok(Some(db_version_setting)) =
+                Self::internal_setting_get(&conn, "SYSTEM_VERSION")
+            {
+                if let Some(db_version_local) = db_version_setting.num {
+                    if db_version_local != DB_VERSION {
+                        log::warn!(
+                            "Local db version: {db_version_local} does not match system_version: {DB_VERSION} will attempt an upgrade."
+                        );
+
+                        if db_version_local == 1 {
+                            Self::internal_update_db_1_to_2(&conn)?;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                self.create_initial_db(&conn)?;
+                break;
+            }
         }
 
         Self::internal_file_download_location_set_default(&conn).unwrap();
@@ -125,9 +145,12 @@ PRAGMA cache_size = -64000;
     ///
     /// Creates the initial version of the DB at the file location
     ///
-    fn create_initial_db(&self, conn: &Connection) {
+    fn create_initial_db(&self, conn: &Connection) -> Result<(), r2d2_sqlite::rusqlite::Error> {
         Self::internal_table_create_namespace_v1(conn);
         Self::internal_table_create_tags_v1(conn);
+
+        // Added in DB Version 2
+        Self::internal_table_create_dead_urls_v1(conn)?;
 
         Self::internal_table_create_relationship_v1(conn);
         Self::internal_trigger_create_relationship_v1(conn);
@@ -141,16 +164,7 @@ PRAGMA cache_size = -64000;
         Self::internal_table_create_jobs_v1(conn);
         RelationshipStorage::internal_table_relationship_cache_create_v1(conn);
 
-        Self::internal_setting_set(
-            conn,
-            &shared_types::DbSettingsObj {
-                name: "SYSTEM_VERSION".into(),
-                description: Some("Current version that the DB is on.".into()),
-                num: Some(DB_VERSION),
-                param: None,
-            },
-        )
-        .unwrap();
+        Self::internal_db_version_set(conn, DB_VERSION)?;
         Self::internal_setting_set(
             conn,
             &shared_types::DbSettingsObj {
@@ -171,8 +185,7 @@ PRAGMA cache_size = -64000;
                 num: None,
                 param: Some("IntScrape V1.0".into()),
             },
-        )
-        .unwrap();
+        )?;
 
         Self::internal_setting_set(
             conn,
@@ -184,8 +197,7 @@ PRAGMA cache_size = -64000;
                 num: Some(5),
                 param: None,
             },
-        )
-        .unwrap();
+        )?;
         Self::internal_setting_set(
             conn,
             &shared_types::DbSettingsObj {
@@ -196,8 +208,8 @@ PRAGMA cache_size = -64000;
                 num: Some(5),
                 param: None,
             },
-        )
-        .unwrap();
+        )?;
         Self::internal_setup_default_cache(conn);
+        Ok(())
     }
 }

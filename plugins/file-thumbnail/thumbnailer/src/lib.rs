@@ -18,14 +18,16 @@
 //! thumbnail.write_png(&mut buf).unwrap();
 //! ```
 use crate::error::ThumbResult;
-use file_format::FileFormat;
-use image::{DynamicImage, GenericImageView, ImageFormat};
-use rayon::prelude::*;
-use std::io::{BufRead, BufReader, Seek, Write};
-
-use crate::formats::get_base_image;
+use crate::utils::ffmpeg_cli::get_webp_frame;
+use avio::{HardwareAccel, PixelFormat, VideoDecoder};
+use file_format::{FileFormat, Kind};
+use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader};
 pub use size::ThumbnailSize;
-use std::convert::From;
+use std::io::Cursor;
+use std::io::{BufRead, Seek, Write};
+use std::time::Duration;
+use tempfile::NamedTempFile;
+use webp_animation::EncodingConfig;
 
 pub mod error;
 mod formats;
@@ -38,33 +40,6 @@ pub struct Thumbnail {
     mime: FileFormat,
 }
 
-#[derive(Clone, Debug)]
-pub enum FilterType {
-    Nearest,
-    Triangle,
-    CatmullRom,
-    Gaussian,
-    Lanczos3,
-}
-
-impl FilterType {
-    const fn translate_filter(&self) -> image::imageops::FilterType {
-        match self {
-            Self::Nearest => image::imageops::FilterType::Nearest,
-            Self::Triangle => image::imageops::FilterType::Triangle,
-            Self::CatmullRom => image::imageops::FilterType::CatmullRom,
-            Self::Gaussian => image::imageops::FilterType::Gaussian,
-            Self::Lanczos3 => image::imageops::FilterType::Lanczos3,
-        }
-    }
-}
-
-impl From<FilterType> for image::imageops::FilterType {
-    fn from(filter_type: FilterType) -> Self {
-        filter_type.translate_filter()
-    }
-}
-
 impl Thumbnail {
     /// Writes the bytes of the image in a png format
     pub fn write_png<W: Write + Seek>(self, writer: &mut W) -> ThumbResult<()> {
@@ -72,6 +47,13 @@ impl Thumbnail {
         image.write_to(writer, ImageFormat::Png)?;
 
         Ok(())
+    }
+
+    ///
+    /// Gives internal dynamic image object
+    ///
+    pub fn return_dynamic_img(self) -> DynamicImage {
+        self.inner
     }
 
     /// Writes the bytes of the image in a jpeg format
@@ -105,79 +87,201 @@ impl Thumbnail {
     }
 }
 
-/// Creates thumbnails of the requested sizes for the given reader providing the content as bytes and
-/// the mime describing the contents type
-pub fn create_thumbnails_samplefilter<R: BufRead + Seek, I: IntoIterator<Item = ThumbnailSize>>(
-    reader: R,
-    mime: FileFormat,
-    sizes: I,
-    filter: FilterType,
-) -> ThumbResult<Vec<Thumbnail>> {
-    let image = get_base_image(reader, mime)?;
-    let sizes: Vec<ThumbnailSize> = sizes.into_iter().collect();
-    let thumbnails = resize_images(image, &sizes, filter)
-        .into_iter()
-        .map(|image| Thumbnail { inner: image, mime })
-        .collect();
+use image::Pixel;
+pub fn create_thumbnails_dynamic<R: BufRead + Seek>(
+    mut reader: R,
+    size: &ThumbnailSize,
+) -> ThumbResult<Vec<u8>> {
+    let frate = 4;
+    let mut temp1 = reader.fill_buf().unwrap();
+    let le = temp1.len();
+    let temp2 = &temp1[..];
+    let mime = FileFormat::from_bytes(temp2);
 
-    Ok(thumbnails)
+    let (width, height) = size.dimensions();
+    let mut frames: Vec<Vec<u8>>;
+
+    match mime.kind() {
+        //Kind::Image => Ok(vec![resize_image(get_base_image(reader, mime)?, size)]),
+        Kind::Video | Kind::Audio => {
+            let total_frames = 50;
+
+            let mut video_file = NamedTempFile::new()?;
+
+            let mut buffer = Vec::new();
+            reader.read_to_end(&mut buffer)?;
+            video_file.write_all(&buffer)?;
+
+            frames = Vec::with_capacity(total_frames);
+            let video_file_path = video_file.into_temp_path().keep().unwrap();
+            let mut step = 4;
+
+            let mut decoder = VideoDecoder::open(video_file_path)
+                .output_format(PixelFormat::Rgba)
+                .hardware_accel(HardwareAccel::Auto)
+                .thread_count(4)
+                .build()
+                .unwrap();
+
+            let time_of_one_frame = 1.0 / decoder.frame_rate();
+
+            // let mut frames_to_get = Vec::with_capacity(total_frames);
+
+            'main: for i in 1..=total_frames.max(1) {
+                let frame_index = i * step;
+                //frames_to_get.push(frame_index);
+                let frame_seek = frame_index as f64 * time_of_one_frame * 1000.0;
+
+                if let Ok(Some(frame)) = decoder.thumbnail_at_exact(
+                    Duration::from_millis(frame_seek.floor() as u64),
+                    width,
+                    height,
+                ) {
+                    frames.push(frame.data());
+                }
+
+                /*  if let Ok(thumb_webp) =
+                    get_webp_frame(&video_file_path.to_string_lossy(), frame_index)
+                {
+                    //dbg!(thumb_webp.len());
+                    let image =
+                        match ImageReader::with_format(Cursor::new(thumb_webp), ImageFormat::WebP)
+                            .decode()
+                        {
+                            Ok(img) => img,
+                            Err(_) => continue,
+                        };
+
+                    let image = resize_image(image, size).clone();
+                    let mut pixelbuf = Vec::with_capacity((width * height * 4).try_into().unwrap());
+                    for each in image.into_rgba8().pixels() {
+                        for test in each.channels() {
+                            pixelbuf.push(*test);
+                        }
+                    }
+
+                    frames.push(pixelbuf);
+
+                    /*      if let Ok(Some(frame)) = decoder.thumbnail_at_exact(
+                                            Duration::from_millis(frame_seek.floor() as u64),
+                    width, height
+                                    ) {dbg!(
+                                            &frame_seek,
+                                            frame_seek.floor(),
+                                            frame.width(),
+                                            frame.height(),
+                                            frame.timestamp(),
+                                            frame.timestamp().as_duration()
+                                        );
+                                        frames.push(frame.data());
+                                    }*/
+
+                    /*    decoder
+                        .seek(
+                            Duration::from_millis(frame_seek.floor() as u64),
+                            SeekMode::Exact,
+                        )
+                        .unwrap();
+                    if let Ok(Some(frame)) = decoder.decode_one() {
+                        dbg!(
+                            &frame_seek,
+                            frame_seek.floor(),
+                            frame.width(),
+                            frame.height(),
+                            frame.timestamp(),
+                            frame.timestamp().as_duration()
+                        );
+                        frames.push(frame.data());
+                    }*/
+                }*/
+            }
+        }
+        _ => {
+            return ThumbResult::Err(error::ThumbError::Unsupported(mime));
+        }
+    }
+
+    let webpconfig = EncodingConfig {
+        encoding_type: webp_animation::EncodingType::Lossy(webp_animation::LossyEncodingConfig {
+            alpha_quality: 50,
+            alpha_filtering: 2,
+            sns_strength: 70,
+            filter_strength: 100,
+            preprocessing: true,
+            filter_type: 1,
+            pass: 10,
+            ..Default::default()
+        }),
+        quality: 50.0,
+        method: 6,
+    };
+    use webp_animation::Encoder;
+    use webp_animation::EncoderOptions;
+    let mut encoder = Encoder::new_with_options(
+        (width, height),
+        EncoderOptions {
+            kmin: 3,
+            kmax: 5,
+            encoding_config: Some(webpconfig),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    if frames.is_empty() {
+        ThumbResult::Err(error::ThumbError::Unsupported(mime))
+    } else {
+        let mut last_cnt = 0;
+        for (cnt, frame) in frames.iter().enumerate() {
+            encoder
+                .add_frame(frame, (cnt * frate).try_into().unwrap())
+                .unwrap();
+            last_cnt += 1;
+        }
+        Ok(encoder
+            .finalize((last_cnt * frate).try_into().unwrap())
+            .unwrap()
+            .to_vec())
+    }
 }
 
-/// Creates thumbnails of the requested sizes for the given reader providing the content as bytes and
-/// the mime describing the contents type
-pub fn create_thumbnails<R: BufRead + Seek, I: IntoIterator<Item = ThumbnailSize>>(
-    reader: R,
-    mime: FileFormat,
-    sizes: I,
-) -> ThumbResult<Vec<Thumbnail>> {
-    let image = get_base_image(reader, mime)?;
-    let sizes: Vec<ThumbnailSize> = sizes.into_iter().collect();
-    let thumbnails = resize_images(image, &sizes, FilterType::Lanczos3)
-        .into_iter()
-        .map(|image| Thumbnail { inner: image, mime })
-        .collect();
-
-    Ok(thumbnails)
-}
-
-///
+/*///
 /// Creates thumbnail of requestes size despite not knowing the mime.
 ///
 pub fn create_thumbnails_unknown_type<R: BufRead + Seek, I: IntoIterator<Item = ThumbnailSize>>(
     reader: R,
     sizes: I,
-) -> ThumbResult<Vec<Thumbnail>> {
+) -> ThumbResult<Vec<DynamicImage>> {
     let mut temp = BufReader::new(reader);
     let mut temp1 = temp.fill_buf().unwrap();
     let le = temp1.len();
     let temp2 = &temp1[..];
     let mime = FileFormat::from_bytes(temp2);
-    temp1.consume(le);
 
-    let image = get_base_image(temp, mime)?;
-    let sizes: Vec<ThumbnailSize> = sizes.into_iter().collect();
+    dbg!(&mime);
+
+    temp1.consume(le);
+    match mime.kind() {
+    Kind::Image => {},
+        Kind::Video => {},
+
+    }
+
+   /* let image = get_base_image(temp, mime)?;
+    let sizes: ThumbnailSize = sizes.into_iter().collect();
     let thumbnails = resize_images(image, &sizes, FilterType::Lanczos3)
         .into_iter()
         .map(|image| Thumbnail { inner: image, mime })
-        .collect();
+        .collect();*/
 
     Ok(thumbnails)
-}
+}*/
 
-fn resize_images(
-    image: DynamicImage,
-    sizes: &[ThumbnailSize],
-    _filter_type: crate::FilterType,
-) -> Vec<DynamicImage> {
-    sizes
-        .into_par_iter()
-        .map(|size| {
-            let (width, height) = size.dimensions();
-            image.thumbnail_exact(width, height)
-        })
-        .collect()
+fn resize_image(image: DynamicImage, size: &ThumbnailSize) -> DynamicImage {
+    let (width, height) = size.dimensions();
+    image.thumbnail_exact(width, height)
 }
-
+/*
 ///
 /// Gets multiple frames from a video if they exist.
 ///
@@ -252,7 +356,7 @@ pub fn get_video_frame_multiple<R: BufRead + Seek>(
             };
 
         let image = if let Some(size) = scale {
-            resize_images(image, &[ThumbnailSize::Custom(size)], FilterType::Lanczos3)[0].clone()
+            resize_image(image, &ThumbnailSize::Custom(size)).clone()
         } else {
             image
         };
@@ -262,4 +366,4 @@ pub fn get_video_frame_multiple<R: BufRead + Seek>(
 
     tempdir.close()?;
     Ok(frames)
-}
+}*/
