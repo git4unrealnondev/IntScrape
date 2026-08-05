@@ -45,7 +45,7 @@ fn setup_log() -> Result<(), Box<dyn Error>> {
                     .to_str()
                     .ok_or("Failed to convert log_path to string")?,
             )
-            .chan_len(None),
+            .chan_len(Some(16384)),
     )?;
     Ok(())
 }
