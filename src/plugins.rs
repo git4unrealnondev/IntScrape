@@ -284,6 +284,8 @@ impl PluginManager {
             }
         }
     }
+
+    /// Compiles regex if it doesnt exist in the local cache
     fn get_or_compile_regex(&self, pattern: &str) -> Result<Arc<Regex>, regex::Error> {
         {
             let cache = self.regex_cache.read();
@@ -306,6 +308,8 @@ impl PluginManager {
                 .or_insert_with(|| Arc::clone(&compiled)),
         ))
     }
+
+    /// Runs the regex on tags inside the internal cache
     pub fn callback_tag_regex(&self) {
         let callbacks: Vec<_> = {
             let callbacks = self.storage_callbacks.read();
