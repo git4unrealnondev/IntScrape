@@ -74,6 +74,8 @@ pub enum SupportedDBRequests {
     ParentsRel(u64),
     ExternalPluginCall(String, CallbackInfoInput),
     ShouldExit,
+    AddDeadUrl(String),
+    GetDeadUrl(Vec<String>),
 }
 
 macro_rules! define_db_requests {

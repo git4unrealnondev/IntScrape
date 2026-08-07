@@ -415,6 +415,13 @@ impl Scraper {
             )
             .await;
 
+        // Runs regex on new tags added in previous steps.
+        // NOTE RUNS GLOBALLY so if ANY job adds tags to be checked then this will run them
+        let _ = tokio::task::spawn_blocking(move || {
+            self.plugin_manager.callback_tag_regex();
+        })
+        .await;
+
         /* if  {
           /*  // Updates internal jobs cache
             if let Some(_internal_storage) = self
@@ -536,7 +543,7 @@ impl Scraper {
                         file_url,
                     );
                     let db = self.download_manager.db.clone();
-                    db.dead_url_add(file_url.to_string()).await;
+                    db.dead_url_add_async(file_url.to_string()).await;
                 } else {
                     log::error!(
                         "Scraper: {} JobId: {} Got error {:?}",

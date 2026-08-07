@@ -1,13 +1,13 @@
-use crate::ThumbResult;
-use crate::error::ThumbError;
-use std::ffi::OsStr;
-use std::io::ErrorKind;
-use std::process::{Command, Stdio};
+/*use crate::ThumbResult;
+use crate::error::thumberror;
+use std::ffi::osstr;
+use std::io::errorkind;
+use std::process::{command, stdio};
 
-const FFMPEG: &str = "ffmpeg";
+const ffmpeg: &str = "ffmpeg";
 
-/// Runs ffmpeg to retrieve a png video frame
-pub fn get_png_frame(video_file: &str, index: usize) -> ThumbResult<Vec<u8>> {
+/// runs ffmpeg to retrieve a png video frame
+pub fn get_png_frame(video_file: &str, index: usize) -> thumbresult<vec<u8>> {
     ffmpeg([
         "-loglevel",
         "panic",
@@ -27,8 +27,8 @@ pub fn get_png_frame(video_file: &str, index: usize) -> ThumbResult<Vec<u8>> {
     ])
 }
 
-/// Runs ffmpeg to retrieve a png video frame
-pub fn get_webp_frame(video_file: &str, index: usize) -> ThumbResult<Vec<u8>> {
+/// runs ffmpeg to retrieve a png video frame
+pub fn get_webp_frame(video_file: &str, index: usize) -> thumbresult<vec<u8>> {
     ffmpeg([
         "-loglevel",
         "panic",
@@ -48,26 +48,26 @@ pub fn get_webp_frame(video_file: &str, index: usize) -> ThumbResult<Vec<u8>> {
     ])
 }
 
-/// Runs ffmpeg with the given args
-fn ffmpeg<I: IntoIterator<Item = S>, S: AsRef<OsStr>>(args: I) -> ThumbResult<Vec<u8>> {
-    let child = Command::new(FFMPEG)
+/// runs ffmpeg with the given args
+fn ffmpeg<i: intoiterator<item = s>, s: asref<osstr>>(args: i) -> thumbresult<vec<u8>> {
+    let child = command::new(ffmpeg)
         .args(args)
-        .stdout(Stdio::piped())
+        .stdout(stdio::piped())
         .spawn()?;
 
     let output = child.wait_with_output()?;
     if output.status.success() && !output.stdout.is_empty() {
-        Ok(output.stdout)
+        ok(output.stdout)
     } else {
-        Err(ThumbError::FFMPEG(
-            String::from_utf8_lossy(&output.stderr[..]).to_string(),
+        err(thumberror::ffmpeg(
+            string::from_utf8_lossy(&output.stderr[..]).to_string(),
         ))
     }
 }
 
 pub fn is_ffmpeg_installed() -> bool {
-    match Command::new("ffmpeg").args(["-loglevel", "quiet"]).spawn() {
-        Ok(_) => true,
-        Err(e) => !matches!(e.kind(), ErrorKind::NotFound),
+    match command::new("ffmpeg").args(["-loglevel", "quiet"]).spawn() {
+        ok(_) => true,
+        err(e) => !matches!(e.kind(), errorkind::notfound),
     }
-}
+}*/

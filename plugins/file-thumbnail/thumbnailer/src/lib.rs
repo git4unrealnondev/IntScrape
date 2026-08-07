@@ -18,12 +18,12 @@
 //! thumbnail.write_png(&mut buf).unwrap();
 //! ```
 use crate::error::ThumbResult;
-use crate::utils::ffmpeg_cli::get_webp_frame;
+//use crate::formats::get_base_image;
+use crate::formats::image_format::read_image;
 use avio::{HardwareAccel, PixelFormat, VideoDecoder};
 use file_format::{FileFormat, Kind};
-use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader};
+use image::{DynamicImage, EncodableLayout, GenericImageView, ImageFormat};
 pub use size::ThumbnailSize;
-use std::io::Cursor;
 use std::io::{BufRead, Seek, Write};
 use std::time::Duration;
 use tempfile::NamedTempFile;
@@ -72,7 +72,7 @@ impl Thumbnail {
         let image = DynamicImage::ImageRgba8(self.inner.into_rgba8());
         let webp = webp::Encoder::from_image(&image).unwrap();
         let out = webp.encode(70.0);
-        writer.write_all(out.as_bytes());
+        writer.write_all(out.as_bytes()).unwrap();
         Ok(())
     }
 
@@ -87,22 +87,69 @@ impl Thumbnail {
     }
 }
 
-use image::Pixel;
 pub fn create_thumbnails_dynamic<R: BufRead + Seek>(
     mut reader: R,
     size: &ThumbnailSize,
 ) -> ThumbResult<Vec<u8>> {
     let frate = 4;
-    let mut temp1 = reader.fill_buf().unwrap();
-    let le = temp1.len();
-    let temp2 = &temp1[..];
+    let temp2 = reader.fill_buf().unwrap();
     let mime = FileFormat::from_bytes(temp2);
 
     let (width, height) = size.dimensions();
     let mut frames: Vec<Vec<u8>>;
 
+    if mime == FileFormat::GraphicsInterchangeFormat {
+        let total_frames = 50;
+
+        let mut video_file = NamedTempFile::new()?;
+
+        let mut buffer = Vec::new();
+        reader.read_to_end(&mut buffer)?;
+        video_file.write_all(&buffer)?;
+
+        frames = Vec::with_capacity(total_frames);
+        let video_file_path = video_file.into_temp_path().keep().unwrap();
+        let step = 4;
+
+        let mut decoder = VideoDecoder::open(video_file_path)
+            .output_format(PixelFormat::Rgba)
+            .hardware_accel(HardwareAccel::None)
+            .thread_count(4)
+            .build()
+            .unwrap();
+
+        let time_of_one_frame = 1.0 / decoder.frame_rate();
+
+        for i in 1..=total_frames.max(1) {
+            let frame_index = i * step;
+            //frames_to_get.push(frame_index);
+            let frame_seek = frame_index as f64 * time_of_one_frame * 1000.0;
+
+            if let Ok(Some(frame)) = decoder.thumbnail_at_exact(
+                Duration::from_millis(frame_seek.floor() as u64),
+                width,
+                height,
+            ) {
+                frames.push(frame.data());
+            }
+        }
+    } else {
+        frames = Vec::new();
+    }
+
     match mime.kind() {
-        //Kind::Image => Ok(vec![resize_image(get_base_image(reader, mime)?, size)]),
+        Kind::Image => {
+            if frames.is_empty() {
+                let dyn_img = read_image(reader, mime)?;
+
+                let image = DynamicImage::ImageRgba8(dyn_img.to_rgba8());
+                let image =
+                    image.resize_exact(width, height, image::imageops::FilterType::Lanczos3);
+                let webp = webp::Encoder::from_image(&image).unwrap();
+
+                return Ok(webp.encode(70.0).as_bytes().to_vec());
+            }
+        }
         Kind::Video | Kind::Audio => {
             let total_frames = 50;
 
@@ -114,20 +161,18 @@ pub fn create_thumbnails_dynamic<R: BufRead + Seek>(
 
             frames = Vec::with_capacity(total_frames);
             let video_file_path = video_file.into_temp_path().keep().unwrap();
-            let mut step = 4;
+            let step = 4;
 
             let mut decoder = VideoDecoder::open(video_file_path)
                 .output_format(PixelFormat::Rgba)
-                .hardware_accel(HardwareAccel::Auto)
+                .hardware_accel(HardwareAccel::None)
                 .thread_count(4)
                 .build()
                 .unwrap();
 
             let time_of_one_frame = 1.0 / decoder.frame_rate();
 
-            // let mut frames_to_get = Vec::with_capacity(total_frames);
-
-            'main: for i in 1..=total_frames.max(1) {
+            for i in 1..=total_frames.max(1) {
                 let frame_index = i * step;
                 //frames_to_get.push(frame_index);
                 let frame_seek = frame_index as f64 * time_of_one_frame * 1000.0;
@@ -139,61 +184,6 @@ pub fn create_thumbnails_dynamic<R: BufRead + Seek>(
                 ) {
                     frames.push(frame.data());
                 }
-
-                /*  if let Ok(thumb_webp) =
-                    get_webp_frame(&video_file_path.to_string_lossy(), frame_index)
-                {
-                    //dbg!(thumb_webp.len());
-                    let image =
-                        match ImageReader::with_format(Cursor::new(thumb_webp), ImageFormat::WebP)
-                            .decode()
-                        {
-                            Ok(img) => img,
-                            Err(_) => continue,
-                        };
-
-                    let image = resize_image(image, size).clone();
-                    let mut pixelbuf = Vec::with_capacity((width * height * 4).try_into().unwrap());
-                    for each in image.into_rgba8().pixels() {
-                        for test in each.channels() {
-                            pixelbuf.push(*test);
-                        }
-                    }
-
-                    frames.push(pixelbuf);
-
-                    /*      if let Ok(Some(frame)) = decoder.thumbnail_at_exact(
-                                            Duration::from_millis(frame_seek.floor() as u64),
-                    width, height
-                                    ) {dbg!(
-                                            &frame_seek,
-                                            frame_seek.floor(),
-                                            frame.width(),
-                                            frame.height(),
-                                            frame.timestamp(),
-                                            frame.timestamp().as_duration()
-                                        );
-                                        frames.push(frame.data());
-                                    }*/
-
-                    /*    decoder
-                        .seek(
-                            Duration::from_millis(frame_seek.floor() as u64),
-                            SeekMode::Exact,
-                        )
-                        .unwrap();
-                    if let Ok(Some(frame)) = decoder.decode_one() {
-                        dbg!(
-                            &frame_seek,
-                            frame_seek.floor(),
-                            frame.width(),
-                            frame.height(),
-                            frame.timestamp(),
-                            frame.timestamp().as_duration()
-                        );
-                        frames.push(frame.data());
-                    }*/
-                }*/
             }
         }
         _ => {

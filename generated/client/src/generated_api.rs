@@ -38,7 +38,7 @@ pub fn get_tag_file(
 ///
 pub fn get_namespace_file_ids(
     namespace_id: u64,
-) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+) -> Result<HashSet<u64>, Box<dyn std::error::Error>> {
     crate::init_data_request(
         &crate::SupportedDBRequests::GetNamespaceFileIDs(namespace_id),
     )
@@ -80,10 +80,27 @@ pub fn put_tags_to_files(
 pub fn get_file_ids_all() -> Result<Vec<u64>, Box<dyn std::error::Error>> {
     crate::init_data_request(&crate::SupportedDBRequests::GetFileListId())
 }
+///
+/// Adds tags into db in a bulk manner
+///
 pub fn get_tag_id_bulk(
     tags: HashSet<u64>,
 ) -> Result<HashMap<u64, Tag>, Box<dyn std::error::Error>> {
     crate::init_data_request(&crate::SupportedDBRequests::GetTagIds(tags))
+}
+///
+/// Marks a url as being dead in the db
+///
+pub fn dead_url_add(dead_url: String) -> Result<bool, Box<dyn std::error::Error>> {
+    crate::init_data_request(&crate::SupportedDBRequests::AddDeadUrl(dead_url))
+}
+///
+/// Checks if a lsit of urls are dead
+///
+pub fn dead_url_get(
+    dead_urls: Vec<String>,
+) -> Result<HashMap<String, bool>, Box<dyn std::error::Error>> {
+    crate::init_data_request(&crate::SupportedDBRequests::GetDeadUrl(dead_urls))
 }
 ///
 /// Adds a namespace into the db
@@ -93,6 +110,9 @@ pub fn namespace_set(
 ) -> Result<u64, Box<dyn std::error::Error>> {
     crate::init_data_request(&crate::SupportedDBRequests::SetNamespace(namespace))
 }
+///
+/// Searches the db for all file_ids that are related to the searchobj
+///
 pub fn search_db_files(
     search: SearchObj,
     limit: Option<u64>,
@@ -105,6 +125,9 @@ pub fn setting_get(
 ) -> Result<Option<DbSettingsObj>, Box<dyn std::error::Error>> {
     crate::init_data_request(&crate::SupportedDBRequests::SettingsGetName(name))
 }
+///
+/// Sets the setting in the db. Updates it if the setting already exists
+///
 pub fn setting_set(obj: DbSettingsObj) -> Result<bool, Box<dyn std::error::Error>> {
     crate::init_data_request(&crate::SupportedDBRequests::SettingsSet(obj))
 }

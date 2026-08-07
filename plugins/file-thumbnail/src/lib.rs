@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     error::Error,
     fs::create_dir_all,
+    io::{BufReader, Cursor},
     path::{Path, PathBuf},
 };
 
@@ -10,26 +11,12 @@ use shared_types::{
     CallbackCustomData, CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks,
     PluginTag, Tag,
 };
-use webp_animation::EncodingConfig;
 
-use thumbnailer::{Thumbnail, ThumbnailSize, create_thumbnails_dynamic, error::ThumbError};
+use thumbnailer::{ThumbnailSize, create_thumbnails_dynamic};
 
-static PLUGIN_NAME: &str = "file_thumbnail";
+static PLUGIN_NAME: &str = "File-Thumbnailer";
 static SIZE_THUMBNAIL_X: u32 = 250;
 static SIZE_THUMBNAIL_Y: u32 = 250;
-static DEFAULT_VIDEO_SETTINGS: VideoDefaults = VideoDefaults {
-    frames: 50,
-    //duration: VideoSpacing::Duration(1000),
-};
-
-///
-/// Default video settings
-///
-#[derive(Clone)]
-pub struct VideoDefaults {
-    frames: u32, // how many frames should be in the animated webp
-                 //   duration: VideoSpacing, // how much duration should be before each frame get's captures
-}
 
 ///
 /// Will determine how long the video will be before attempting to take another frame.
@@ -117,6 +104,9 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
             num: None,
             param: Some("False".into()),
         });
+        let _ = client::log_silent(format!(
+            "{PLUGIN_NAME}: Has finished on_start calculating thumbnails."
+        ));
     }
 
     Ok(())
@@ -126,7 +116,7 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
 fn on_start() {
     if let Ok(thumbnail_path) = process_thumb_location() {
         let _ = client::log_silent(format!(
-            "File-Thumbnailer: Will download thumbnails to: {}",
+            "{PLUGIN_NAME}: Will download thumbnails to: {}",
             thumbnail_path.to_string_lossy()
         ));
     }
@@ -191,6 +181,7 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
     }]
 }
 
+/// Gets default folder to dump thumbnails into
 fn process_thumb_location() -> Result<PathBuf, Box<dyn Error>> {
     if client::setting_get("PLUGIN_thumbnail_location".into())?.is_none_or(|f| f.param.is_none())
         && let Ok(Some(local_file_setting)) = client::setting_get("SYSTEM_file_location".into())
@@ -232,8 +223,10 @@ fn process_thumb_location() -> Result<PathBuf, Box<dyn Error>> {
 fn on_download(bytes: &[u8]) -> CallbackReturn {
     let mut tags = HashSet::new();
 
-    if let Ok(thumb) = generate_thumbnail_u8(bytes)
-        && let Ok(thumbpath) = process_thumb_location()
+    if let Ok(thumb) = create_thumbnails_dynamic(
+        BufReader::new(Cursor::new(bytes)),
+        &ThumbnailSize::Custom((SIZE_THUMBNAIL_X, SIZE_THUMBNAIL_Y)),
+    ) && let Ok(thumbpath) = process_thumb_location()
     {
         let (thumb_path, thumb_hash) = make_thumbnail_path(&thumbpath, &thumb);
         let thpath = thumb_path
@@ -243,7 +236,7 @@ fn on_download(bytes: &[u8]) -> CallbackReturn {
 
         match std::fs::write(&pa, thumb) {
             Ok(_) => {
-                let _ = client::log_silent(format!("File-Thumbnailer: Thumbnail put at: {}", pa));
+                let _ = client::log_silent(format!("{PLUGIN_NAME}: Thumbnail put at: {}", pa));
                 let _ = tags.insert(FileTagAction {
                     operation: shared_types::TagOperation::Set,
                     tags: vec![PluginTag {
@@ -259,7 +252,7 @@ fn on_download(bytes: &[u8]) -> CallbackReturn {
                 });
             }
             Err(e) => {
-                let _ = client::log_silent(format!("File-Thumbnailer: Got error {:?}", e));
+                let _ = client::log_silent(format!("{PLUGIN_NAME}: Got error {:?}", e));
             }
         }
     }
@@ -269,119 +262,6 @@ fn on_download(bytes: &[u8]) -> CallbackReturn {
         ..Default::default()
     }
 }
-
-fn make_img(thumb: Thumbnail) -> Vec<u8> {
-    use std::io::Cursor;
-    let mut buf = Cursor::new(Vec::new());
-    thumb.write_webp(&mut buf).unwrap();
-    buf.into_inner()
-}
-use image::{AnimationDecoder, DynamicImage, ImageResult, codecs::gif::GifDecoder};
-pub fn extract_gif_frames(cursor: std::io::Cursor<&[u8]>) -> ImageResult<Vec<DynamicImage>> {
-    // Wrap the data in a Cursor so the decoder can read it like a file
-
-    // Create the decoder
-    let decoder = GifDecoder::new(cursor)?;
-
-    // Decode the animation into frames
-    // into_frames() returns an iterator of Frame objects
-    let frames = decoder.into_frames();
-
-    // Convert each frame into a DynamicImage and collect into a vector
-    frames
-        .map(|f| {
-            // f? handles any decoding errors per frame
-            let frame = f?;
-            Ok(DynamicImage::ImageRgba8(frame.into_buffer()).resize_exact(
-                SIZE_THUMBNAIL_X,
-                SIZE_THUMBNAIL_Y,
-                image::imageops::FilterType::Lanczos3,
-            ))
-        })
-        .collect()
-}
-/*
-fn make_animated_img(
-    filebytes: &[u8],
-    fileformat: file_format::FileFormat,
-    spl: VideoDefaults,
-) -> Option<Vec<u8>> {
-    use image::Pixel;
-    use std::io::Cursor;
-    let frate = 4;
-
-    let cursor = Cursor::new(filebytes);
-
-    let res = thumbnailer::get_video_frame_multiple(
-        cursor.clone(),
-        fileformat,
-        spl.frames as usize,
-        frate,
-        Some((SIZE_THUMBNAIL_X, SIZE_THUMBNAIL_Y)),
-    );
-    let webpconfig = EncodingConfig {
-        encoding_type: webp_animation::EncodingType::Lossy(webp_animation::LossyEncodingConfig {
-            alpha_quality: 50,
-            alpha_filtering: 2,
-            sns_strength: 70,
-            filter_strength: 100,
-            preprocessing: true,
-            filter_type: 1,
-            pass: 10,
-            ..Default::default()
-        }),
-        quality: 50.0,
-        method: 6,
-    };
-    match res {
-        Ok(mut ve) => {
-            if ve.is_empty()
-                && fileformat.extension() == "gif"
-                && let Ok(frames) = extract_gif_frames(cursor)
-            {
-                for frame in frames {
-                    ve.push(frame);
-                }
-            }
-
-            use webp_animation::Encoder;
-            use webp_animation::EncoderOptions;
-            let mut encoder = Encoder::new_with_options(
-                (SIZE_THUMBNAIL_X, SIZE_THUMBNAIL_Y),
-                EncoderOptions {
-                    kmin: 3,
-                    kmax: 5,
-                    encoding_config: Some(webpconfig),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            let mut cnt = 0;
-            for each in ve {
-                let mut pixelbuf =
-                    Vec::with_capacity((each.width() * each.height() * 4).try_into().unwrap());
-                for each in each.into_rgba8().pixels() {
-                    for test in each.channels() {
-                        pixelbuf.push(*test);
-                    }
-                }
-
-                encoder
-                    .add_frame(&pixelbuf, (cnt * frate).try_into().unwrap())
-                    .unwrap();
-                cnt += 1;
-            }
-            let out = match encoder.finalize(((cnt + 1) * frate).try_into().unwrap()) {
-                Ok(out) => out,
-                Err(_err) => {
-                    return None;
-                }
-            };
-            Some(out.to_vec())
-        }
-        Err(_err) => None,
-    }
-}*/
 
 fn make_thumbnail_path(dbloc: &PathBuf, imgdata: &Vec<u8>) -> (PathBuf, String) {
     use sha2::Digest;
@@ -416,131 +296,4 @@ fn make_thumbnail_path(dbloc: &PathBuf, imgdata: &Vec<u8>) -> (PathBuf, String) 
     }
 
     (folderpath, hash)
-}
-
-fn generate_thumbnail_u8(inp: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    use file_format::{FileFormat, Kind};
-    use image::Pixel;
-    use std::io::{Error, ErrorKind};
-
-    return Ok(create_thumbnails_dynamic(
-        std::io::BufReader::new(std::io::Cursor::new(inp)),
-        &ThumbnailSize::Custom((SIZE_THUMBNAIL_X, SIZE_THUMBNAIL_Y)),
-    )?);
-    /*
-    let thumbvec = match create_thumbnails_dynamic(
-        std::io::BufReader::new(std::io::Cursor::new(inp)),
-        &ThumbnailSize::Custom((SIZE_THUMBNAIL_X, SIZE_THUMBNAIL_Y)),
-    ) {
-        Ok(t) => t,
-        Err(err) => match err {
-            ThumbError::Unsupported(fformat) => {
-                return Err(format!(
-                    "{PLUGIN_NAME} - Cannot Parse file with format: {:?}.",
-                    fformat.kind()
-                )
-                .into());
-            }
-            _ => {
-                return Err(format!("{PLUGIN_NAME} - Failed to match err - 190 {:?}", err).into());
-            }
-        },
-    };
-    if thumbvec.len() > 1 {
-        let webpconfig = EncodingConfig {
-            encoding_type: webp_animation::EncodingType::Lossy(
-                webp_animation::LossyEncodingConfig {
-                    alpha_quality: 50,
-                    alpha_filtering: 2,
-                    sns_strength: 70,
-                    filter_strength: 100,
-                    preprocessing: true,
-                    filter_type: 1,
-                    pass: 10,
-                    ..Default::default()
-                },
-            ),
-            quality: 50.0,
-            method: 6,
-        };
-        use webp_animation::Encoder;
-        use webp_animation::EncoderOptions;
-        let mut encoder = Encoder::new_with_options(
-            (SIZE_THUMBNAIL_X, SIZE_THUMBNAIL_Y),
-            EncoderOptions {
-                kmin: 3,
-                kmax: 5,
-                encoding_config: Some(webpconfig),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let frate = 4;
-        let mut cnt = 0;
-        for dyn_image in thumbvec {
-            let mut pixelbuf = Vec::with_capacity(
-                (dyn_image.width() * dyn_image.height() * 4)
-                    .try_into()
-                    .unwrap(),
-            );
-            for each in dyn_image.into_rgba8().pixels() {
-                for test in each.channels() {
-                    pixelbuf.push(*test);
-                }
-            }
-
-            encoder
-                .add_frame(&pixelbuf, (cnt * frate).try_into().unwrap())
-                .unwrap();
-            cnt += 1;
-        }
-
-        Ok(encoder
-            .finalize(((cnt + 1) * frate).try_into().unwrap())
-            .map(|f| f.to_vec())?)
-    } else if thumbvec.len() == 1 {
-        let webp = webp::Encoder::from_image(&thumbvec[0]).unwrap();
-        let out = webp.encode(70.0);
-
-        Ok(out.to_vec())
-    } else {
-        Err("No thumbs returned".into())
-    }*/
-    /*
-    let thumb = &thumbvec[0];
-    match thumb.return_fileformat().kind() {
-        Kind::Image => match thumb.return_fileformat() {
-            FileFormat::GraphicsInterchangeFormat => {
-                match make_animated_img(
-                    inp,
-                    thumb.return_fileformat(),
-                    DEFAULT_VIDEO_SETTINGS.clone(),
-                ) {
-                    Some(vec) => Ok(vec),
-                    None => Err(Error::new(ErrorKind::Unsupported, "GIF Defuzzing failed")),
-                }
-            }
-            _ => Ok(make_img(thumb.clone())),
-        },
-        Kind::Video => {
-            match make_animated_img(
-                inp,
-                thumb.return_fileformat(),
-                DEFAULT_VIDEO_SETTINGS.clone(),
-            ) {
-                Some(vec) => Ok(vec),
-                None => Err(Error::new(ErrorKind::Unsupported, "")),
-            }
-        }
-        _ => {
-            match make_animated_img(
-                inp,
-                thumb.return_fileformat(),
-                DEFAULT_VIDEO_SETTINGS.clone(),
-            ) {
-                Some(vec) => Ok(vec),
-                None => Err(Error::new(ErrorKind::Unsupported, "gif is bad")),
-            }
-        }
-    }*/
 }

@@ -1,6 +1,8 @@
 use crate::cli::cli_structs::CheckFilesEnum;
+use crate::plugins::PluginManager;
 use bytes::Bytes;
 use log::info;
+use parking_lot::RwLock;
 use r2d2_sqlite::rusqlite::OptionalExtension;
 use r2d2_sqlite::rusqlite::{self, Connection, Row, params};
 use rusqlite::{ToSql, Transaction};
@@ -743,7 +745,7 @@ ON Jobs (time, reptime, site, param);
     pub(in crate::db) fn internal_file_id_get_namespace_id_sync(
         conn: &Connection,
         namespace_id: &u64,
-    ) -> Result<Vec<u64>, rusqlite::Error> {
+    ) -> Result<HashSet<u64>, rusqlite::Error> {
         let mut stmt = conn.prepare(
             "
 SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
@@ -929,7 +931,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     ///
     #[must_use]
     #[ipc(name = "get_namespace_file_ids", request = "GetNamespaceFileIDs")]
-    pub fn file_id_get_namespace_id_sync(&self, namespace_id: &u64) -> Vec<u64> {
+    pub fn file_id_get_namespace_id_sync(&self, namespace_id: &u64) -> HashSet<u64> {
         let conn = self.pool.get().unwrap();
         Self::internal_file_id_get_namespace_id_sync(&conn, namespace_id).unwrap_or_default()
     }
@@ -959,7 +961,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
         let mut guard = self.writer_conn.lock();
         let conn = guard.transaction().unwrap();
 
-        let tag_map = Self::internal_tag_bulk_add(&conn, tag);
+        let tag_map = Self::internal_tag_bulk_add(&conn, tag, self.plugin_manager.clone());
         let relationships: HashSet<(u64, u64)> = tag_map.values().map(|f| (*file_id, *f)).collect();
         Self::internal_relationship_bulk_add(Arc::new(self.clone()), &conn, &relationships);
 
@@ -989,7 +991,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
         };
 
         for (file_id, tags) in tags_by_file {
-            let tag_map = Self::internal_tag_bulk_add(&conn, tags);
+            let tag_map = Self::internal_tag_bulk_add(&conn, tags, self.plugin_manager.clone());
             let relationships: HashSet<(u64, u64)> =
                 tag_map.values().map(|tag_id| (*file_id, *tag_id)).collect();
             Self::internal_relationship_bulk_add(Arc::new(self.clone()), &conn, &relationships);
@@ -1080,6 +1082,9 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
         Ok(out)
     }
 
+    ///
+    /// Adds tags into db in a bulk manner
+    ///
     #[must_use]
     #[ipc(name = "get_tag_id_bulk", request = "GetTagIds")]
     pub fn tag_id_get_tag_sync(&self, tags: &HashSet<u64>) -> HashMap<u64, Tag> {
@@ -1661,11 +1666,21 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     }
 
     ///
+    /// Gets the max id from the tags table
+    ///
+    pub(in crate::db) fn internal_tag_get_max_id(
+        conn: &Connection,
+    ) -> Result<u64, rusqlite::Error> {
+        conn.query_one("SELECT MAX(id) FROM Tags;", [], |f| f.get(0))
+    }
+
+    ///
     /// Adds tags into db
     ///
     pub(in crate::db) fn internal_tag_bulk_add(
         conn: &Connection,
         tag_actions: &[FileTagAction],
+        plugin_manager: Arc<RwLock<Option<Arc<PluginManager>>>>,
     ) -> HashMap<shared_types::Tag, u64> {
         let mut out = HashMap::new();
         let mut parents = HashSet::new();
@@ -1739,6 +1754,13 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             return out;
         }
 
+        // Gets the largest tag_id in the db for regex filtering
+        let max_tag_id = if let Ok(max_id) = Self::internal_tag_get_max_id(conn) {
+            max_id
+        } else {
+            return out;
+        };
+
         for chunk in pending_tags.chunks(SQL_CHUNK_SIZE) {
             let mut query = String::from("INSERT INTO Tags (name, namespace) VALUES ");
             let mut params_vector: Vec<&dyn ToSql> = Vec::with_capacity(chunk.len() * 2);
@@ -1766,6 +1788,20 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                 let (tag_obj, _) = &chunk[idx];
                 out.insert(tag_obj.clone(), tag_id);
                 idx += 1;
+            }
+        }
+
+        // Handles the regex tags getting added into the db
+        {
+            let plugin_manager = plugin_manager.write();
+            if let Some(plugin_manager) = &*plugin_manager {
+                let mut tags_to_add = HashSet::new();
+                for (tag, tag_id) in out.iter() {
+                    if tag_id > &max_tag_id {
+                        tags_to_add.insert(tag.clone());
+                    }
+                }
+                plugin_manager.add_regex_tags(tags_to_add);
             }
         }
 
@@ -1804,6 +1840,11 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         }
 
         out
+    }
+
+    pub fn set_plugin_manager(&self, plugin_manager_add: Arc<PluginManager>) {
+        let mut plugin_manager = self.plugin_manager.write();
+        *plugin_manager = Some(plugin_manager_add);
     }
 
     ///
@@ -2306,14 +2347,37 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     }
 
     ///
+    /// Marks a url as being dead in the db
+    ///
+    #[ipc(name = "dead_url_add", request = "AddDeadUrl")]
+    pub fn dead_url_add_sync(&self, dead_url: &String) -> bool {
+        let mut writer_conn = self.writer_conn.lock();
+        let conn = writer_conn.transaction().unwrap();
+        let _ = Self::internal_dead_url_add(&conn, dead_url);
+        let _ = conn.commit();
+
+        false
+    }
+
+    ///
+    /// Checks if a lsit of urls are dead
+    ///
+    #[ipc(name = "dead_url_get", request = "GetDeadUrl")]
+    pub fn dead_url_get_sync(&self, dead_urls: &[String]) -> HashMap<String, bool> {
+        let conn = self.pool.get().unwrap();
+
+        if let Ok(status) = Self::internal_dead_url_exist(&conn, dead_urls) {
+            return status;
+        }
+        HashMap::new()
+    }
+
+    ///
     /// Adds dead url into db
     ///
-    pub async fn dead_url_add(self: Arc<Self>, dead_url: String) {
+    pub async fn dead_url_add_async(self: Arc<Self>, dead_url: String) {
         let result = tokio::task::spawn_blocking(move || {
-            let mut writer_conn = self.writer_conn.lock();
-            let conn = writer_conn.transaction().unwrap();
-            let _ = Self::internal_dead_url_add(&conn, &dead_url);
-            let _ = conn.commit();
+            self.dead_url_add_sync(&dead_url);
         });
         let _ = result.await;
     }
@@ -2408,7 +2472,8 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             // Collect all action definitions across every file block into one flat vector
             let all_tag_actions: Vec<FileTagAction> = map.values().flatten().cloned().collect();
 
-            let tag_cache = Self::internal_tag_bulk_add(&conn, &all_tag_actions);
+            let tag_cache =
+                Self::internal_tag_bulk_add(&conn, &all_tag_actions, self.plugin_manager.clone());
 
             let file_ids: Vec<u64> = file_cache.values().copied().collect();
             let current_file_relationships =
@@ -2777,6 +2842,9 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         .unwrap()
     }
 
+    ///
+    /// Searches the db for all file_ids that are related to the searchobj
+    ///
     #[must_use]
     #[ipc(name = "search_db_files", request = "SearchFiles")]
     pub fn search_db_files_sync(&self, search: &SearchObj, limit: &Option<u64>) -> Vec<u64> {
@@ -2928,6 +2996,9 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             .flatten() // Flattens the JoinError wrapper Option as well
     }
 
+    ///
+    /// Sets the setting in the db. Updates it if the setting already exists
+    ///
     #[must_use]
     #[ipc(name = "setting_set", request = "SettingsSet")]
     pub fn setting_set_sync(&self, obj: &DbSettingsObj) -> bool {
@@ -3073,6 +3144,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         let tags_owned = tags.to_vec();
         let writer_conn = self.writer_conn.clone();
 
+        let plugin_manager = self.plugin_manager.clone();
         tokio::task::spawn_blocking(move || {
             let out_tags;
             {
@@ -3080,7 +3152,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 let tn = writer_lock_guard
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .unwrap();
-                out_tags = Self::internal_tag_bulk_add(&tn, &tags_owned);
+                out_tags = Self::internal_tag_bulk_add(&tn, &tags_owned, plugin_manager.clone());
 
                 tn.commit().unwrap();
             }

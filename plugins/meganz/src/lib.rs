@@ -6,15 +6,15 @@
 //! as `RelationContext::limit_to` values for metadata relations.
 //! Slop coded by GPT5.6-Luna with himan supervision
 
-use std::collections::HashSet;
+use std::{collections::HashSet, error::Error};
 
 use chrono::{DateTime, Utc};
-use mega::{Client, Node, Nodes};
+use mega::{Client, ErrorCode, Node, Nodes};
 use reqwest::header::HeaderMap;
 use shared_types::{
     FileObject, FileSource, FileTagAction, GenericNamespaceObj, GlobalCallbacks, PluginProperties,
-    PluginTag, RelationContext, ScraperDataReturn, ScraperParam, ScraperReturn, SkipIf, Tag,
-    TagOperation,
+    PluginTag, RelationContext, ScraperDataReturn, ScraperParam, ScraperReturn, SearchType, SkipIf,
+    Tag, TagOperation,
 };
 
 const SITE: &str = "meganz";
@@ -295,14 +295,20 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
         ],
         callbacks: vec![GlobalCallbacks::Start(
             shared_types::StartupThreadType::Spawn,
-        )],
-        ..Default::default()
+        ),
+        GlobalCallbacks::Tag((SearchType::Regex(r#"(?i)\bhttps?://(?:www\.)?(?:mega\.nz|mega\.co\.nz)/(?:file|folder)/[A-Za-z0-9_-]+(?:#[A-Za-z0-9_-]+)?|https?://(?:www\.)?(?:mega\.nz|mega\.co\.nz)/#![A-Za-z0-9_-]+![A-Za-z0-9_-]+"#.into()), vec![], vec![NS_SOURCE_URL.into()]))],
     }]
 }
 
 #[unsafe(no_mangle)]
 pub fn url_dump(data: &ScraperDataReturn) -> Vec<ScraperDataReturn> {
-    if public_url(&data.job.param).is_some() {
+    if let Some(url) = public_url(&data.job.param) {
+        dbg!(client::dead_url_get(vec![url.clone()]), &url);
+        if let Ok(dead) = client::dead_url_get(vec![url.clone()])
+            && dead.contains_key(&url)
+        {
+            return Vec::new();
+        }
         vec![data.clone()]
     } else {
         Vec::new()
@@ -363,6 +369,14 @@ pub fn parser_call(_text: &str, source_url: &str, data: &ScraperDataReturn) -> V
 
     match result {
         Err(error) => {
+            dbg!(&data.job.param);
+            // If we're blocked IE bad folder then dont try it
+            if let Some(pub_url) = public_url(&data.job.param)
+                && is_mega_blocked(error.as_ref())
+            {
+                let _ = client::dead_url_add(pub_url.to_string());
+            }
+
             vec![ScraperReturn::Stop(format!(
                 "MEGA: STOPPING due to error {:?}",
                 error
@@ -395,4 +409,29 @@ pub fn parser_call(_text: &str, source_url: &str, data: &ScraperDataReturn) -> V
             output
         }
     }
+}
+
+fn is_mega_blocked(error: &(dyn Error + 'static)) -> bool {
+    error
+        .downcast_ref::<mega::Error>()
+        .is_some_and(|mega_error| {
+            matches!(
+                mega_error,
+                mega::Error::MegaError {
+                    code: ErrorCode::EBLOCKED,
+                    ..
+                }
+            )
+        })
+        || error
+            .downcast_ref::<mega::Error>()
+            .is_some_and(|mega_error| {
+                matches!(
+                    mega_error,
+                    mega::Error::MegaError {
+                        code: ErrorCode::ENOENT,
+                        ..
+                    }
+                )
+            })
 }

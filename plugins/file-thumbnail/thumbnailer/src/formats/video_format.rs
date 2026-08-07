@@ -1,7 +1,5 @@
-use crate::error::{ThumbError, ThumbResult};
-use crate::utils::ffmpeg_cli::{get_png_frame, is_ffmpeg_installed};
+/*use crate::error::{ThumbError, ThumbResult};
 use file_format::FileFormat;
-use image::io::Reader as ImageReader;
 use image::{DynamicImage, ImageFormat};
 use std::fs;
 use std::io::{BufRead, Cursor, Seek};
@@ -37,4 +35,4 @@ pub fn get_video_frame<R: BufRead + Seek>(
     let img = ImageReader::with_format(Cursor::new(png_bytes), ImageFormat::Png).decode()?;
 
     Ok(img)
-}
+}*/

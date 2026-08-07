@@ -1,21 +1,17 @@
-use std::{env, fs, path::PathBuf};
+use std::{env, error::Error, fs, path::PathBuf};
 
 use quote::{format_ident, quote};
 use syn::{FnArg, ImplItem, ImplItemFn, Item, Pat, Type};
 
-fn main() {
+fn main() -> Result<(), Box<dyn Error>> {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let source_path = manifest.join("../../src/db/main.rs");
     println!("cargo:rerun-if-changed=../../src/db/",);
     println!("cargo:rerun-if-changed=../../libs/shared_types/src");
 
-    let source = fs::read_to_string(&source_path).unwrap_or_else(|error| {
-        panic!(
-            "cannot read database source {}: {error}",
-            source_path.display()
-        )
-    });
-    let file = syn::parse_file(&source).expect("cannot parse database source");
+    let source = fs::read_to_string(&source_path)?;
+    dbg!(&source_path);
+    let file = syn::parse_file(&source)?;
     let mut methods = Vec::new();
 
     for item in file.items {
@@ -91,6 +87,7 @@ fn main() {
             )
         });
     }
+    Ok(())
 }
 
 fn ipc_options(method: &ImplItemFn) -> (Option<syn::Ident>, Option<syn::Ident>) {
