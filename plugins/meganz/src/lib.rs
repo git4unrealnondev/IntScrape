@@ -285,6 +285,9 @@ async fn collect_files(
 }
 
 #[unsafe(no_mangle)]
+fn on_start() {}
+
+#[unsafe(no_mangle)]
 fn get_plugin_info() -> Vec<shared_types::Plugin> {
     vec![shared_types::Plugin {
         name: SITE.into(),
@@ -303,9 +306,8 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
 #[unsafe(no_mangle)]
 pub fn url_dump(data: &ScraperDataReturn) -> Vec<ScraperDataReturn> {
     if let Some(url) = public_url(&data.job.param) {
-        dbg!(client::dead_url_get(vec![url.clone()]), &url);
         if let Ok(dead) = client::dead_url_get(vec![url.clone()])
-            && dead.contains_key(&url)
+            && dead.get(&url).is_some_and(|x| *x)
         {
             return Vec::new();
         }
@@ -369,7 +371,6 @@ pub fn parser_call(_text: &str, source_url: &str, data: &ScraperDataReturn) -> V
 
     match result {
         Err(error) => {
-            dbg!(&data.job.param);
             // If we're blocked IE bad folder then dont try it
             if let Some(pub_url) = public_url(&data.job.param)
                 && is_mega_blocked(error.as_ref())

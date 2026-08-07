@@ -223,37 +223,44 @@ fn process_thumb_location() -> Result<PathBuf, Box<dyn Error>> {
 fn on_download(bytes: &[u8]) -> CallbackReturn {
     let mut tags = HashSet::new();
 
-    if let Ok(thumb) = create_thumbnails_dynamic(
+    match create_thumbnails_dynamic(
         BufReader::new(Cursor::new(bytes)),
         &ThumbnailSize::Custom((SIZE_THUMBNAIL_X, SIZE_THUMBNAIL_Y)),
-    ) && let Ok(thumbpath) = process_thumb_location()
-    {
-        let (thumb_path, thumb_hash) = make_thumbnail_path(&thumbpath, &thumb);
-        let thpath = thumb_path
-            .join(thumb_hash.clone())
-            .with_added_extension("webp");
-        let pa = thpath.to_string_lossy().to_string();
+    ) {
+        Ok(thumb) => {
+            if let Ok(thumbpath) = process_thumb_location() {
+                let (thumb_path, thumb_hash) = make_thumbnail_path(&thumbpath, &thumb);
+                let thpath = thumb_path
+                    .join(thumb_hash.clone())
+                    .with_added_extension("webp");
+                let pa = thpath.to_string_lossy().to_string();
 
-        match std::fs::write(&pa, thumb) {
-            Ok(_) => {
-                let _ = client::log_silent(format!("{PLUGIN_NAME}: Thumbnail put at: {}", pa));
-                let _ = tags.insert(FileTagAction {
-                    operation: shared_types::TagOperation::Set,
-                    tags: vec![PluginTag {
-                        tag: Tag {
-                            name: thumb_hash.to_string(),
-                            namespace: GenericNamespaceObj {
-                                name: "file_thumbnail".to_string(),
-                                description: Some("A thumbnail hash.".into()),
-                            },
-                        },
-                        ..Default::default()
-                    }],
-                });
+                match std::fs::write(&pa, thumb) {
+                    Ok(_) => {
+                        let _ =
+                            client::log_silent(format!("{PLUGIN_NAME}: Thumbnail put at: {}", pa));
+                        let _ = tags.insert(FileTagAction {
+                            operation: shared_types::TagOperation::Set,
+                            tags: vec![PluginTag {
+                                tag: Tag {
+                                    name: thumb_hash.to_string(),
+                                    namespace: GenericNamespaceObj {
+                                        name: "file_thumbnail".to_string(),
+                                        description: Some("A thumbnail hash.".into()),
+                                    },
+                                },
+                                ..Default::default()
+                            }],
+                        });
+                    }
+                    Err(e) => {
+                        let _ = client::log_silent(format!("{PLUGIN_NAME}: Got error {:?}", e));
+                    }
+                }
             }
-            Err(e) => {
-                let _ = client::log_silent(format!("{PLUGIN_NAME}: Got error {:?}", e));
-            }
+        }
+        Err(e) => {
+            let _ = client::log_silent(format!("{PLUGIN_NAME}: Recieved Error {:?}", e));
         }
     }
 
