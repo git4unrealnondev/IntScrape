@@ -1,4 +1,4 @@
-use crate::error::{ThumbError, ThumbResult};
+/*use crate::error::{ThumbError, ThumbResult};
 use crate::formats::image_format::read_image;
 use file_format::{FileFormat, Kind};
 use image::DynamicImage;
@@ -26,4 +26,5 @@ pub fn get_base_image<R: BufRead + Seek>(reader: R, mime: FileFormat) -> ThumbRe
         },
         _ => Err(ThumbError::Unsupported(mime)),
     }
-}
+}*/
+pub mod image_format;

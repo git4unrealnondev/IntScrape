@@ -23,7 +23,7 @@ const LISTOFSUPSET: [Supset; 7] = [
 ];
 
 // Number of jobs to run concurrently while on_start runs
-const NUMOFJOBS: usize = 10;
+const NUMOFJOBS: usize = 20;
 
 #[derive(PartialEq, Clone, Copy, Debug, Eq, Hash)]
 enum Supset {
@@ -61,34 +61,36 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
             }
         }
     }
+    let _ = client::log_silent(format!(
+        "FileHash: We've got {} files to process.",
+        total_file_ids.len()
+    ));
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
-    let pool = threadpool::ThreadPool::new(NUMOFJOBS);
+    let pool = threadpool::Builder::new().build();
 
-    for (file_id, tables) in total_file_ids {
+    for (idx, (file_id, tables)) in total_file_ids.iter().enumerate() {
         // Stop scheduling new work immediately if exit is requested
-        if cancel_flag.clone().load(Ordering::Relaxed) {
-            return Ok(());
-        }
 
-        if !tables.is_empty()
-            && let Some(file_path) = client::get_file_path(file_id)?
-            && let Ok(file_data) = std::fs::read(file_path)
-        {
+        if idx % 100 == 0 {
+            pool.join();
+            let _ = client::log_silent(format!("FileHash: Processed {} files.", idx));
             if let Ok(result) = client::should_exit()
                 && result
             {
                 cancel_flag.store(true, Ordering::Relaxed);
-                return Ok(());
+                break;
             }
+        }
 
-            let cancel_flag = cancel_flag.clone();
-            pool.execute(move || {
-                // Check immediately when worker picks up the job
-                if cancel_flag.clone().load(Ordering::Relaxed) {
-                    return;
-                }
+        let file_id = *file_id;
+        let tables = tables.clone();
 
+        pool.execute(move || {
+            if !tables.is_empty()
+                && let Ok(Some(file_path)) = client::get_file_path(file_id)
+                && let Ok(file_data) = std::fs::read(file_path)
+            {
                 let mut tags = Vec::with_capacity(tables.len());
                 for table in tables {
                     if let Some(file_hash) = hash_file(&table, &file_data) {
@@ -100,38 +102,35 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
                             ..Default::default()
                         });
 
-                        let _ = client::log_silent(format!(
+                        /*  let _ = client::log_silent(format!(
                             "FileHash: FileId: {} hash: {} type: {}",
                             file_id,
                             file_hash,
                             get_set(&table).name
-                        ));
+                        ));*/
                     }
                 }
-                if client::put_tags_to_file(
+                let _ = client::put_tags_to_file(
                     file_id,
                     vec![FileTagAction {
                         operation: shared_types::TagOperation::Set,
                         tags,
                     }],
-                )
-                .is_err()
-                {
-                    cancel_flag.store(true, Ordering::Relaxed);
-                }
-            });
-        }
+                );
+            }
+        });
     }
 
-    if !client::should_exit()? {
-        pool.join();
+    pool.join();
+    let _ = client::log_silent(format!("FileHash: Finished processing files.",));
 
-        let _ = client::setting_set(shared_types::DbSettingsObj {
+    if !cancel_flag.load(Ordering::Relaxed) && !client::should_exit()? {
+        client::setting_set(shared_types::DbSettingsObj {
             name: "PLUGIN_FileHash_ShouldRun".into(),
             description: Some("Should the plugin filehash run on_start".into()),
             num: None,
             param: Some("False".into()),
-        });
+        })?;
     }
     Ok(())
 }

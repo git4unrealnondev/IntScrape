@@ -66,6 +66,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let plugin_manager =
         PluginManager::new(Path::new(PLUGINS_PATH), db.clone(), should_exit.clone());
+    db.set_plugin_manager(plugin_manager.clone());
 
     let download_manager = DownloadsManager::new(
         db.clone(),

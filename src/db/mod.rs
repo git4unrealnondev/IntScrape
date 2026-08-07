@@ -7,6 +7,7 @@ use std::{collections::HashMap, path::Path, time::Duration};
 use crate::{
     Arc, DB_VERSION,
     db::roaring::{InternalCacheType, RelationshipStorage},
+    plugins::PluginManager,
 };
 
 pub mod main;
@@ -27,6 +28,7 @@ pub struct MainDatabase {
     namespace_cache: Arc<RwLock<HashMap<String, u64>>>,
     cache_type: Arc<RwLock<CacheType>>,
     relationship_roaring_storage: Arc<RwLock<Option<RelationshipStorage>>>,
+    plugin_manager: Arc<RwLock<Option<Arc<PluginManager>>>>,
 }
 
 impl MainDatabase {
@@ -63,6 +65,7 @@ PRAGMA cache_size = -64000;
             cache_type: Arc::new(RwLock::new(CacheType::Bare)),
             relationship_roaring_storage: Arc::new(RwLock::new(None)),
             writer_conn,
+            plugin_manager: Arc::new(RwLock::new(None)),
         }
         .into();
 

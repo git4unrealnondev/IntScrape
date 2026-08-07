@@ -12,10 +12,11 @@ use libloading::Library;
 
 use log::{error, info};
 use parking_lot::RwLock;
+use regex::Regex;
 use shared_types::{
     CallbackCustomData, CallbackCustomDataReturning, CallbackInfo, CallbackInfoInput,
     CallbackReturn, DbJobsObj, FileTagAction, GlobalCallbacks, Plugin, PluginProperties,
-    ScraperDataReturn, StartupThreadType,
+    ScraperDataReturn, StartupThreadType, Tag,
 };
 
 use crate::db::MainDatabase;
@@ -28,6 +29,8 @@ pub struct PluginManager {
     db: Arc<MainDatabase>,
     threads: RwLock<Vec<JoinHandle<()>>>,
     should_exit: Arc<AtomicBool>,
+    regex_tags_cache: RwLock<HashSet<Tag>>,
+    regex_cache: RwLock<HashMap<String, Arc<Regex>>>,
 }
 
 impl Drop for PluginManager {
@@ -54,6 +57,8 @@ impl PluginManager {
             db,
             threads: Vec::new().into(),
             should_exit,
+            regex_tags_cache: HashSet::new().into(),
+            regex_cache: HashMap::new().into(),
         };
 
         plugin_manager.load_libs(path);
@@ -70,6 +75,13 @@ impl PluginManager {
     pub fn get_storage_sites(&self) -> Vec<String> {
         let guard = self.storage_site.read();
         guard.keys().cloned().collect()
+    }
+
+    /// Adds tags to cache will let system process later.
+    /// called from db needs to be relatively fast and non-blocking
+    pub fn add_regex_tags(&self, tags: HashSet<Tag>) {
+        let mut regex_tags_cache = self.regex_tags_cache.write();
+        regex_tags_cache.extend(tags);
     }
 
     pub fn are_start_threads_closed(&self) -> bool {
@@ -272,7 +284,102 @@ impl PluginManager {
             }
         }
     }
+    fn get_or_compile_regex(&self, pattern: &str) -> Result<Arc<Regex>, regex::Error> {
+        {
+            let cache = self.regex_cache.read();
 
+            if let Some(regex) = cache.get(pattern) {
+                return Ok(Arc::clone(regex));
+            }
+        }
+
+        // Compile outside the lock. This prevents blocking other readers.
+        let compiled = Arc::new(Regex::new(pattern)?);
+
+        let mut cache = self.regex_cache.write();
+
+        // Another thread may have compiled it while we were compiling.
+        // Reuse the existing value in that case.
+        Ok(Arc::clone(
+            cache
+                .entry(pattern.to_owned())
+                .or_insert_with(|| Arc::clone(&compiled)),
+        ))
+    }
+    pub fn callback_tag_regex(&self) {
+        let callbacks: Vec<_> = {
+            let callbacks = self.storage_callbacks.read();
+
+            callbacks
+                .iter()
+                .filter_map(|(callback, plugins)| {
+                    let GlobalCallbacks::Tag((search_type, namespace_allow, namespace_deny)) =
+                        callback
+                    else {
+                        return None;
+                    };
+
+                    Some((
+                        search_type.clone(),
+                        namespace_allow.clone(),
+                        namespace_deny.clone(),
+                        plugins.clone(),
+                    ))
+                })
+                .collect()
+        };
+
+        let regex_tags = self.regex_tags_cache.read();
+
+        for (search_type, namespace_allow, namespace_deny, plugins) in callbacks {
+            let compiled_regex = match &search_type {
+                shared_types::SearchType::Regex(pattern) => {
+                    match self.get_or_compile_regex(pattern) {
+                        Ok(regex) => Some(regex),
+                        Err(error) => {
+                            log::error!("Invalid regex {pattern:?}: {error}");
+                            continue;
+                        }
+                    }
+                }
+                shared_types::SearchType::String(_) => None,
+            };
+
+            for regex_tag in regex_tags.iter() {
+                let namespace = &regex_tag.namespace.name;
+
+                if namespace_deny.contains(namespace) {
+                    continue;
+                }
+
+                if !namespace_allow.is_empty() && !namespace_allow.contains(namespace) {
+                    continue;
+                }
+
+                let matched = match &search_type {
+                    shared_types::SearchType::String(search_string) => {
+                        regex_tag.name.contains(search_string)
+                    }
+
+                    shared_types::SearchType::Regex(_) => compiled_regex
+                        .as_ref()
+                        .is_some_and(|regex| regex.is_match(&regex_tag.name)),
+                };
+
+                if matched {
+                    for plugin in &plugins {
+                        dbg!(plugin, regex_tag);
+
+                        // Invoke the plugin callback here.
+                    }
+                }
+            }
+        }
+    }
+
+    ///
+    /// External callbacks IE Plugin -> Plugin
+    ///
     pub fn external_plugin_call(
         &self,
         func_name: &String,

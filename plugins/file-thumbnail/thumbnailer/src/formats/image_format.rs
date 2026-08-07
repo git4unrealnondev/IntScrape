@@ -1,7 +1,6 @@
 use crate::error::{ThumbError, ThumbResult};
 use file_format::FileFormat;
-use image::io::Reader as ImageReader;
-use image::{DynamicImage, ImageFormat};
+use image::{DynamicImage, ImageFormat, ImageReader};
 use std::io::{BufRead, Read, Seek};
 use webp::Decoder as WebpDecoder;
 

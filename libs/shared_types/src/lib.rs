@@ -512,10 +512,10 @@ pub enum GlobalCallbacks {
     LoginNeeded,
     // Custom callback to be used for cross communication
     Callback(CallbackInfo),
-    // Runs when a tag has exists.
+    // Runs when a tag is added to the db.
     // First when the ns exists, 2nd when the namespace does not exist
-    // Use None when searching all or Some when searching restrictivly
-    Tag((Option<SearchType>, Vec<String>, Vec<String>)),
+    // Leave the Vecs empty to ignore the category
+    Tag((SearchType, Vec<String>, Vec<String>)),
 }
 
 #[derive(
