@@ -155,6 +155,9 @@ impl IpcServer {
                     AddDeadUrl(dead_url) => dead_url_add_sync,
                     GetDeadUrl(dead_urls) => dead_url_get_sync,
 
+                    GetNamespaceTagIDs(namespace_id) => tag_id_get_namespace_id,
+
+
                 }
             }
         }

@@ -742,7 +742,7 @@ ON Jobs (time, reptime, site, param);
     ///
     /// Gets all `file_ids` associated with a tag with namespace id x
     ///
-    pub(in crate::db) fn internal_file_id_get_namespace_id_sync(
+    pub(in crate::db) fn internal_file_id_get_namespace_id(
         conn: &Connection,
         namespace_id: &u64,
     ) -> Result<HashSet<u64>, rusqlite::Error> {
@@ -753,6 +753,19 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
 ); 
 ",
         )?;
+        let rows = stmt.query_map(params![namespace_id], |row| row.get(0))?;
+
+        rows.collect()
+    }
+
+    ///
+    /// Gets all 'tag_ids' associated with a namespace
+    ///
+    pub(in crate::db) fn internal_tag_id_get_namespace_id(
+        conn: &Connection,
+        namespace_id: &u64,
+    ) -> Result<HashSet<u64>, rusqlite::Error> {
+        let mut stmt = conn.prepare("SELECT id FROM Tags WHERE namespace = ?1;")?;
         let rows = stmt.query_map(params![namespace_id], |row| row.get(0))?;
 
         rows.collect()
@@ -917,6 +930,15 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     }
 
     ///
+    /// Gets all tag ids assocated with a namespace id
+    ///
+    #[ipc(name = "get_tag_ids_namespace_id", request = "GetNamespaceTagIDs")]
+    pub fn tag_id_get_namespace_id(&self, namespace_id: &u64) -> HashSet<u64> {
+        let conn = self.pool.get().unwrap();
+        Self::internal_tag_id_get_namespace_id(&conn, namespace_id).unwrap_or_default()
+    }
+
+    ///
     /// Gets a file if a tag is associated with it
     ///
     #[must_use]
@@ -933,7 +955,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     #[ipc(name = "get_namespace_file_ids", request = "GetNamespaceFileIDs")]
     pub fn file_id_get_namespace_id_sync(&self, namespace_id: &u64) -> HashSet<u64> {
         let conn = self.pool.get().unwrap();
-        Self::internal_file_id_get_namespace_id_sync(&conn, namespace_id).unwrap_or_default()
+        Self::internal_file_id_get_namespace_id(&conn, namespace_id).unwrap_or_default()
     }
 
     ///
@@ -1671,7 +1693,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     pub(in crate::db) fn internal_tag_get_max_id(
         conn: &Connection,
     ) -> Result<u64, rusqlite::Error> {
-        conn.query_one("SELECT MAX(id) FROM Tags;", [], |f| f.get(0))
+        conn.query_one("SELECT COALESCE(MAX(id), 1) FROM Tags;", [], |f| f.get(0))
     }
 
     ///
