@@ -22,9 +22,6 @@ const LISTOFSUPSET: [Supset; 7] = [
     Supset::Imagehash,
 ];
 
-// Number of jobs to run concurrently while on_start runs
-const NUMOFJOBS: usize = 20;
-
 #[derive(PartialEq, Clone, Copy, Debug, Eq, Hash)]
 enum Supset {
     MD5,

@@ -26,6 +26,16 @@ pub fn get_file_path(
     crate::init_data_request(&crate::SupportedDBRequests::GetFileLocation(file_id))
 }
 ///
+/// Gets all tag ids assocated with a namespace id
+///
+pub fn get_tag_ids_namespace_id(
+    namespace_id: u64,
+) -> Result<HashSet<u64>, Box<dyn std::error::Error>> {
+    crate::init_data_request(
+        &crate::SupportedDBRequests::GetNamespaceTagIDs(namespace_id),
+    )
+}
+///
 /// Gets a file if a tag is associated with it
 ///
 pub fn get_tag_file(

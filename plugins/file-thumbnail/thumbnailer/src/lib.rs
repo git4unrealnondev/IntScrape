@@ -237,4 +237,3 @@ pub fn create_thumbnails_dynamic<R: BufRead + Seek>(
     }
     ThumbResult::Err(error::ThumbError::Unsupported(mime))
 }
-

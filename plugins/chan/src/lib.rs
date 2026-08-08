@@ -1,6 +1,7 @@
 use base64::Engine;
 use std::{
     collections::{BTreeMap, HashSet},
+    error::Error,
     time::Duration,
 };
 
@@ -9,11 +10,42 @@ use shared_types::*;
 enum Nsid {
     PostId,
     PostComment,
+    PostCommentClean,
     PostTimestamp,
     ThreadId,
     AttachmentName,
     OriginalMD5,
     ThreadTitle,
+}
+fn handle_on_start() -> Result<(), Box<dyn Error>> {
+    let should_run = match client::setting_get("PLUGIN_Chan_ShouldCheckComments".into())? {
+        None => true,
+        Some(setting) => setting.param.map(|param| param != "False").unwrap_or(true),
+    };
+
+    if !should_run {
+        return Ok(());
+    }
+
+    if let Some(ns_id) = client::namespace_get(nsout(&Nsid::PostComment).name)? {
+        let comment_tag_ids = client::get_tag_ids_namespace_id(ns_id)?;
+
+        let comment_tags = client::get_tag_id_bulk(comment_tag_ids)?;
+    }
+
+    client::setting_set(shared_types::DbSettingsObj {
+        name: "PLUGIN_Chan_ShouldCheckComments".into(),
+        description: Some("Should the plugin Chan run PLUGIN_Chan_ShouldCheckComments".into()),
+        num: None,
+        param: Some("False".into()),
+    })?;
+
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
+pub fn on_start() {
+    let _ = handle_on_start();
 }
 
 #[unsafe(no_mangle)]
@@ -35,6 +67,7 @@ pub fn get_plugin_info() -> Vec<Plugin> {
                 )),
             }),
         ],
+        callbacks: vec![GlobalCallbacks::Start(StartupThreadType::Spawn)],
         ..Default::default()
     }]
 }
@@ -185,6 +218,9 @@ fn nsout(inp: &Nsid) -> GenericNamespaceObj {
         Nsid::PostComment => GenericNamespaceObj {
             name: "Thread_Comment".to_string(),
             description: Some("A comment attached to a post".to_string()),
+        },Nsid::PostCommentClean => GenericNamespaceObj {
+            name: "Thread_Comment_cleaned".to_string(),
+            description: Some("A cleaned comment attached to a post".to_string()),
         },
         Nsid::AttachmentName => GenericNamespaceObj {
             name: "Thread_Attachment_Name".to_string(),
@@ -265,15 +301,28 @@ fn extract_post_info(
     tags: &mut HashSet<PluginTag>,
     rel_context: RelationContext,
 ) {
-    if let Some(post_comment) = post_json["com"].as_str() {
+    if let Some(comment_html) = post_json["com"].as_str() {
         tags.insert(PluginTag {
             tag: Tag {
-                name: post_comment.to_string(),
+                name: comment_html.to_owned(),
                 namespace: nsout(&Nsid::PostComment),
             },
             relates_to: Some(rel_context.clone()),
             ..Default::default()
         });
+
+        if let Ok(comment_clean) = html2text::from_read(comment_html.as_bytes(), 10_000)
+            && !comment_clean.trim().is_empty()
+        {
+            tags.insert(PluginTag {
+                tag: Tag {
+                    name: comment_clean.trim().to_owned(),
+                    namespace: nsout(&Nsid::PostCommentClean),
+                },
+                relates_to: Some(rel_context.clone()),
+                ..Default::default()
+            });
+        }
     }
     if let Some(post_timestamp) = post_json["time"].as_u64() {
         tags.insert(PluginTag {
