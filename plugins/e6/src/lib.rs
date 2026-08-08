@@ -2,8 +2,8 @@ use std::{collections::HashSet, fmt};
 
 use shared_types::{
     DEFAULT_PRIORITY, FileObject, FileSource, FileTagAction, GenericNamespaceObj, HashesSupported,
-    PluginJob, PluginProperties, PluginTag, RelationContext, ScraperDataReturn, ScraperParam,
-    ScraperReturn, SkipIf, Tag,
+    LoginNeed, LoginType, PluginJob, PluginProperties, PluginTag, RelationContext,
+    ScraperDataReturn, ScraperParam, ScraperReturn, SkipIf, Tag,
 };
 
 pub enum Site {
@@ -58,6 +58,7 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
             properties: vec![
                 PluginProperties::Ratelimit(1, std::time::Duration::from_secs(1)),
                 PluginProperties::Sites(vec!["e6".into(), "E621".into(), "e621.com".into()]),
+                PluginProperties::Login((LoginNeed::Optional, LoginType::Api("Put API key first then username. Can find more info here: https://e621.net/api_keys".into(), None) ))
             ],
             ..Default::default()
         },
@@ -87,38 +88,65 @@ pub fn url_dump(
 
     let hardlimit = 751;
 
-    for i in 1..hardlimit {
-        let url = build_url(&scraperdata.job.param, i, &site);
+    let normal_params: Vec<_> = scraperdata
+        .job
+        .param
+        .iter()
+        .filter(|f| matches!(f, ScraperParam::Normal(_)))
+        .cloned()
+        .collect();
+    let url_params: Vec<_> = scraperdata
+        .job
+        .param
+        .iter()
+        .filter(|f| matches!(f, ScraperParam::Url(_)))
+        .cloned()
+        .collect();
+    let login_params: Vec<_> = scraperdata
+        .job
+        .param
+        .iter()
+        .filter(|f| matches!(f, ScraperParam::Login(_)))
+        .cloned()
+        .collect();
 
-        if let Some(url) = url {
-            out.push(ScraperDataReturn {
-                job: shared_types::PluginJob {
-                    site: scraperdata.job.site.clone(),
-                    priority: shared_types::DEFAULT_PRIORITY - 2,
-                    param: vec![shared_types::ScraperParam::Url(shared_types::Url {
-                        url,
+    if !normal_params.is_empty() {
+        for i in 1..hardlimit {
+            let mut temp_params = Vec::new();
+            temp_params.extend(normal_params.clone());
+            temp_params.extend(login_params.clone());
+            let url = build_url(&temp_params, Some(i), &site);
+
+            if let Some(url) = url {
+                out.push(ScraperDataReturn {
+                    job: shared_types::PluginJob {
+                        site: scraperdata.job.site.clone(),
+                        priority: shared_types::DEFAULT_PRIORITY - 2,
+                        param: vec![shared_types::ScraperParam::Url(shared_types::Url {
+                            url,
+                            ..Default::default()
+                        })],
                         ..Default::default()
-                    })],
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            });
+                });
+            }
         }
     }
 
     // Handles URL passthrough
-    for param in scraperdata.job.param.iter() {
-        if let ScraperParam::Url(url) = param {
-            out.push(ScraperDataReturn {
-                job: shared_types::PluginJob {
-                    site: scraperdata.job.site.clone(),
-                    priority: shared_types::DEFAULT_PRIORITY - 2,
-                    param: vec![shared_types::ScraperParam::Url(url.clone())],
-                    ..Default::default()
-                },
+    for param in url_params.iter() {
+        let mut temp_params = vec![param.clone()];
+        temp_params.extend(login_params.clone());
+        out.push(ScraperDataReturn {
+            job: shared_types::PluginJob {
+                site: scraperdata.job.site.clone(),
+                priority: shared_types::DEFAULT_PRIORITY - 2,
+                param: temp_params,
                 ..Default::default()
-            });
-        }
+            },
+            ..Default::default()
+        });
     }
 
     out
@@ -144,7 +172,6 @@ pub fn parser_call(
     };
 
     // Adds the posts from pool parsing
-    //let mut post_ids = Vec::new();
 
     let mut files = HashSet::new();
     let mut jobs = HashSet::new();
@@ -152,6 +179,16 @@ pub fn parser_call(
 
     // Parents and children parsing
     let mut posts_to_search = Vec::new();
+
+    let login_params: Vec<_> = scraperdata
+        .job
+        .param
+        .iter()
+        .filter(|f| matches!(f, ScraperParam::Login(_)))
+        .cloned()
+        .collect();
+
+    let is_logged_in = !login_params.is_empty();
 
     if let Ok(payload) = json::parse(text_input) {
         if !payload["posts"].is_empty() {
@@ -187,27 +224,6 @@ pub fn parser_call(
                         // Adds job to get parent
                         if recursion {
                             posts_to_search.push(parent);
-                            /* let parse_url = format!(
-                                "https://{}.net/posts.json?tags=id:{}",
-                                site.to_string().to_lowercase(),
-                                parent
-                            );
-                            jobs.insert(ScraperDataReturn {
-                                job: PluginJob {
-                                    site: scraperdata.job.site.clone(),
-                                    param: vec![ScraperParam::Url(shared_types::Url {
-                                        url: parse_url,
-                                        ..Default::default()
-                                    })],
-                                    priority: DEFAULT_PRIORITY - 2,
-
-                                    ..Default::default()
-                                },
-                                skip_conditions: vec![SkipIf::FileTagRelationship(Tag {
-                                    name: parent.to_string(),
-                                    namespace: nsobjplg(&NsIdent::PostId, &site),
-                                })],
-                            });*/
                         }
                     }
 
@@ -228,30 +244,6 @@ pub fn parser_call(
                                 }),
                                 ..Default::default()
                             });
-
-                            /*  // Adds job to get child
-                            if recursion {
-                                let parse_url = format!(
-                                    "https://{}.net/posts.json?tags=id:{}",
-                                    site.to_string().to_lowercase(),
-                                    child
-                                );
-                                jobs.insert(ScraperDataReturn {
-                                    job: PluginJob {
-                                        site: scraperdata.job.site.clone(),
-                                        param: vec![ScraperParam::Url(shared_types::Url {
-                                            url: parse_url,
-                                            ..Default::default()
-                                        })],
-                                        priority: DEFAULT_PRIORITY - 2,
-                                        ..Default::default()
-                                    },
-                                    skip_conditions: vec![SkipIf::FileTagRelationship(Tag {
-                                        name: child.to_string(),
-                                        namespace: nsobjplg(&NsIdent::PostId, &site),
-                                    })],
-                                });
-                            }*/
                         }
                     }
                 }
@@ -346,12 +338,41 @@ pub fn parser_call(
                     }
                 }
 
+                // Only attempt to bypass the source url IF we're not logged in
+                let md5 = post["file"]["md5"].as_str();
                 let source = post["file"]["url"]
                     .as_str()
-                    .map(|u| FileSource::Url(u.to_string()));
+                    .map(|u| FileSource::Url(u.to_string()))
+                    .or_else(|| {
+                        let hash = md5?;
+                        let extension = post["file"]["ext"].as_str()?;
+
+                        if is_logged_in {
+                            return None;
+                        }
+
+                        // MD5 must contain at least four ASCII characters.
+                        if hash.len() < 4
+                            || !hash.is_ascii()
+                            || !hash.chars().all(|character| character.is_ascii_hexdigit())
+                        {
+                            return None;
+                        }
+
+                        let static_url = format!(
+                            "https://static1.{}.net/data/{}/{}/{}.{}",
+                            site.to_string().to_lowercase(),
+                            &hash[0..2],
+                            &hash[2..4],
+                            hash,
+                            extension,
+                        );
+
+                        Some(FileSource::Url(static_url))
+                    });
 
                 // Adds file into db
-                if let Some(hash) = post["file"]["md5"].as_str() {
+                if let Some(hash) = md5 {
                     files.insert(FileObject {
                         source,
                         hash: Some(HashesSupported::Md5(hash.to_string())),
@@ -360,15 +381,7 @@ pub fn parser_call(
                             ..Default::default()
                         }],
                         // Skip file if we have the md5 hash inside the db
-                        skip_if: vec![/*SkipIf::FileTagRelationship(Tag {
-                            name: hash.to_string(),
-                            namespace: GenericNamespaceObj {
-                                name: "FileHash-MD5".to_string(),
-                                description: Some(
-                                    "From plugin FileHash. MD5 hash of the file.".to_string(),
-                                ),
-                            },
-                        })*/],
+                        skip_if: vec![],
                     });
                 }
             }
@@ -455,27 +468,26 @@ pub fn parser_call(
                     for (cnt, post_id) in item["post_ids"].members().enumerate() {
                         if let Some(post_id) = post_id.as_u64() {
                             if recursion {
-                                let parse_url = format!(
-                                    "https://{}.net/posts.json?tags=id:{}",
-                                    site.to_string().to_lowercase(),
-                                    post_id
-                                );
-                                //posts_to_search.push(post_id);
-                                jobs.insert(ScraperDataReturn {
-                                    job: PluginJob {
-                                        site: scraperdata.job.site.clone(),
-                                        param: vec![ScraperParam::Url(shared_types::Url {
-                                            url: parse_url,
+                                let mut local_params: Vec<_> = login_params.to_vec();
+                                local_params.push(ScraperParam::Normal(format!("id:{}", post_id)));
+                                if let Some(parse_url) = build_url(&local_params, None, &site) {
+                                    //posts_to_search.push(post_id);
+                                    jobs.insert(ScraperDataReturn {
+                                        job: PluginJob {
+                                            site: scraperdata.job.site.clone(),
+                                            param: vec![ScraperParam::Url(shared_types::Url {
+                                                url: parse_url,
+                                                ..Default::default()
+                                            })],
+                                            priority: DEFAULT_PRIORITY - 2,
                                             ..Default::default()
+                                        },
+                                        skip_conditions: vec![SkipIf::FileTagRelationship(Tag {
+                                            name: post_id.to_string(),
+                                            namespace: nsobjplg(&NsIdent::PostId, &site),
                                         })],
-                                        priority: DEFAULT_PRIORITY - 2,
-                                        ..Default::default()
-                                    },
-                                    skip_conditions: vec![SkipIf::FileTagRelationship(Tag {
-                                        name: post_id.to_string(),
-                                        namespace: nsobjplg(&NsIdent::PostId, &site),
-                                    })],
-                                });
+                                    });
+                                }
                             }
                             tags.insert(PluginTag {
                                 tag: Tag {
@@ -511,27 +523,20 @@ pub fn parser_call(
 
     // Adds posts to search for individually
     if !posts_to_search.is_empty() {
-        let site_lower = site.to_string().to_lowercase();
-
         for chunk in posts_to_search.chunks(10) {
-            let mut search_string = format!("https://{}.net/posts.json?tags=", site_lower);
+            let mut local_params: Vec<_> = login_params.to_vec();
+            //           local_params.push(ScraperParam::Normal(format!("~id:{}", post_id)));
+            chunk.iter().for_each(|post_id| {
+                local_params.push(ScraperParam::Normal(format!("~id:{}", post_id)));
+            });
+            local_params.push(ScraperParam::Normal("+status:any".into()));
 
-            // Append each post ID in the chunk with the '~id:' prefix
-            for (i, post_id) in chunk.iter().enumerate() {
-                if i > 0 {
-                    search_string.push('+');
-                }
-                search_string.push_str(&format!("~id:{}", post_id));
-            }
-
-            search_string.push_str("+status:any");
-
-            if recursion {
+            if recursion && let Some(url) = build_url(&local_params, None, &site) {
                 jobs.insert(ScraperDataReturn {
                     job: PluginJob {
                         site: scraperdata.job.site.clone(),
                         param: vec![ScraperParam::Url(shared_types::Url {
-                            url: search_string,
+                            url,
                             ..Default::default()
                         })],
                         priority: DEFAULT_PRIORITY - 2,
@@ -657,7 +662,11 @@ fn nsobjplg(name: &NsIdent, site: &Site) -> GenericNamespaceObj {
 ///
 /// Builds local URLs for parsing
 ///
-fn build_url(params: &[shared_types::ScraperParam], pagenum: u64, site: &Site) -> Option<String> {
+fn build_url(
+    params: &[shared_types::ScraperParam],
+    pagenum: Option<u64>,
+    site: &Site,
+) -> Option<String> {
     if params.is_empty() {
         return None;
     }
@@ -666,11 +675,7 @@ fn build_url(params: &[shared_types::ScraperParam], pagenum: u64, site: &Site) -
     let mut url = format!("https://{}.net/posts.json", lowercase_site);
 
     let login_info = params.iter().find_map(|p| {
-        if let shared_types::ScraperParam::Login(shared_types::LoginType::ApiNamespaced(
-            _,
-            Some(user),
-            Some(key),
-        )) = p
+        if let shared_types::ScraperParam::Login(shared_types::LoginType::Api(user, Some(key))) = p
         {
             Some((user, key))
         } else {
@@ -694,14 +699,15 @@ fn build_url(params: &[shared_types::ScraperParam], pagenum: u64, site: &Site) -
     }
 
     if let Some((username, api_key)) = login_info {
-        url += &format!("?login={}&api_key={}", username, api_key);
+        url += &format!("?api_key={}&login={}", username, api_key);
         url += &format!("&tags={}", tags.join("+"));
     } else {
         url += &format!("?tags={}", tags.join("+"));
     }
 
-    // 4. Append the pagination tracker at the tail end
-    url += &format!("&page={}", pagenum);
+    if let Some(pagenum) = pagenum {
+        url += &format!("&page={}", pagenum);
+    }
 
     Some(url)
 }

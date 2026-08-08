@@ -1028,7 +1028,7 @@ impl DownloadsManager {
                 }
 
                 // Check if we need to load login data
-                self.handle_login_db(plugin);
+                let _ = self.handle_login_db(plugin);
 
                 // Loads login parameters from db into job
                 let mut job_storage = job_storage.clone();
@@ -1117,7 +1117,33 @@ impl DownloadsManager {
                             ))
                             .is_none() =>
                     {
-                        dbg!(&key, &api);
+                        dbg!(&plugin.name, &key, &api);
+                        let mut user_name = String::new();
+                        print!("Api Key: ");
+                        let _ = stdout().flush();
+                        stdin().read_line(&mut user_name)?;
+                        if user_name.ends_with('\n') {
+                            user_name.pop();
+                        }
+                        if user_name.ends_with('\r') {
+                            user_name.pop();
+                        }
+                        let mut user_pass = String::new();
+                        print!("Password: ");
+                        let _ = stdout().flush();
+                        stdin().read_line(&mut user_pass)?;
+                        if user_pass.ends_with('\n') {
+                            user_pass.pop();
+                        }
+                        if user_pass.ends_with('\r') {
+                            user_pass.pop();
+                        }
+                        self.db.setting_set_sync(&DbSettingsObj {
+                            name: format!("PLUGIN_{}_{}_{}", plugin.name, ns, "API_NS"),
+                            description: Some("API Login for site.".into()),
+                            num: None,
+                            param: Some(user_name),
+                        });
                     }
                     LoginType::Cookie(cookie_name, help_text)
                         if self
@@ -1208,12 +1234,16 @@ impl DownloadsManager {
             // Explicitly drop the guard before doing any async work or sleeping
             drop(guard);
 
-            if let Some((job, plugin, ratelimiter)) = job_to_run {
+            if let Some((mut job, plugin, ratelimiter)) = job_to_run {
                 info!("DownloadManager: Setting job {} to running status.", job.id);
                 self.db.job_set_is_running(&job).await;
 
                 let job_id = job.id;
                 let scraper_name = scraper_name.clone();
+
+                for logins in self.load_logins(&plugin) {
+                    job.config.param.push(logins);
+                }
 
                 let scraper = Scraper::new(
                     job,

@@ -1,10 +1,11 @@
-use std::{collections::HashSet, fmt};
+use std::{collections::HashSet, fmt, time::Duration};
 
 use json::JsonValue;
 use scraper::{Html, Selector};
 use shared_types::{
     FileObject, FileSource, FileTagAction, GenericNamespaceObj, PluginJob, PluginProperties,
-    PluginTag, ScraperDataReturn, ScraperParam, ScraperReturn, Tag, TagOperation, Url,
+    PluginTag, ScraperDataReturn, ScraperParam, ScraperReturn, Tag, TagOperation, TargetModifier,
+    Url,
 };
 pub enum Site {
     Rule34Video,
@@ -40,6 +41,10 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
     vec![shared_types::Plugin {
         name: "rule34video".into(),
         properties: vec![
+            PluginProperties::Modifier(TargetModifier {
+                target: shared_types::ModifierTarget::Media,
+                modifier: shared_types::DownloadModifiers::Timeout(Some(Duration::from_mins(300))),
+            }),
             PluginProperties::Ratelimit(4, std::time::Duration::from_secs(1)),
             PluginProperties::Sites(vec!["rule34video.com".into(), "rule34video".into()]),
         ],
