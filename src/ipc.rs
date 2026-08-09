@@ -17,26 +17,6 @@ pub struct IpcServer {
     plugin_manager: Arc<PluginManager>,
 }
 
-macro_rules! register_db_requests {
-    (
-        $self:expr, $action:expr; // Accepts the context variables for the match statement
-        $(
-            // Syntax: EnumVariant(args) => DB_Function(args)
-            $variant:ident ( $($arg:ident),* ) => $db_fn:ident
-        ),* $(,)?
-    ) => {
-        match $action {
-            $(
-                // Automatically generate the match arm for each variant
-                client::SupportedDBRequests::$variant( $($arg),* ) => {
-                    client::data_size_to_b(&$self.db.$db_fn($(&$arg),*))
-                }
-            )*
-            _ => client::data_size_to_b(&false),
-        }
-    };
-}
-
 impl Drop for IpcServer {
     fn drop(&mut self) {
         self.should_exit
@@ -133,36 +113,10 @@ impl IpcServer {
 
                 client::data_size_to_b(&out)
             }
-            _ => {
-                register_db_requests! {
-                    self, action;
-
-                    // Enum Variant         =>  Database Synchronous Method
-                    SettingsGetName(name)   =>  setting_get_sync,
-                    SettingsSet(settings)   =>  setting_set_sync,
-                    SearchFiles(search, limit) => search_db_files_sync,
-                    GetTagFile(tag) => tag_get_file_sync,
-                    GetTagIds(tag_ids) => tag_id_get_tag_sync,
-                    SearchTags(tag, limit) => search_db_tags_fts,
-                    GetNamespace(name) => search_db_namespace_sync,
-                    SetNamespace(namespace) => namespace_add_sync,
-                    GetNamespaceTagIdsFiltered(file_id, namespace_id) => internal_file_id_get_tag_ids_where_namespace_id_sync,
-                    GetFileLocation(file_id) => file_get_physical_path_sync,
-                    GetNamespaceFileIDs(namespace_id) => file_id_get_namespace_id_sync,
-                    GetFileListId() => file_id_get_all_sync,
-                    PutTagsRelationship(file_id, tags) => file_relationship_tags_add_sync,
-                    PutTagsRelationships(tags_by_file) => file_relationship_tags_add_bulk_sync,
-                    AddDeadUrl(dead_url) => dead_url_add_sync,
-                    GetDeadUrl(dead_urls) => dead_url_get_sync,
-
-                    GetNamespaceTagIDs(namespace_id) => tag_id_get_namespace_id,
-
-
-                    RelationshipGetFileid(file_id) => relationship_get_tagid_sync,
-                }
-            }
+            action => self
+                .db
+                .dispatch_ipc_request(action)
+                .unwrap_or_else(|| client::data_size_to_b(&false)),
         }
-
-        // db calls go here
     }
 }

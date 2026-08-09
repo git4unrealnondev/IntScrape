@@ -2,8 +2,13 @@ extern crate proc_macro;
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{ToTokens, format_ident, quote};
-use std::{fs, path::PathBuf};
+use quote::{format_ident, quote};
+use std::{
+    fs,
+    io::Write as _,
+    path::PathBuf,
+    process::{Command, Stdio},
+};
 use syn::{
     Attribute, File, FnArg, ImplItem, ImplItemFn, ItemImpl, Meta, Pat, ReturnType, Type,
     parse_macro_input,
@@ -153,7 +158,46 @@ fn expand(mut input: ItemImpl, client_path: String) -> syn::Result<TokenStream2>
         methods.push((method.clone(), options));
     }
     write_client_file(&client_path, &methods)?;
+    input
+        .items
+        .push(ImplItem::Fn(server_dispatch_method(&methods)));
     Ok(quote! { #input })
+}
+
+fn server_dispatch_method(methods: &[(ImplItemFn, IpcOptions)]) -> ImplItemFn {
+    let arms = methods.iter().map(|(method, options)| {
+        let default_variant = pascal_case(&method.sig.ident);
+        let variant = options.request_variant.as_ref().unwrap_or(&default_variant);
+        let method_name = &method.sig.ident;
+        let args = method_arguments(method).expect("validated IPC method");
+        let names = args.iter().map(|(name, _)| name).collect::<Vec<_>>();
+        let pattern = quote! { client::SupportedDBRequests::#variant(#(#names),*) };
+        let call_args = args.iter().map(|(name, ty)| {
+            if matches!(ty, Type::Reference(_)) {
+                quote! { &#name }
+            } else {
+                quote! { #name }
+            }
+        });
+
+        quote! {
+            #pattern => Some(
+                client::data_size_to_b(&self.#method_name(#(#call_args),*))
+            ),
+        }
+    });
+
+    syn::parse_quote! {
+        pub fn dispatch_ipc_request(
+            &self,
+            request: client::SupportedDBRequests,
+        ) -> Option<Vec<u8>> {
+            match request {
+                #(#arms)*
+                _ => None,
+            }
+        }
+    }
 }
 
 fn method_arguments(method: &ImplItemFn) -> syn::Result<Vec<(&syn::Ident, &Type)>> {
@@ -193,13 +237,6 @@ fn owned_type(ty: &Type) -> Type {
         syn::parse_quote!(String)
     } else {
         (*reference.elem).clone()
-    }
-}
-
-fn return_type(output: &ReturnType) -> TokenStream2 {
-    match output {
-        ReturnType::Default => quote! { () },
-        ReturnType::Type(_, ty) => quote! { #ty },
     }
 }
 
@@ -259,12 +296,13 @@ fn write_client_file(path: &str, methods: &[(ImplItemFn, IpcOptions)]) -> syn::R
             let ty = owned_type(ty);
             quote! { #name: #ty }
         });
-        let names = args.iter().map(|(name, _)| name);
+        let names = args.iter().map(|(name, _)| name).collect::<Vec<_>>();
         let ret = client_return_type(&method.sig.output);
+        let request = quote! { crate::SupportedDBRequests::#variant(#(#names),*) };
         quote! {
             #(#docs)*
             pub fn #name(#(#definitions),*) -> #ret {
-                crate::init_data_request(&crate::SupportedDBRequests::#variant(#(#names),*))
+                crate::init_data_request(&#request)
             }
         }
     });
@@ -283,6 +321,11 @@ fn write_client_file(path: &str, methods: &[(ImplItemFn, IpcOptions)]) -> syn::R
         pub fn should_exit() -> Result<bool, Box<dyn std::error::Error>> {
             crate::init_data_request(&crate::SupportedDBRequests::ShouldExit)
         }
+
+        /// Writes to the host log without printing to stdout.
+        pub fn log_silent(log: String) -> Result<bool, Box<dyn std::error::Error>> {
+            crate::init_data_request(&crate::SupportedDBRequests::LoggingNoPrint(log))
+        }
     };
     let source_file: File = syn::parse2(source_tokens).map_err(|error| {
         syn::Error::new(
@@ -290,9 +333,44 @@ fn write_client_file(path: &str, methods: &[(ImplItemFn, IpcOptions)]) -> syn::R
             format!("failed to parse generated client: {error}"),
         )
     })?;
-    let source = prettyplease::unparse(&source_file);
+    let source = format_source(&prettyplease::unparse(&source_file))?;
     write_if_changed(&output, &source)?;
     Ok(())
+}
+
+fn format_source(source: &str) -> syn::Result<String> {
+    let mut formatter = Command::new("rustfmt")
+        .args(["--edition", "2024", "--emit", "stdout"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(io_error)?;
+
+    formatter
+        .stdin
+        .take()
+        .ok_or_else(|| {
+            syn::Error::new(proc_macro2::Span::call_site(), "rustfmt stdin unavailable")
+        })?
+        .write_all(source.as_bytes())
+        .map_err(io_error)?;
+
+    let output = formatter.wait_with_output().map_err(io_error)?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!("rustfmt failed: {error}"),
+        ));
+    }
+
+    String::from_utf8(output.stdout).map_err(|error| {
+        syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!("rustfmt returned invalid UTF-8: {error}"),
+        )
+    })
 }
 
 fn write_if_changed(path: &std::path::Path, contents: &str) -> syn::Result<()> {

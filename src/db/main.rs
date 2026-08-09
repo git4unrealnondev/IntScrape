@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use walkdir::WalkDir;
 
-use crate::db::roaring::{InternalCacheType, SearchQuery};
+use crate::db::roaring::InternalCacheType;
 use crate::db::{CacheType, RelationshipStorage};
 use crate::web::manager::hash_bytes;
 use crate::{db::MainDatabase, helper_functions::get_sys_time_in_secs};
@@ -2907,26 +2907,70 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             return vec![];
         }
 
+        let mut driver_or_group = if and_tags.is_empty() {
+            Some(or_groups.remove(0))
+        } else {
+            None
+        };
+
         let conn = self.pool.get().unwrap();
+        let mut cached_candidates = None;
+        let mut cached_all_tags = false;
+        let mut cached_search_type = None;
         // 2. PATH A: Roaring Bitmap Optimization (Memory Speed)
         let read_guard = self.relationship_roaring_storage.read();
         if let Some(ref roaring) = *read_guard {
-            let mut should_quick_search = true;
+            if !and_tags.is_empty() && driver_or_group.is_none() && or_groups.is_empty() {
+                let (candidates, all_cached) = roaring
+                    .cached_file_ids_for_tags(&and_tags, shared_types::DbSearchTypeEnum::And);
+                cached_candidates = candidates;
+                cached_all_tags = all_cached;
+                cached_search_type = Some(shared_types::DbSearchTypeEnum::And);
+            } else if and_tags.is_empty()
+                && not_groups.is_empty()
+                && driver_or_group.is_some()
+                && or_groups.is_empty()
+            {
+                let tags = driver_or_group.as_ref().unwrap();
+                let (candidates, all_cached) =
+                    roaring.cached_file_ids_for_tags(tags, shared_types::DbSearchTypeEnum::Or);
+                cached_candidates = candidates;
+                cached_all_tags = all_cached;
+                cached_search_type = Some(shared_types::DbSearchTypeEnum::Or);
+            }
+        }
 
-            for and_tag in &and_tags {
-                if !roaring.relationship_cache_tagid_exists(&conn, *and_tag) {
-                    should_quick_search = false;
-                    break;
+        if let (Some(candidates), true, Some(search_type)) = (
+            &cached_candidates,
+            cached_all_tags,
+            cached_search_type.as_ref(),
+        ) && not_groups.is_empty()
+        {
+            let mut results = candidates.clone();
+            results.sort_unstable_by(|left, right| right.cmp(left));
+            if let Some(limit) = limit {
+                results.truncate(*limit as usize);
+            }
+            if matches!(
+                search_type,
+                shared_types::DbSearchTypeEnum::And | shared_types::DbSearchTypeEnum::Or
+            ) {
+                return results;
+            }
+        }
+
+        if matches!(cached_search_type, Some(shared_types::DbSearchTypeEnum::Or)) {
+            if let Some(tags) = driver_or_group.as_mut() {
+                if let Some(ref roaring) = *read_guard {
+                    tags.retain(|tag_id| roaring.tag_is_cached_in_memory(*tag_id));
                 }
             }
-            let _start_time = Instant::now();
-            if should_quick_search {
-                let results = SearchQuery::new(roaring)
-                    .and_search(&and_tags)
-                    .sort()
-                    .limit(*limit)
-                    .build();
-
+            if driver_or_group.as_ref().is_some_and(Vec::is_empty) {
+                let mut results = cached_candidates.unwrap_or_default();
+                results.sort_unstable_by(|left, right| right.cmp(left));
+                if let Some(limit) = limit {
+                    results.truncate(*limit as usize);
+                }
                 return results;
             }
         }
@@ -2953,29 +2997,58 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         }
 
         let mut params = Vec::new();
-        let driver_tag = sorted_and[0];
-
-        // We start the query with our rarest tag
-        let mut sql = "SELECT r0.file_id FROM Relationship r0".to_string();
+        let mut sql = if let Some(driver_group) = driver_or_group {
+            let placeholders = vec!["?"; driver_group.len()].join(",");
+            params.extend(driver_group);
+            format!(
+                "SELECT DISTINCT r0.file_id FROM Relationship r0 WHERE r0.tag_id IN ({placeholders})"
+            )
+        } else {
+            "SELECT r0.file_id FROM Relationship r0".to_string()
+        };
 
         // Only add JOINs if there are more AND tags
         for (i, tag) in sorted_and.iter().skip(1).enumerate() {
             let alias = format!("r{}", i + 1);
             sql.push_str(&format!(
-                " JOIN Relationship {alias} ON r0.file_id = {alias}.fileid AND {alias}.tag_id = ?"
+                " JOIN Relationship {alias} ON r0.file_id = {alias}.file_id AND {alias}.tag_id = ?"
             ));
             params.push(*tag);
         }
 
-        // Start conditions with the Driver Tag
-        sql.push_str(" WHERE r0.tag_id = ?");
-        params.push(driver_tag);
+        // Start conditions with the driver tag when an AND group exists.
+        if !sorted_and.is_empty() {
+            sql.push_str(" WHERE r0.tag_id = ?");
+            params.push(sorted_and[0]);
+        }
+
+        if matches!(
+            cached_search_type,
+            Some(shared_types::DbSearchTypeEnum::And)
+        ) {
+            if let Some(candidates) = &cached_candidates {
+                if candidates.is_empty() {
+                    return Vec::new();
+                }
+                let placeholders = vec!["?"; candidates.len()].join(",");
+                sql.push_str(&format!(" AND r0.file_id IN ({placeholders})"));
+                params.extend(candidates.iter().copied());
+            }
+        } else if matches!(cached_search_type, Some(shared_types::DbSearchTypeEnum::Or)) {
+            if let Some(candidates) = &cached_candidates {
+                if !candidates.is_empty() {
+                    let placeholders = vec!["?"; candidates.len()].join(",");
+                    sql.push_str(&format!(" AND r0.file_id NOT IN ({placeholders})"));
+                    params.extend(candidates.iter().copied());
+                }
+            }
+        }
 
         // Add OR groups
         for (i, group) in or_groups.iter().enumerate() {
             let placeholders = vec!["?"; group.len()].join(",");
             sql.push_str(&format!(
-        " AND EXISTS (SELECT 1 FROM Relationship or{i} WHERE or{i}.file_id = r0.fileid AND or{i}.tag_id IN ({placeholders}))"
+        " AND EXISTS (SELECT 1 FROM Relationship or{i} WHERE or{i}.file_id = r0.file_id AND or{i}.tag_id IN ({placeholders}))"
     ));
             for &tag_id in group {
                 params.push(tag_id);
@@ -2986,7 +3059,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         for (i, group) in not_groups.iter().enumerate() {
             let placeholders = vec!["?"; group.len()].join(",");
             sql.push_str(&format!(
-        " AND NOT EXISTS (SELECT 1 FROM Relationship not{i} WHERE not{i}.file_id = r0.fileid AND not{i}.tag_id IN ({placeholders}))"
+        " AND NOT EXISTS (SELECT 1 FROM Relationship not{i} WHERE not{i}.file_id = r0.file_id AND not{i}.tag_id IN ({placeholders}))"
     ));
             for &tag_id in group {
                 params.push(tag_id);
@@ -3002,11 +3075,20 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         }
 
         let mut stmt = conn.prepare(&sql).expect("Unable to prepare a db search");
-        let results: Vec<u64> = stmt
+        let mut results: Vec<u64> = stmt
             .query_map(params_from_iter(params), |row| row.get(0))
             .expect(" Unable to querymap")
             .filter_map(std::result::Result::ok)
             .collect();
+
+        if matches!(cached_search_type, Some(shared_types::DbSearchTypeEnum::Or)) {
+            results.extend(cached_candidates.unwrap_or_default());
+            results.sort_unstable_by(|left, right| right.cmp(left));
+            results.dedup();
+            if let Some(limit) = limit {
+                results.truncate(*limit as usize);
+            }
+        }
 
         results
     }
@@ -3228,42 +3310,61 @@ SELECT id, name, namespace FROM High_Value_Tags;",
 mod tests {
     use super::*;
     use crate::DB_VERSION;
-    use parking_lot::lock_api::RwLock;
-    use r2d2::Pool;
-    use r2d2_sqlite::SqliteConnectionManager;
-    use r2d2_sqlite::rusqlite::OpenFlags;
-    use shared_types::GenericNamespaceObj;
     use shared_types::*;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
     pub fn new_test() -> Arc<MainDatabase> {
-        // Generate a unique database name for this specific test thread
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let db_uri = format!("file:test_db_{}?mode=memory&cache=shared", id);
+        let path = std::env::temp_dir().join(format!("intscrape-db-test-{id}.sqlite"));
+        let _ = fs::remove_file(&path);
+        MainDatabase::new(&path)
+    }
 
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_URI;
+    fn namespace(name: &str, description: Option<&str>) -> GenericNamespaceObj {
+        GenericNamespaceObj {
+            name: name.to_string(),
+            description: description.map(str::to_string),
+        }
+    }
 
-        // Pass the unique URI here
-        let manager = SqliteConnectionManager::file(db_uri)
-            .with_flags(flags)
-            .with_init(|c| c.execute_batch("PRAGMA foreign_keys = ON;"));
+    fn tag(name: &str, namespace_name: &str) -> Tag {
+        Tag {
+            name: name.to_string(),
+            namespace: namespace(namespace_name, None),
+        }
+    }
 
-        // Set a realistic pool size (e.g., 2 or 3) to prevent pool-starvation deadlocks
-        let pool = Pool::builder()
-            .max_size(3)
-            .build(manager)
-            .expect("Failed to create test pool");
+    fn plugin_tag(name: &str, namespace_name: &str) -> PluginTag {
+        PluginTag {
+            tag: tag(name, namespace_name),
+            ..Default::default()
+        }
+    }
 
-        let main_db = Arc::new(MainDatabase {
-            pool,
-            namespace_cache: Arc::new(RwLock::new(HashMap::new())),
-        });
-        main_db.check_db().unwrap();
-        main_db
+    fn file_action(operation: TagOperation, tags: Vec<PluginTag>) -> FileTagAction {
+        FileTagAction { operation, tags }
+    }
+
+    fn file(hash: &str, extension: &str) -> FileInternal {
+        FileInternal {
+            hash: hash.to_string(),
+            extension: extension.to_string(),
+            storage_id: 1,
+            ..Default::default()
+        }
+    }
+
+    fn job(site: &str, time: u64, reptime: u64) -> PluginJob {
+        PluginJob {
+            site: site.to_string(),
+            time,
+            reptime,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -3332,7 +3433,7 @@ mod tests {
         let tag2 = tag1.clone();
 
         // Pass duplicate elements in the batch array
-        MainDatabase::internal_tag_bulk_add(&conn, &[tag1, tag2]);
+        MainDatabase::internal_tag_bulk_add(&conn, &[tag1, tag2], db.plugin_manager.clone());
 
         // Due to INSERT OR IGNORE, SQL should gracefully process without panicking on unique constraints
         let tag_count: i32 = conn
@@ -3440,7 +3541,11 @@ mod tests {
 
         // 2. Add tags dynamically through your revamped bulk add function
         // This registers all 3 tags and their namespaces simultaneously
-        let tag_ids = MainDatabase::internal_tag_bulk_add(&conn, &[complex_plugin_tag]);
+        let tag_ids = MainDatabase::internal_tag_bulk_add(
+            &conn,
+            &[complex_plugin_tag],
+            db.plugin_manager.clone(),
+        );
 
         // Extract the generated IDs from the map returned by the tag function
         let rust_id = *tag_ids.get(&t_rust).expect("Rust tag missing ID");
@@ -3528,7 +3633,7 @@ mod tests {
         };
 
         // Execute bulk add
-        MainDatabase::internal_tag_bulk_add(&conn, &[complex_tag]);
+        MainDatabase::internal_tag_bulk_add(&conn, &[complex_tag], db.plugin_manager.clone());
 
         // Assertions 1: Ensure all 3 distinct namespaces were automatically extracted and created
         let ns_count: i32 = conn
@@ -3549,5 +3654,462 @@ mod tests {
             |r| r.get(0)
         ).unwrap();
         assert_eq!(mapped_ns_name, "base_ns");
+    }
+
+    #[test]
+    fn test_namespace_lookup_and_empty_bulk_inputs() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+
+        assert!(MainDatabase::internal_namespace_bulk_add(&conn, &HashSet::new()).is_empty());
+        assert_eq!(
+            MainDatabase::internal_namespace_get_id(&conn, "missing"),
+            None
+        );
+
+        let original = namespace("edge", Some("first"));
+        let id = MainDatabase::internal_namespace_get_or_create(&conn, &original);
+        assert_eq!(
+            MainDatabase::internal_namespace_get_id(&conn, "edge"),
+            Some(id)
+        );
+        assert_eq!(
+            MainDatabase::internal_namespace_get_generic(&conn, &id),
+            Some(original)
+        );
+
+        let updated = namespace("edge", Some("updated"));
+        assert_eq!(
+            MainDatabase::internal_namespace_get_or_create(&conn, &updated),
+            id
+        );
+        assert_eq!(
+            MainDatabase::internal_namespace_get_generic(&conn, &id),
+            Some(updated)
+        );
+    }
+
+    #[test]
+    fn test_tag_bulk_add_filters_empty_and_non_normal_tags() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        let mut special_tag = plugin_tag("special", "tags");
+        special_tag.tag_type = TagType::Special;
+
+        let actions = [file_action(
+            TagOperation::Add,
+            vec![
+                plugin_tag("", "tags"),
+                special_tag,
+                plugin_tag("valid", "tags"),
+                plugin_tag("valid", "tags"),
+            ],
+        )];
+        let result =
+            MainDatabase::internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
+
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key(&tag("valid", "tags")));
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM Tags", [], |row| row.get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_file_bulk_add_upserts_and_empty_input() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        assert!(MainDatabase::internal_file_bulk_add(&conn, HashSet::new()).is_empty());
+
+        let first = file("abcdef123", "jpg");
+        let mut files = HashSet::new();
+        files.insert(first.clone());
+        let inserted = MainDatabase::internal_file_bulk_add(&conn, files);
+        assert_eq!(inserted.len(), 1);
+        let inserted = inserted.into_iter().next().unwrap();
+        assert!(inserted.id.is_some());
+
+        let updated = file("abcdef123", "png");
+        let mut files = HashSet::new();
+        files.insert(updated);
+        let upserted = MainDatabase::internal_file_bulk_add(&conn, files)
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(upserted.id, inserted.id);
+        assert_eq!(upserted.extension, "png");
+        assert_eq!(MainDatabase::internal_file_get_all(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_relationships_are_deduplicated_and_filtered() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        let file_id =
+            MainDatabase::internal_file_bulk_add(&conn, [file("relhash123", "jpg")].into())
+                .into_iter()
+                .next()
+                .unwrap()
+                .id
+                .unwrap();
+        let tag_ids = MainDatabase::internal_tag_bulk_add(
+            &conn,
+            &[
+                file_action(TagOperation::Add, vec![plugin_tag("one", "a")]),
+                file_action(TagOperation::Add, vec![plugin_tag("two", "b")]),
+            ],
+            db.plugin_manager.clone(),
+        );
+        let one_id = tag_ids[&tag("one", "a")];
+        let two_id = tag_ids[&tag("two", "b")];
+        let relationships =
+            HashSet::from([(file_id, one_id), (file_id, one_id), (file_id, two_id)]);
+        MainDatabase::internal_relationship_bulk_add(db.clone(), &conn, &relationships);
+
+        assert_eq!(
+            MainDatabase::internal_file_id_get_tag_ids(&conn, &file_id).unwrap(),
+            HashSet::from([one_id, two_id])
+        );
+        assert_eq!(
+            MainDatabase::internal_file_id_get_tag_ids_bulk(&conn, &[file_id, 999])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(MainDatabase::internal_tag_has_files(&conn, one_id));
+        assert!(!MainDatabase::internal_tag_has_files(&conn, 999));
+        let namespace_id = MainDatabase::internal_namespace_get_id(&conn, "a").unwrap();
+        assert_eq!(
+            MainDatabase::internal_file_id_get_tag_ids_where_namespace_id(
+                &conn,
+                &file_id,
+                &namespace_id
+            )
+            .unwrap(),
+            HashSet::from([one_id])
+        );
+
+        MainDatabase::internal_relationship_bulk_delete(
+            db.clone(),
+            &conn,
+            &HashSet::from([(file_id, one_id)]),
+        );
+        assert_eq!(
+            MainDatabase::internal_file_id_get_tag_ids(&conn, &file_id).unwrap(),
+            HashSet::from([two_id])
+        );
+    }
+
+    #[test]
+    fn test_tag_and_file_lookup_empty_and_missing_inputs() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        assert!(MainDatabase::internal_tag_id_get_tag(&conn, &HashSet::new()).is_empty());
+        assert!(MainDatabase::internal_file_ids_get_tags(&conn, &HashSet::new()).is_empty());
+        assert_eq!(
+            MainDatabase::internal_file_id_get(&conn, &999),
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        );
+        assert_eq!(
+            MainDatabase::internal_tag_get_file_id(&conn, &tag("missing", "missing")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_search_supports_and_or_not_and_limit() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        let mut ids = HashMap::new();
+        for hash in ["searchaaa", "searchbbb", "searchccc"] {
+            let inserted =
+                MainDatabase::internal_file_bulk_add(&conn, HashSet::from([file(hash, "jpg")]));
+            let inserted = inserted.into_iter().next().unwrap();
+            ids.insert(hash.to_string(), inserted.id.unwrap());
+        }
+        let tags = MainDatabase::internal_tag_bulk_add(
+            &conn,
+            &[
+                file_action(
+                    TagOperation::Add,
+                    vec![plugin_tag("red", "color"), plugin_tag("round", "shape")],
+                ),
+                file_action(
+                    TagOperation::Add,
+                    vec![plugin_tag("blue", "color"), plugin_tag("round", "shape")],
+                ),
+                file_action(
+                    TagOperation::Add,
+                    vec![plugin_tag("red", "color"), plugin_tag("square", "shape")],
+                ),
+            ],
+            db.plugin_manager.clone(),
+        );
+        let red = tags[&tag("red", "color")];
+        let blue = tags[&tag("blue", "color")];
+        let round = tags[&tag("round", "shape")];
+        let square = tags[&tag("square", "shape")];
+        MainDatabase::internal_relationship_bulk_add(
+            db.clone(),
+            &conn,
+            &HashSet::from([
+                (ids["searchaaa"], red),
+                (ids["searchaaa"], round),
+                (ids["searchbbb"], blue),
+                (ids["searchbbb"], round),
+                (ids["searchccc"], red),
+                (ids["searchccc"], square),
+            ]),
+        );
+
+        let and = SearchObj {
+            search_relate: None,
+            searches: vec![SearchHolder::And(vec![red, round])],
+        };
+        assert_eq!(db.search_db_files_sync(&and, &None), vec![ids["searchaaa"]]);
+        let or = SearchObj {
+            search_relate: None,
+            searches: vec![SearchHolder::Or(vec![blue, square])],
+        };
+        assert_eq!(
+            db.search_db_files_sync(&or, &None)
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([ids["searchbbb"], ids["searchccc"]])
+        );
+        let not = SearchObj {
+            search_relate: None,
+            searches: vec![
+                SearchHolder::And(vec![red]),
+                SearchHolder::Not(vec![square]),
+            ],
+        };
+        let not_results = db.search_db_files_sync(&not, &Some(1));
+        assert_eq!(not_results, vec![ids["searchaaa"]]);
+        let empty = SearchObj {
+            search_relate: None,
+            searches: vec![],
+        };
+        assert!(db.search_db_files_sync(&empty, &None).is_empty());
+    }
+
+    #[test]
+    fn test_partial_roaring_cache_falls_back_to_sqlite() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        let mut ids = HashMap::new();
+        for hash in ["partialaaa", "partialbbb"] {
+            let inserted =
+                MainDatabase::internal_file_bulk_add(&conn, HashSet::from([file(hash, "jpg")]));
+            ids.insert(
+                hash.to_string(),
+                inserted.into_iter().next().unwrap().id.unwrap(),
+            );
+        }
+
+        let tags = MainDatabase::internal_tag_bulk_add(
+            &conn,
+            &[
+                file_action(
+                    TagOperation::Add,
+                    vec![
+                        plugin_tag("popular", "cache"),
+                        plugin_tag("uncached", "cache"),
+                    ],
+                ),
+                file_action(TagOperation::Add, vec![plugin_tag("popular", "cache")]),
+            ],
+            db.plugin_manager.clone(),
+        );
+        let popular = tags[&tag("popular", "cache")];
+        let uncached = tags[&tag("uncached", "cache")];
+        MainDatabase::internal_relationship_bulk_add(
+            db.clone(),
+            &conn,
+            &HashSet::from([
+                (ids["partialaaa"], popular),
+                (ids["partialaaa"], uncached),
+                (ids["partialbbb"], popular),
+            ]),
+        );
+
+        let mut partial_cache = RelationshipStorage::new(db.clone(), InternalCacheType::Popular(2));
+        partial_cache.load_relationship_cache(&conn);
+        *db.relationship_roaring_storage.write() = Some(partial_cache);
+
+        let and = SearchObj {
+            search_relate: None,
+            searches: vec![SearchHolder::And(vec![popular, uncached])],
+        };
+        assert_eq!(
+            db.search_db_files_sync(&and, &None),
+            vec![ids["partialaaa"]]
+        );
+
+        let or = SearchObj {
+            search_relate: None,
+            searches: vec![SearchHolder::Or(vec![popular, uncached])],
+        };
+        assert_eq!(
+            db.search_db_files_sync(&or, &None)
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([ids["partialaaa"], ids["partialbbb"]])
+        );
+    }
+
+    #[test]
+    fn test_settings_and_dead_urls_round_trip() {
+        let db = new_test();
+        let setting = DbSettingsObj {
+            name: "TEST_SETTING".into(),
+            description: Some("first".into()),
+            num: Some(1),
+            param: Some("a".into()),
+        };
+        assert!(!db.setting_set_sync(&setting));
+        assert_eq!(
+            db.setting_get_sync("TEST_SETTING").unwrap().param,
+            Some("a".into())
+        );
+
+        let updated = DbSettingsObj {
+            description: Some("second".into()),
+            num: Some(2),
+            param: Some("b".into()),
+            ..setting
+        };
+        let _ = db.setting_set_sync(&updated);
+        assert_eq!(
+            db.setting_get_sync("TEST_SETTING").unwrap().description,
+            Some("second".into())
+        );
+        assert!(db.setting_get_sync("missing").is_none());
+
+        let url = "https://example.test/a?x=1".to_string();
+        assert!(!db.dead_url_add_sync(&url));
+        let status = db.dead_url_get_sync(&[url.clone(), "https://example.test/missing".into()]);
+        assert_eq!(status.get(&url), Some(&true));
+        assert_eq!(status.get("https://example.test/missing"), Some(&false));
+    }
+
+    #[test]
+    fn test_storage_location_and_file_path_edge_cases() {
+        let db = new_test();
+        assert_eq!(db.file_download_location_get_sync("short", "jpg"), None);
+        assert_eq!(db.file_download_location_get_sync("abcdef", "jpg"), None);
+        let (base, storage_id) = db.file_download_location_main_sync().unwrap();
+        assert_eq!(base, PathBuf::from("files"));
+        assert!(storage_id > 0);
+        let (path, _) = db
+            .file_download_location_get_sync("abcdef123456", "jpg")
+            .unwrap();
+        assert_eq!(path, PathBuf::from("files/ab/cd/ef/abcdef123456.jpg"));
+
+        let file = file("abcdef123456", "jpg");
+        assert_eq!(
+            MainDatabase::get_file_location(&file, &"missing-base".into()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_job_lifecycle_and_duplicate_upsert() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        let config = job("site", 0, 0);
+        let id = MainDatabase::internal_jobs_add(&conn, &config);
+        let duplicate_id = MainDatabase::internal_jobs_add(&conn, &config);
+        assert_eq!(id, duplicate_id);
+        assert_eq!(
+            MainDatabase::internal_jobs_get_all_sites(&conn).unwrap(),
+            vec!["site"]
+        );
+        assert_eq!(
+            MainDatabase::internal_jobs_get_site(&conn, "missing").unwrap(),
+            Vec::<DbJobsObj>::new()
+        );
+
+        MainDatabase::internal_jobs_set_isrunning(&conn, id).unwrap();
+        assert!(MainDatabase::internal_jobs_get_site(&conn, "site").unwrap()[0].isrunning);
+        MainDatabase::internal_jobs_reset_isrunning(&conn).unwrap();
+        assert!(!MainDatabase::internal_jobs_get_site(&conn, "site").unwrap()[0].isrunning);
+        assert_eq!(
+            MainDatabase::internal_jobs_get_torun(&conn, vec!["site".into()])
+                .unwrap()
+                .len(),
+            1
+        );
+        MainDatabase::internal_job_remove(&conn, id).unwrap();
+        assert!(
+            MainDatabase::internal_jobs_get_site(&conn, "site")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_parent_constraints_distinguish_limit_to() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        let child = plugin_tag("child", "ns");
+        let parent = plugin_tag("parent", "ns");
+        let limit = plugin_tag("limit", "ns");
+        let actions = [file_action(
+            TagOperation::Add,
+            vec![
+                PluginTag {
+                    relates_to: Some(RelationContext {
+                        tag: parent.tag.clone(),
+                        limit_to: Some(limit.tag.clone()),
+                        ..Default::default()
+                    }),
+                    ..child.clone()
+                },
+                parent.clone(),
+                limit.clone(),
+            ],
+        )];
+        let ids = MainDatabase::internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
+        let relation = TagParents {
+            tag_id: ids[&child.tag],
+            relate_tag_id: ids[&parent.tag],
+            limit_to: Some(ids[&limit.tag]),
+        };
+        MainDatabase::internal_parents_bulk_add(&conn, &HashSet::from([relation]));
+        assert!(
+            MainDatabase::internal_parent_structure_exists(
+                &conn,
+                &PluginTag {
+                    relates_to: Some(RelationContext {
+                        tag: parent.tag.clone(),
+                        limit_to: Some(limit.tag.clone()),
+                        ..Default::default()
+                    }),
+                    ..child.clone()
+                }
+            )
+            .unwrap()
+        );
+        assert!(
+            MainDatabase::internal_parent_relate_limit_exists(&conn, &parent.tag, &limit.tag)
+                .unwrap()
+        );
+        assert!(
+            !MainDatabase::internal_parent_structure_exists(
+                &conn,
+                &PluginTag {
+                    relates_to: Some(RelationContext {
+                        tag: parent.tag,
+                        limit_to: None,
+                        ..Default::default()
+                    }),
+                    ..child
+                }
+            )
+            .unwrap()
+        );
     }
 }

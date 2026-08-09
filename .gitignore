@@ -8,5 +8,6 @@ log*
 files
 compiled_plugins
 *.json
+.vscode/*.json
 thumbnail
 *.sh

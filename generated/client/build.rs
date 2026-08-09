@@ -1,117 +1,103 @@
 use std::{env, error::Error, fs, path::PathBuf};
 
-use quote::{format_ident, quote};
-use syn::{FnArg, ImplItem, ImplItemFn, Item, Pat, Type};
+use quote::quote;
+use syn::{Attribute, FnArg, ImplItem, Item, Meta, Pat, Type};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let source_path = manifest.join("../../src/db/main.rs");
-    println!("cargo:rerun-if-changed=../../src/db/",);
+    println!("cargo:rerun-if-changed={}", source_path.display());
     println!("cargo:rerun-if-changed=../../libs/shared_types/src");
 
-    let source = fs::read_to_string(&source_path)?;
-    dbg!(&source_path);
-    let file = syn::parse_file(&source)?;
-    let mut methods = Vec::new();
+    let source = fs::read_to_string(source_path)?;
+    let file = syn::parse_file(&source)
+        .map_err(|error| format!("failed to parse database source: {error}"))?;
+    let mut variants = Vec::new();
 
     for item in file.items {
         let Item::Impl(item) = item else { continue };
         for item in item.items {
             let ImplItem::Fn(method) = item else { continue };
-            if !method.attrs.iter().any(|attr| attr.path().is_ident("ipc")) {
+            let Some(request) = ipc_request(&method).map_err(|error| {
+                format!(
+                    "failed to parse IPC attribute on {}: {error}",
+                    method.sig.ident
+                )
+            })?
+            else {
                 continue;
-            }
-            methods.push(method);
+            };
+            let fields = arguments(&method)
+                .into_iter()
+                .map(|(_, ty)| owned_type(ty))
+                .collect::<Vec<_>>();
+            variants.push(quote! { #request(#(#fields),*) });
         }
     }
 
-    let functions = methods.iter().map(|method| {
-        let (client_name, request_variant) = ipc_options(method);
-        let docs = method
-            .attrs
-            .iter()
-            .filter(|attr| attr.path().is_ident("doc"));
-        let args = arguments(method);
-        let definitions = args.iter().map(|(name, ty)| {
-            let ty = owned_type(ty);
-            quote!(#name: #ty)
-        });
-        let names = args.iter().map(|(name, _)| name);
-        let return_type = match &method.sig.output {
-            syn::ReturnType::Default => quote!(Result<(), Box<dyn std::error::Error>>),
-            syn::ReturnType::Type(_, ty) => quote!(Result<#ty, Box<dyn std::error::Error>>),
-        };
-        let function = client_name.unwrap_or_else(|| method.sig.ident.clone());
-        let variant = request_variant.unwrap_or_else(|| pascal_case(&method.sig.ident));
-        quote! {
-            #(#docs)*
-            pub fn #function(#(#definitions),*) -> #return_type {
-                crate::init_data_request(&crate::SupportedDBRequests::#variant(#(#names),*))
-            }
-        }
-    });
+    variants.extend([
+        quote! { ExternalPluginCall(String, shared_types::CallbackInfoInput) },
+        quote! { LoggingNoPrint(String) },
+        quote! { ShouldExit },
+    ]);
 
     let tokens = quote! {
-        //! Generated from `src/db/main.rs`; do not edit manually.
-        #![allow(dead_code)]
-        use std::collections::{HashMap, HashSet};
-        use shared_types::*;
-        #(#functions)*
-
-        /// Returns whether the host application is shutting down.
-        ///
-        /// This lifecycle request is generated alongside the database client
-        /// because plugins use it to stop long-running work cleanly.
-        pub fn should_exit() -> Result<bool, Box<dyn std::error::Error>> {
-            crate::init_data_request(&crate::SupportedDBRequests::ShouldExit)
+        #[derive(Debug, serde::Serialize, serde::Deserialize, bitcode::Encode, bitcode::Decode)]
+        pub enum SupportedDBRequests {
+            #(#variants),*
         }
     };
-    let parsed = syn::parse2(tokens).expect("generated client is invalid Rust");
+    let parsed = syn::parse2(tokens)
+        .map_err(|error| format!("failed to parse generated request enum: {error}"))?;
     let output = prettyplease::unparse(&parsed);
-    let output_path = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("generated_api.rs");
-    let unchanged = fs::read_to_string(&output_path)
-        .map(|existing| existing == output)
-        .unwrap_or(false);
-    if !unchanged {
-        let temporary_path = output_path.with_extension("rs.tmp");
-        fs::write(&temporary_path, output).unwrap_or_else(|error| {
-            panic!(
-                "cannot write generated client {}: {error}",
-                output_path.display()
-            )
-        });
-        fs::rename(&temporary_path, &output_path).unwrap_or_else(|error| {
-            panic!(
-                "cannot replace generated client {}: {error}",
-                output_path.display()
-            )
-        });
-    }
+    let output_path =
+        PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("supported_db_requests.rs");
+    write_if_changed(&output_path, &output)?;
     Ok(())
 }
 
-fn ipc_options(method: &ImplItemFn) -> (Option<syn::Ident>, Option<syn::Ident>) {
-    let mut name = None;
-    let mut request = None;
-    for attr in &method.attrs {
-        if !attr.path().is_ident("ipc") {
+fn ipc_request(method: &syn::ImplItemFn) -> syn::Result<Option<syn::Ident>> {
+    for attribute in &method.attrs {
+        if !attribute.path().is_ident("ipc") {
             continue;
         }
-        let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("name") {
-                let value: syn::LitStr = meta.value()?.parse()?;
-                name = Some(syn::parse_str(&value.value()).unwrap());
-            } else if meta.path.is_ident("request") {
-                let value: syn::LitStr = meta.value()?.parse()?;
-                request = Some(syn::parse_str(&value.value()).unwrap());
+
+        let mut request = None;
+        let Attribute { meta, .. } = attribute;
+        let Meta::List(list) = meta else {
+            return Ok(Some(pascal_case(&method.sig.ident)));
+        };
+        let args = syn::parse::Parser::parse2(
+            syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
+            list.tokens.clone(),
+        )?;
+        for arg in args {
+            if let Meta::NameValue(value) = arg
+                && value.path.is_ident("request")
+            {
+                let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(value),
+                    ..
+                }) = value.value
+                else {
+                    return Err(syn::Error::new_spanned(
+                        value,
+                        "request must be a string literal",
+                    ));
+                };
+                request = Some(syn::parse_str(&value.value()).map_err(|_| {
+                    syn::Error::new_spanned(value, "request must be a Rust identifier")
+                })?);
             }
-            Ok(())
-        });
+        }
+        return Ok(Some(
+            request.unwrap_or_else(|| pascal_case(&method.sig.ident)),
+        ));
     }
-    (name, request)
+    Ok(None)
 }
 
-fn arguments(method: &ImplItemFn) -> Vec<(&syn::Ident, &Type)> {
+fn arguments(method: &syn::ImplItemFn) -> Vec<(&syn::Ident, &Type)> {
     method
         .sig
         .inputs
@@ -144,18 +130,31 @@ fn owned_type(ty: &Type) -> Type {
 
 fn pascal_case(name: &syn::Ident) -> syn::Ident {
     let mut output = String::new();
-    let mut upper = true;
-    for c in name.to_string().chars() {
-        if !c.is_ascii_alphanumeric() {
-            upper = true;
+    let mut uppercase = true;
+    for character in name.to_string().chars() {
+        if !character.is_ascii_alphanumeric() {
+            uppercase = true;
             continue;
         }
-        if upper {
-            output.extend(c.to_uppercase());
-            upper = false
+        if uppercase {
+            output.extend(character.to_uppercase());
+            uppercase = false;
         } else {
-            output.push(c)
+            output.push(character);
         }
     }
-    format_ident!("{output}")
+    syn::parse_str(&output).expect("generated request variant must be an identifier")
+}
+
+fn write_if_changed(path: &std::path::Path, contents: &str) -> Result<(), Box<dyn Error>> {
+    if fs::read_to_string(path)
+        .map(|existing| existing == contents)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let temporary = path.with_extension("rs.tmp");
+    fs::write(&temporary, contents)?;
+    fs::rename(temporary, path)?;
+    Ok(())
 }

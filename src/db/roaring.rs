@@ -329,6 +329,47 @@ impl RelationshipStorage {
         }
     }
 
+    /// Returns candidates from the in-memory portion of the cache.
+    ///
+    /// `None` means none of the requested tags are cached in memory. The
+    /// boolean indicates whether every requested tag was cached.
+    pub(in crate::db) fn cached_file_ids_for_tags(
+        &self,
+        tag_ids: &[u64],
+        search_type: DbSearchTypeEnum,
+    ) -> (Option<Vec<u64>>, bool) {
+        if tag_ids.is_empty() {
+            return (None, false);
+        }
+
+        let mut cached = tag_ids.iter().filter_map(|tag_id| self.tag_id.get(*tag_id));
+        let cached_count = cached.clone().count();
+        let all_cached = cached_count == tag_ids.len();
+        let Some(first) = cached.next() else {
+            return (None, false);
+        };
+
+        let mut result = first.clone();
+        match search_type {
+            DbSearchTypeEnum::And => {
+                for bitmap in cached {
+                    result &= bitmap;
+                }
+            }
+            DbSearchTypeEnum::Or => {
+                for bitmap in cached {
+                    result |= bitmap;
+                }
+            }
+        }
+
+        (Some(result.iter().collect()), all_cached)
+    }
+
+    pub(in crate::db) fn tag_is_cached_in_memory(&self, tag_id: u64) -> bool {
+        self.tag_id.contains_key(tag_id)
+    }
+
     ///
     /// Returns a list of all `file_id`'s associated with a tag
     ///
