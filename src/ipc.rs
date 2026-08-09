@@ -158,6 +158,7 @@ impl IpcServer {
                     GetNamespaceTagIDs(namespace_id) => tag_id_get_namespace_id,
 
 
+                    RelationshipGetFileid(file_id) => relationship_get_tagid_sync,
                 }
             }
         }

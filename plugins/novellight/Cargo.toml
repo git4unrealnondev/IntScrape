@@ -7,8 +7,6 @@ edition = "2024"
 crate-type = ["cdylib"] 
 
 [dependencies]
-chrono = "0.4.45"
-json = "0.12.4"
 regex = "1.12.4"
 scraper = "0.27.0"
 serde = { workspace = true, features = ["derive"] }

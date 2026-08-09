@@ -159,9 +159,9 @@ version = "0.12.1"
 version = "1.0.128"
 package = "serde_json"
 
-[dependencies.num-bigint-dig]
-version = "0.8.4"
-features = ["zeroize"]
+#[dependencies.num-bigint-dig]
+#version = "0.8.4"
+#features = ["zeroize"]
 
 [dependencies.pbkdf2]
 version = "0.12.2"

@@ -1041,6 +1041,20 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     }
 
     ///
+    /// Gets all tag ids associated with a fileid
+    ///
+    #[ipc(name = "relationship_get_tagid", request = "RelationshipGetFileid")]
+    pub fn relationship_get_tagid_sync(&self, file_id: &u64) -> HashSet<u64> {
+        let conn = self.pool.get().unwrap();
+
+        let mut out = HashSet::new();
+        if let Ok(tag_ids) = Self::internal_file_id_get_tag_ids(&conn, file_id) {
+            out.extend(tag_ids);
+        }
+        out
+    }
+
+    ///
     /// Gets filtered `tag_ids` for a fileid filters by nsid
     ///
     pub(in crate::db) fn internal_file_id_get_tag_ids_where_namespace_id(
