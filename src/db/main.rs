@@ -18,6 +18,7 @@ use std::sync::Arc;
 use walkdir::WalkDir;
 
 use crate::db::roaring::InternalCacheType;
+use crate::db::tag_search::{self, TagSearchCache};
 use crate::db::{CacheType, RelationshipStorage};
 use crate::web::manager::hash_bytes;
 use crate::{db::MainDatabase, helper_functions::get_sys_time_in_secs};
@@ -117,6 +118,223 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
         .unwrap();
     }
 
+    /// Creates the V3 audit trail. JSON snapshots keep the log useful when the
+    /// shape of the audited tables changes in a later database version.
+    pub(in crate::db) fn internal_table_create_audit_log_v3(
+        conn: &Connection,
+    ) -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS AuditLog (
+                id INTEGER PRIMARY KEY,
+                changed_at INTEGER NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                before_json TEXT,
+                after_json TEXT,
+                reason TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_log_changed_at ON AuditLog(changed_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON AuditLog(entity_type, entity_id);
+            ",
+        )
+    }
+
+    pub(in crate::db) fn internal_audit_triggers_setup(
+        conn: &Connection,
+    ) -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS AuditContext (
+                reason TEXT NOT NULL
+            );
+
+            CREATE TEMP TRIGGER IF NOT EXISTS audit_file_insert
+            AFTER INSERT ON main.File
+            BEGIN
+                INSERT INTO main.AuditLog
+                    (changed_at, entity_type, entity_id, action, before_json, after_json, reason)
+                VALUES (
+                    unixepoch(), 'file', CAST(NEW.id AS TEXT), 'create', NULL,
+                    json_object('id', NEW.id, 'hash', NEW.hash,
+                                'extension', NEW.extension, 'storage_id', NEW.storage_id),
+                    COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
+                             'file created')
+                );
+            END;
+
+            CREATE TEMP TRIGGER IF NOT EXISTS audit_file_delete
+            AFTER DELETE ON main.File
+            BEGIN
+                INSERT INTO main.AuditLog
+                    (changed_at, entity_type, entity_id, action, before_json, after_json, reason)
+                VALUES (
+                    unixepoch(), 'file', CAST(OLD.id AS TEXT), 'delete',
+                    json_object('id', OLD.id, 'hash', OLD.hash,
+                                'extension', OLD.extension, 'storage_id', OLD.storage_id), NULL,
+                    COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
+                             'file deleted')
+                );
+            END;
+
+            CREATE TEMP TRIGGER IF NOT EXISTS audit_file_update
+            AFTER UPDATE ON main.File
+            BEGIN
+                INSERT INTO main.AuditLog
+                    (changed_at, entity_type, entity_id, action, before_json, after_json, reason)
+                VALUES (
+                    unixepoch(), 'file', CAST(NEW.id AS TEXT), 'update',
+                    json_object('id', OLD.id, 'hash', OLD.hash,
+                                'extension', OLD.extension, 'storage_id', OLD.storage_id),
+                    json_object('id', NEW.id, 'hash', NEW.hash,
+                                'extension', NEW.extension, 'storage_id', NEW.storage_id),
+                    COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
+                             'file updated')
+                );
+            END;
+
+            CREATE TEMP TRIGGER IF NOT EXISTS audit_tag_insert
+            AFTER INSERT ON main.Tags
+            BEGIN
+                INSERT INTO main.AuditLog
+                    (changed_at, entity_type, entity_id, action, before_json, after_json, reason)
+                VALUES (
+                    unixepoch(), 'tag', CAST(NEW.id AS TEXT), 'create', NULL,
+                    json_object('id', NEW.id, 'name', NEW.name, 'namespace', NEW.namespace),
+                    COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
+                             'tag created')
+                );
+            END;
+
+            CREATE TEMP TRIGGER IF NOT EXISTS audit_tag_delete
+            AFTER DELETE ON main.Tags
+            BEGIN
+                INSERT INTO main.AuditLog
+                    (changed_at, entity_type, entity_id, action, before_json, after_json, reason)
+                VALUES (
+                    unixepoch(), 'tag', CAST(OLD.id AS TEXT), 'delete',
+                    json_object('id', OLD.id, 'name', OLD.name, 'namespace', OLD.namespace), NULL,
+                    COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
+                             'tag deleted')
+                );
+            END;
+
+            CREATE TEMP TRIGGER IF NOT EXISTS audit_tag_update
+            AFTER UPDATE ON main.Tags
+            WHEN OLD.name IS NOT NEW.name OR OLD.namespace IS NOT NEW.namespace
+            BEGIN
+                INSERT INTO main.AuditLog
+                    (changed_at, entity_type, entity_id, action, before_json, after_json, reason)
+                VALUES (
+                    unixepoch(), 'tag', CAST(NEW.id AS TEXT), 'update',
+                    json_object('id', OLD.id, 'name', OLD.name, 'namespace', OLD.namespace),
+                    json_object('id', NEW.id, 'name', NEW.name, 'namespace', NEW.namespace),
+                    COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
+                             'tag updated')
+                );
+            END;
+
+            CREATE TEMP TRIGGER IF NOT EXISTS audit_relationship_insert
+            AFTER INSERT ON main.Relationship
+            BEGIN
+                INSERT INTO main.AuditLog
+                    (changed_at, entity_type, entity_id, action, before_json, after_json, reason)
+                VALUES (
+                    unixepoch(), 'relationship', NEW.file_id || ':' || NEW.tag_id, 'create', NULL,
+                    json_object('file_id', NEW.file_id, 'tag_id', NEW.tag_id),
+                    COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
+                             'relationship added')
+                );
+            END;
+
+            CREATE TEMP TRIGGER IF NOT EXISTS audit_relationship_delete
+            AFTER DELETE ON main.Relationship
+            BEGIN
+                INSERT INTO main.AuditLog
+                    (changed_at, entity_type, entity_id, action, before_json, after_json, reason)
+                VALUES (
+                    unixepoch(), 'relationship', OLD.file_id || ':' || OLD.tag_id, 'delete',
+                    json_object('file_id', OLD.file_id, 'tag_id', OLD.tag_id), NULL,
+                    COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
+                             'relationship removed')
+                );
+            END;
+
+            CREATE TEMP TRIGGER IF NOT EXISTS audit_parent_insert
+            AFTER INSERT ON main.Parents
+            BEGIN
+                INSERT INTO main.AuditLog
+                    (changed_at, entity_type, entity_id, action, before_json, after_json, reason)
+                VALUES (
+                    unixepoch(), 'relationship', 'parent:' || NEW.id, 'create', NULL,
+                    json_object('tag_id', NEW.tag_id, 'relate_tag_id', NEW.relate_tag_id,
+                                'limit_to', NEW.limit_to),
+                    COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
+                             'tag parent relationship added')
+                );
+            END;
+
+            CREATE TEMP TRIGGER IF NOT EXISTS audit_parent_delete
+            AFTER DELETE ON main.Parents
+            BEGIN
+                INSERT INTO main.AuditLog
+                    (changed_at, entity_type, entity_id, action, before_json, after_json, reason)
+                VALUES (
+                    unixepoch(), 'relationship', 'parent:' || OLD.id, 'delete',
+                    json_object('tag_id', OLD.tag_id, 'relate_tag_id', OLD.relate_tag_id,
+                                'limit_to', OLD.limit_to), NULL,
+                    COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
+                             'tag parent relationship removed')
+                );
+            END;",
+        )
+    }
+
+    pub(in crate::db) fn internal_audit_context_set(
+        conn: &Connection,
+        reason: &str,
+    ) -> Result<(), rusqlite::Error> {
+        Self::internal_audit_triggers_setup(conn)?;
+        conn.execute("DELETE FROM temp.AuditContext", [])?;
+        conn.execute(
+            "INSERT INTO temp.AuditContext (reason) VALUES (?1)",
+            params![reason],
+        )?;
+        Ok(())
+    }
+
+    pub(in crate::db) fn internal_audit_log(
+        conn: &Connection,
+        entity_type: &str,
+        entity_id: impl ToString,
+        action: &str,
+        before_json: Option<String>,
+        after_json: Option<String>,
+        reason: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let enabled = Self::internal_setting_get(conn, "SYSTEM_audit_log_enabled")?
+            .and_then(|setting| setting.num)
+            .unwrap_or(1)
+            != 0;
+        if !enabled {
+            return Ok(());
+        }
+        conn.execute(
+            "INSERT INTO AuditLog
+                (changed_at, entity_type, entity_id, action, before_json, after_json, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                get_sys_time_in_secs(),
+                entity_type,
+                entity_id.to_string(),
+                action,
+                before_json,
+                after_json,
+                reason,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub(in crate::db) fn internal_load_caching(self: Arc<Self>, conn: &Connection) {
         let temp;
         loop {
@@ -189,6 +407,58 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
         if let Some(rel) = guard.as_mut() {
             rel.load_relationship_cache(conn);
         }
+        self.reload_tag_cache(conn);
+        self.reload_tag_search_cache(conn);
+    }
+
+    fn reload_tag_cache(&self, conn: &Connection) {
+        let mut stmt = conn
+            .prepare(
+                "SELECT t.id, t.name, n.name, n.description
+                 FROM Tags t JOIN Namespace n ON n.id = t.namespace",
+            )
+            .unwrap();
+        let entries = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    Tag {
+                        name: row.get(1)?,
+                        namespace: GenericNamespaceObj {
+                            name: row.get(2)?,
+                            description: row.get(3)?,
+                        },
+                    },
+                ))
+            })
+            .unwrap()
+            .flatten()
+            .collect();
+        *self.tag_cache.write() = entries;
+    }
+
+    fn reload_tag_search_cache(&self, conn: &Connection) {
+        let mut stmt = conn
+            .prepare(
+                "SELECT t.id, t.name, t.count, n.name, n.description
+                 FROM Tags t JOIN Namespace n ON n.id = t.namespace
+                 WHERE t.count >= ?1",
+            )
+            .unwrap();
+        let entries = stmt
+            .query_map([tag_search::high_value_count()], |row| {
+                Ok(tag_search::tag_entry(
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .flatten()
+            .collect();
+        *self.tag_search_cache.write() = TagSearchCache::from_entries(entries);
     }
 
     /// Sets up internal cache structure
@@ -270,12 +540,13 @@ END;
     #[must_use]
     #[ipc(name = "search_tag_fts", request = "SearchTags")]
     pub fn search_db_tags_fts(&self, tag: &str, limit: &Option<u64>) -> Vec<TagSearch> {
-        let conn = self.pool.get().unwrap();
-        let cleaned_tag = tag.trim().replace('"', "\"\"");
-        let fts_query = format!("\"{cleaned_tag}\"");
-        let max_rows = limit.unwrap_or(10);
+        let max_rows = limit.unwrap_or(10) as usize;
+        let mut results = self.tag_search_cache.read().search(tag, max_rows);
+        if results.len() >= max_rows {
+            return results;
+        }
 
-        // Join FTS results back to real tables to hydrate Namespace name
+        let conn = self.pool.get().unwrap();
         let mut stmt = conn
             .prepare(
                 "SELECT 
@@ -284,43 +555,143 @@ END;
     t.count, 
     n.name AS ns_name,
     n.description AS ns_desc
- FROM Tags_Popular_fts f
- JOIN Tags t ON f.rowid = t.id
+ FROM Tags t
  JOIN Namespace n ON t.namespace = n.id
- WHERE Tags_Popular_fts MATCH ?1
- ORDER BY t.count DESC, f.rank ASC
- LIMIT ?2",
+ WHERE t.count < ?1
+ ORDER BY t.count DESC, t.name ASC",
             )
             .unwrap();
 
         let tag_iter = stmt
-            .query_map(params![fts_query, max_rows], |row| {
+            .query_map([tag_search::high_value_count()], |row| {
                 let tag_id: u64 = row.get(0)?;
                 let tag_name: String = row.get(1)?;
                 let count: u64 = row.get(2)?;
                 let ns_name: String = row.get(3)?;
                 let ns_desc: Option<String> = row.get(4)?;
 
-                Ok(TagSearch {
-                    tag_id,
-                    count,
-                    tag: Tag {
-                        name: tag_name,
-                        namespace: GenericNamespaceObj {
-                            name: ns_name,
-                            description: ns_desc,
-                        },
-                    },
-                })
+                Ok(tag_search::tag_entry(
+                    tag_id, tag_name, count, ns_name, ns_desc,
+                ))
             })
             .unwrap();
+        let slow_entries = tag_iter.flatten().collect();
+        for entry in TagSearchCache::from_entries(slow_entries).search(tag, max_rows) {
+            let candidate = TagSearch {
+                tag: entry.tag,
+                tag_id: entry.tag_id,
+                count: entry.count,
+            };
+            if !results
+                .iter()
+                .any(|result| result.tag_id == candidate.tag_id)
+            {
+                results.push(candidate);
+            }
+        }
+        results.sort_unstable_by(tag_search::compare_results);
+        results.truncate(max_rows);
+        results
+    }
 
-        let mut results = Vec::new();
-        for item in tag_iter.flatten() {
-            results.push(item);
+    /// Resolves tag names across namespaces and searches for files matching
+    /// every input name, while allowing any tag with that name.
+    #[must_use]
+    #[ipc(name = "search_db_files_by_tags", request = "SearchFilesByTags")]
+    pub fn search_db_files_by_tags_sync(&self, tags: &[String], limit: &Option<u64>) -> Vec<u64> {
+        self.search_db_files_by_tag_groups_sync(&[], tags, &[], &[], &[], &[], limit)
+    }
+
+    /// Resolves tag names across namespaces while preserving boolean groups.
+    #[must_use]
+    #[ipc(
+        name = "search_db_files_by_tag_groups",
+        request = "SearchFilesByTagGroups"
+    )]
+    pub fn search_db_files_by_tag_groups_sync(
+        &self,
+        and_ids: &[u64],
+        and_tags: &[String],
+        or_ids: &[u64],
+        or_tags: &[String],
+        not_ids: &[u64],
+        not_tags: &[String],
+        limit: &Option<u64>,
+    ) -> Vec<u64> {
+        let conn = self.pool.get().unwrap();
+        let resolve_tags = |tag_names: &[String]| {
+            tag_names
+                .iter()
+                .filter_map(|tag_name| {
+                    let normalized = tag_search::normalize(tag_name);
+                    if normalized.is_empty() {
+                        return None;
+                    }
+
+                    let mut stmt = conn
+                        .prepare("SELECT id, name FROM Tags ORDER BY count DESC, id ASC")
+                        .unwrap();
+                    let matching_ids = stmt
+                        .query_map([], |row| {
+                            Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+                        })
+                        .unwrap()
+                        .flatten()
+                        .filter_map(|(tag_id, name)| {
+                            (tag_search::normalize(&name) == normalized).then_some(tag_id)
+                        })
+                        .collect::<Vec<_>>();
+
+                    let matching_ids = if matching_ids.is_empty() {
+                        self.search_db_tags_fts(tag_name, &Some(100))
+                            .into_iter()
+                            .map(|result| result.tag_id)
+                            .collect()
+                    } else {
+                        matching_ids
+                    };
+
+                    (!matching_ids.is_empty()).then_some(matching_ids)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut searches = Vec::new();
+        for tag_id in and_ids {
+            searches.push(SearchHolder::Or(vec![*tag_id]));
+        }
+        let resolved_and = resolve_tags(and_tags);
+        if resolved_and.len() != and_tags.len() {
+            return Vec::new();
+        }
+        for matching_ids in resolved_and {
+            searches.push(SearchHolder::Or(matching_ids));
+        }
+        if !or_tags.is_empty() {
+            let mut matching_ids = or_ids.to_vec();
+            matching_ids.extend(resolve_tags(or_tags).into_iter().flatten());
+            if matching_ids.is_empty() {
+                return Vec::new();
+            }
+            searches.push(SearchHolder::Or(matching_ids));
+        } else if !or_ids.is_empty() {
+            searches.push(SearchHolder::Or(or_ids.to_vec()));
+        }
+        let mut resolved_not = not_ids.to_vec();
+        for matching_ids in resolve_tags(not_tags) {
+            resolved_not.extend(matching_ids);
+        }
+        if !resolved_not.is_empty() {
+            searches.push(SearchHolder::Not(resolved_not));
         }
 
-        results
+        self.search_db_files_sync(
+            &SearchObj {
+                search_relate: None,
+                searches,
+            },
+            limit,
+        )
     }
 
     ///
@@ -597,6 +968,7 @@ CREATE INDEX IF NOT EXISTS idx_file_hash ON File (hash);
         tn: Transaction,
         files: &[FileInternal],
     ) -> Result<(), rusqlite::Error> {
+        Self::internal_audit_context_set(&tn, "file metadata updated")?;
         {
             let mut stmt = tn.prepare(
                 "UPDATE File 
@@ -859,7 +1231,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     }
 
     ///
-    /// Gets `tag_ids` for `file_ids`
+    /// Gets `tag_ids` for `file_id`
     ///
     pub(in crate::db) fn internal_file_id_get_tag_ids(
         conn: &Connection,
@@ -870,6 +1242,24 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
             .unwrap();
         let mut out = HashSet::new();
         for tag_id in stmt.query_map([file_id], |row| row.get(0))?.flatten() {
+            out.insert(tag_id);
+        }
+
+        Ok(out)
+    }
+
+    ///
+    /// Gets `file_ids` for `tag_id`
+    ///
+    pub(in crate::db) fn internal_tag_id_get_file_ids(
+        conn: &Connection,
+        tag_id: &u64,
+    ) -> Result<HashSet<u64>, rusqlite::Error> {
+        let mut stmt = conn
+            .prepare("SELECT file_id FROM Relationship where tag_id = ?1;")
+            .unwrap();
+        let mut out = HashSet::new();
+        for tag_id in stmt.query_map([tag_id], |row| row.get(0))?.flatten() {
             out.insert(tag_id);
         }
 
@@ -1044,12 +1434,33 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     /// Gets all tag ids associated with a fileid
     ///
     #[ipc(name = "relationship_get_tagid", request = "RelationshipGetFileid")]
-    pub fn relationship_get_tagid_sync(&self, file_id: &u64) -> HashSet<u64> {
+    pub fn relationship_get_tag_id_sync(&self, file_id: &u64) -> HashSet<u64> {
+        let roaring_guard = self.relationship_roaring_storage.read();
+        if let Some(roaring) = roaring_guard.as_ref()
+            && let Some(tag_ids) = roaring.relationship_search_tagid_roaring_in_memory(*file_id)
+        {
+            return tag_ids.into_iter().collect();
+        }
+
         let conn = self.pool.get().unwrap();
 
         let mut out = HashSet::new();
         if let Ok(tag_ids) = Self::internal_file_id_get_tag_ids(&conn, file_id) {
             out.extend(tag_ids);
+        }
+        out
+    }
+
+    ///
+    /// Gets all file ids associated with a tag_id
+    ///
+    #[ipc(name = "relationship_get_fileid", request = "RelationshipGetTagid")]
+    pub fn relationship_get_file_id_sync(&self, tag_id: &u64) -> HashSet<u64> {
+        let conn = self.pool.get().unwrap();
+
+        let mut out = HashSet::new();
+        if let Ok(file_ids) = Self::internal_tag_id_get_file_ids(&conn, tag_id) {
+            out.extend(file_ids);
         }
         out
     }
@@ -1124,6 +1535,14 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     #[must_use]
     #[ipc(name = "get_tag_id_bulk", request = "GetTagIds")]
     pub fn tag_id_get_tag_sync(&self, tags: &HashSet<u64>) -> HashMap<u64, Tag> {
+        let tag_cache = self.tag_cache.read();
+        if tags.iter().all(|tag_id| tag_cache.contains_key(tag_id)) {
+            return tags
+                .iter()
+                .filter_map(|tag_id| tag_cache.get(tag_id).cloned().map(|tag| (*tag_id, tag)))
+                .collect();
+        }
+
         let conn = self.pool.get().unwrap();
         Self::internal_tag_id_get_tag(&conn, tags)
     }
@@ -1690,6 +2109,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         file_id: u64,
         tag_id: u64,
     ) -> Result<(), r2d2_sqlite::rusqlite::Error> {
+        Self::internal_audit_context_set(conn, "relationship added")?;
         // Option A: Using raw fields manually
         let mut stmt = conn.prepare(
             "INSERT OR IGNORE INTO Relationship (file_id, tag_id) 
@@ -1718,6 +2138,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         tag_actions: &[FileTagAction],
         plugin_manager: Arc<RwLock<Option<Arc<PluginManager>>>>,
     ) -> HashMap<shared_types::Tag, u64> {
+        Self::internal_audit_context_set(conn, "tag discovered from input").unwrap();
         let mut out = HashMap::new();
         let mut parents = HashSet::new();
 
@@ -1939,6 +2360,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         conn: &Connection,
         relationships: &HashSet<(u64, u64)>,
     ) {
+        Self::internal_audit_context_set(conn, "relationship removed").unwrap();
         if relationships.is_empty() {
             return;
         }
@@ -1972,6 +2394,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         }
 
         conn.execute(&query, &*params_vector).unwrap();
+        self.reload_tag_search_cache(conn);
     }
     ///
     /// Bulk adds relationship into DB with chunking to prevent parameter limit overflow
@@ -1981,6 +2404,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         conn: &Connection,
         relationships: &HashSet<(u64, u64)>,
     ) {
+        Self::internal_audit_context_set(conn, "relationship added").unwrap();
         if relationships.is_empty() {
             return;
         }
@@ -2017,6 +2441,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                 return;
             }
         }
+        self.reload_tag_search_cache(conn);
     }
 
     ///
@@ -2041,6 +2466,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         conn: &Connection,
         parents: &HashSet<shared_types::TagParents>,
     ) -> HashMap<shared_types::TagParents, u64> {
+        Self::internal_audit_context_set(conn, "tag parent relationship added").unwrap();
         let mut out = HashMap::new();
 
         if parents.is_empty() {
@@ -2093,6 +2519,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         conn: &Connection,
         parents: HashSet<shared_types::FileInternal>,
     ) -> HashSet<shared_types::FileInternal> {
+        Self::internal_audit_context_set(conn, "file discovered from scraper or import").unwrap();
         let mut out = HashSet::new();
 
         if parents.is_empty() {
@@ -2100,7 +2527,6 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         }
 
         let parents_vec: Vec<&shared_types::FileInternal> = parents.iter().collect();
-
         let mut query = String::from("INSERT INTO File (hash, extension, storage_id) VALUES ");
         let mut params_vector: Vec<&dyn rusqlite::types::ToSql> =
             Vec::with_capacity(parents_vec.len() * 3);
@@ -2903,17 +3329,25 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             }
         }
 
-        if and_tags.is_empty() && or_groups.is_empty() {
+        // A NOT-only search still has a valid candidate set: all tagged files.
+        // Only an entirely empty search should return no results.
+        if and_tags.is_empty() && or_groups.is_empty() && not_groups.is_empty() {
             return vec![];
         }
 
         let mut driver_or_group = if and_tags.is_empty() {
-            Some(or_groups.remove(0))
+            or_groups.first().is_some().then(|| or_groups.remove(0))
         } else {
             None
         };
 
-        let conn = self.pool.get().unwrap();
+        let conn = match self.pool.get() {
+            Ok(conn) => conn,
+            Err(error) => {
+                log::error!("Failed to acquire DB connection for file search: {error}");
+                return Vec::new();
+            }
+        };
         let mut cached_candidates = None;
         let mut cached_all_tags = false;
         let mut cached_search_type = None;
@@ -2921,8 +3355,11 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         let read_guard = self.relationship_roaring_storage.read();
         if let Some(ref roaring) = *read_guard {
             if !and_tags.is_empty() && driver_or_group.is_none() && or_groups.is_empty() {
-                let (candidates, all_cached) = roaring
-                    .cached_file_ids_for_tags(&and_tags, shared_types::DbSearchTypeEnum::And);
+                let (candidates, all_cached) = roaring.cached_file_ids_for_tags(
+                    &conn,
+                    &and_tags,
+                    &shared_types::DbSearchTypeEnum::And,
+                );
                 cached_candidates = candidates;
                 cached_all_tags = all_cached;
                 cached_search_type = Some(shared_types::DbSearchTypeEnum::And);
@@ -2931,13 +3368,100 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 && driver_or_group.is_some()
                 && or_groups.is_empty()
             {
-                let tags = driver_or_group.as_ref().unwrap();
-                let (candidates, all_cached) =
-                    roaring.cached_file_ids_for_tags(tags, shared_types::DbSearchTypeEnum::Or);
-                cached_candidates = candidates;
-                cached_all_tags = all_cached;
-                cached_search_type = Some(shared_types::DbSearchTypeEnum::Or);
+                if let Some(tags) = driver_or_group.as_ref() {
+                    let (candidates, all_cached) = roaring.cached_file_ids_for_tags(
+                        &conn,
+                        tags,
+                        &shared_types::DbSearchTypeEnum::Or,
+                    );
+                    cached_candidates = candidates;
+                    cached_all_tags = all_cached;
+                    cached_search_type = Some(shared_types::DbSearchTypeEnum::Or);
+                }
             }
+        }
+
+        // When every exclusion bitmap is available, apply NOT directly to the
+        // positive roaring candidates. Falling back to SQL is necessary if an
+        // exclusion tag is not cached, because merging uncached candidates would
+        // otherwise bypass the NOT predicate.
+        let not_tag_ids = not_groups.iter().flatten().copied().collect::<Vec<_>>();
+        let (cached_exclusions, all_exclusions_cached) = if not_tag_ids.is_empty() {
+            (None, true)
+        } else if let Some(ref roaring) = *read_guard {
+            roaring.cached_file_ids_for_tags(
+                &conn,
+                &not_tag_ids,
+                &shared_types::DbSearchTypeEnum::Or,
+            )
+        } else {
+            (None, false)
+        };
+
+        // Evaluate the complete positive expression from roaring when every
+        // referenced tag is resident. This also covers grouped searches,
+        // where each OR group is a required condition.
+        if let Some(ref roaring) = *read_guard {
+            let mut cache_groups = Vec::new();
+            if !and_tags.is_empty() {
+                cache_groups.push((and_tags.as_slice(), shared_types::DbSearchTypeEnum::And));
+            }
+            if let Some(group) = driver_or_group.as_ref() {
+                cache_groups.push((group.as_slice(), shared_types::DbSearchTypeEnum::Or));
+            }
+            cache_groups.extend(
+                or_groups
+                    .iter()
+                    .map(|group| (group.as_slice(), shared_types::DbSearchTypeEnum::Or)),
+            );
+
+            if !cache_groups.is_empty() {
+                let mut candidates: Option<std::collections::HashSet<u64>> = None;
+                let all_positive_cached = cache_groups.iter().all(|(tags, search_type)| {
+                    let (group_candidates, all_cached) =
+                        roaring.cached_file_ids_for_tags(&conn, tags, search_type);
+                    if all_cached {
+                        if let Some(group_candidates) = group_candidates {
+                            let group_candidates = group_candidates
+                                .into_iter()
+                                .collect::<std::collections::HashSet<_>>();
+                            if let Some(current) = candidates.as_mut() {
+                                current.retain(|file_id| group_candidates.contains(file_id));
+                            } else {
+                                candidates = Some(group_candidates);
+                            }
+                        }
+                    }
+                    all_cached
+                });
+
+                if all_positive_cached && all_exclusions_cached {
+                    if let Some(exclusions) = cached_exclusions {
+                        let excluded = exclusions
+                            .into_iter()
+                            .collect::<std::collections::HashSet<_>>();
+                        if let Some(current) = candidates.as_mut() {
+                            current.retain(|file_id| !excluded.contains(file_id));
+                        }
+                    }
+                    let mut results = candidates
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    results.sort_unstable_by(|left, right| right.cmp(left));
+                    if let Some(limit) = limit {
+                        results.truncate(*limit as usize);
+                    }
+                    return results;
+                }
+            }
+        }
+
+        if !not_tag_ids.is_empty() && !all_exclusions_cached {
+            // Do not merge a partial OR cache into a SQL result when NOT tags
+            // are present. SQL must evaluate the complete boolean expression.
+            cached_candidates = None;
+            cached_search_type = None;
         }
 
         if let (Some(candidates), true, Some(search_type)) = (
@@ -2985,11 +3509,14 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             let count_sql =
                 format!("SELECT id FROM Tags WHERE id IN ({placeholders}) ORDER BY count ASC");
             if let Ok(mut stmt) = conn.prepare(&count_sql) {
-                let ids: Vec<u64> = stmt
-                    .query_map(params_from_iter(&sorted_and), |r| r.get(0))
-                    .unwrap()
-                    .filter_map(std::result::Result::ok)
-                    .collect();
+                let ids: Vec<u64> =
+                    match stmt.query_map(params_from_iter(&sorted_and), |r| r.get(0)) {
+                        Ok(rows) => rows.filter_map(std::result::Result::ok).collect(),
+                        Err(error) => {
+                            log::error!("Failed to rank AND tags for file search: {error}");
+                            Vec::new()
+                        }
+                    };
                 if !ids.is_empty() {
                     sorted_and = ids;
                 }
@@ -3004,7 +3531,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 "SELECT DISTINCT r0.file_id FROM Relationship r0 WHERE r0.tag_id IN ({placeholders})"
             )
         } else {
-            "SELECT r0.file_id FROM Relationship r0".to_string()
+            "SELECT DISTINCT r0.file_id FROM Relationship r0".to_string()
         };
 
         // Only add JOINs if there are more AND tags
@@ -3016,10 +3543,17 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             params.push(*tag);
         }
 
-        // Start conditions with the driver tag when an AND group exists.
+        // Start the predicate list with the driver tag or a neutral condition.
         if !sorted_and.is_empty() {
-            sql.push_str(" WHERE r0.tag_id = ?");
+            sql.push_str(if sql.contains(" WHERE ") {
+                " AND r0.tag_id = ?"
+            } else {
+                " WHERE r0.tag_id = ?"
+            });
             params.push(sorted_and[0]);
+        } else if !sql.contains(" WHERE ") {
+            // Start the predicate list when there is no AND driver.
+            sql.push_str(" WHERE 1 = 1");
         }
 
         if matches!(
@@ -3069,25 +3603,30 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         // Finalize
         sql.push_str(" ORDER BY r0.file_id DESC");
 
-        if let Some(l) = limit {
-            sql.push_str(" LIMIT ?");
-            params.push(*l);
-        }
-
-        let mut stmt = conn.prepare(&sql).expect("Unable to prepare a db search");
-        let mut results: Vec<u64> = stmt
-            .query_map(params_from_iter(params), |row| row.get(0))
-            .expect(" Unable to querymap")
-            .filter_map(std::result::Result::ok)
-            .collect();
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(error) => {
+                log::error!("Unable to prepare a db search: {error}");
+                return Vec::new();
+            }
+        };
+        let mut results: Vec<u64> = match stmt.query_map(params_from_iter(params), |row| row.get(0))
+        {
+            Ok(rows) => rows.filter_map(std::result::Result::ok).collect(),
+            Err(error) => {
+                log::error!("Unable to execute a db search: {error}");
+                return Vec::new();
+            }
+        };
 
         if matches!(cached_search_type, Some(shared_types::DbSearchTypeEnum::Or)) {
             results.extend(cached_candidates.unwrap_or_default());
             results.sort_unstable_by(|left, right| right.cmp(left));
             results.dedup();
-            if let Some(limit) = limit {
-                results.truncate(*limit as usize);
-            }
+        }
+
+        if let Some(limit) = limit {
+            results.truncate(*limit as usize);
         }
 
         results
@@ -3233,6 +3772,19 @@ SELECT id, name, namespace FROM High_Value_Tags;",
 
     ///
     /// Adds job into db
+    ///
+    #[must_use]
+    #[ipc(name = "jobs_add_single", request = "JobsAddSingle")]
+    pub fn jobs_add_single_sync(&self, job: PluginJob) -> u64 {
+        let mut writer_conn = self.writer_conn.lock();
+        let conn = writer_conn.transaction().unwrap();
+        let out = Self::internal_jobs_add(&conn, &job);
+        conn.commit().unwrap();
+        out
+    }
+
+    ///
+    /// Adds job into db asynchronously.
     ///
     pub async fn jobs_add_single(&self, job: PluginJob) -> u64 {
         let pool = self.pool.clone();
@@ -3403,6 +3955,155 @@ mod tests {
             .expect("Default user agent missing");
 
         assert_eq!(user_agent.param, Some("IntScrape V1.0".to_string()));
+
+        let audit_table: i32 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'AuditLog'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_table, 1);
+
+        let audit_enabled = MainDatabase::internal_setting_get(&conn, "SYSTEM_audit_log_enabled")
+            .unwrap()
+            .expect("audit setting should be configured");
+        assert_eq!(audit_enabled.num, Some(1));
+    }
+
+    #[test]
+    fn test_v2_database_upgrades_to_v3_audit_log() {
+        let path = std::env::temp_dir().join("intscrape-db-v2-upgrade.sqlite");
+        let _ = fs::remove_file(&path);
+        let db = MainDatabase::new(&path);
+        let conn = db.pool.get().unwrap();
+        conn.execute("DROP TABLE AuditLog", []).unwrap();
+        conn.execute(
+            "DELETE FROM Settings WHERE name = 'SYSTEM_audit_log_enabled'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO File (hash, extension, storage_id) VALUES ('upgrade-hash', 'jpg', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO Namespace (name, description) VALUES ('upgrade', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO Tags (name, namespace) VALUES ('upgrade-tag', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO Relationship (file_id, tag_id) VALUES (1, 1)",
+            [],
+        )
+        .unwrap();
+        MainDatabase::internal_db_version_set(&conn, 2).unwrap();
+        drop(conn);
+        drop(db);
+
+        let db = MainDatabase::new(&path);
+        let conn = db.pool.get().unwrap();
+        let version = MainDatabase::internal_setting_get(&conn, "SYSTEM_VERSION")
+            .unwrap()
+            .unwrap();
+        assert_eq!(version.num, Some(3));
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM AuditLog", [], |row| row
+                .get::<_, i32>(0),)
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_relationship_and_tag_changes_are_audited() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        let actions = [file_action(
+            TagOperation::Add,
+            vec![plugin_tag("audit", "test")],
+        )];
+        let tags = MainDatabase::internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
+        let tag_id = *tags.values().next().unwrap();
+        MainDatabase::internal_file_bulk_add(&conn, HashSet::from([file("audit-hash", "bin")]));
+        let file_id: u64 = conn
+            .query_row("SELECT id FROM File WHERE hash = 'audit-hash'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        MainDatabase::internal_relationship_bulk_add(
+            db.clone(),
+            &conn,
+            &HashSet::from([(file_id, tag_id)]),
+        );
+
+        let count: i32 = conn
+            .query_row(
+                "SELECT count(*) FROM AuditLog WHERE entity_type IN ('tag', 'relationship')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        let reason: String = conn
+            .query_row(
+                "SELECT reason FROM AuditLog WHERE entity_type = 'relationship'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!reason.is_empty());
+    }
+
+    #[test]
+    fn test_relationship_cascade_delete_is_audited() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        MainDatabase::internal_audit_context_set(&conn, "cascade test").unwrap();
+        conn.execute(
+            "INSERT INTO Namespace (name, description) VALUES ('cascade', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO File (hash, extension, storage_id) VALUES ('cascade-hash', 'bin', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO Tags (name, namespace) VALUES (
+                'cascade-tag', (SELECT id FROM Namespace WHERE name = 'cascade')
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO Relationship (file_id, tag_id) VALUES (
+                (SELECT id FROM File WHERE hash = 'cascade-hash'),
+                (SELECT id FROM Tags WHERE name = 'cascade-tag')
+            )",
+            [],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM File WHERE hash = 'cascade-hash'", [])
+            .unwrap();
+
+        let relationship_delete_count: i32 = conn
+            .query_row(
+                "SELECT count(*) FROM AuditLog
+                 WHERE entity_type = 'relationship' AND action = 'delete'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(relationship_delete_count, 1);
     }
 
     #[test]
@@ -3896,6 +4597,234 @@ mod tests {
     }
 
     #[test]
+    fn test_search_malformed_inputs_do_not_panic() {
+        let db = new_test();
+
+        let not_only = SearchObj {
+            search_relate: None,
+            searches: vec![SearchHolder::Not(vec![u64::MAX])],
+        };
+        assert!(db.search_db_files_sync(&not_only, &None).is_empty());
+
+        let empty_groups = SearchObj {
+            search_relate: None,
+            searches: vec![
+                SearchHolder::And(Vec::new()),
+                SearchHolder::Or(Vec::new()),
+                SearchHolder::Not(Vec::new()),
+            ],
+        };
+        assert!(db.search_db_files_sync(&empty_groups, &None).is_empty());
+
+        let extreme_limit = SearchObj {
+            search_relate: None,
+            searches: vec![SearchHolder::And(vec![u64::MAX])],
+        };
+        assert!(
+            db.search_db_files_sync(&extreme_limit, &Some(u64::MAX))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_not_only_search_deduplicates_file_ids() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        let file_id =
+            MainDatabase::internal_file_bulk_add(&conn, HashSet::from([file("not-only", "jpg")]))
+                .into_iter()
+                .next()
+                .unwrap()
+                .id
+                .unwrap();
+        let tags = MainDatabase::internal_tag_bulk_add(
+            &conn,
+            &[file_action(
+                TagOperation::Add,
+                vec![
+                    plugin_tag("keep-one", "test"),
+                    plugin_tag("keep-two", "test"),
+                    plugin_tag("excluded", "test"),
+                ],
+            )],
+            db.plugin_manager.clone(),
+        );
+        let keep_one = tags[&tag("keep-one", "test")];
+        let keep_two = tags[&tag("keep-two", "test")];
+        let excluded = tags[&tag("excluded", "test")];
+        MainDatabase::internal_relationship_bulk_add(
+            db.clone(),
+            &conn,
+            &HashSet::from([(file_id, keep_one), (file_id, keep_two)]),
+        );
+
+        let search = SearchObj {
+            search_relate: None,
+            searches: vec![SearchHolder::Not(vec![excluded])],
+        };
+        assert_eq!(db.search_db_files_sync(&search, &None), vec![file_id]);
+    }
+
+    #[test]
+    fn test_search_boolean_operators_exclude_not_matches() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        let mut file_ids = HashMap::new();
+
+        for hash in [
+            "and_only",
+            "or_only",
+            "and_and_or",
+            "and_and_not",
+            "unrelated",
+        ] {
+            let file_id =
+                MainDatabase::internal_file_bulk_add(&conn, HashSet::from([file(hash, "jpg")]))
+                    .into_iter()
+                    .next()
+                    .unwrap()
+                    .id
+                    .unwrap();
+            file_ids.insert(hash, file_id);
+        }
+
+        let tags = MainDatabase::internal_tag_bulk_add(
+            &conn,
+            &[file_action(
+                TagOperation::Add,
+                vec![
+                    plugin_tag("and", "test"),
+                    plugin_tag("or", "test"),
+                    plugin_tag("not", "test"),
+                ],
+            )],
+            db.plugin_manager.clone(),
+        );
+        let and_tag = tags[&tag("and", "test")];
+        let or_tag = tags[&tag("or", "test")];
+        let not_tag = tags[&tag("not", "test")];
+
+        MainDatabase::internal_relationship_bulk_add(
+            db.clone(),
+            &conn,
+            &HashSet::from([
+                (file_ids["and_only"], and_tag),
+                (file_ids["or_only"], or_tag),
+                (file_ids["and_and_or"], and_tag),
+                (file_ids["and_and_or"], or_tag),
+                (file_ids["and_and_not"], and_tag),
+                (file_ids["and_and_not"], not_tag),
+            ]),
+        );
+
+        let run = |searches| {
+            db.search_db_files_sync(
+                &SearchObj {
+                    search_relate: None,
+                    searches,
+                },
+                &None,
+            )
+            .into_iter()
+            .collect::<HashSet<_>>()
+        };
+
+        assert_eq!(
+            run(vec![SearchHolder::And(vec![and_tag])]),
+            HashSet::from([
+                file_ids["and_only"],
+                file_ids["and_and_or"],
+                file_ids["and_and_not"],
+            ])
+        );
+        assert_eq!(
+            run(vec![SearchHolder::Or(vec![and_tag, or_tag])]),
+            HashSet::from([
+                file_ids["and_only"],
+                file_ids["or_only"],
+                file_ids["and_and_or"],
+                file_ids["and_and_not"],
+            ])
+        );
+        assert_eq!(
+            run(vec![
+                SearchHolder::And(vec![and_tag]),
+                SearchHolder::Not(vec![not_tag]),
+            ]),
+            HashSet::from([file_ids["and_only"], file_ids["and_and_or"]])
+        );
+        assert_eq!(
+            run(vec![
+                SearchHolder::And(vec![and_tag]),
+                SearchHolder::Or(vec![or_tag]),
+                SearchHolder::Not(vec![not_tag]),
+            ]),
+            HashSet::from([file_ids["and_and_or"]])
+        );
+    }
+
+    #[test]
+    fn test_search_db_files_by_tag_groups_resolves_ids_and_names() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        let files = ["grouped-and", "grouped-global", "grouped-excluded"];
+        let file_ids = files
+            .iter()
+            .map(|hash| {
+                (
+                    *hash,
+                    MainDatabase::internal_file_bulk_add(&conn, HashSet::from([file(hash, "jpg")]))
+                        .into_iter()
+                        .next()
+                        .unwrap()
+                        .id
+                        .unwrap(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let tags = MainDatabase::internal_tag_bulk_add(
+            &conn,
+            &[file_action(
+                TagOperation::Add,
+                vec![
+                    plugin_tag("required", "test"),
+                    plugin_tag("female", "e6"),
+                    plugin_tag("female", "e6ai"),
+                    plugin_tag("excluded", "test"),
+                ],
+            )],
+            db.plugin_manager.clone(),
+        );
+        let required = tags[&tag("required", "test")];
+        let female_e6 = tags[&tag("female", "e6")];
+        let female_e6ai = tags[&tag("female", "e6ai")];
+        let excluded = tags[&tag("excluded", "test")];
+        MainDatabase::internal_relationship_bulk_add(
+            db.clone(),
+            &conn,
+            &HashSet::from([
+                (file_ids["grouped-and"], required),
+                (file_ids["grouped-global"], required),
+                (file_ids["grouped-global"], female_e6),
+                (file_ids["grouped-excluded"], required),
+                (file_ids["grouped-excluded"], female_e6ai),
+                (file_ids["grouped-excluded"], excluded),
+            ]),
+        );
+
+        let results = db.search_db_files_by_tag_groups_sync(
+            &[required],
+            &["female".to_string()],
+            &[],
+            &[],
+            &[excluded],
+            &[],
+            &None,
+        );
+        assert_eq!(results, vec![file_ids["grouped-global"]]);
+    }
+
+    #[test]
     fn test_partial_roaring_cache_falls_back_to_sqlite() {
         let db = new_test();
         let conn = db.pool.get().unwrap();
@@ -3957,6 +4886,109 @@ mod tests {
                 .into_iter()
                 .collect::<HashSet<_>>(),
             HashSet::from([ids["partialaaa"], ids["partialbbb"]])
+        );
+    }
+
+    #[test]
+    fn test_tag_search_resolves_typos_from_ram_and_sqlite() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        let tags = MainDatabase::internal_tag_bulk_add(
+            &conn,
+            &[
+                file_action(TagOperation::Add, vec![plugin_tag("red fox", "subject")]),
+                file_action(TagOperation::Add, vec![plugin_tag("blue fox", "subject")]),
+                file_action(
+                    TagOperation::Add,
+                    vec![plugin_tag("rare creature", "subject")],
+                ),
+                file_action(TagOperation::Add, vec![plugin_tag("female", "subject")]),
+            ],
+            db.plugin_manager.clone(),
+        );
+        let red_fox = tags[&tag("red fox", "subject")];
+        let blue_fox = tags[&tag("blue fox", "subject")];
+        let rare_creature = tags[&tag("rare creature", "subject")];
+        let female = tags[&tag("female", "subject")];
+
+        let mut file_ids = Vec::new();
+        for index in 1..=11 {
+            let item = file(&format!("tag-search-{index}"), "jpg");
+            let inserted = MainDatabase::internal_file_bulk_add(&conn, HashSet::from([item]));
+            file_ids.push(inserted.into_iter().next().unwrap().id.unwrap());
+        }
+
+        let relationships = HashSet::from([
+            (file_ids[0], red_fox),
+            (file_ids[1], red_fox),
+            (file_ids[2], red_fox),
+            (file_ids[3], red_fox),
+            (file_ids[4], red_fox),
+            (file_ids[5], blue_fox),
+            (file_ids[6], blue_fox),
+            (file_ids[7], blue_fox),
+            (file_ids[8], blue_fox),
+            (file_ids[9], blue_fox),
+            (file_ids[10], rare_creature),
+            (file_ids[0], female),
+            (file_ids[1], female),
+            (file_ids[2], female),
+            (file_ids[3], female),
+            (file_ids[4], female),
+        ]);
+        MainDatabase::internal_relationship_bulk_add(db.clone(), &conn, &relationships);
+
+        let popular = db.search_db_tags_fts("red fxo", &Some(1));
+        assert_eq!(popular[0].tag.name, "red fox");
+
+        let prefix = db.search_db_tags_fts("fema", &Some(1));
+        assert_eq!(prefix[0].tag.name, "female");
+
+        let slow = db.search_db_tags_fts("raer creatur", &Some(1));
+        assert_eq!(slow[0].tag.name, "rare creature");
+    }
+
+    #[test]
+    fn test_tag_name_search_groups_same_names_across_namespaces() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        let tags = MainDatabase::internal_tag_bulk_add(
+            &conn,
+            &[
+                file_action(TagOperation::Add, vec![plugin_tag("female", "e6")]),
+                file_action(TagOperation::Add, vec![plugin_tag("female", "e6ai")]),
+                file_action(TagOperation::Add, vec![plugin_tag("tank", "e6")]),
+            ],
+            db.plugin_manager.clone(),
+        );
+        let female_e6 = tags[&tag("female", "e6")];
+        let female_e6ai = tags[&tag("female", "e6ai")];
+        let tank = tags[&tag("tank", "e6")];
+
+        let mut file_ids = Vec::new();
+        for index in 1..=4 {
+            let inserted = MainDatabase::internal_file_bulk_add(
+                &conn,
+                HashSet::from([file(&format!("same-name-{index}"), "jpg")]),
+            );
+            file_ids.push(inserted.into_iter().next().unwrap().id.unwrap());
+        }
+        MainDatabase::internal_relationship_bulk_add(
+            db.clone(),
+            &conn,
+            &HashSet::from([
+                (file_ids[0], female_e6),
+                (file_ids[1], female_e6ai),
+                (file_ids[2], female_e6),
+                (file_ids[2], tank),
+                (file_ids[3], tank),
+            ]),
+        );
+
+        let results = db.search_db_files_by_tags_sync(&["female".into(), "tank".into()], &None);
+        assert_eq!(
+            results.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([file_ids[2]])
         );
     }
 

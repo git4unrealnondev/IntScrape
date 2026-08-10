@@ -53,6 +53,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let output_path =
         PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("supported_db_requests.rs");
     write_if_changed(&output_path, &output)?;
+
     Ok(())
 }
 

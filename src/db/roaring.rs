@@ -74,7 +74,9 @@ impl<'a> SearchQuery<'a> {
     /// Finalizes the search returns applicable fileids
     #[must_use]
     pub fn build(self) -> Vec<u64> {
-        if let Some((searchtype, tag_id_list)) = self.and_search
+        let search = self.and_search.or(self.or_search);
+
+        if let Some((searchtype, tag_id_list)) = search
             && let Some(bitmap) = self.engine.internal_search_item(tag_id_list, searchtype)
         {
             let offset = self.offset.unwrap_or(0) as usize;
@@ -272,7 +274,6 @@ impl RelationshipStorage {
         }
         if let InternalCacheType::Popular(_) = self.internal_cache {}
 
-        /*
         let mut stmt = conn
             .prepare("SELECT fileid, tagid_bitmap FROM RelationshipRoaringFileid")
             .unwrap();
@@ -285,14 +286,14 @@ impl RelationshipStorage {
             })
             .unwrap();
 
-
         for (fileid, tagid_bitmap) in rows.flatten() {
-            if let Ok(bitmap) =
+            if let Ok(mut bitmap) =
                 RoaringTreemap::deserialize_unchecked_from(Cursor::new(tagid_bitmap))
             {
-                //self.file_id.insert(fileid, bitmap);
+                bitmap.optimize();
+                self.file_id.insert(fileid, bitmap);
             }
-        }*/
+        }
     }
 
     /// Checks if a relationship exists
@@ -335,39 +336,48 @@ impl RelationshipStorage {
     /// boolean indicates whether every requested tag was cached.
     pub(in crate::db) fn cached_file_ids_for_tags(
         &self,
+        conn: &Connection,
         tag_ids: &[u64],
-        search_type: DbSearchTypeEnum,
+        search_type: &DbSearchTypeEnum,
     ) -> (Option<Vec<u64>>, bool) {
         if tag_ids.is_empty() {
             return (None, false);
         }
 
-        let mut cached = tag_ids.iter().filter_map(|tag_id| self.tag_id.get(*tag_id));
-        let cached_count = cached.clone().count();
-        let all_cached = cached_count == tag_ids.len();
-        let Some(first) = cached.next() else {
-            return (None, false);
-        };
+        let mut result = None;
+        let mut all_cached = true;
+        for tag_id in tag_ids {
+            let Some(bitmap) = self.relationship_cache_tagid_get(conn, *tag_id) else {
+                all_cached = false;
+                continue;
+            };
 
-        let mut result = first.clone();
-        match search_type {
-            DbSearchTypeEnum::And => {
-                for bitmap in cached {
-                    result &= bitmap;
+            if let Some(current) = result.as_mut() {
+                match search_type {
+                    DbSearchTypeEnum::And => *current &= bitmap.as_ref(),
+                    DbSearchTypeEnum::Or => *current |= bitmap.as_ref(),
                 }
-            }
-            DbSearchTypeEnum::Or => {
-                for bitmap in cached {
-                    result |= bitmap;
-                }
+            } else {
+                result = Some(bitmap.into_owned());
             }
         }
 
-        (Some(result.iter().collect()), all_cached)
+        (result.map(|bitmap| bitmap.iter().collect()), all_cached)
     }
 
     pub(in crate::db) fn tag_is_cached_in_memory(&self, tag_id: u64) -> bool {
         self.tag_id.contains_key(tag_id)
+    }
+
+    pub(in crate::db) fn relationship_search_tagid_roaring_in_memory(
+        &self,
+        file_id: u64,
+    ) -> Option<Vec<u64>> {
+        if !matches!(self.internal_cache, InternalCacheType::Full) {
+            return None;
+        }
+
+        self.file_id.get(file_id).map(|tags| tags.iter().collect())
     }
 
     ///
@@ -547,7 +557,7 @@ impl RelationshipStorage {
                     None => {
                         let mut bitmap = RoaringTreemap::new();
                         bitmap.insert(tag_id);
-                        //self.file_id.insert(file_id, bitmap);
+                        self.file_id.insert(file_id, bitmap);
                     }
                     Some(bitmap) => {
                         bitmap.insert(tag_id);
@@ -604,5 +614,140 @@ impl RelationshipStorage {
                 Some(acc)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    fn test_storage(cache_type: InternalCacheType) -> (RelationshipStorage, Connection) {
+        let database_file = NamedTempFile::new().unwrap();
+        let db = MainDatabase::new(database_file.path());
+        let conn = Connection::open_in_memory().unwrap();
+        RelationshipStorage::internal_table_relationship_cache_create_v1(&conn);
+
+        (RelationshipStorage::new(db, cache_type), conn)
+    }
+
+    #[test]
+    fn adding_a_relationship_stores_the_tag_for_the_file() {
+        let (mut storage, conn) = test_storage(InternalCacheType::Full);
+
+        storage.relationship_roaring_add(&conn, 42, 7);
+
+        assert_eq!(
+            storage.relationship_search_tagid_roaring_in_memory(42),
+            Some(vec![7])
+        );
+    }
+
+    #[test]
+    fn adding_a_second_relationship_keeps_both_tags() {
+        let (mut storage, conn) = test_storage(InternalCacheType::Full);
+
+        storage.relationship_roaring_add(&conn, 42, 7);
+        storage.relationship_roaring_add(&conn, 42, 11);
+
+        assert_eq!(
+            storage.relationship_search_tagid_roaring_in_memory(42),
+            Some(vec![7, 11])
+        );
+    }
+
+    #[test]
+    fn adding_a_relationship_stores_the_file_for_the_tag() {
+        let (mut storage, conn) = test_storage(InternalCacheType::Full);
+
+        storage.relationship_roaring_add(&conn, 42, 7);
+
+        assert_eq!(
+            storage.relationship_search_fileid_roaring(&conn, 7),
+            vec![42]
+        );
+    }
+
+    #[test]
+    fn repeated_relationships_are_stored_once() {
+        let (mut storage, conn) = test_storage(InternalCacheType::Full);
+
+        storage.relationship_roaring_add(&conn, 42, 7);
+        storage.relationship_roaring_add(&conn, 42, 7);
+
+        assert_eq!(
+            storage.relationship_search_tagid_roaring_in_memory(42),
+            Some(vec![7])
+        );
+    }
+
+    #[test]
+    fn unknown_files_have_no_in_memory_tags() {
+        let (storage, _conn) = test_storage(InternalCacheType::Full);
+
+        assert_eq!(
+            storage.relationship_search_tagid_roaring_in_memory(404),
+            None
+        );
+    }
+
+    #[test]
+    fn table_cache_reads_file_tags_from_sqlite() {
+        let (mut storage, conn) = test_storage(InternalCacheType::Table);
+
+        storage.relationship_roaring_add(&conn, 42, 7);
+
+        assert_eq!(
+            storage.relationship_search_tagid_roaring(&conn, 42),
+            vec![7]
+        );
+    }
+
+    #[test]
+    fn loading_the_full_cache_populates_file_tags_in_memory() {
+        let (mut storage, conn) = test_storage(InternalCacheType::Full);
+
+        storage.relationship_roaring_add(&conn, 42, 7);
+        storage.file_id.clear();
+
+        storage.load_relationship_cache(&conn);
+
+        assert_eq!(
+            storage.relationship_search_tagid_roaring_in_memory(42),
+            Some(vec![7])
+        );
+    }
+
+    #[test]
+    fn and_search_returns_files_with_every_tag() {
+        let (mut storage, conn) = test_storage(InternalCacheType::Full);
+
+        storage.relationship_roaring_add(&conn, 1, 7);
+        storage.relationship_roaring_add(&conn, 1, 11);
+        storage.relationship_roaring_add(&conn, 2, 7);
+
+        assert_eq!(
+            SearchQuery::new(&storage)
+                .and_search(&[7, 11])
+                .sort()
+                .build(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn or_search_returns_files_with_any_tag() {
+        let (mut storage, conn) = test_storage(InternalCacheType::Full);
+
+        storage.relationship_roaring_add(&conn, 1, 7);
+        storage.relationship_roaring_add(&conn, 2, 11);
+
+        assert_eq!(
+            SearchQuery::new(&storage)
+                .or_search(&[7, 11])
+                .sort()
+                .build(),
+            vec![2, 1]
+        );
     }
 }

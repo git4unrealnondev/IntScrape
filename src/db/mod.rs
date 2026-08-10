@@ -13,6 +13,7 @@ use crate::{
 pub mod main;
 mod old_code;
 pub mod roaring;
+mod tag_search;
 mod update_handler;
 
 pub enum CacheType {
@@ -26,8 +27,10 @@ pub struct MainDatabase {
     pool: Pool<SqliteConnectionManager>,
     writer_conn: Arc<Mutex<PooledConnection<SqliteConnectionManager>>>,
     namespace_cache: Arc<RwLock<HashMap<String, u64>>>,
+    tag_cache: Arc<RwLock<HashMap<u64, shared_types::Tag>>>,
     cache_type: Arc<RwLock<CacheType>>,
     relationship_roaring_storage: Arc<RwLock<Option<RelationshipStorage>>>,
+    tag_search_cache: Arc<RwLock<tag_search::TagSearchCache>>,
     plugin_manager: Arc<RwLock<Option<Arc<PluginManager>>>>,
 }
 
@@ -35,7 +38,7 @@ impl MainDatabase {
     #[must_use]
     pub fn new(db_path: &Path) -> Arc<Self> {
         let manager = SqliteConnectionManager::file(db_path).with_init(|c| {
-            /*c.trace(Some(|statement: &str| {
+            /* c.trace(Some(|statement: &str| {
                 log::info!("Executing SQL: {}", statement);
             }));*/
             c.busy_timeout(Duration::from_secs(1))?;
@@ -62,8 +65,10 @@ PRAGMA cache_size = -64000;
         let main_db: Arc<Self> = Self {
             pool,
             namespace_cache: Arc::new(RwLock::new(HashMap::new())),
+            tag_cache: Arc::new(RwLock::new(HashMap::new())),
             cache_type: Arc::new(RwLock::new(CacheType::Bare)),
             relationship_roaring_storage: Arc::new(RwLock::new(None)),
+            tag_search_cache: Arc::new(RwLock::new(tag_search::TagSearchCache::default())),
             writer_conn,
             plugin_manager: Arc::new(RwLock::new(None)),
         }
@@ -120,8 +125,10 @@ PRAGMA cache_size = -64000;
                             "Local db version: {db_version_local} does not match system_version: {DB_VERSION} will attempt an upgrade."
                         );
 
-                        if db_version_local == 1 {
-                            Self::internal_update_db_1_to_2(&conn)?;
+                        match db_version_local {
+                            1 => Self::internal_update_db_1_to_2(&conn)?,
+                            2 => Self::internal_update_db_2_to_3(&conn)?,
+                            _ => break,
                         }
                     } else {
                         break;
@@ -166,6 +173,7 @@ PRAGMA cache_size = -64000;
 
         Self::internal_table_create_jobs_v1(conn);
         RelationshipStorage::internal_table_relationship_cache_create_v1(conn);
+        Self::internal_table_create_audit_log_v3(conn)?;
 
         Self::internal_db_version_set(conn, DB_VERSION)?;
         Self::internal_setting_set(
@@ -187,6 +195,15 @@ PRAGMA cache_size = -64000;
                 ),
                 num: None,
                 param: Some("IntScrape V1.0".into()),
+            },
+        )?;
+        Self::internal_setting_set(
+            conn,
+            &shared_types::DbSettingsObj {
+                name: "SYSTEM_audit_log_enabled".into(),
+                description: Some("Whether database changes are recorded in AuditLog.".into()),
+                num: Some(1),
+                param: None,
             },
         )?;
 

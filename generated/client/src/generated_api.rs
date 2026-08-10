@@ -17,6 +17,28 @@ pub fn search_tag_fts(
 ) -> Result<Vec<TagSearch>, Box<dyn std::error::Error>> {
     crate::init_data_request(&crate::SupportedDBRequests::SearchTags(tag, limit))
 }
+/// Resolves tag names across namespaces and searches for files matching
+/// every input name, while allowing any tag with that name.
+pub fn search_db_files_by_tags(
+    tags: Vec<String>,
+    limit: Option<u64>,
+) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+    crate::init_data_request(&crate::SupportedDBRequests::SearchFilesByTags(tags, limit))
+}
+/// Resolves tag names across namespaces while preserving boolean groups.
+pub fn search_db_files_by_tag_groups(
+    and_ids: Vec<u64>,
+    and_tags: Vec<String>,
+    or_ids: Vec<u64>,
+    or_tags: Vec<String>,
+    not_ids: Vec<u64>,
+    not_tags: Vec<String>,
+    limit: Option<u64>,
+) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+    crate::init_data_request(&crate::SupportedDBRequests::SearchFilesByTagGroups(
+        and_ids, and_tags, or_ids, or_tags, not_ids, not_tags, limit,
+    ))
+}
 ///
 /// Gets the file path of a fileid
 ///
@@ -94,6 +116,12 @@ pub fn relationship_get_tagid(file_id: u64) -> Result<HashSet<u64>, Box<dyn std:
     crate::init_data_request(&crate::SupportedDBRequests::RelationshipGetFileid(file_id))
 }
 ///
+/// Gets all file ids associated with a tag_id
+///
+pub fn relationship_get_fileid(tag_id: u64) -> Result<HashSet<u64>, Box<dyn std::error::Error>> {
+    crate::init_data_request(&crate::SupportedDBRequests::RelationshipGetTagid(tag_id))
+}
+///
 /// Adds tags into db in a bulk manner
 ///
 pub fn get_tag_id_bulk(
@@ -139,6 +167,12 @@ pub fn setting_get(name: String) -> Result<Option<DbSettingsObj>, Box<dyn std::e
 ///
 pub fn setting_set(obj: DbSettingsObj) -> Result<bool, Box<dyn std::error::Error>> {
     crate::init_data_request(&crate::SupportedDBRequests::SettingsSet(obj))
+}
+///
+/// Adds job into db
+///
+pub fn jobs_add_single(job: PluginJob) -> Result<u64, Box<dyn std::error::Error>> {
+    crate::init_data_request(&crate::SupportedDBRequests::JobsAddSingle(job))
 }
 /// Returns whether the host application is shutting down.
 ///

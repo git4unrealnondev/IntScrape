@@ -23,7 +23,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 const DB_PATH: &str = "main.db";
 const LOG_PATH: &str = "log.txt";
 pub const PLUGINS_PATH: &str = "compiled_plugins";
-const DB_VERSION: u64 = 2;
+const DB_VERSION: u64 = 3;
 
 ///
 /// Sets up logging in the environment
