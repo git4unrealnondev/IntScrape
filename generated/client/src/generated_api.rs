@@ -2,6 +2,13 @@
 #![allow(dead_code)]
 use shared_types::*;
 use std::collections::{HashMap, HashSet};
+/// Returns audit entries filtered by either entity identifier.
+pub fn audit_get(
+    file_id: Option<u64>,
+    tag_id: Option<u64>,
+) -> Result<Vec<AuditLogEntry>, Box<dyn std::error::Error>> {
+    crate::init_data_request(&crate::SupportedDBRequests::AuditGet(file_id, tag_id))
+}
 ///
 /// Gets namespace id if it exists
 ///

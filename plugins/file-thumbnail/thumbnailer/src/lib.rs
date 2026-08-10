@@ -189,6 +189,15 @@ pub fn create_thumbnails_dynamic<R: BufRead + Seek>(
                     frames.push(frame.data());
                 }
             }
+            if frames.is_empty() 
+                && let Ok(Some(frame)) = decoder.thumbnail_at_exact(
+                    Duration::from_millis(0),
+                    width,
+                    height,
+                ) {
+                    frames.push(frame.data());
+                
+            }
             let webpconfig = EncodingConfig {
                 encoding_type: webp_animation::EncodingType::Lossy(
                     webp_animation::LossyEncodingConfig {

@@ -34,8 +34,8 @@ impl MainDatabase {
         // initial V3 value rather than leaving the audit history incomplete.
         conn.execute(
             "INSERT INTO AuditLog
-                (changed_at, entity_type, entity_id, action, before_json, after_json, reason)
-             SELECT unixepoch(), 'file', CAST(id AS TEXT), 'create', NULL,
+                (changed_at, entity_type, entity_id, action, file_id, before_json, after_json, reason)
+             SELECT unixepoch(), 'file', CAST(id AS TEXT), 'create', id, NULL,
                     json_object('id', id, 'hash', hash, 'extension', extension,
                                 'storage_id', storage_id),
                     'existing file imported during V3 migration'
@@ -44,8 +44,8 @@ impl MainDatabase {
         )?;
         conn.execute(
             "INSERT INTO AuditLog
-                (changed_at, entity_type, entity_id, action, before_json, after_json, reason)
-             SELECT unixepoch(), 'tag', CAST(t.id AS TEXT), 'create', NULL,
+                (changed_at, entity_type, entity_id, action, tag_id, before_json, after_json, reason)
+             SELECT unixepoch(), 'tag', CAST(t.id AS TEXT), 'create', t.id, NULL,
                     json_object('id', t.id, 'name', t.name, 'namespace', t.namespace),
                     'existing tag imported during V3 migration'
              FROM Tags t",
@@ -53,8 +53,8 @@ impl MainDatabase {
         )?;
         conn.execute(
             "INSERT INTO AuditLog
-                (changed_at, entity_type, entity_id, action, before_json, after_json, reason)
-             SELECT unixepoch(), 'relationship', r.file_id || ':' || r.tag_id, 'create', NULL,
+                (changed_at, entity_type, entity_id, action, file_id, tag_id, before_json, after_json, reason)
+             SELECT unixepoch(), 'relationship', r.file_id || ':' || r.tag_id, 'create', r.file_id, r.tag_id, NULL,
                     json_object('file_id', r.file_id, 'tag_id', r.tag_id),
                     'existing relationship imported during V3 migration'
              FROM Relationship r",

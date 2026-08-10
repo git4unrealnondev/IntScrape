@@ -5,6 +5,20 @@ use std::time::Duration;
 
 pub const DEFAULT_PRIORITY: u64 = 10;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+pub struct AuditLogEntry {
+    pub id: u64,
+    pub changed_at: u64,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub action: String,
+    pub file_id: Option<u64>,
+    pub tag_id: Option<u64>,
+    pub before_json: Option<String>,
+    pub after_json: Option<String>,
+    pub reason: String,
+}
+
 /// FFI-safe alternative to String
 #[repr(C)]
 pub struct CVec<T> {
