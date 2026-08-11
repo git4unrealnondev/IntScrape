@@ -291,7 +291,6 @@ pub struct FileInternal {
     bitcode::Decode,
 )]
 pub struct TagSearch {
-    pub tag: Tag,
     pub tag_id: u64,
     pub count: u64,
 }

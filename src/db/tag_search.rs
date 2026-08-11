@@ -1,6 +1,6 @@
-use shared_types::{GenericNamespaceObj, Tag, TagSearch};
+use shared_types::TagSearch;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use strsim::levenshtein;
 
 const HIGH_VALUE_TAG_COUNT: u64 = 5;
@@ -8,10 +8,8 @@ const HIGH_VALUE_TAG_COUNT: u64 = 5;
 #[derive(Clone)]
 pub(crate) struct TagEntry {
     pub(crate) tag_id: u64,
-    pub(crate) name: String,
     normalized_name: String,
     pub(crate) count: u64,
-    pub(crate) tag: Tag,
 }
 
 #[derive(Default)]
@@ -62,13 +60,12 @@ impl TagSearchCache {
             left_distance
                 .cmp(right_distance)
                 .then_with(|| right.count.cmp(&left.count))
-                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.tag_id.cmp(&right.tag_id))
         });
         matches
             .into_iter()
             .take(limit)
             .map(|(entry, _)| TagSearch {
-                tag: entry.tag.clone(),
                 tag_id: entry.tag_id,
                 count: entry.count,
             })
@@ -76,25 +73,81 @@ impl TagSearchCache {
     }
 }
 
-pub(crate) fn tag_entry(
-    tag_id: u64,
-    name: String,
-    count: u64,
-    namespace: String,
-    description: Option<String>,
-) -> TagEntry {
+/// Searches a streamed set of entries without materializing the full set.
+pub(crate) fn search_entries<I>(
+    entries: I,
+    query: &str,
+    limit: usize,
+    excluded_ids: &HashSet<u64>,
+) -> Vec<TagSearch>
+where
+    I: IntoIterator<Item = TagEntry>,
+{
+    let normalized_query = normalize(query);
+    if normalized_query.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+
+    let mut matches: Vec<(TagEntry, usize)> = Vec::with_capacity(limit);
+    for entry in entries {
+        if excluded_ids.contains(&entry.tag_id) {
+            continue;
+        }
+
+        let Some(score) = match_score(&normalized_query, &entry.normalized_name) else {
+            continue;
+        };
+
+        if matches.len() < limit {
+            matches.push((entry, score));
+            continue;
+        }
+
+        let mut worst_index = 0;
+        for index in 1..matches.len() {
+            let (_, candidate_score) = &matches[index];
+            let (_, worst_score) = &matches[worst_index];
+            if candidate_score > worst_score
+                || (candidate_score == worst_score
+                    && (matches[index].0.count < matches[worst_index].0.count
+                        || (matches[index].0.count == matches[worst_index].0.count
+                            && matches[index].0.tag_id > matches[worst_index].0.tag_id)))
+            {
+                worst_index = index;
+            }
+        }
+
+        let (_, worst_score) = &matches[worst_index];
+        let is_better = score < *worst_score
+            || (score == *worst_score
+                && (entry.count > matches[worst_index].0.count
+                    || (entry.count == matches[worst_index].0.count
+                        && entry.tag_id < matches[worst_index].0.tag_id)));
+        if is_better {
+            matches[worst_index] = (entry, score);
+        }
+    }
+
+    matches.sort_unstable_by(|(left, left_score), (right, right_score)| {
+        left_score
+            .cmp(right_score)
+            .then_with(|| right.count.cmp(&left.count))
+            .then_with(|| left.tag_id.cmp(&right.tag_id))
+    });
+    matches
+        .into_iter()
+        .map(|(entry, _)| TagSearch {
+            tag_id: entry.tag_id,
+            count: entry.count,
+        })
+        .collect()
+}
+
+pub(crate) fn tag_entry(tag_id: u64, name: &str, count: u64) -> TagEntry {
     TagEntry {
         tag_id,
-        normalized_name: normalize(&name),
-        name: name.clone(),
+        normalized_name: normalize(name),
         count,
-        tag: Tag {
-            name,
-            namespace: GenericNamespaceObj {
-                name: namespace,
-                description,
-            },
-        },
     }
 }
 
@@ -134,8 +187,22 @@ pub(crate) fn compare_results(left: &TagSearch, right: &TagSearch) -> Ordering {
     right
         .count
         .cmp(&left.count)
-        .then_with(|| left.tag.name.cmp(&right.tag.name))
         .then_with(|| left.tag_id.cmp(&right.tag_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streamed_search_keeps_only_requested_result_count() {
+        let entries = (0..10_000).map(|id| tag_entry(id, &format!("common-tag-{id}"), id));
+
+        let results = search_entries(entries, "common", 3, &HashSet::new());
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].tag_id, 9999);
+    }
 }
 
 pub(crate) const fn high_value_count() -> u64 {

@@ -534,19 +534,16 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
     fn reload_tag_search_cache(&self, conn: &Connection) {
         let mut stmt = conn
             .prepare(
-                "SELECT t.id, t.name, t.count, n.name, n.description
-                 FROM Tags t JOIN Namespace n ON n.id = t.namespace
-                 WHERE t.count >= ?1",
+                "SELECT t.id, t.name, t.count
+                 FROM Tags t",
             )
             .unwrap();
         let entries = stmt
-            .query_map([tag_search::high_value_count()], |row| {
+            .query_map([], |row| {
                 Ok(tag_search::tag_entry(
                     row.get(0)?,
-                    row.get(1)?,
+                    row.get::<_, String>(1)?.as_str(),
                     row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
                 ))
             })
             .unwrap()
@@ -646,13 +643,9 @@ END;
                 "SELECT 
     t.id, 
     t.name, 
-    t.count, 
-    n.name AS ns_name,
-    n.description AS ns_desc
+    t.count
  FROM Tags t
- JOIN Namespace n ON t.namespace = n.id
- WHERE t.count < ?1
- ORDER BY t.count DESC, t.name ASC",
+ WHERE t.count < ?1",
             )
             .unwrap();
 
@@ -661,21 +654,13 @@ END;
                 let tag_id: u64 = row.get(0)?;
                 let tag_name: String = row.get(1)?;
                 let count: u64 = row.get(2)?;
-                let ns_name: String = row.get(3)?;
-                let ns_desc: Option<String> = row.get(4)?;
-
-                Ok(tag_search::tag_entry(
-                    tag_id, tag_name, count, ns_name, ns_desc,
-                ))
+                Ok(tag_search::tag_entry(tag_id, &tag_name, count))
             })
             .unwrap();
-        let slow_entries = tag_iter.flatten().collect();
-        for entry in TagSearchCache::from_entries(slow_entries).search(tag, max_rows) {
-            let candidate = TagSearch {
-                tag: entry.tag,
-                tag_id: entry.tag_id,
-                count: entry.count,
-            };
+        let existing_ids = results.iter().map(|result| result.tag_id).collect();
+        for candidate in
+            tag_search::search_entries(tag_iter.flatten(), tag, max_rows, &existing_ids)
+        {
             if !results
                 .iter()
                 .any(|result| result.tag_id == candidate.tag_id)
@@ -712,38 +697,21 @@ END;
         not_tags: &[String],
         limit: &Option<u64>,
     ) -> Vec<u64> {
-        let conn = self.pool.get().unwrap();
         let resolve_tags = |tag_names: &[String]| {
             tag_names
                 .iter()
                 .filter_map(|tag_name| {
-                    let normalized = tag_search::normalize(tag_name);
-                    if normalized.is_empty() {
+                    if tag_search::normalize(tag_name).is_empty() {
                         return None;
                     }
 
-                    let mut stmt = conn
-                        .prepare("SELECT id, name FROM Tags ORDER BY count DESC, id ASC")
-                        .unwrap();
-                    let matching_ids = stmt
-                        .query_map([], |row| {
-                            Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
-                        })
-                        .unwrap()
-                        .flatten()
-                        .filter_map(|(tag_id, name)| {
-                            (tag_search::normalize(&name) == normalized).then_some(tag_id)
-                        })
+                    let matching_ids = self
+                        .tag_search_cache
+                        .read()
+                        .search(tag_name, 100)
+                        .into_iter()
+                        .map(|result| result.tag_id)
                         .collect::<Vec<_>>();
-
-                    let matching_ids = if matching_ids.is_empty() {
-                        self.search_db_tags_fts(tag_name, &Some(100))
-                            .into_iter()
-                            .map(|result| result.tag_id)
-                            .collect()
-                    } else {
-                        matching_ids
-                    };
 
                     (!matching_ids.is_empty()).then_some(matching_ids)
                 })
@@ -2298,7 +2266,6 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                             }
                         }
                     }
-
                 }
             }
         }
@@ -2761,8 +2728,10 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         if !file_storage_missing.is_empty() || *action == CheckFilesEnum::StorageCheck {
             info!("Scanning file locations");
 
-            let file_hash: HashMap<String, FileInternal> =
-                files.into_iter().map(|file| (file.hash.clone(), file)).collect();
+            let file_hash: HashMap<String, FileInternal> = files
+                .into_iter()
+                .map(|file| (file.hash.clone(), file))
+                .collect();
 
             let default_file_location = self.file_download_location_main_sync().unwrap();
 
@@ -2804,8 +2773,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                             if entry.path().exists()
                                 && !target_path.exists()
                                 && std::fs::create_dir_all(target_path.parent().unwrap()).is_ok()
-                                && std::fs::copy(entry.path(), &target_path)
-                                    .is_ok()
+                                && std::fs::copy(entry.path(), &target_path).is_ok()
                                 && std::fs::remove_file(entry.path()).is_ok()
                             {
                                 info!(
@@ -3023,11 +2991,8 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             let all_tag_actions: Vec<FileTagAction> = map.values().flatten().cloned().collect();
 
             Self::internal_audit_context_set(&conn, &audit_reason).unwrap();
-            let tag_cache = Self::internal_tag_bulk_add(
-                &conn,
-                &all_tag_actions,
-                self.plugin_manager.clone(),
-            );
+            let tag_cache =
+                Self::internal_tag_bulk_add(&conn, &all_tag_actions, self.plugin_manager.clone());
 
             let file_ids: Vec<u64> = file_cache.values().copied().collect();
             let current_file_relationships =
@@ -5106,13 +5071,13 @@ mod tests {
         MainDatabase::internal_relationship_bulk_add(db.clone(), &conn, &relationships);
 
         let popular = db.search_db_tags_fts("red fxo", &Some(1));
-        assert_eq!(popular[0].tag.name, "red fox");
+        assert_eq!(popular[0].tag_id, red_fox);
 
         let prefix = db.search_db_tags_fts("fema", &Some(1));
-        assert_eq!(prefix[0].tag.name, "female");
+        assert_eq!(prefix[0].tag_id, female);
 
         let slow = db.search_db_tags_fts("raer creatur", &Some(1));
-        assert_eq!(slow[0].tag.name, "rare creature");
+        assert_eq!(slow[0].tag_id, rare_creature);
     }
 
     #[test]
@@ -5226,7 +5191,8 @@ mod tests {
         let file = file(&hash, "bin");
 
         let conn = db.pool.get().unwrap();
-        conn.execute("DELETE FROM FileStorageLocations", []).unwrap();
+        conn.execute("DELETE FROM FileStorageLocations", [])
+            .unwrap();
         conn.execute(
             "UPDATE Settings SET param = ?1 WHERE name = 'SYSTEM_file_location'",
             params![&target_location],
@@ -5253,7 +5219,8 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        db.fix_internal_files(&CheckFilesEnum::StorageCheck).unwrap();
+        db.fix_internal_files(&CheckFilesEnum::StorageCheck)
+            .unwrap();
 
         let target_path = Path::new(&target_location)
             .join(&hash[0..2])
@@ -5274,7 +5241,8 @@ mod tests {
         let (hash, _) = hash_bytes(&bytes, &HashesSupported::Sha512(String::new()));
         let file = file(&hash, "bin");
         let conn = db.pool.get().unwrap();
-        conn.execute("DELETE FROM FileStorageLocations", []).unwrap();
+        conn.execute("DELETE FROM FileStorageLocations", [])
+            .unwrap();
         conn.execute(
             "UPDATE Settings SET param = ?1 WHERE name = 'SYSTEM_file_location'",
             params![&storage_location],
@@ -5299,7 +5267,8 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        db.fix_internal_files(&CheckFilesEnum::StorageCheck).unwrap();
+        db.fix_internal_files(&CheckFilesEnum::StorageCheck)
+            .unwrap();
 
         assert_eq!(std::fs::read(&file_path).unwrap(), bytes);
     }
@@ -5310,7 +5279,8 @@ mod tests {
         let storage_dir = tempfile::tempdir().unwrap();
         let storage_location = storage_dir.path().to_string_lossy().into_owned();
         let conn = db.pool.get().unwrap();
-        conn.execute("DELETE FROM FileStorageLocations", []).unwrap();
+        conn.execute("DELETE FROM FileStorageLocations", [])
+            .unwrap();
         conn.execute(
             "UPDATE Settings SET param = ?1 WHERE name = 'SYSTEM_file_location'",
             params![&storage_location],
@@ -5322,7 +5292,8 @@ mod tests {
         let empty_path = storage_dir.path().join("aa").join("bb").join("cc");
         std::fs::create_dir_all(&empty_path).unwrap();
 
-        db.fix_internal_files(&CheckFilesEnum::StorageCheck).unwrap();
+        db.fix_internal_files(&CheckFilesEnum::StorageCheck)
+            .unwrap();
 
         assert!(storage_dir.path().exists());
         assert!(!storage_dir.path().join("aa").exists());
