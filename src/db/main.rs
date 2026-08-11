@@ -180,7 +180,7 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             CREATE TEMP TRIGGER IF NOT EXISTS audit_file_insert
             AFTER INSERT ON main.File
             BEGIN
-                INSERT INTO main.AuditLog
+                INSERT INTO AuditLog
                     (changed_at, entity_type, entity_id, action, file_id, before_json, after_json, reason)
                 VALUES (
                     unixepoch(), 'file', CAST(NEW.id AS TEXT), 'create', NEW.id, NULL,
@@ -194,7 +194,7 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             CREATE TEMP TRIGGER IF NOT EXISTS audit_file_delete
             AFTER DELETE ON main.File
             BEGIN
-                INSERT INTO main.AuditLog
+                INSERT INTO AuditLog
                     (changed_at, entity_type, entity_id, action, file_id, before_json, after_json, reason)
                 VALUES (
                     unixepoch(), 'file', CAST(OLD.id AS TEXT), 'delete', OLD.id,
@@ -208,7 +208,7 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             CREATE TEMP TRIGGER IF NOT EXISTS audit_file_update
             AFTER UPDATE ON main.File
             BEGIN
-                INSERT INTO main.AuditLog
+                INSERT INTO AuditLog
                     (changed_at, entity_type, entity_id, action, file_id, before_json, after_json, reason)
                 VALUES (
                     unixepoch(), 'file', CAST(NEW.id AS TEXT), 'update', NEW.id,
@@ -224,7 +224,7 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             CREATE TEMP TRIGGER IF NOT EXISTS audit_tag_insert
             AFTER INSERT ON main.Tags
             BEGIN
-                INSERT INTO main.AuditLog
+                INSERT INTO AuditLog
                     (changed_at, entity_type, entity_id, action, tag_id, before_json, after_json, reason)
                 VALUES (
                     unixepoch(), 'tag', CAST(NEW.id AS TEXT), 'create', NEW.id, NULL,
@@ -237,7 +237,7 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             CREATE TEMP TRIGGER IF NOT EXISTS audit_tag_delete
             AFTER DELETE ON main.Tags
             BEGIN
-                INSERT INTO main.AuditLog
+                INSERT INTO AuditLog
                     (changed_at, entity_type, entity_id, action, tag_id, before_json, after_json, reason)
                 VALUES (
                     unixepoch(), 'tag', CAST(OLD.id AS TEXT), 'delete', OLD.id,
@@ -251,7 +251,7 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             AFTER UPDATE ON main.Tags
             WHEN OLD.name IS NOT NEW.name OR OLD.namespace IS NOT NEW.namespace
             BEGIN
-                INSERT INTO main.AuditLog
+                INSERT INTO AuditLog
                     (changed_at, entity_type, entity_id, action, tag_id, before_json, after_json, reason)
                 VALUES (
                     unixepoch(), 'tag', CAST(NEW.id AS TEXT), 'update', NEW.id,
@@ -265,7 +265,7 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             CREATE TEMP TRIGGER IF NOT EXISTS audit_relationship_insert
             AFTER INSERT ON main.Relationship
             BEGIN
-                INSERT INTO main.AuditLog
+                INSERT INTO AuditLog
                     (changed_at, entity_type, entity_id, action, file_id, tag_id, before_json, after_json, reason)
                 VALUES (
                     unixepoch(), 'relationship', NEW.file_id || ':' || NEW.tag_id, 'create', NEW.file_id, NEW.tag_id, NULL,
@@ -278,7 +278,7 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             CREATE TEMP TRIGGER IF NOT EXISTS audit_relationship_delete
             AFTER DELETE ON main.Relationship
             BEGIN
-                INSERT INTO main.AuditLog
+                INSERT INTO AuditLog
                     (changed_at, entity_type, entity_id, action, file_id, tag_id, before_json, after_json, reason)
                 VALUES (
                     unixepoch(), 'relationship', OLD.file_id || ':' || OLD.tag_id, 'delete', OLD.file_id, OLD.tag_id,
@@ -291,7 +291,7 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             CREATE TEMP TRIGGER IF NOT EXISTS audit_parent_insert
             AFTER INSERT ON main.Parents
             BEGIN
-                INSERT INTO main.AuditLog
+                INSERT INTO AuditLog
                     (changed_at, entity_type, entity_id, action, tag_id, before_json, after_json, reason)
                 VALUES (
                     unixepoch(), 'relationship', 'parent:' || NEW.id, 'create', NEW.tag_id, NULL,
@@ -305,7 +305,7 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             CREATE TEMP TRIGGER IF NOT EXISTS audit_parent_delete
             AFTER DELETE ON main.Parents
             BEGIN
-                INSERT INTO main.AuditLog
+                INSERT INTO AuditLog
                     (changed_at, entity_type, entity_id, action, tag_id, before_json, after_json, reason)
                 VALUES (
                     unixepoch(), 'relationship', 'parent:' || OLD.id, 'delete', OLD.tag_id,
