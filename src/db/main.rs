@@ -135,10 +135,7 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
                 before_json TEXT,
                 after_json TEXT,
                 reason TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_audit_log_changed_at ON AuditLog(changed_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON AuditLog(entity_type, entity_id);
-            ",
+            );",
         )?;
 
         let columns = conn
@@ -163,7 +160,16 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
                  WHEN entity_type = 'tag' THEN CAST(entity_id AS INTEGER)
                  ELSE json_extract(COALESCE(after_json, before_json), '$.tag_id')
              END
-             WHERE tag_id IS NULL;
+             WHERE tag_id IS NULL;",
+        )
+    }
+
+    pub(in crate::db) fn internal_audit_log_indexes_create_v3(
+        conn: &Connection,
+    ) -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_audit_log_changed_at ON AuditLog(changed_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON AuditLog(entity_type, entity_id);
              CREATE INDEX IF NOT EXISTS idx_audit_log_file_id ON AuditLog(file_id, changed_at DESC);
              CREATE INDEX IF NOT EXISTS idx_audit_log_tag_id ON AuditLog(tag_id, changed_at DESC);",
         )
@@ -1460,6 +1466,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
         let mut guard = self.writer_conn.lock();
         let conn = guard.transaction().unwrap();
 
+        Self::internal_audit_context_set(&conn, "relationship added").unwrap();
         let tag_map = Self::internal_tag_bulk_add(&conn, tag, self.plugin_manager.clone());
         let relationships: HashSet<(u64, u64)> = tag_map.values().map(|f| (*file_id, *f)).collect();
         Self::internal_relationship_bulk_add(Arc::new(self.clone()), &conn, &relationships);
@@ -1490,6 +1497,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
         };
 
         for (file_id, tags) in tags_by_file {
+            Self::internal_audit_context_set(&conn, "relationship added").unwrap();
             let tag_map = Self::internal_tag_bulk_add(&conn, tags, self.plugin_manager.clone());
             let relationships: HashSet<(u64, u64)> =
                 tag_map.values().map(|tag_id| (*file_id, *tag_id)).collect();
@@ -2225,7 +2233,6 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         tag_actions: &[FileTagAction],
         plugin_manager: Arc<RwLock<Option<Arc<PluginManager>>>>,
     ) -> HashMap<shared_types::Tag, u64> {
-        Self::internal_audit_context_set(conn, "tag discovered from input").unwrap();
         let mut out = HashMap::new();
         let mut parents = HashSet::new();
 
@@ -2290,6 +2297,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                             }
                         }
                     }
+
                 }
             }
         }
@@ -2447,7 +2455,6 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         conn: &Connection,
         relationships: &HashSet<(u64, u64)>,
     ) {
-        Self::internal_audit_context_set(conn, "relationship removed").unwrap();
         if relationships.is_empty() {
             return;
         }
@@ -2491,7 +2498,6 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         conn: &Connection,
         relationships: &HashSet<(u64, u64)>,
     ) {
-        Self::internal_audit_context_set(conn, "relationship added").unwrap();
         if relationships.is_empty() {
             return;
         }
@@ -2726,56 +2732,36 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         action: &crate::cli::cli_structs::CheckFilesEnum,
     ) -> Result<(), Box<dyn std::error::Error>> {
         info!("Staring to fix internal files");
-        let mut conn = self.pool.get()?;
+        let conn = self.pool.get()?;
 
         let file_storage_map = Self::internal_file_storage_get_all(&conn)?;
 
         let files = Self::internal_file_get_all(&conn)?;
 
-        let mut file_storage_to_fix = Vec::new();
         let mut file_storage_missing = HashSet::new();
 
         let mut valid_paths = HashSet::new();
 
-        // Fixes storage IDs inside of the db.
-        'fileloop: for file in &files {
-            for (_idx, file_base_path) in file_storage_map.iter() {
-                if let Some(file_path) = Self::get_file_location(file, file_base_path) {
-                    valid_paths.insert(file_path);
-                    continue 'fileloop;
-                }
-
-                for storage_id in file_storage_map.keys() {
-                    let mut file_temp = file.clone();
-                    file_temp.storage_id = *storage_id;
-                    if let Some(file_path) = Self::get_file_location(&file_temp, file_base_path) {
-                        valid_paths.insert(file_path);
-                        file_storage_to_fix.push(file_temp);
-                        continue 'fileloop;
-                    }
-                }
-
-                file_storage_missing.insert(file);
+        // Check the recorded storage first. A file found in another storage is
+        // misplaced, not valid for the current database record.
+        for file in &files {
+            if let Some(file_base_path) = file_storage_map.get(&file.storage_id)
+                && let Some(file_path) = Self::get_file_location(file, file_base_path)
+            {
+                valid_paths.insert(file_path);
+                continue;
             }
-        }
 
-        // updates files
-        if !file_storage_to_fix.is_empty() {
-            info!(
-                "Fixed the extensions of {} files.",
-                file_storage_to_fix.len()
-            );
-            let tn = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            Self::internal_file_update_batch(tn, &file_storage_to_fix)?;
+            file_storage_missing.insert(file);
         }
 
         info!("Missing {} files from db.", file_storage_missing.len());
 
-        if !file_storage_missing.is_empty() {
+        if !file_storage_missing.is_empty() || *action == CheckFilesEnum::StorageCheck {
             info!("Scanning file locations");
 
-            let file_hash: HashMap<String, String> =
-                files.into_iter().map(|e| (e.hash, e.extension)).collect();
+            let file_hash: HashMap<String, FileInternal> =
+                files.into_iter().map(|file| (file.hash.clone(), file)).collect();
 
             let default_file_location = self.file_download_location_main_sync().unwrap();
 
@@ -2784,7 +2770,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                     info!("Just printing the missing file: {hash}");
                 }
             } else if CheckFilesEnum::StorageCheck == *action {
-                for (storage_id, storage_loc) in &file_storage_map {
+                for (_storage_id, storage_loc) in &file_storage_map {
                     for entry in WalkDir::new(storage_loc)
                         .into_iter()
                         .filter_map(std::result::Result::ok)
@@ -2803,28 +2789,28 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                         let bytes = &Bytes::from(file);
                         let (hash, _) = hash_bytes(bytes, &HashesSupported::Sha512(String::new()));
 
-                        if let Some(file_extension) = file_hash.get(&hash)
-                            && let Some(base_file_path) = file_storage_map.get(storage_id)
+                        if let Some(file_internal) = file_hash.get(&hash)
+                            && let Some(base_file_path) =
+                                file_storage_map.get(&file_internal.storage_id)
                         {
                             let mut path_buf = Path::new(base_file_path).to_path_buf();
                             path_buf.push(&hash[0..2]);
                             path_buf.push(&hash[2..4]);
                             path_buf.push(&hash[4..6]);
-                            path_buf.push(hash);
+                            path_buf.push(&hash);
 
+                            let target_path = path_buf.with_extension(&file_internal.extension);
                             if entry.path().exists()
-                                && !path_buf.with_extension(file_extension).exists()
-                                && std::fs::copy(
-                                    entry.path(),
-                                    path_buf.with_extension(file_extension),
-                                )
-                                .is_ok()
+                                && !target_path.exists()
+                                && std::fs::create_dir_all(target_path.parent().unwrap()).is_ok()
+                                && std::fs::copy(entry.path(), &target_path)
+                                    .is_ok()
                                 && std::fs::remove_file(entry.path()).is_ok()
                             {
                                 info!(
                                     "Moved file: {} to: {}",
                                     entry.path().display(),
-                                    path_buf.with_extension(file_extension).as_path().display()
+                                    target_path.display()
                                 );
                             }
                         } else {
@@ -2845,6 +2831,19 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                                     default_file_location.display()
                                 );
                             }
+                        }
+                    }
+
+                    for entry in WalkDir::new(storage_loc)
+                        .contents_first(true)
+                        .into_iter()
+                        .filter_map(std::result::Result::ok)
+                        .filter(|entry| entry.file_type().is_dir())
+                    {
+                        if entry.path() != Path::new(storage_loc)
+                            && std::fs::remove_dir(entry.path()).is_ok()
+                        {
+                            info!("Removed empty directory: {}", entry.path().display());
                         }
                     }
                 }
@@ -2982,6 +2981,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         self: Arc<Self>,
         map: HashMap<FileInternal, Vec<FileTagAction>>,
         jobs: Vec<ScraperDataReturn>,
+        audit_reason: String,
     ) {
         // Early Exit
         if map.is_empty() && jobs.is_empty() {
@@ -3021,8 +3021,12 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             // Collect all action definitions across every file block into one flat vector
             let all_tag_actions: Vec<FileTagAction> = map.values().flatten().cloned().collect();
 
-            let tag_cache =
-                Self::internal_tag_bulk_add(&conn, &all_tag_actions, self.plugin_manager.clone());
+            Self::internal_audit_context_set(&conn, &audit_reason).unwrap();
+            let tag_cache = Self::internal_tag_bulk_add(
+                &conn,
+                &all_tag_actions,
+                self.plugin_manager.clone(),
+            );
 
             let file_ids: Vec<u64> = file_cache.values().copied().collect();
             let current_file_relationships =
@@ -3141,10 +3145,12 @@ SELECT id, name, namespace FROM High_Value_Tags;",
 
             // 6️⃣ Step 5: Flush Relationship Mutations to DB in Batch
             if !rels_to_del.is_empty() {
+                Self::internal_audit_context_set(&conn, &audit_reason).unwrap();
                 Self::internal_relationship_bulk_delete(self.clone(), &conn, &rels_to_del);
             }
 
             if !rels_to_add.is_empty() {
+                Self::internal_audit_context_set(&conn, &audit_reason).unwrap();
                 Self::internal_relationship_bulk_add(self.clone(), &conn, &rels_to_add);
             }
 
@@ -3262,6 +3268,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .unwrap();
 
+            Self::internal_audit_context_set(&tn, "relationship added").unwrap();
             Self::internal_relationship_bulk_add(self, &tn, &rel_list);
             tn.commit().unwrap();
         })
@@ -3290,6 +3297,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .unwrap();
 
+            Self::internal_audit_context_set(&tn, "relationship removed").unwrap();
             Self::internal_relationship_bulk_delete(self, &tn, &rel_list);
             tn.commit().unwrap();
         })
@@ -3893,12 +3901,17 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     ///
     /// Adds tags into db in bulk. Also adds parents
     ///
-    pub async fn tags_add_bulk(&self, tags: &[FileTagAction]) -> HashMap<shared_types::Tag, u64> {
+    pub async fn tags_add_bulk(
+        &self,
+        tags: &[FileTagAction],
+        audit_reason: &str,
+    ) -> HashMap<shared_types::Tag, u64> {
         if tags.is_empty() {
             return HashMap::new();
         }
 
         let tags_owned = tags.to_vec();
+        let audit_reason = audit_reason.to_string();
         let writer_conn = self.writer_conn.clone();
 
         let plugin_manager = self.plugin_manager.clone();
@@ -3909,6 +3922,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 let tn = writer_lock_guard
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .unwrap();
+                Self::internal_audit_context_set(&tn, &audit_reason).unwrap();
                 out_tags = Self::internal_tag_bulk_add(&tn, &tags_owned, plugin_manager.clone());
 
                 tn.commit().unwrap();
@@ -3960,6 +3974,8 @@ mod tests {
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let path = std::env::temp_dir().join(format!("intscrape-db-test-{id}.sqlite"));
         let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite-shm"));
         MainDatabase::new(&path)
     }
 
@@ -4116,6 +4132,7 @@ mod tests {
             TagOperation::Add,
             vec![plugin_tag("audit", "test")],
         )];
+        MainDatabase::internal_audit_context_set(&conn, "tag discovered from input").unwrap();
         let tags = MainDatabase::internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
         let tag_id = *tags.values().next().unwrap();
         MainDatabase::internal_file_bulk_add(&conn, HashSet::from([file("audit-hash", "bin")]));
@@ -4124,6 +4141,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
+        MainDatabase::internal_audit_context_set(&conn, "relationship added").unwrap();
         MainDatabase::internal_relationship_bulk_add(
             db.clone(),
             &conn,
@@ -4163,6 +4181,50 @@ mod tests {
         let tag_entries = db.audit_get_sync(&None, &Some(tag_id));
         assert_eq!(tag_entries.len(), 2);
         assert!(tag_entries.iter().all(|entry| entry.tag_id == Some(tag_id)));
+    }
+
+    #[test]
+    fn test_audit_reason_can_identify_scraper_source() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        let actions = [file_action(
+            TagOperation::Add,
+            vec![plugin_tag("source-tag", "source")],
+        )];
+        let reason = "scraper: test-scraper";
+        MainDatabase::internal_audit_context_set(&conn, reason).unwrap();
+        let tags = MainDatabase::internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
+        let tag_id = *tags.values().next().unwrap();
+        MainDatabase::internal_file_bulk_add(&conn, HashSet::from([file("source-hash", "bin")]));
+        let file_id: u64 = conn
+            .query_row(
+                "SELECT id FROM File WHERE hash = 'source-hash'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        MainDatabase::internal_audit_context_set(&conn, reason).unwrap();
+        MainDatabase::internal_relationship_bulk_add(
+            db.clone(),
+            &conn,
+            &HashSet::from([(file_id, tag_id)]),
+        );
+
+        let reasons: Vec<String> = conn
+            .prepare(
+                "SELECT reason FROM AuditLog
+                 WHERE (entity_type = 'tag' AND tag_id = ?1)
+                    OR (entity_type = 'relationship' AND file_id = ?2 AND tag_id = ?1)",
+            )
+            .unwrap()
+            .query_map(params![tag_id, file_id], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+
+        assert_eq!(reasons.len(), 2);
+        assert!(reasons.iter().all(|audit_reason| audit_reason == reason));
     }
 
     #[test]
@@ -5149,6 +5211,120 @@ mod tests {
             MainDatabase::get_file_location(&file, &"missing-base".into()),
             None
         );
+    }
+
+    #[test]
+    fn test_fix_internal_files_moves_misplaced_file_to_recorded_storage() {
+        let db = new_test();
+        let source_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let source_location = source_dir.path().to_string_lossy().into_owned();
+        let target_location = target_dir.path().to_string_lossy().into_owned();
+        let bytes = Bytes::from_static(b"misplaced file");
+        let (hash, _) = hash_bytes(&bytes, &HashesSupported::Sha512(String::new()));
+        let file = file(&hash, "bin");
+
+        let conn = db.pool.get().unwrap();
+        conn.execute("DELETE FROM FileStorageLocations", []).unwrap();
+        conn.execute(
+            "UPDATE Settings SET param = ?1 WHERE name = 'SYSTEM_file_location'",
+            params![&target_location],
+        )
+        .unwrap();
+        MainDatabase::internal_file_storage_location_set(&conn, &source_location).unwrap();
+
+        let source_path = Path::new(&source_location)
+            .join(&hash[0..2])
+            .join(&hash[2..4])
+            .join(&hash[4..6])
+            .join(&hash)
+            .with_extension(&file.extension);
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(&source_path, &bytes).unwrap();
+
+        let target_storage_id =
+            MainDatabase::internal_file_storage_location_get_or_create(&conn, &target_location)
+                .unwrap();
+        conn.execute(
+            "INSERT INTO File (hash, extension, storage_id) VALUES (?1, ?2, ?3)",
+            params![&file.hash, &file.extension, target_storage_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        db.fix_internal_files(&CheckFilesEnum::StorageCheck).unwrap();
+
+        let target_path = Path::new(&target_location)
+            .join(&hash[0..2])
+            .join(&hash[2..4])
+            .join(&hash[4..6])
+            .join(&hash)
+            .with_extension(&file.extension);
+        assert!(!source_path.exists());
+        assert_eq!(std::fs::read(target_path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn test_fix_internal_files_leaves_file_in_recorded_storage() {
+        let db = new_test();
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_location = storage_dir.path().to_string_lossy().into_owned();
+        let bytes = Bytes::from_static(b"correctly placed file");
+        let (hash, _) = hash_bytes(&bytes, &HashesSupported::Sha512(String::new()));
+        let file = file(&hash, "bin");
+        let conn = db.pool.get().unwrap();
+        conn.execute("DELETE FROM FileStorageLocations", []).unwrap();
+        conn.execute(
+            "UPDATE Settings SET param = ?1 WHERE name = 'SYSTEM_file_location'",
+            params![&storage_location],
+        )
+        .unwrap();
+        let file_path = Path::new(&storage_location)
+            .join(&hash[0..2])
+            .join(&hash[2..4])
+            .join(&hash[4..6])
+            .join(&hash)
+            .with_extension(&file.extension);
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, &bytes).unwrap();
+
+        let storage_id =
+            MainDatabase::internal_file_storage_location_get_or_create(&conn, &storage_location)
+                .unwrap();
+        conn.execute(
+            "INSERT INTO File (hash, extension, storage_id) VALUES (?1, ?2, ?3)",
+            params![&file.hash, &file.extension, storage_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        db.fix_internal_files(&CheckFilesEnum::StorageCheck).unwrap();
+
+        assert_eq!(std::fs::read(&file_path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn test_fix_internal_files_removes_empty_directories_but_keeps_storage_root() {
+        let db = new_test();
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_location = storage_dir.path().to_string_lossy().into_owned();
+        let conn = db.pool.get().unwrap();
+        conn.execute("DELETE FROM FileStorageLocations", []).unwrap();
+        conn.execute(
+            "UPDATE Settings SET param = ?1 WHERE name = 'SYSTEM_file_location'",
+            params![&storage_location],
+        )
+        .unwrap();
+        MainDatabase::internal_file_storage_location_set(&conn, &storage_location).unwrap();
+        drop(conn);
+
+        let empty_path = storage_dir.path().join("aa").join("bb").join("cc");
+        std::fs::create_dir_all(&empty_path).unwrap();
+
+        db.fix_internal_files(&CheckFilesEnum::StorageCheck).unwrap();
+
+        assert!(storage_dir.path().exists());
+        assert!(!storage_dir.path().join("aa").exists());
     }
 
     #[test]

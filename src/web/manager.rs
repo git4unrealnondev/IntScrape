@@ -379,18 +379,23 @@ impl Scraper {
                 .expect("Arc reference leak")
                 .into_inner();
 
+            let audit_reason = format!("scraper: {plugin_name}");
+
             self.download_manager
                 .db
-                .tags_add_bulk(&[FileTagAction {
-                    operation: TagOperation::Add,
-                    tags,
-                }])
+                .tags_add_bulk(
+                    &[FileTagAction {
+                        operation: TagOperation::Add,
+                        tags,
+                    }],
+                    &audit_reason,
+                )
                 .await;
 
             self.download_manager
                 .db
                 .clone()
-                .process_scraper(file_id_tag_map, job_list)
+                .process_scraper(file_id_tag_map, job_list, audit_reason)
                 .await;
         }
         if self.manage_recreation().await {

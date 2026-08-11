@@ -143,6 +143,7 @@ PRAGMA cache_size = -64000;
         // Ensure additive schema changes are applied to databases already at the
         // current version as well as databases upgraded through a version step.
         Self::internal_table_create_audit_log_v3(&conn)?;
+        Self::internal_audit_log_indexes_create_v3(&conn)?;
         Self::internal_file_download_location_set_default(&conn).unwrap();
 
         // Resetting is_running to false

@@ -60,6 +60,7 @@ impl MainDatabase {
              FROM Relationship r",
             [],
         )?;
+        Self::internal_audit_log_indexes_create_v3(conn)?;
         Self::internal_db_version_set(conn, 3)
     }
 }
