@@ -1,8 +1,8 @@
-FROM ubuntu:24.04
+FROM archlinux:base
 
 # Install sqlite + ffmpeg + certs (common requirement)
-RUN apt-get update && apt-get install -y \
+RUN pacman -Syu --noconfirm \
     sqlite3 \
     ffmpeg \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && pacman -Scc --noconfirm
