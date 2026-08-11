@@ -25,6 +25,7 @@ use file_format::{FileFormat, Kind};
 use image::{DynamicImage, EncodableLayout, GenericImageView, ImageFormat};
 pub use size::ThumbnailSize;
 use std::io::{self, BufRead, ErrorKind, Seek, Write};
+use std::sync::Once;
 use std::time::Duration;
 use tempfile::NamedTempFile;
 use webp_animation::EncodingConfig;
@@ -33,6 +34,14 @@ pub mod error;
 mod formats;
 mod size;
 pub(crate) mod utils;
+
+static QUIET_FFMPEG_LOGGING: Once = Once::new();
+
+fn suppress_ffmpeg_logging() {
+    QUIET_FFMPEG_LOGGING.call_once(|| unsafe {
+        ff_sys::av_log_set_level(ff_sys::AV_LOG_QUIET);
+    });
+}
 
 #[derive(Clone, Debug)]
 pub struct Thumbnail {
@@ -97,6 +106,8 @@ pub fn create_thumbnails_dynamic<R: BufRead + Seek>(
     mut reader: R,
     size: &ThumbnailSize,
 ) -> ThumbResult<Vec<u8>> {
+    suppress_ffmpeg_logging();
+
     let frate = 4;
     let temp2 = reader.fill_buf().unwrap();
     let mime = FileFormat::from_bytes(temp2);

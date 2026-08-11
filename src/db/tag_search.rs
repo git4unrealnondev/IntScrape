@@ -1,33 +1,47 @@
 use shared_types::TagSearch;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use strsim::levenshtein;
 
 const HIGH_VALUE_TAG_COUNT: u64 = 5;
 
-#[derive(Clone)]
 pub(crate) struct TagEntry {
     pub(crate) tag_id: u64,
     normalized_name: String,
     pub(crate) count: u64,
 }
 
+struct CompactTagEntry {
+    tag_id: u64,
+    name_start: u32,
+    name_len: u32,
+    count: u64,
+}
+
 #[derive(Default)]
 pub(crate) struct TagSearchCache {
-    entries: Vec<TagEntry>,
-    exact: HashMap<String, Vec<usize>>,
+    entries: Vec<CompactTagEntry>,
+    names: Vec<u8>,
 }
 
 impl TagSearchCache {
     pub(crate) fn from_entries(entries: Vec<TagEntry>) -> Self {
-        let mut exact: HashMap<String, Vec<usize>> = HashMap::new();
-        for (index, entry) in entries.iter().enumerate() {
-            exact
-                .entry(entry.normalized_name.clone())
-                .or_default()
-                .push(index);
+        let mut compact_entries = Vec::with_capacity(entries.len());
+        let mut names = Vec::new();
+        for entry in entries {
+            let name_start = names.len() as u32;
+            names.extend_from_slice(entry.normalized_name.as_bytes());
+            compact_entries.push(CompactTagEntry {
+                tag_id: entry.tag_id,
+                name_start,
+                name_len: entry.normalized_name.len() as u32,
+                count: entry.count,
+            });
         }
-        Self { entries, exact }
+        Self {
+            entries: compact_entries,
+            names,
+        }
     }
 
     pub(crate) fn search(&self, query: &str, limit: usize) -> Vec<TagSearch> {
@@ -36,23 +50,23 @@ impl TagSearchCache {
             return Vec::new();
         }
 
-        let mut matches = self
-            .exact
-            .get(&normalized_query)
-            .into_iter()
-            .flatten()
-            .map(|index| (&self.entries[*index], 0usize))
-            .collect::<Vec<_>>();
-
+        let mut matches = Vec::with_capacity(limit);
         for entry in &self.entries {
-            if matches
-                .iter()
-                .any(|(matched, _)| matched.tag_id == entry.tag_id)
-            {
-                continue;
-            }
-            if let Some(score) = match_score(&normalized_query, &entry.normalized_name) {
-                matches.push((entry, score));
+            let name = self.entry_name(entry);
+            if let Some(score) = match_score(&normalized_query, name) {
+                if matches.len() < limit {
+                    matches.push((entry, score));
+                } else {
+                    let mut worst_index = 0;
+                    for index in 1..matches.len() {
+                        if is_worse(matches[index], matches[worst_index]) {
+                            worst_index = index;
+                        }
+                    }
+                    if is_better(score, entry, matches[worst_index]) {
+                        matches[worst_index] = (entry, score);
+                    }
+                }
             }
         }
 
@@ -71,6 +85,27 @@ impl TagSearchCache {
             })
             .collect()
     }
+
+    fn entry_name<'a>(&'a self, entry: &CompactTagEntry) -> &'a str {
+        std::str::from_utf8(
+            &self.names[entry.name_start as usize..(entry.name_start + entry.name_len) as usize],
+        )
+        .expect("normalized tag names are valid UTF-8")
+    }
+}
+
+fn is_worse(left: (&CompactTagEntry, usize), right: (&CompactTagEntry, usize)) -> bool {
+    left.1 > right.1
+        || (left.1 == right.1
+            && (left.0.count < right.0.count
+                || (left.0.count == right.0.count && left.0.tag_id > right.0.tag_id)))
+}
+
+fn is_better(score: usize, entry: &CompactTagEntry, worst: (&CompactTagEntry, usize)) -> bool {
+    score < worst.1
+        || (score == worst.1
+            && (entry.count > worst.0.count
+                || (entry.count == worst.0.count && entry.tag_id < worst.0.tag_id)))
 }
 
 /// Searches a streamed set of entries without materializing the full set.

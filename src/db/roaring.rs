@@ -197,6 +197,22 @@ impl RelationshipStorage {
             self.relationship_cache_add_fileid_sql(tn, fileid, &bitmap);
         }
 
+        if matches!(self.internal_cache, InternalCacheType::Full) {
+            let mut stmt =
+                tn.prepare("SELECT fileid, tagid_bitmap FROM RelationshipRoaringFileid")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            for (fileid, tagid_bitmap) in rows.flatten() {
+                if let Ok(mut bitmap) =
+                    RoaringTreemap::deserialize_unchecked_from(Cursor::new(tagid_bitmap))
+                {
+                    bitmap.optimize();
+                    self.file_id.insert(fileid, bitmap);
+                }
+            }
+        }
+
         let mut stmt = tn.prepare("SELECT CAST(file_id AS INTEGER), CAST(tag_id AS INTEGER) FROM Relationship ORDER BY tag_id")?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)))?;
 
@@ -227,9 +243,6 @@ impl RelationshipStorage {
         if let Some(tagid) = current_tagid {
             self.relationship_cache_add_tagid_sql(tn, tagid, &bitmap);
         }
-        //self.file_id.shrink_to_fit();
-        //self.tag_id.shrink_to_fit();
-
         info!("Finished recaching roaring table");
         Ok(())
     }
@@ -272,26 +285,22 @@ impl RelationshipStorage {
                 self.tag_id.insert(tagid, bitmap);
             }
         }
-        if let InternalCacheType::Popular(_) = self.internal_cache {}
 
-        let mut stmt = conn
-            .prepare("SELECT fileid, tagid_bitmap FROM RelationshipRoaringFileid")
-            .unwrap();
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, u64>(0).unwrap(),     // fileid
-                    row.get::<_, Vec<u8>>(1).unwrap(), // tagid_bitmap
-                ))
-            })
-            .unwrap();
-
-        for (fileid, tagid_bitmap) in rows.flatten() {
-            if let Ok(mut bitmap) =
-                RoaringTreemap::deserialize_unchecked_from(Cursor::new(tagid_bitmap))
+        if matches!(self.internal_cache, InternalCacheType::Full) {
+            if let Ok(mut stmt) =
+                conn.prepare("SELECT fileid, tagid_bitmap FROM RelationshipRoaringFileid")
+                && let Ok(rows) = stmt.query_map([], |row| {
+                    Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
             {
-                bitmap.optimize();
-                self.file_id.insert(fileid, bitmap);
+                for (fileid, tagid_bitmap) in rows.flatten() {
+                    if let Ok(mut bitmap) =
+                        RoaringTreemap::deserialize_unchecked_from(Cursor::new(tagid_bitmap))
+                    {
+                        bitmap.optimize();
+                        self.file_id.insert(fileid, bitmap);
+                    }
+                }
             }
         }
     }
@@ -552,26 +561,26 @@ impl RelationshipStorage {
                     }
                 }*/
             }
-            InternalCacheType::Full => {
-                match self.file_id.get_mut(file_id) {
-                    None => {
-                        let mut bitmap = RoaringTreemap::new();
-                        bitmap.insert(tag_id);
-                        self.file_id.insert(file_id, bitmap);
-                    }
-                    Some(bitmap) => {
-                        bitmap.insert(tag_id);
-                    }
+            InternalCacheType::Full => match self.tag_id.get_mut(tag_id) {
+                None => {
+                    let mut bitmap = RoaringTreemap::new();
+                    bitmap.insert(file_id);
+                    self.tag_id.insert(tag_id, bitmap);
                 }
-                match self.tag_id.get_mut(tag_id) {
-                    None => {
-                        let mut bitmap = RoaringTreemap::new();
-                        bitmap.insert(file_id);
-                        self.tag_id.insert(tag_id, bitmap);
-                    }
-                    Some(bitmap) => {
-                        bitmap.insert(file_id);
-                    }
+                Some(bitmap) => {
+                    bitmap.insert(file_id);
+                }
+            },
+        }
+        if matches!(self.internal_cache, InternalCacheType::Full) {
+            match self.file_id.get_mut(file_id) {
+                Some(bitmap) => {
+                    bitmap.insert(tag_id);
+                }
+                None => {
+                    let mut bitmap = RoaringTreemap::new();
+                    bitmap.insert(tag_id);
+                    self.file_id.insert(file_id, bitmap);
                 }
             }
         }
@@ -638,8 +647,8 @@ mod tests {
         storage.relationship_roaring_add(&conn, 42, 7);
 
         assert_eq!(
-            storage.relationship_search_tagid_roaring_in_memory(42),
-            Some(vec![7])
+            storage.relationship_search_tagid_roaring(&conn, 42),
+            vec![7]
         );
     }
 
@@ -651,8 +660,8 @@ mod tests {
         storage.relationship_roaring_add(&conn, 42, 11);
 
         assert_eq!(
-            storage.relationship_search_tagid_roaring_in_memory(42),
-            Some(vec![7, 11])
+            storage.relationship_search_tagid_roaring(&conn, 42),
+            vec![7, 11]
         );
     }
 
@@ -676,8 +685,8 @@ mod tests {
         storage.relationship_roaring_add(&conn, 42, 7);
 
         assert_eq!(
-            storage.relationship_search_tagid_roaring_in_memory(42),
-            Some(vec![7])
+            storage.relationship_search_tagid_roaring(&conn, 42),
+            vec![7]
         );
     }
 
@@ -686,8 +695,8 @@ mod tests {
         let (storage, _conn) = test_storage(InternalCacheType::Full);
 
         assert_eq!(
-            storage.relationship_search_tagid_roaring_in_memory(404),
-            None
+            storage.relationship_search_tagid_roaring(&Connection::open_in_memory().unwrap(), 404),
+            Vec::<u64>::new()
         );
     }
 
@@ -708,13 +717,11 @@ mod tests {
         let (mut storage, conn) = test_storage(InternalCacheType::Full);
 
         storage.relationship_roaring_add(&conn, 42, 7);
-        storage.file_id.clear();
-
         storage.load_relationship_cache(&conn);
 
         assert_eq!(
-            storage.relationship_search_tagid_roaring_in_memory(42),
-            Some(vec![7])
+            storage.relationship_search_fileid_roaring(&conn, 7),
+            vec![42]
         );
     }
 

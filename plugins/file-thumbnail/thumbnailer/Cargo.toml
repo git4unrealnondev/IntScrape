@@ -23,6 +23,7 @@ webp-animation = "0.10.0"
 #sha2 = "0.11.0"
 #ffmpeg-next = "8.1.0"
 avio = {git = "https://github.com/git4unrealnondev/avio", default-features = false, features=["decode"]}
+ff-sys = { git = "https://github.com/git4unrealnondev/avio" }
 #ff-format = "0.15.0"
 [features]
 default = ["webp"]

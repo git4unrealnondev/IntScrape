@@ -31,6 +31,25 @@ use tokio::{
 };
 
 const MAX_CONCURRENT_DOWNLOADS: usize = 5;
+const MAX_DOWNLOAD_RETRIES: u8 = 3;
+
+fn retry_delay(attempt: u8) -> Duration {
+    let backoff_seconds = 1u64 << attempt.min(4);
+    Duration::from_secs(backoff_seconds) + Duration::from_millis(rand::random::<u64>() % 500)
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_EARLY
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
 
 use crate::{
     db::MainDatabase,
@@ -41,7 +60,42 @@ use crate::{
 
 enum TrackedFile {
     Temp(tempfile::NamedTempFile),
-    Manual(std::path::PathBuf),
+}
+
+enum DownloadHasher {
+    Md5(md5::Context),
+    Sha1(sha1::Sha1),
+    Sha256(Sha256),
+    Sha512(Sha512),
+}
+
+impl DownloadHasher {
+    fn new(hash: &HashesSupported) -> Self {
+        match hash {
+            HashesSupported::Md5(_) => Self::Md5(md5::Context::new()),
+            HashesSupported::Sha1(_) => Self::Sha1(sha1::Sha1::new()),
+            HashesSupported::Sha256(_) => Self::Sha256(Sha256::new()),
+            HashesSupported::Sha512(_) => Self::Sha512(Sha512::new()),
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Md5(hasher) => hasher.consume(bytes),
+            Self::Sha1(hasher) => hasher.update(bytes),
+            Self::Sha256(hasher) => hasher.update(bytes),
+            Self::Sha512(hasher) => hasher.update(bytes),
+        }
+    }
+
+    fn finish(self) -> String {
+        match self {
+            Self::Md5(hasher) => format!("{:x}", hasher.finalize()),
+            Self::Sha1(hasher) => encode_upper(hasher.finalize()),
+            Self::Sha256(hasher) => encode_upper(hasher.finalize()),
+            Self::Sha512(hasher) => encode_upper(hasher.finalize()),
+        }
+    }
 }
 
 impl TrackedFile {
@@ -49,7 +103,6 @@ impl TrackedFile {
     fn path(&self) -> &std::path::Path {
         match self {
             Self::Temp(f) => f.path(),
-            Self::Manual(p) => p,
         }
     }
 }
@@ -486,14 +539,25 @@ impl Scraper {
         false
     }
 
+    async fn release_download_file(&self, url: &str) {
+        if let Some(internal_storage) = self
+            .download_manager
+            .jobs
+            .write()
+            .await
+            .get_mut(&self.plugin.name)
+        {
+            internal_storage.file_urls.remove(url);
+        }
+    }
+
     async fn download_file(
         self: Arc<Self>,
         file_url: &str,
         hash: &Option<HashesSupported>,
-        _temp_dir: &std::path::Path,
+        temp_dir: &std::path::Path,
     ) -> Option<NamedTempFile> {
         let mut cnt = 0;
-        let mut hash_cnt = 0;
 
         let url = match Url::parse(file_url) {
             Ok(u) => u,
@@ -532,15 +596,17 @@ impl Scraper {
                         file_url,
                         err
                     );
-                    cnt += 1;
-                    if cnt >= 3 {
+                    if cnt >= MAX_DOWNLOAD_RETRIES {
                         break;
                     }
+                    tokio::time::sleep(retry_delay(cnt)).await;
+                    cnt += 1;
                     continue;
                 }
             };
             if let Err(err) = response.error_for_status_ref() {
-                if err.status() == Some(StatusCode::NOT_FOUND) {
+                let status = err.status();
+                if status == Some(StatusCode::NOT_FOUND) || status == Some(StatusCode::GONE) {
                     log::error!(
                         "Scraper: {} JobId: {} While processing url: {} got a 404 error adding dead_url to db.",
                         self.plugin.name,
@@ -549,9 +615,19 @@ impl Scraper {
                     );
                     let db = self.download_manager.db.clone();
                     db.dead_url_add_async(file_url.to_string()).await;
+                } else if status.is_some_and(is_retryable_status) && cnt < MAX_DOWNLOAD_RETRIES {
+                    log::error!(
+                        "Scraper: {} JobId: {} Got retryable error {:?}; retrying",
+                        self.plugin.name,
+                        self.job.id,
+                        err
+                    );
+                    tokio::time::sleep(retry_delay(cnt)).await;
+                    cnt += 1;
+                    continue 'main_loop;
                 } else {
                     log::error!(
-                        "Scraper: {} JobId: {} Got error {:?}",
+                        "Scraper: {} JobId: {} Got permanent error {:?}",
                         self.plugin.name,
                         self.job.id,
                         err
@@ -564,7 +640,13 @@ impl Scraper {
             let content_length_header = response.content_length();
 
             // Build unique temp file path
-            let temp_file = tempfile::NamedTempFile::new().unwrap();
+            let temp_file = match tempfile::NamedTempFile::new_in(temp_dir) {
+                Ok(file) => file,
+                Err(error) => {
+                    log::error!("Failed to create temporary file: {error:?}");
+                    return None;
+                }
+            };
             let temp_file_path = temp_file.path().to_path_buf();
 
             let mut file = match File::create(&temp_file_path).await {
@@ -577,12 +659,16 @@ impl Scraper {
 
             let mut downloaded_bytes_count = 0;
             let mut stream_failed = false;
+            let mut hasher = hash.as_ref().map(DownloadHasher::new);
 
             // Stream network chunks straight to disk (Constantly uses ~8KB to 64KB max per active task)
             loop {
                 match response.chunk().await {
                     Ok(Some(chunk)) => {
                         downloaded_bytes_count += chunk.len();
+                        if let Some(hasher) = hasher.as_mut() {
+                            hasher.update(&chunk);
+                        }
                         if let Err(err) = file.write_all(&chunk).await {
                             log::error!("Failed to write chunk to disk: {err:?}");
                             stream_failed = true;
@@ -603,59 +689,48 @@ impl Scraper {
                 }
             }
 
-            let _ = file.flush().await;
+            if let Err(err) = file.flush().await {
+                log::error!("Failed to flush temporary file: {err:?}");
+                let _ = tokio::fs::remove_file(&temp_file).await;
+                if cnt >= MAX_DOWNLOAD_RETRIES {
+                    break;
+                }
+                tokio::time::sleep(retry_delay(cnt)).await;
+                cnt += 1;
+                continue;
+            }
 
             if stream_failed {
                 let _ = tokio::fs::remove_file(&temp_file).await;
-                cnt += 1;
-                if cnt >= 3 {
+                if cnt >= MAX_DOWNLOAD_RETRIES {
                     break;
                 }
+                tokio::time::sleep(retry_delay(cnt)).await;
+                cnt += 1;
                 continue;
             }
 
             let size_matches = match content_length_header {
-                Some(expected) => downloaded_bytes_count == expected as usize,
+                Some(expected) => downloaded_bytes_count as u64 == expected,
                 None => true,
             };
 
             if size_matches {
-                let temp_path_clone = temp_file_path.clone();
-                let hash_clone = hash.clone();
-
-                // Compute validation hashes synchronously inside spawn_blocking
-                let hash_matches = if let Some(hash_rule) = hash_clone {
-                    tokio::task::spawn_blocking(move || {
-                        if let Ok(bytes) = std::fs::read(&temp_path_clone) {
-                            hash_bytes(&Bytes::from(bytes), &hash_rule).1
-                        } else {
-                            false
-                        }
-                    })
-                    .await
-                    .ok()
-                    .unwrap_or(false)
-                } else {
-                    true
+                let hash_matches = match (hash, hasher) {
+                    (Some(expected), Some(hasher)) => hasher.finish() == expected_hash(&expected),
+                    _ => true,
                 };
 
-                if hash_matches || hash_cnt >= 2 {
-                    if hash.is_some() && hash_matches {
-                        hash_cnt += 1;
-                    }
-                    if hash_cnt >= 2 {
-                        info!("Overriding downloaded md5 with downloaded one.");
-                    }
+                if hash_matches {
                     return Some(temp_file);
                 } else {
                     log::warn!(
                         "Scraper: {} JobId: {} Hash mismatch detected. Retrying. Attempt: {}",
                         self.plugin.name,
                         self.job.id,
-                        hash_cnt + 1
+                        cnt + 1
                     );
                     let _ = tokio::fs::remove_file(&temp_file).await;
-                    hash_cnt += 1;
                 }
             } else {
                 log::error!(
@@ -668,10 +743,11 @@ impl Scraper {
                 let _ = tokio::fs::remove_file(&temp_file).await;
             }
 
-            cnt += 1;
-            if cnt >= 3 {
+            if cnt >= MAX_DOWNLOAD_RETRIES {
                 break;
             }
+            tokio::time::sleep(retry_delay(cnt)).await;
+            cnt += 1;
         }
 
         None
@@ -688,6 +764,13 @@ impl Scraper {
     ) -> Result<Option<FileReturn>, Box<dyn Error>> {
         let plugin_manager = self.download_manager.plugin_manager.clone();
         let self_clone = self.clone();
+
+        if let Some(file_url) = file.source.as_ref().and_then(|source| match source {
+            FileSource::Url(file_url) => Some(file_url.clone()),
+            FileSource::Bytes(_) => None,
+        }) {
+            Self::add_source_url_tag(file, &file_url);
+        }
 
         // Skips downloading file IF we have tag x associated with file_id
         for skip in &file.skip_if {
@@ -710,6 +793,12 @@ impl Scraper {
         if let Some(ref hash) = file.hash
             && let Some(file_internal) = self.download_manager.db.contains_hash_sync(hash)
         {
+            if let Some(file_id) = file_internal.id {
+                let _ = self
+                    .download_manager
+                    .db
+                    .file_relationship_tags_add_sync(&file_id, &file.tag_list);
+            }
             info!(
                 "Scraper: {} JobId: {} Skipping file_id {} because hash: {:?} already in db.",
                 self.plugin.name,
@@ -723,79 +812,69 @@ impl Scraper {
         // Download or fetch file via its disk path reference
         let temp_file = match file.source {
             None => return Ok(None),
-            Some(ref url_source) => match url_source {
-                FileSource::Url(file_url) => {
-                    if let Some(file_id) = self
-                        .download_manager
-                        .db
-                        .tag_get_file_id(&Tag {
-                            name: file_url.clone(),
-                            namespace: GenericNamespaceObj {
-                                name: "source_url".into(),
-                                description: None,
-                            },
-                        })
-                        .await
-                    {
-                        info!(
-                            "Scraper: {} JobId: {} Skipping file_id {} because URL: {} already in db.",
-                            self.plugin.name, self.job.id, file_id, file_url
-                        );
-                        return Ok(self
+            Some(ref url_source) => {
+                match url_source {
+                    FileSource::Url(file_url) => {
+                        if let Some(file_id) = self
                             .download_manager
                             .db
-                            .file_id_get(file_id)
-                            .await
-                            .map(|f| FileReturn::File(f)));
-                    } else {
-                        file.tag_list.push(FileTagAction {
-                            operation: TagOperation::Add,
-                            tags: vec![PluginTag {
-                                tag: Tag {
-                                    name: file_url.clone(),
-                                    namespace: GenericNamespaceObj {
-                                        name: "source_url".into(),
-                                        description: Some("A source for a file".into()),
-                                    },
+                            .tag_get_file_id(&Tag {
+                                name: file_url.clone(),
+                                namespace: GenericNamespaceObj {
+                                    name: "source_url".into(),
+                                    description: None,
                                 },
-                                ..Default::default()
-                            }],
-                        });
-
-                        if self.should_download_file(file_url).await {
-                            // Calls disk streaming download helper
-                            if let Some(path_out) = self_clone
-                                .download_file(file_url, &file.hash, temp_dir().as_path())
-                                .await
-                            {
-                                TrackedFile::Temp(path_out)
-                            } else {
-                                *download_issue = true;
-                                return Ok(None);
-                            }
-                        } else {
-                            log::info!(
-                                "Worker: {} JobId: {} -- Skipping file download of url: {} due to already being in download queue.",
-                                self.plugin.name,
-                                self.job.id,
-                                file_url
+                            })
+                            .await
+                        {
+                            info!(
+                                "Scraper: {} JobId: {} Skipping file_id {} because URL: {} already in db.",
+                                self.plugin.name, self.job.id, file_id, file_url
                             );
-                            return Ok(Some(FileReturn::InDownloadQueue));
+                            return Ok(self.download_manager.db.file_id_get(file_id).await.map(
+                                |f| {
+                                    if let Some(id) = f.id {
+                                        let _ = self
+                                            .download_manager
+                                            .db
+                                            .file_relationship_tags_add_sync(&id, &file.tag_list);
+                                    }
+                                    FileReturn::File(f)
+                                },
+                            ));
+                        } else {
+                            if self.should_download_file(file_url).await {
+                                // Calls disk streaming download helper
+                                let downloaded = self_clone
+                                    .download_file(file_url, &file.hash, temp_dir().as_path())
+                                    .await;
+                                self.release_download_file(file_url).await;
+                                if let Some(path_out) = downloaded {
+                                    TrackedFile::Temp(path_out)
+                                } else {
+                                    *download_issue = true;
+                                    return Ok(None);
+                                }
+                            } else {
+                                log::info!(
+                                    "Worker: {} JobId: {} -- Skipping file download of url: {} due to already being in download queue.",
+                                    self.plugin.name,
+                                    self.job.id,
+                                    file_url
+                                );
+                                return Ok(Some(FileReturn::InDownloadQueue));
+                            }
                         }
                     }
-                }
-                // If bytes are fed instantly, spill them out to a temporary file right away
-                // to maintain identical architectural tracking shapes.
-                FileSource::Bytes(file_bytes) => {
-                    let path = temp_dir()
-                        .as_path()
-                        .join(format!("direct_bytes_{}.tmp", rand::random::<u32>()));
-                    if std::fs::write(&path, file_bytes).is_err() {
-                        return Ok(None);
+                    // If bytes are fed instantly, spill them out to a temporary file right away
+                    // to maintain identical architectural tracking shapes.
+                    FileSource::Bytes(file_bytes) => {
+                        let mut temp_file = tempfile::NamedTempFile::new_in(temp_dir())?;
+                        temp_file.write_all(&file_bytes)?;
+                        TrackedFile::Temp(temp_file)
                     }
-                    TrackedFile::Manual(path)
                 }
-            },
+            }
         };
 
         let mut tags_owned = file.tag_list.clone();
@@ -804,56 +883,55 @@ impl Scraper {
         let temp_file_path = temp_file.path().to_path_buf();
 
         // RUN EVERYTHING HEAVY SEQUENTIALLY ON THE THREAD POOL
-        let (hash, extension, storage_id_result, final_tags, final_jobs) =
-            tokio::task::spawn_blocking(move || {
-                // 1. Read bytes from local disk (Hits OS Page Cache, near instantaneous)
-                let bytes = Bytes::from(std::fs::read(&temp_file_path).ok().unwrap());
+        let processed = tokio::task::spawn_blocking(move || {
+            // Read the temporary file once for hashing, format detection, and callbacks.
+            let bytes = Bytes::from(
+                std::fs::read(&temp_file_path)
+                    .map_err(|error| format!("failed to read temporary file: {error}"))?,
+            );
 
-                // 2. Compute format and layout
-                let hash = hash_bytes(&bytes, &HashesSupported::Sha512(String::new())).0;
-                let extension = FileFormat::from_bytes(&bytes).extension().to_string();
+            // 2. Compute format and layout
+            let hash = hash_bytes(&bytes, &HashesSupported::Sha512(String::new())).0;
+            let extension = FileFormat::from_bytes(&bytes).extension().to_string();
 
-                let file_download_location = self
-                    .download_manager
-                    .db
-                    .file_download_location_get_sync(&hash, &extension);
+            let file_download_location = self
+                .download_manager
+                .db
+                .file_download_location_get_sync(&hash, &extension);
 
-                // 3. Fire your dynamic plugin boundary (.so loading boundary takes a slice safely)
-                plugin_manager.callback_on_download(&bytes, &mut tags_owned, &mut jobs_owned);
+            // 3. Fire your dynamic plugin boundary (.so loading boundary takes a slice safely)
+            plugin_manager.callback_on_download(&bytes, &mut tags_owned, &mut jobs_owned);
 
-                // 4. Save file out to its designated destination location path context
-                let mut storage_id = None;
-                if let Some((file_storage_path, storage_id_db)) = file_download_location
-                    && let Some(parent_dir) = file_storage_path.parent()
-                {
-                    let mut cnt = 0;
-                    loop {
-                        if std::fs::create_dir_all(parent_dir).is_ok()
-                            && std::fs::write(&file_storage_path, &bytes).is_ok()
-                        {
-                            storage_id = Some(storage_id_db);
-                            break;
-                        }
-                        cnt += 1;
-                        if cnt >= 3 {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
+            // 4. Save file out to its designated destination location path context
+            if let Some((file_storage_path, storage_id_db)) = file_download_location
+                && let Some(parent_dir) = file_storage_path.parent()
+            {
+                std::fs::create_dir_all(parent_dir)
+                    .map_err(|error| format!("failed to create storage directory: {error}"))?;
+
+                let staging_path = file_storage_path.with_extension("part");
+                if std::fs::rename(&temp_file_path, &staging_path).is_err() {
+                    std::fs::copy(&temp_file_path, &staging_path)
+                        .map_err(|error| format!("failed to stage file: {error}"))?;
                 }
+                std::fs::rename(&staging_path, &file_storage_path)
+                    .map_err(|error| format!("failed to finalize file: {error}"))?;
+                let storage_id = storage_id_db;
+                return Ok::<_, String>((
+                    hash,
+                    extension,
+                    Some(storage_id),
+                    tags_owned,
+                    jobs_owned,
+                ));
+            } else {
+                return Err("no file storage location configured".to_string());
+            }
+        })
+        .await
+        .map_err(|error| format!("file processing task failed: {error}"))??;
 
-                // Clean up the temporary file immediately
-                let _ = std::fs::remove_file(&temp_file_path);
-
-                // CRITICAL: `bytes` falls out of scope HERE.
-                // Allocated heap memory drops back down to absolute zero before task returns.
-                Some((hash, extension, storage_id, tags_owned, jobs_owned))
-            })
-            .await
-            .unwrap()
-            .into_iter()
-            .next()
-            .ok_or("No hash data from hashdata")?;
+        let (hash, extension, storage_id_result, final_tags, final_jobs) = processed;
 
         file.tag_list = final_tags;
         *jobs = final_jobs;
@@ -869,6 +947,31 @@ impl Scraper {
             extension,
             storage_id,
         })))
+    }
+
+    fn add_source_url_tag(file: &mut FileObject, file_url: &str) {
+        let already_present = file.tag_list.iter().any(|action| {
+            action.tags.iter().any(|plugin_tag| {
+                plugin_tag.tag.name == file_url && plugin_tag.tag.namespace.name == "source_url"
+            })
+        });
+        if already_present {
+            return;
+        }
+
+        file.tag_list.push(FileTagAction {
+            operation: TagOperation::Add,
+            tags: vec![PluginTag {
+                tag: Tag {
+                    name: file_url.to_string(),
+                    namespace: GenericNamespaceObj {
+                        name: "source_url".into(),
+                        description: Some("A source for a file".into()),
+                    },
+                },
+                ..Default::default()
+            }],
+        });
     }
 }
 
@@ -1274,6 +1377,37 @@ impl DownloadsManager {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         }
+    }
+}
+
+fn expected_hash(hash: &HashesSupported) -> &str {
+    match hash {
+        HashesSupported::Md5(value)
+        | HashesSupported::Sha1(value)
+        | HashesSupported::Sha256(value)
+        | HashesSupported::Sha512(value) => value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_url_tag_is_added_once() {
+        let mut file = FileObject {
+            source: Some(FileSource::Url("https://example.test/file.jpg".into())),
+            ..Default::default()
+        };
+
+        let url = "https://example.test/file.jpg";
+        Scraper::add_source_url_tag(&mut file, url);
+        Scraper::add_source_url_tag(&mut file, url);
+
+        assert_eq!(file.tag_list.len(), 1);
+        assert_eq!(file.tag_list[0].tags.len(), 1);
+        assert_eq!(file.tag_list[0].tags[0].tag.name, url);
+        assert_eq!(file.tag_list[0].tags[0].tag.namespace.name, "source_url");
     }
 }
 
