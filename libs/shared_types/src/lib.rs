@@ -10,12 +10,9 @@ pub struct AuditLogEntry {
     pub id: u64,
     pub changed_at: u64,
     pub entity_type: String,
-    pub entity_id: String,
     pub action: String,
     pub file_id: Option<u64>,
     pub tag_id: Option<u64>,
-    pub before_json: Option<String>,
-    pub after_json: Option<String>,
     pub reason: String,
 }
 

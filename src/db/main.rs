@@ -118,8 +118,7 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
         .unwrap();
     }
 
-    /// Creates the V3 audit trail. JSON snapshots keep the log useful when the
-    /// shape of the audited tables changes in a later database version.
+    /// Creates the compact V3 audit trail.
     pub(in crate::db) fn internal_table_create_audit_log_v3(
         conn: &Connection,
     ) -> Result<(), rusqlite::Error> {
@@ -128,12 +127,9 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
                 id INTEGER PRIMARY KEY,
                 changed_at INTEGER NOT NULL,
                 entity_type TEXT NOT NULL,
-                entity_id TEXT NOT NULL,
                 action TEXT NOT NULL,
                 file_id INTEGER,
                 tag_id INTEGER,
-                before_json TEXT,
-                after_json TEXT,
                 reason TEXT NOT NULL
             );",
         )?;
@@ -148,30 +144,59 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
         if !columns.contains("tag_id") {
             conn.execute("ALTER TABLE AuditLog ADD COLUMN tag_id INTEGER", [])?;
         }
-        conn.execute_batch(
-            "UPDATE AuditLog
-             SET file_id = CASE
-                 WHEN entity_type = 'file' THEN CAST(entity_id AS INTEGER)
-                 ELSE json_extract(COALESCE(after_json, before_json), '$.file_id')
-             END
-             WHERE file_id IS NULL;
-             UPDATE AuditLog
-             SET tag_id = CASE
-                 WHEN entity_type = 'tag' THEN CAST(entity_id AS INTEGER)
-                 ELSE json_extract(COALESCE(after_json, before_json), '$.tag_id')
-             END
-             WHERE tag_id IS NULL;",
-        )
+        if columns.contains("entity_id")
+            || columns.contains("before_json")
+            || columns.contains("after_json")
+        {
+            if columns.contains("entity_id") {
+                conn.execute_batch(
+                    "UPDATE AuditLog
+                     SET file_id = CASE
+                         WHEN entity_type = 'file' THEN CAST(entity_id AS INTEGER)
+                         ELSE file_id
+                     END
+                     WHERE file_id IS NULL;
+                     UPDATE AuditLog
+                     SET tag_id = CASE
+                         WHEN entity_type = 'tag' THEN CAST(entity_id AS INTEGER)
+                         ELSE tag_id
+                     END
+                     WHERE tag_id IS NULL;",
+                )?;
+            }
+            conn.execute_batch(
+                "CREATE TABLE AuditLog_compact (
+                    id INTEGER PRIMARY KEY,
+                    changed_at INTEGER NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    file_id INTEGER,
+                    tag_id INTEGER,
+                    reason TEXT NOT NULL
+                );
+                INSERT INTO AuditLog_compact
+                    (id, changed_at, entity_type, action, file_id, tag_id, reason)
+                SELECT id, changed_at, entity_type, action, file_id, tag_id, reason
+                FROM AuditLog;
+                DROP TABLE AuditLog;
+                ALTER TABLE AuditLog_compact RENAME TO AuditLog;",
+            )?;
+        }
+        Ok(())
     }
 
     pub(in crate::db) fn internal_audit_log_indexes_create_v3(
         conn: &Connection,
     ) -> Result<(), rusqlite::Error> {
         conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_audit_log_changed_at ON AuditLog(changed_at DESC);
-             CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON AuditLog(entity_type, entity_id);
-             CREATE INDEX IF NOT EXISTS idx_audit_log_file_id ON AuditLog(file_id, changed_at DESC);
-             CREATE INDEX IF NOT EXISTS idx_audit_log_tag_id ON AuditLog(tag_id, changed_at DESC);",
+            "DROP INDEX IF EXISTS idx_audit_log_entity;
+             DROP INDEX IF EXISTS idx_audit_log_file_id;
+             DROP INDEX IF EXISTS idx_audit_log_tag_id;
+             CREATE INDEX IF NOT EXISTS idx_audit_log_changed_at ON AuditLog(changed_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_audit_log_file_id ON AuditLog(file_id, changed_at DESC)
+                 WHERE file_id IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_audit_log_tag_id ON AuditLog(tag_id, changed_at DESC)
+                 WHERE tag_id IS NOT NULL;",
         )
     }
 
@@ -187,11 +212,9 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             AFTER INSERT ON main.File
             BEGIN
                 INSERT INTO AuditLog
-                    (changed_at, entity_type, entity_id, action, file_id, before_json, after_json, reason)
+                    (changed_at, entity_type, action, file_id, reason)
                 VALUES (
-                    unixepoch(), 'file', CAST(NEW.id AS TEXT), 'create', NEW.id, NULL,
-                    json_object('id', NEW.id, 'hash', NEW.hash,
-                                'extension', NEW.extension, 'storage_id', NEW.storage_id),
+                    unixepoch(), 'file', 'create', NEW.id,
                     COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
                              'file created')
                 );
@@ -201,11 +224,9 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             AFTER DELETE ON main.File
             BEGIN
                 INSERT INTO AuditLog
-                    (changed_at, entity_type, entity_id, action, file_id, before_json, after_json, reason)
+                    (changed_at, entity_type, action, file_id, reason)
                 VALUES (
-                    unixepoch(), 'file', CAST(OLD.id AS TEXT), 'delete', OLD.id,
-                    json_object('id', OLD.id, 'hash', OLD.hash,
-                                'extension', OLD.extension, 'storage_id', OLD.storage_id), NULL,
+                    unixepoch(), 'file', 'delete', OLD.id,
                     COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
                              'file deleted')
                 );
@@ -215,13 +236,9 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             AFTER UPDATE ON main.File
             BEGIN
                 INSERT INTO AuditLog
-                    (changed_at, entity_type, entity_id, action, file_id, before_json, after_json, reason)
+                    (changed_at, entity_type, action, file_id, reason)
                 VALUES (
-                    unixepoch(), 'file', CAST(NEW.id AS TEXT), 'update', NEW.id,
-                    json_object('id', OLD.id, 'hash', OLD.hash,
-                                'extension', OLD.extension, 'storage_id', OLD.storage_id),
-                    json_object('id', NEW.id, 'hash', NEW.hash,
-                                'extension', NEW.extension, 'storage_id', NEW.storage_id),
+                    unixepoch(), 'file', 'update', NEW.id,
                     COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
                              'file updated')
                 );
@@ -231,10 +248,9 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             AFTER INSERT ON main.Tags
             BEGIN
                 INSERT INTO AuditLog
-                    (changed_at, entity_type, entity_id, action, tag_id, before_json, after_json, reason)
+                    (changed_at, entity_type, action, tag_id, reason)
                 VALUES (
-                    unixepoch(), 'tag', CAST(NEW.id AS TEXT), 'create', NEW.id, NULL,
-                    json_object('id', NEW.id, 'name', NEW.name, 'namespace', NEW.namespace),
+                    unixepoch(), 'tag', 'create', NEW.id,
                     COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
                              'tag created')
                 );
@@ -244,10 +260,9 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             AFTER DELETE ON main.Tags
             BEGIN
                 INSERT INTO AuditLog
-                    (changed_at, entity_type, entity_id, action, tag_id, before_json, after_json, reason)
+                    (changed_at, entity_type, action, tag_id, reason)
                 VALUES (
-                    unixepoch(), 'tag', CAST(OLD.id AS TEXT), 'delete', OLD.id,
-                    json_object('id', OLD.id, 'name', OLD.name, 'namespace', OLD.namespace), NULL,
+                    unixepoch(), 'tag', 'delete', OLD.id,
                     COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
                              'tag deleted')
                 );
@@ -258,11 +273,9 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             WHEN OLD.name IS NOT NEW.name OR OLD.namespace IS NOT NEW.namespace
             BEGIN
                 INSERT INTO AuditLog
-                    (changed_at, entity_type, entity_id, action, tag_id, before_json, after_json, reason)
+                    (changed_at, entity_type, action, tag_id, reason)
                 VALUES (
-                    unixepoch(), 'tag', CAST(NEW.id AS TEXT), 'update', NEW.id,
-                    json_object('id', OLD.id, 'name', OLD.name, 'namespace', OLD.namespace),
-                    json_object('id', NEW.id, 'name', NEW.name, 'namespace', NEW.namespace),
+                    unixepoch(), 'tag', 'update', NEW.id,
                     COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
                              'tag updated')
                 );
@@ -272,10 +285,9 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             AFTER INSERT ON main.Relationship
             BEGIN
                 INSERT INTO AuditLog
-                    (changed_at, entity_type, entity_id, action, file_id, tag_id, before_json, after_json, reason)
+                    (changed_at, entity_type, action, file_id, tag_id, reason)
                 VALUES (
-                    unixepoch(), 'relationship', NEW.file_id || ':' || NEW.tag_id, 'create', NEW.file_id, NEW.tag_id, NULL,
-                    json_object('file_id', NEW.file_id, 'tag_id', NEW.tag_id),
+                    unixepoch(), 'relationship', 'create', NEW.file_id, NEW.tag_id,
                     COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
                              'relationship added')
                 );
@@ -285,10 +297,9 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             AFTER DELETE ON main.Relationship
             BEGIN
                 INSERT INTO AuditLog
-                    (changed_at, entity_type, entity_id, action, file_id, tag_id, before_json, after_json, reason)
+                    (changed_at, entity_type, action, file_id, tag_id, reason)
                 VALUES (
-                    unixepoch(), 'relationship', OLD.file_id || ':' || OLD.tag_id, 'delete', OLD.file_id, OLD.tag_id,
-                    json_object('file_id', OLD.file_id, 'tag_id', OLD.tag_id), NULL,
+                    unixepoch(), 'relationship', 'delete', OLD.file_id, OLD.tag_id,
                     COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
                              'relationship removed')
                 );
@@ -298,11 +309,9 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             AFTER INSERT ON main.Parents
             BEGIN
                 INSERT INTO AuditLog
-                    (changed_at, entity_type, entity_id, action, tag_id, before_json, after_json, reason)
+                    (changed_at, entity_type, action, tag_id, reason)
                 VALUES (
-                    unixepoch(), 'relationship', 'parent:' || NEW.id, 'create', NEW.tag_id, NULL,
-                    json_object('tag_id', NEW.tag_id, 'relate_tag_id', NEW.relate_tag_id,
-                                'limit_to', NEW.limit_to),
+                    unixepoch(), 'relationship', 'create', NEW.tag_id,
                     COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
                              'tag parent relationship added')
                 );
@@ -312,11 +321,9 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
             AFTER DELETE ON main.Parents
             BEGIN
                 INSERT INTO AuditLog
-                    (changed_at, entity_type, entity_id, action, tag_id, before_json, after_json, reason)
+                    (changed_at, entity_type, action, tag_id, reason)
                 VALUES (
-                    unixepoch(), 'relationship', 'parent:' || OLD.id, 'delete', OLD.tag_id,
-                    json_object('tag_id', OLD.tag_id, 'relate_tag_id', OLD.relate_tag_id,
-                                'limit_to', OLD.limit_to), NULL,
+                    unixepoch(), 'relationship', 'delete', OLD.tag_id,
                     COALESCE((SELECT reason FROM temp.AuditContext LIMIT 1),
                              'tag parent relationship removed')
                 );
@@ -340,10 +347,9 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
     pub(in crate::db) fn internal_audit_log(
         conn: &Connection,
         entity_type: &str,
-        entity_id: impl ToString,
         action: &str,
-        before_json: Option<String>,
-        after_json: Option<String>,
+        file_id: Option<u64>,
+        tag_id: Option<u64>,
         reason: &str,
     ) -> Result<(), rusqlite::Error> {
         let enabled = Self::internal_setting_get(conn, "SYSTEM_audit_log_enabled")?
@@ -355,15 +361,14 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
         }
         conn.execute(
             "INSERT INTO AuditLog
-                (changed_at, entity_type, entity_id, action, before_json, after_json, reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (changed_at, entity_type, action, file_id, tag_id, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 get_sys_time_in_secs(),
                 entity_type,
-                entity_id.to_string(),
                 action,
-                before_json,
-                after_json,
+                file_id,
+                tag_id,
                 reason,
             ],
         )?;
@@ -383,8 +388,7 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
         };
 
         let mut sql = String::from(
-            "SELECT id, changed_at, entity_type, entity_id, action, file_id, tag_id,
-                    before_json, after_json, reason
+            "SELECT id, changed_at, entity_type, action, file_id, tag_id, reason
              FROM AuditLog WHERE 1 = 1",
         );
         if file_id.is_some() {
@@ -414,13 +418,10 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
                 id: row.get(0)?,
                 changed_at: row.get(1)?,
                 entity_type: row.get(2)?,
-                entity_id: row.get(3)?,
-                action: row.get(4)?,
-                file_id: row.get(5)?,
-                tag_id: row.get(6)?,
-                before_json: row.get(7)?,
-                after_json: row.get(8)?,
-                reason: row.get(9)?,
+                action: row.get(3)?,
+                file_id: row.get(4)?,
+                tag_id: row.get(5)?,
+                reason: row.get(6)?,
             })
         }) else {
             return Vec::new();
