@@ -63,7 +63,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let heavy_processing_pool = Arc::new(
         ThreadPoolBuilder::new()
-            .num_threads(2)
             .thread_name(|index| format!("intscrape-processing-{index}"))
             .build()?,
     );

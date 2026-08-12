@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use walkdir::WalkDir;
 
 use crate::db::roaring::InternalCacheType;
@@ -535,11 +536,12 @@ CREATE INDEX IF NOT EXISTS idx_tag_id_file_id ON Relationship(tag_id, file_id DE
         let mut stmt = conn
             .prepare(
                 "SELECT t.id, t.name, t.count
-                 FROM Tags t",
+                 FROM Tags t
+                 WHERE t.count >= ?1",
             )
             .unwrap();
         let entries = stmt
-            .query_map([], |row| {
+            .query_map([tag_search::high_value_count()], |row| {
                 Ok(tag_search::tag_entry(
                     row.get(0)?,
                     row.get::<_, String>(1)?.as_str(),
@@ -706,9 +708,7 @@ END;
                     }
 
                     let matching_ids = self
-                        .tag_search_cache
-                        .read()
-                        .search(tag_name, 100)
+                        .search_db_tags_fts(tag_name, &Some(100))
                         .into_iter()
                         .map(|result| result.tag_id)
                         .collect::<Vec<_>>();
@@ -1432,6 +1432,7 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     #[must_use]
     #[ipc(name = "put_tags_to_file", request = "PutTagsRelationship")]
     pub fn file_relationship_tags_add_sync(&self, file_id: &u64, tag: &[FileTagAction]) -> bool {
+        let started = std::time::Instant::now();
         let mut guard = self.writer_conn.lock();
         let conn = guard.transaction().unwrap();
 
@@ -1441,6 +1442,16 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
         Self::internal_relationship_bulk_add(Arc::new(self.clone()), &conn, &relationships);
 
         conn.commit().unwrap();
+
+        let elapsed = started.elapsed();
+        if elapsed >= std::time::Duration::from_millis(100) {
+            info!(
+                "Performance: relationship tag update file_id={} tags={} elapsed={:?}",
+                file_id,
+                tag.len(),
+                elapsed,
+            );
+        }
 
         true
     }
@@ -2470,17 +2481,8 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             return;
         }
 
-        // adds relationships between roaring
-        {
-            let mut guard = self.relationship_roaring_storage.write();
-            if let Some(roaring) = guard.as_mut() {
-                for (file_id, tag_id) in relationships {
-                    roaring.relationship_roaring_add(conn, *file_id, *tag_id);
-                }
-            }
-        }
-
         let relationships_vec: Vec<&(u64, u64)> = relationships.iter().collect();
+        let mut inserted_relationships = 0;
 
         for chunk in relationships_vec.chunks(SQL_CHUNK_SIZE) {
             let mut query =
@@ -2497,12 +2499,27 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                 params_vector.push(&relationship.1);
             }
 
-            if let Err(e) = conn.execute(&query, &*params_vector) {
-                log::error!("Failed to bulk insert relationships: {e}");
-                return;
+            match conn.execute(&query, &*params_vector) {
+                Ok(inserted) => inserted_relationships += inserted,
+                Err(e) => {
+                    log::error!("Failed to bulk insert relationships: {e}");
+                    return;
+                }
             }
         }
-        self.reload_tag_search_cache(conn);
+
+        // Duplicate relationship updates are common when a known file is
+        // encountered again. Avoid rewriting roaring blobs in that case.
+        if inserted_relationships > 0 {
+            let mut guard = self.relationship_roaring_storage.write();
+            if let Some(roaring) = guard.as_mut() {
+                for (file_id, tag_id) in relationships {
+                    roaring.relationship_roaring_add(conn, *file_id, *tag_id);
+                }
+            }
+
+            self.reload_tag_search_cache(conn);
+        }
     }
 
     ///
@@ -3372,7 +3389,6 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     #[ipc(name = "search_db_files", request = "SearchFiles")]
     pub fn search_db_files_sync(&self, search: &SearchObj, limit: &Option<u64>) -> Vec<u64> {
         use rusqlite::params_from_iter;
-        use std::time::Instant;
 
         let _start_time = Instant::now();
 
