@@ -8,6 +8,7 @@ use std::{
 use crate::{
     db::MainDatabase, ipc::IpcServer, plugins::PluginManager, web::manager::DownloadsManager,
 };
+use rayon::ThreadPoolBuilder;
 
 pub mod cli;
 pub mod db;
@@ -45,7 +46,7 @@ fn setup_log() -> Result<(), Box<dyn Error>> {
                     .to_str()
                     .ok_or("Failed to convert log_path to string")?,
             )
-            .chan_len(Some(16384)),
+            .chan_len(Some(4096)),
     )?;
     Ok(())
 }
@@ -60,7 +61,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     setup_log()?;
 
-    let heavy_processing_pool = Arc::new(rayon::ThreadPoolBuilder::new().build()?);
+    let heavy_processing_pool = Arc::new(
+        ThreadPoolBuilder::new()
+            .num_threads(2)
+            .thread_name(|index| format!("intscrape-processing-{index}"))
+            .build()?,
+    );
 
     let db = MainDatabase::new(Path::new(DB_PATH));
 

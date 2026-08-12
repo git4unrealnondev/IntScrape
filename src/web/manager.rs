@@ -31,6 +31,7 @@ use tokio::{
 };
 
 const MAX_CONCURRENT_DOWNLOADS: usize = 5;
+const MAX_CONCURRENT_PROCESSING: usize = 2;
 const MAX_DOWNLOAD_RETRIES: u8 = 3;
 
 fn retry_delay(attempt: u8) -> Duration {
@@ -133,6 +134,7 @@ pub struct DownloadsManager {
     jobs: RwLock<HashMap<String, InternalStorage>>,
     heavy_processing_pool: Arc<ThreadPool>,
     job_limiter: Arc<Semaphore>,
+    processing_limiter: Arc<Semaphore>,
     should_exit: Arc<AtomicBool>,
 }
 
@@ -881,55 +883,67 @@ impl Scraper {
         let mut jobs_owned = jobs.clone();
 
         let temp_file_path = temp_file.path().to_path_buf();
+        let processing_permit = self
+            .download_manager
+            .processing_limiter
+            .clone()
+            .acquire_owned()
+            .await?;
+        let processing_pool = self.download_manager.heavy_processing_pool.clone();
+        let db = self.download_manager.db.clone();
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
 
-        // RUN EVERYTHING HEAVY SEQUENTIALLY ON THE THREAD POOL
-        let processed = tokio::task::spawn_blocking(move || {
-            // Read the temporary file once for hashing, format detection, and callbacks.
-            let bytes = Bytes::from(
-                std::fs::read(&temp_file_path)
-                    .map_err(|error| format!("failed to read temporary file: {error}"))?,
-            );
+        // Run CPU-heavy hashing and plugin callbacks on the bounded Rayon pool.
+        processing_pool.spawn(move || {
+            let _processing_permit = processing_permit;
+            let result = (|| {
+                // Read the temporary file once for hashing, format detection, and callbacks.
+                let bytes = Bytes::from(
+                    std::fs::read(&temp_file_path)
+                        .map_err(|error| format!("failed to read temporary file: {error}"))?,
+                );
 
-            // 2. Compute format and layout
-            let hash = hash_bytes(&bytes, &HashesSupported::Sha512(String::new())).0;
-            let extension = FileFormat::from_bytes(&bytes).extension().to_string();
+                // 2. Compute format and layout
+                let hash = hash_bytes(&bytes, &HashesSupported::Sha512(String::new())).0;
+                let extension = FileFormat::from_bytes(&bytes).extension().to_string();
 
-            let file_download_location = self
-                .download_manager
-                .db
-                .file_download_location_get_sync(&hash, &extension);
+                let file_download_location = db.file_download_location_get_sync(&hash, &extension);
 
-            // 3. Fire your dynamic plugin boundary (.so loading boundary takes a slice safely)
-            plugin_manager.callback_on_download(&bytes, &mut tags_owned, &mut jobs_owned);
+                // 3. Fire your dynamic plugin boundary (.so loading boundary takes a slice safely)
+                plugin_manager.callback_on_download(&bytes, &mut tags_owned, &mut jobs_owned);
 
-            // 4. Save file out to its designated destination location path context
-            if let Some((file_storage_path, storage_id_db)) = file_download_location
-                && let Some(parent_dir) = file_storage_path.parent()
-            {
-                std::fs::create_dir_all(parent_dir)
-                    .map_err(|error| format!("failed to create storage directory: {error}"))?;
+                // 4. Save file out to its designated destination location path context
+                if let Some((file_storage_path, storage_id_db)) = file_download_location
+                    && let Some(parent_dir) = file_storage_path.parent()
+                {
+                    std::fs::create_dir_all(parent_dir)
+                        .map_err(|error| format!("failed to create storage directory: {error}"))?;
 
-                let staging_path = file_storage_path.with_extension("part");
-                if std::fs::rename(&temp_file_path, &staging_path).is_err() {
-                    std::fs::copy(&temp_file_path, &staging_path)
-                        .map_err(|error| format!("failed to stage file: {error}"))?;
+                    let staging_path = file_storage_path.with_extension("part");
+                    if std::fs::rename(&temp_file_path, &staging_path).is_err() {
+                        std::fs::copy(&temp_file_path, &staging_path)
+                            .map_err(|error| format!("failed to stage file: {error}"))?;
+                    }
+                    std::fs::rename(&staging_path, &file_storage_path)
+                        .map_err(|error| format!("failed to finalize file: {error}"))?;
+                    let storage_id = storage_id_db;
+                    return Ok::<_, String>((
+                        hash,
+                        extension,
+                        Some(storage_id),
+                        tags_owned,
+                        jobs_owned,
+                    ));
+                } else {
+                    return Err("no file storage location configured".to_string());
                 }
-                std::fs::rename(&staging_path, &file_storage_path)
-                    .map_err(|error| format!("failed to finalize file: {error}"))?;
-                let storage_id = storage_id_db;
-                return Ok::<_, String>((
-                    hash,
-                    extension,
-                    Some(storage_id),
-                    tags_owned,
-                    jobs_owned,
-                ));
-            } else {
-                return Err("no file storage location configured".to_string());
-            }
-        })
-        .await
-        .map_err(|error| format!("file processing task failed: {error}"))??;
+            })();
+            let _ = result_sender.send(result);
+        });
+
+        let processed = result_receiver
+            .await
+            .map_err(|_| "file processing task failed: processing pool stopped")??;
 
         let (hash, extension, storage_id_result, final_tags, final_jobs) = processed;
 
@@ -988,6 +1002,7 @@ impl DownloadsManager {
             jobs: HashMap::new().into(),
             heavy_processing_pool,
             job_limiter: Arc::new(Semaphore::new(3)),
+            processing_limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_PROCESSING)),
             should_exit,
         };
 

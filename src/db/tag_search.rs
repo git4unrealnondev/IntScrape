@@ -13,8 +13,8 @@ pub(crate) struct TagEntry {
 
 struct CompactTagEntry {
     tag_id: u64,
-    name_start: u32,
-    name_len: u32,
+    name_start: usize,
+    name_len: usize,
     count: u64,
 }
 
@@ -29,12 +29,12 @@ impl TagSearchCache {
         let mut compact_entries = Vec::with_capacity(entries.len());
         let mut names = Vec::new();
         for entry in entries {
-            let name_start = names.len() as u32;
+            let name_start = names.len();
             names.extend_from_slice(entry.normalized_name.as_bytes());
             compact_entries.push(CompactTagEntry {
                 tag_id: entry.tag_id,
                 name_start,
-                name_len: entry.normalized_name.len() as u32,
+                name_len: entry.normalized_name.len(),
                 count: entry.count,
             });
         }
@@ -52,7 +52,9 @@ impl TagSearchCache {
 
         let mut matches = Vec::with_capacity(limit);
         for entry in &self.entries {
-            let name = self.entry_name(entry);
+            let Some(name) = self.entry_name(entry) else {
+                continue;
+            };
             if let Some(score) = match_score(&normalized_query, name) {
                 if matches.len() < limit {
                     matches.push((entry, score));
@@ -86,11 +88,10 @@ impl TagSearchCache {
             .collect()
     }
 
-    fn entry_name<'a>(&'a self, entry: &CompactTagEntry) -> &'a str {
-        std::str::from_utf8(
-            &self.names[entry.name_start as usize..(entry.name_start + entry.name_len) as usize],
-        )
-        .expect("normalized tag names are valid UTF-8")
+    fn entry_name<'a>(&'a self, entry: &CompactTagEntry) -> Option<&'a str> {
+        let end = entry.name_start.checked_add(entry.name_len)?;
+        let bytes = self.names.get(entry.name_start..end)?;
+        std::str::from_utf8(bytes).ok()
     }
 }
 
@@ -237,6 +238,21 @@ mod tests {
 
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].tag_id, 9999);
+    }
+
+    #[test]
+    fn compact_cache_ignores_invalid_name_ranges() {
+        let cache = TagSearchCache {
+            entries: vec![CompactTagEntry {
+                tag_id: 42,
+                name_start: usize::MAX,
+                name_len: 312,
+                count: 1,
+            }],
+            names: b"valid".to_vec(),
+        };
+
+        assert!(cache.search("valid", 1).is_empty());
     }
 }
 

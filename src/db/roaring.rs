@@ -249,14 +249,15 @@ impl RelationshipStorage {
 
     /// Loads entire relationships into db
     pub(in crate::db) fn load_relationship_cache(&mut self, conn: &Connection) {
+        // Table mode reads the roaring tables on demand and must not preload them.
+        if matches!(self.internal_cache, InternalCacheType::Table) {
+            return;
+        }
+
         info!(
             "Relationship Roaring is loading data in from the db table: {:?}",
             self.internal_cache
         );
-        // No need to load this
-        if matches!(self.internal_cache, InternalCacheType::Table) {
-            return;
-        }
 
         let params;
         let sql = if let InternalCacheType::Popular(ref popular_count) = self.internal_cache {
@@ -710,6 +711,23 @@ mod tests {
             storage.relationship_search_tagid_roaring(&conn, 42),
             vec![7]
         );
+    }
+
+    #[test]
+    fn loading_table_cache_does_not_preload_relationships() {
+        let (mut storage, conn) = test_storage(InternalCacheType::Table);
+
+        storage.relationship_roaring_add(&conn, 42, 7);
+        storage.load_relationship_cache(&conn);
+
+        let cached_rows: u64 = conn
+            .query_row("SELECT count(*) FROM RelationshipRoaringTagid", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(cached_rows, 1);
+        assert!(storage.tag_id.is_empty());
+        assert!(storage.file_id.is_empty());
     }
 
     #[test]
