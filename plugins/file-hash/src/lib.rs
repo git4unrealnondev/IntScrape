@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     error::Error,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -65,12 +65,17 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let pool = threadpool::Builder::new().build();
+    let pending_tags = Arc::new(Mutex::new(HashMap::<u64, Vec<FileTagAction>>::new()));
 
     for (idx, (file_id, tables)) in total_file_ids.iter().enumerate() {
         // Stop scheduling new work immediately if exit is requested
 
         if idx % 100 == 0 {
             pool.join();
+            let batch = std::mem::take(&mut *pending_tags.lock().unwrap());
+            if !batch.is_empty() && client::put_tags_to_files(batch).is_err() {
+                let _ = client::log_silent("FileHash: Failed to write tag batch.".into());
+            }
             let _ = client::log_silent(format!("FileHash: Processed {} files.", idx));
             if let Ok(result) = client::should_exit()
                 && result
@@ -82,6 +87,7 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
 
         let file_id = *file_id;
         let tables = tables.clone();
+        let pending_tags = pending_tags.clone();
 
         pool.execute(move || {
             if !tables.is_empty()
@@ -107,7 +113,7 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
                         ));*/
                     }
                 }
-                let _ = client::put_tags_to_file(
+                pending_tags.lock().unwrap().insert(
                     file_id,
                     vec![FileTagAction {
                         operation: shared_types::TagOperation::Set,
@@ -119,6 +125,10 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
     }
 
     pool.join();
+    let batch = std::mem::take(&mut *pending_tags.lock().unwrap());
+    if !batch.is_empty() && client::put_tags_to_files(batch).is_err() {
+        let _ = client::log_silent("FileHash: Failed to write final tag batch.".into());
+    }
     let _ = client::log_silent(format!("FileHash: Finished processing files.",));
 
     if !cancel_flag.load(Ordering::Relaxed) && !client::should_exit()? {

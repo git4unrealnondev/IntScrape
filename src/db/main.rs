@@ -3179,6 +3179,27 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         .await
         .unwrap();
     }
+
+    pub async fn complete_system_job(&self, job: &DbJobsObj) {
+        let mut next = job.clone();
+        next.config.time = get_sys_time_in_secs();
+        next.isrunning = false;
+
+        if let Some(DbJobRecreation::AlwaysTime(interval, count)) = next.config.recreation.clone() {
+            if let Some(remaining) = count {
+                if remaining == 0 {
+                    self.job_remove(job).await;
+                    return;
+                }
+                next.config.recreation =
+                    Some(DbJobRecreation::AlwaysTime(interval, Some(remaining - 1)));
+            }
+            next.config.reptime = interval;
+            self.jobs_update(&next).await;
+        } else {
+            self.job_remove(job).await;
+        }
+    }
     ///
     /// Checks if we should download the file or not
     ///

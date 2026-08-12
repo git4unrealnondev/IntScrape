@@ -827,11 +827,12 @@ impl Scraper {
                                 "Scraper: {} JobId: {} Skipping file_id {} because URL: {} already in db.",
                                 self.plugin.name, self.job.id, file_id, file_url
                             );
-                            return Ok(self.download_manager.db.file_id_get(file_id).await.map(
-                                |f| {
-                                    FileReturn::File(f)
-                                },
-                            ));
+                            return Ok(self
+                                .download_manager
+                                .db
+                                .file_id_get(file_id)
+                                .await
+                                .map(|f| FileReturn::File(f)));
                         } else {
                             if self.should_download_file(file_url).await {
                                 // Calls disk streaming download helper

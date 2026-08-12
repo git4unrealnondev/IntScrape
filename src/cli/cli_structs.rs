@@ -143,6 +143,24 @@ pub enum Database {
     AddExtensions,
     /// Recaches the in-memory db.
     RecacheRoaring,
+    /// Schedules recurring database backups through the standard job system.
+    ScheduleBackup(ScheduleBackup),
+}
+
+#[derive(Debug, Parser)]
+pub struct ScheduleBackup {
+    /// Root folder for backups. Each backup is written to root/year/month/day/main.db.
+    #[arg(long)]
+    pub destination: String,
+    /// First execution delay, such as `now`, `1h`, or `1d`.
+    #[arg(long)]
+    pub time: String,
+    /// Recurrence interval in seconds.
+    #[arg(long)]
+    pub every: u64,
+    /// Number of additional executions. Omit for unlimited recursion.
+    #[arg(long)]
+    pub count: Option<u64>,
 }
 /// Removes a namespace, tags & relationships from db.
 #[derive(Debug, Subcommand)]

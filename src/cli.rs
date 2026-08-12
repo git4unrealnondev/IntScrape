@@ -503,6 +503,23 @@ pub async fn main(db: Arc<MainDatabase>) {
                     Database::RecacheRoaring => {
                         db.recache_roaring_db();
                     }
+                    Database::ScheduleBackup(backup) => {
+                        db.jobs_add_single(shared_types::PluginJob {
+                            time: helper_functions::get_sys_time_in_secs(),
+                            reptime: time_conv(&backup.time),
+                            priority: u64::MAX,
+                            site: crate::db::SYSTEM_DATABASE_BACKUP_SITE.to_string(),
+                            param: vec![shared_types::ScraperParam::Normal(
+                                backup.destination.clone(),
+                            )],
+                            user_data: BTreeMap::new(),
+                            recreation: Some(shared_types::DbJobRecreation::AlwaysTime(
+                                backup.every,
+                                backup.count,
+                            )),
+                        })
+                        .await;
+                    }
                     _ => {}
                 }
                 /* let dbstore = data.clone();

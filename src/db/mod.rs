@@ -16,6 +16,8 @@ pub mod roaring;
 mod tag_search;
 mod update_handler;
 
+pub const SYSTEM_DATABASE_BACKUP_SITE: &str = "__system_database_backup__";
+
 pub enum CacheType {
     // Will be use to query the DB directly. No caching. DEFAULT OPTION
     Bare,
@@ -90,6 +92,29 @@ PRAGMA cache_size = -64000;
         if let Err(e) = guard.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
             log::error!("Failed to checkpoint WAL file during drop: {e:?}");
         }
+    }
+
+    /// Creates or replaces an online SQLite backup at `destination`.
+    pub fn backup_db_to(&self, destination: &Path) -> Result<(), r2d2_sqlite::rusqlite::Error> {
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                r2d2_sqlite::rusqlite::Error::ToSqlConversionFailure(error.into())
+            })?;
+        }
+
+        let temporary = destination.with_extension("backup.tmp");
+        let _ = std::fs::remove_file(&temporary);
+        let temporary_string = temporary.to_string_lossy().into_owned();
+        let guard = self.writer_conn.lock();
+        guard.execute(
+            "VACUUM INTO ?1",
+            r2d2_sqlite::rusqlite::params![temporary_string],
+        )?;
+        drop(guard);
+
+        std::fs::rename(&temporary, destination)
+            .map_err(|error| r2d2_sqlite::rusqlite::Error::ToSqlConversionFailure(error.into()))?;
+        Ok(())
     }
 
     ///
