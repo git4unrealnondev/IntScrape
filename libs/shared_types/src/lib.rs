@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 pub const DEFAULT_PRIORITY: u64 = 10;
+pub const SQL_CHUNK_SIZE: u64 = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct AuditLogEntry {

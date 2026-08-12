@@ -8,8 +8,7 @@ use std::{
 
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use shared_types::{
-    CallbackCustomData, CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks,
-    PluginTag, Tag,
+    CallbackCustomData, CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks, PluginTag, SQL_CHUNK_SIZE, Tag
 };
 
 use thumbnailer::{ThumbnailSize, create_thumbnails_dynamic};
@@ -53,10 +52,9 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    const BATCH_SIZE: usize = 100;
     let mut completed = true;
 
-    for batch in total_file_ids.chunks(BATCH_SIZE) {
+    for batch in total_file_ids.chunks(SQL_CHUNK_SIZE as usize) {
         let processed = batch
             .par_iter()
             .try_fold(Vec::new, |mut pending, file_id| {

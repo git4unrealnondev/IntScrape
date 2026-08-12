@@ -9,7 +9,7 @@ use std::{
 
 use client::setting_get;
 use shared_types::{
-    CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks, PluginTag, Tag,
+    CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks, PluginTag, Tag,SQL_CHUNK_SIZE
 };
 
 const LISTOFSUPSET: [Supset; 7] = [
@@ -70,7 +70,7 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
     for (idx, (file_id, tables)) in total_file_ids.iter().enumerate() {
         // Stop scheduling new work immediately if exit is requested
 
-        if idx % 100 == 0 {
+        if idx % SQL_CHUNK_SIZE as usize == 0 {
             pool.join();
             let batch = std::mem::take(&mut *pending_tags.lock().unwrap());
             if !batch.is_empty() && client::put_tags_to_files(batch).is_err() {
