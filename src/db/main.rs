@@ -1433,22 +1433,34 @@ SELECT DISTINCT file_id FROM Relationship WHERE tag_id in (
     #[ipc(name = "put_tags_to_file", request = "PutTagsRelationship")]
     pub fn file_relationship_tags_add_sync(&self, file_id: &u64, tag: &[FileTagAction]) -> bool {
         let started = std::time::Instant::now();
+        let lock_started = std::time::Instant::now();
         let mut guard = self.writer_conn.lock();
+        let writer_lock_elapsed = lock_started.elapsed();
+        let transaction_started = std::time::Instant::now();
         let conn = guard.transaction().unwrap();
+        let transaction_begin_elapsed = transaction_started.elapsed();
 
         Self::internal_audit_context_set(&conn, "relationship added").unwrap();
+        let tag_started = std::time::Instant::now();
         let tag_map = Self::internal_tag_bulk_add(&conn, tag, self.plugin_manager.clone());
+        let tag_elapsed = tag_started.elapsed();
         let relationships: HashSet<(u64, u64)> = tag_map.values().map(|f| (*file_id, *f)).collect();
+        let relationship_started = std::time::Instant::now();
         Self::internal_relationship_bulk_add(Arc::new(self.clone()), &conn, &relationships);
+        let relationship_elapsed = relationship_started.elapsed();
 
         conn.commit().unwrap();
 
         let elapsed = started.elapsed();
         if elapsed >= std::time::Duration::from_millis(100) {
             info!(
-                "Performance: relationship tag update file_id={} tags={} elapsed={:?}",
+                "Performance: relationship tag update file_id={} tags={} writer_lock={:?} transaction_begin={:?} tag_resolution={:?} relationship_write={:?} commit_total={:?}",
                 file_id,
                 tag.len(),
+                writer_lock_elapsed,
+                transaction_begin_elapsed,
+                tag_elapsed,
+                relationship_elapsed,
                 elapsed,
             );
         }

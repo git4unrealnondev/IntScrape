@@ -7,7 +7,7 @@ use std::{
     env::temp_dir,
     io::{Write, stdin, stdout},
     sync::{Arc, atomic::AtomicBool},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tempfile::NamedTempFile;
 use url::Url;
@@ -764,7 +764,6 @@ impl Scraper {
         jobs: &mut Vec<ScraperDataReturn>,
         download_issue: &mut bool,
     ) -> Result<Option<FileReturn>, Box<dyn Error>> {
-        let file_started = Instant::now();
         let plugin_manager = self.download_manager.plugin_manager.clone();
         let self_clone = self.clone();
 
@@ -796,25 +795,6 @@ impl Scraper {
         if let Some(ref hash) = file.hash
             && let Some(file_internal) = self.download_manager.db.contains_hash_sync(hash)
         {
-            let hash_lookup_elapsed = file_started.elapsed();
-            let relationship_started = Instant::now();
-            if let Some(file_id) = file_internal.id {
-                let _ = self
-                    .download_manager
-                    .db
-                    .file_relationship_tags_add_sync(&file_id, &file.tag_list);
-            }
-            let relationship_elapsed = relationship_started.elapsed();
-            let total_elapsed = file_started.elapsed();
-            if total_elapsed >= Duration::from_millis(100) {
-                info!(
-                    "Performance: duplicate file hash lookup={} relationship update={} total={} file_id={}",
-                    format_duration(hash_lookup_elapsed),
-                    format_duration(relationship_elapsed),
-                    format_duration(total_elapsed),
-                    file_internal.id.unwrap_or(0),
-                );
-            }
             info!(
                 "Scraper: {} JobId: {} Skipping file_id {} because hash: {:?} already in db.",
                 self.plugin.name,
@@ -849,12 +829,6 @@ impl Scraper {
                             );
                             return Ok(self.download_manager.db.file_id_get(file_id).await.map(
                                 |f| {
-                                    if let Some(id) = f.id {
-                                        let _ = self
-                                            .download_manager
-                                            .db
-                                            .file_relationship_tags_add_sync(&id, &file.tag_list);
-                                    }
                                     FileReturn::File(f)
                                 },
                             ));
@@ -1000,14 +974,6 @@ impl Scraper {
                 ..Default::default()
             }],
         });
-    }
-}
-
-fn format_duration(duration: Duration) -> String {
-    if duration >= Duration::from_secs(1) {
-        format!("{:.3}s", duration.as_secs_f64())
-    } else {
-        format!("{:.3}ms", duration.as_secs_f64() * 1_000.0)
     }
 }
 
