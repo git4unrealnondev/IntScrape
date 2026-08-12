@@ -164,7 +164,10 @@ impl RelationshipStorage {
             .unwrap();
         tn.execute("DELETE FROM RelationshipRoaringFileid", [])
             .unwrap();
-        let mut stmt = tn.prepare("SELECT CAST(file_id AS INTEGER), CAST(tag_id AS INTEGER) FROM Relationship ORDER BY file_id")?;
+        let mut stmt = tn.prepare(&format!(
+            "SELECT CAST(file_id AS INTEGER), CAST(tag_id AS INTEGER) FROM {} ORDER BY file_id",
+            MainDatabase::relationship_union_source(tn, "r")
+        ))?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, u64>(0).unwrap(), row.get::<_, u64>(1).unwrap()))
@@ -213,7 +216,10 @@ impl RelationshipStorage {
             }
         }
 
-        let mut stmt = tn.prepare("SELECT CAST(file_id AS INTEGER), CAST(tag_id AS INTEGER) FROM Relationship ORDER BY tag_id")?;
+        let mut stmt = tn.prepare(&format!(
+            "SELECT CAST(file_id AS INTEGER), CAST(tag_id AS INTEGER) FROM {} ORDER BY tag_id",
+            MainDatabase::relationship_union_source(tn, "r")
+        ))?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)))?;
 
         processed = 0;

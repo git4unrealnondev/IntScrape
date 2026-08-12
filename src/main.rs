@@ -27,7 +27,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 const DB_PATH: &str = "main.db";
 const LOG_PATH: &str = "log.txt";
 pub const PLUGINS_PATH: &str = "compiled_plugins";
-const DB_VERSION: u64 = 3;
+const DB_VERSION: u64 = 4;
 
 ///
 /// Sets up logging in the environment
@@ -206,6 +206,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
 
     spawner.await?;
+
+    // Ctrl-C stops new work first; allow active downloads to finish and release
+    // their in-progress URL guards before the manager is dropped.
+    while !download_manager.downloads_complete().await {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     // Ensures that everything gets dropped properly
     drop(plugin_manager);

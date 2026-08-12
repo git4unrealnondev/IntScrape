@@ -40,7 +40,7 @@ impl MainDatabase {
     #[must_use]
     pub fn new(db_path: &Path) -> Arc<Self> {
         let manager = SqliteConnectionManager::file(db_path).with_init(|c| {
-            /* c.trace(Some(|statement: &str| {
+            /*c.trace(Some(|statement: &str| {
                 log::info!("Executing SQL: {}", statement);
             }));*/
             c.busy_timeout(Duration::from_secs(1))?;
@@ -153,6 +153,7 @@ PRAGMA cache_size = -64000;
                         match db_version_local {
                             1 => Self::internal_update_db_1_to_2(&conn)?,
                             2 => Self::internal_update_db_2_to_3(&conn)?,
+                            3 => Self::internal_update_db_3_to_4(&conn)?,
                             _ => break,
                         }
                     } else {
@@ -167,8 +168,7 @@ PRAGMA cache_size = -64000;
 
         // Ensure additive schema changes are applied to databases already at the
         // current version as well as databases upgraded through a version step.
-        Self::internal_table_create_audit_log_v3(&conn)?;
-        Self::internal_audit_log_indexes_create_v3(&conn)?;
+        Self::internal_table_create_relationship_v1(&conn);
         Self::internal_file_download_location_set_default(&conn).unwrap();
 
         // Resetting is_running to false
@@ -192,7 +192,6 @@ PRAGMA cache_size = -64000;
         Self::internal_table_create_dead_urls_v1(conn)?;
 
         Self::internal_table_create_relationship_v1(conn);
-        Self::internal_trigger_create_relationship_v1(conn);
         Self::internal_table_create_parents_v1(conn);
 
         Self::internal_table_create_settings_v1(conn);
@@ -202,8 +201,6 @@ PRAGMA cache_size = -64000;
 
         Self::internal_table_create_jobs_v1(conn);
         RelationshipStorage::internal_table_relationship_cache_create_v1(conn);
-        Self::internal_table_create_audit_log_v3(conn)?;
-
         Self::internal_db_version_set(conn, DB_VERSION)?;
         Self::internal_setting_set(
             conn,

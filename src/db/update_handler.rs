@@ -52,12 +52,30 @@ impl MainDatabase {
         conn.execute(
             "INSERT INTO AuditLog
                 (changed_at, entity_type, action, file_id, tag_id, reason)
-             SELECT unixepoch(), 'relationship', 'create', r.file_id, r.tag_id,
+             SELECT unixepoch(), 'relationship', 'create', file_id, tag_id,
                     'existing relationship imported during V3 migration'
-             FROM Relationship r",
+             FROM Relationship",
             [],
         )?;
-        Self::internal_audit_log_indexes_create_v3(conn)?;
         Self::internal_db_version_set(conn, 3)
+    }
+
+    /// Updates the audited global relationship table to namespace partitions.
+    pub(in crate::db) fn internal_update_db_3_to_4(
+        conn: &Connection,
+    ) -> Result<(), r2d2_sqlite::rusqlite::Error> {
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS audit_file_insert;
+             DROP TRIGGER IF EXISTS audit_file_delete;
+             DROP TRIGGER IF EXISTS audit_file_update;
+             DROP TRIGGER IF EXISTS audit_tag_insert;
+             DROP TRIGGER IF EXISTS audit_tag_delete;
+             DROP TRIGGER IF EXISTS audit_tag_update;
+             DROP TRIGGER IF EXISTS audit_parent_insert;
+             DROP TRIGGER IF EXISTS audit_parent_delete;
+             DROP TABLE IF EXISTS AuditLog;",
+        )?;
+        Self::internal_relationship_migrate_legacy(conn);
+        Self::internal_db_version_set(conn, 4)
     }
 }

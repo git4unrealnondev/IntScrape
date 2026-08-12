@@ -132,6 +132,7 @@ pub struct DownloadsManager {
     pub db: Arc<MainDatabase>,
     plugin_manager: Arc<PluginManager>,
     jobs: RwLock<HashMap<String, InternalStorage>>,
+    downloading_urls: RwLock<HashSet<String>>,
     heavy_processing_pool: Arc<ThreadPool>,
     job_limiter: Arc<Semaphore>,
     processing_limiter: Arc<Semaphore>,
@@ -531,26 +532,19 @@ impl Scraper {
     /// Checks the internal storage to see if we should download a file
     ///
     async fn should_download_file(&self, url: &str) -> bool {
-        let mut jobs_guard = self.download_manager.jobs.write().await;
-
-        if let Some(internal_storage) = jobs_guard.get_mut(&self.plugin.name) {
-            return internal_storage.file_urls.insert(url.to_string());
-        }
-
-        // Fallback or handle if internal_storage doesn't exist
-        false
+        self.download_manager
+            .downloading_urls
+            .write()
+            .await
+            .insert(url.to_string())
     }
 
     async fn release_download_file(&self, url: &str) {
-        if let Some(internal_storage) = self
-            .download_manager
-            .jobs
+        self.download_manager
+            .downloading_urls
             .write()
             .await
-            .get_mut(&self.plugin.name)
-        {
-            internal_storage.file_urls.remove(url);
-        }
+            .remove(url);
     }
 
     async fn download_file(
@@ -665,7 +659,30 @@ impl Scraper {
 
             // Stream network chunks straight to disk (Constantly uses ~8KB to 64KB max per active task)
             loop {
-                match response.chunk().await {
+                if self
+                    .download_manager
+                    .should_exit
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    let _ = tokio::fs::remove_file(&temp_file).await;
+                    return None;
+                }
+                let chunk = tokio::select! {
+                    chunk = response.chunk() => chunk,
+                    _ = async {
+                        while !self
+                            .download_manager
+                            .should_exit
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                        {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    } => {
+                        let _ = tokio::fs::remove_file(&temp_file).await;
+                        return None;
+                    }
+                };
+                match chunk {
                     Ok(Some(chunk)) => {
                         downloaded_bytes_count += chunk.len();
                         if let Some(hasher) = hasher.as_mut() {
@@ -746,6 +763,13 @@ impl Scraper {
             }
 
             if cnt >= MAX_DOWNLOAD_RETRIES {
+                break;
+            }
+            if self
+                .download_manager
+                .should_exit
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
                 break;
             }
             tokio::time::sleep(retry_delay(cnt)).await;
@@ -989,6 +1013,7 @@ impl DownloadsManager {
             db,
             plugin_manager,
             jobs: HashMap::new().into(),
+            downloading_urls: HashSet::new().into(),
             heavy_processing_pool,
             job_limiter: Arc::new(Semaphore::new(3)),
             processing_limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_PROCESSING)),
@@ -1062,6 +1087,10 @@ impl DownloadsManager {
     ///
     pub async fn all_jobs_complete(&self) -> bool {
         self.jobs.read().await.is_empty()
+    }
+
+    pub async fn downloads_complete(&self) -> bool {
+        self.downloading_urls.read().await.is_empty()
     }
 
     ///
