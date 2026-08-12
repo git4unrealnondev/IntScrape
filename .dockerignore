@@ -1,0 +1,5 @@
+compiled_plugins
+target
+.git
+*.db
+*.json

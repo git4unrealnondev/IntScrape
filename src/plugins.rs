@@ -96,12 +96,41 @@ impl PluginManager {
     }
 
     fn load_libs(&self, path: &Path) {
+        let ignored_plugins = std::env::var("INTSCRAPE_IGNORE_PLUGINS")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+
+        if !ignored_plugins.is_empty() {
+            info!("Ignoring plugins: {:?}", ignored_plugins);
+        }
+
         for entry in fs::read_dir(path).unwrap().flatten() {
             let path = entry.path();
 
             let extension = path.extension().and_then(|s| s.to_str());
             match extension {
                 Some("so" | "dll" | "dylib") => {
+                    let library_name = path
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default()
+                        .strip_prefix("lib")
+                        .unwrap_or_default()
+                        .replace('_', "-");
+
+                    if ignored_plugins.contains(&library_name) {
+                        info!("Skipping ignored plugin library: {:?}", path.file_name());
+                        continue;
+                    }
+
                     info!("🚚 Found plugin candidate: {:?}", path.file_name().unwrap());
 
                     unsafe {
@@ -109,6 +138,11 @@ impl PluginManager {
 
                         if let Some(plugins) = self.get_info(&lib, path) {
                             for plugin in plugins {
+                                if ignored_plugins.contains(&plugin.name) {
+                                    info!("Skipping ignored plugin: {:?}", plugin.name);
+                                    continue;
+                                }
+
                                 info!("Loaded Plugin Name: {:?}", plugin.name);
                                 self.storage_libs
                                     .write()
