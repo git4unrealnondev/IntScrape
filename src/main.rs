@@ -64,8 +64,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let db = MainDatabase::new(Path::new(DB_PATH));
 
+    let plugins_path =
+        std::env::var("INTSCRAPE_PLUGINS_PATH").unwrap_or_else(|_| PLUGINS_PATH.to_owned());
     let plugin_manager =
-        PluginManager::new(Path::new(PLUGINS_PATH), db.clone(), should_exit.clone());
+        PluginManager::new(Path::new(&plugins_path), db.clone(), should_exit.clone());
     db.set_plugin_manager(plugin_manager.clone());
 
     let download_manager = DownloadsManager::new(
