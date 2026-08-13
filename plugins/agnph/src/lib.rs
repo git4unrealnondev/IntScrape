@@ -355,7 +355,7 @@ pub fn parser_call(
             {
                 files.insert(FileObject {
                     source: Some(FileSource::Url(format!("https://agn.ph{}", url))),
-                    hash: Some(HashesSupported::Md5(md5_text.to_string())),
+                    hash: vec![HashesSupported::Md5(md5_text.to_string())],
                     tag_list,
                     skip_if: vec![SkipIf::FileTagRelationship(Tag {
                         name: md5_text.to_string(),

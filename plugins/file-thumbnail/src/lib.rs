@@ -8,7 +8,8 @@ use std::{
 
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use shared_types::{
-    CallbackCustomData, CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks, PluginTag, SQL_CHUNK_SIZE, Tag
+    CallbackCustomData, CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks,
+    PluginTag, SQL_CHUNK_SIZE, Tag,
 };
 
 use thumbnailer::{ThumbnailSize, create_thumbnails_dynamic};
@@ -43,7 +44,7 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
     match client::namespace_get("file_thumbnail".to_string()) {
         Ok(Some(ns_id)) => {
             if let Ok(namespace_file_ids) = client::get_namespace_file_ids(ns_id) {
-                total_file_ids.retain_mut(|f| !namespace_file_ids.contains(f));
+                total_file_ids.retain(|f| !namespace_file_ids.contains(f));
             }
         }
         Ok(None) => {}
@@ -54,7 +55,19 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
 
     let mut completed = true;
 
-    for batch in total_file_ids.chunks(SQL_CHUNK_SIZE as usize) {
+    let mut total_file_ids_iter = total_file_ids.iter();
+
+    loop {
+        // Collect a small chunk of file IDs (e.g., 1000 items) into memory at a time
+        let batch: Vec<_> = total_file_ids_iter
+            .by_ref()
+            .take(SQL_CHUNK_SIZE as usize)
+            .collect();
+
+        if batch.is_empty() {
+            break;
+        }
+
         let processed = batch
             .par_iter()
             .try_fold(Vec::new, |mut pending, file_id| {
@@ -63,12 +76,13 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
                     return Err(());
                 }
 
-                if let Ok(Some(file_path)) = client::get_file_path(*file_id)
+                // Note: file_id is &&FileId because batch contains references from .iter()
+                if let Ok(Some(file_path)) = client::get_file_path(**file_id)
                     && let Ok(file_data) = std::fs::read(&file_path)
                 {
                     let callback = on_download(&file_data);
                     let tags: Vec<_> = callback.tags.into_iter().collect();
-                    pending.push((*file_id, tags));
+                    pending.push((**file_id, tags));
                 }
 
                 Ok(pending)

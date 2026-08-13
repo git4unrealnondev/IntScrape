@@ -263,7 +263,7 @@ pub struct FileTagAction {
 pub struct FileObject {
     pub source: Option<FileSource>,
     // Hash of file
-    pub hash: Option<HashesSupported>,
+    pub hash: Vec<HashesSupported>,
     pub tag_list: Vec<FileTagAction>,
     // Skips downloading the file if a tag matches this.
     pub skip_if: Vec<SkipIf>,
@@ -277,6 +277,23 @@ pub struct FileInternal {
     pub hash: String,
     pub extension: String,
     pub storage_id: u64,
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(
+    Default, Clone, PartialEq, Eq, Hash, Debug, Deserialize, bitcode::Encode, bitcode::Decode,
+)]
+pub struct FileManager {
+    pub internal: FileInternal,
+    pub identifying_hashes: Vec<HashesSupported>,
+}
+impl From<FileInternal> for FileManager {
+    fn from(internal: FileInternal) -> Self {
+        FileManager {
+            internal,
+            identifying_hashes: vec![],
+        }
+    }
 }
 
 #[derive(
@@ -302,12 +319,16 @@ pub enum FileSource {
     Bytes(Vec<u8>),
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Deserialize, bitcode::Encode, bitcode::Decode)]
+#[cfg_attr(feature = "strum", derive(strum_macros::EnumIter))]
 pub enum HashesSupported {
     Md5(String),
     Sha1(String),
     Sha256(String),
     Sha512(String),
+    IPFSCID(String),
+    IPFSCID1(String),
+    ImageHash(String),
 }
 
 #[derive(

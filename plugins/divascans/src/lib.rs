@@ -188,7 +188,7 @@ pub fn parser_call(
     if let Some(cover_url) = extract_cover_image(text_input) {
         files.insert(FileObject {
             source: Some(FileSource::Url(cover_url.to_string())),
-            hash: None,
+            hash: vec![],
             tag_list: vec![FileTagAction {
                 operation: shared_types::TagOperation::Add,
                 tags: vec![PluginTag {
@@ -351,7 +351,7 @@ pub fn parser_call(
         {
             files.insert(FileObject {
                 source: Some(FileSource::Url(image_url.into())),
-                hash: None,
+                hash: vec![],
                 tag_list: vec![FileTagAction {
                     operation: shared_types::TagOperation::Add,
                     tags: vec![PluginTag {

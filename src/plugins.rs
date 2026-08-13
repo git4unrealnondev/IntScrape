@@ -96,7 +96,7 @@ impl PluginManager {
     }
 
     fn load_libs(&self, path: &Path) {
-        let ignored_plugins = std::env::var("INTSCRAPE_IGNORE_PLUGINS")
+        let mut ignored_plugins = std::env::var("INTSCRAPE_IGNORE_PLUGINS")
             .ok()
             .map(|value| {
                 value
@@ -107,6 +107,8 @@ impl PluginManager {
                     .collect::<HashSet<_>>()
             })
             .unwrap_or_default();
+
+        ignored_plugins.insert("file-hash".to_string());
 
         if !ignored_plugins.is_empty() {
             info!("Ignoring plugins: {:?}", ignored_plugins);

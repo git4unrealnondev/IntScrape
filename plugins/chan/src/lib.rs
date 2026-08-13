@@ -271,7 +271,7 @@ fn extract_post_file(
             name: attachment_md5.clone(),
             namespace: nsout(&Nsid::OriginalMD5),
         })],
-        hash: Some(HashesSupported::Md5(attachment_md5.clone())),
+        hash: vec![HashesSupported::Md5(attachment_md5.clone())],
         tag_list: vec![FileTagAction {
             operation: TagOperation::Add,
             tags: vec![

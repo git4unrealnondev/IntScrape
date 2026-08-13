@@ -9,7 +9,8 @@ use std::{
 
 use client::setting_get;
 use shared_types::{
-    CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks, PluginTag, Tag,SQL_CHUNK_SIZE
+    CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks, PluginTag, SQL_CHUNK_SIZE,
+    Tag,
 };
 
 const LISTOFSUPSET: [Supset; 7] = [

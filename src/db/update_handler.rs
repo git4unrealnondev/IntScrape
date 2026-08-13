@@ -1,4 +1,6 @@
-use rusqlite::Connection;
+use std::collections::HashSet;
+
+use rusqlite::{Connection, params};
 
 use crate::db::MainDatabase;
 
@@ -77,5 +79,60 @@ impl MainDatabase {
         )?;
         Self::internal_relationship_migrate_legacy(conn);
         Self::internal_db_version_set(conn, 4)
+    }
+
+    /// Upates from V4 to V5
+    pub(in crate::db) fn internal_update_db_4_to_5(
+        conn: &Connection,
+    ) -> Result<(), r2d2_sqlite::rusqlite::Error> {
+        Self::internal_table_create_file_hashes_v1(conn);
+
+        conn.execute("ALTER TABLE File ADD COLUMN size_bytes INTEGER;", [])?;
+
+        let mut ns_ids_to_remove = HashSet::new();
+
+        for (ns_name, algo_name) in [
+            ("FileHash-MD5", "MD5"),
+            ("FileHash-SHA1", "SHA1"),
+            ("FileHash-SHA256", "SHA256"),
+            ("FileHash-SHA512", "SHA512"),
+            ("FileHash-IPFSCID1", "IPFSCID1"),
+            ("FileHash-ImageHash", "ImageHash"),
+            ("FileHash-IPFSCID", "IPFSCID"),
+        ] {
+            if let Some(ns_id) = Self::internal_namespace_get_id(conn, ns_name) {
+                let tag_ids = Self::internal_tag_id_get_namespace_id(conn, &ns_id)?;
+                let tags = Self::internal_tag_id_get_tag(conn, &tag_ids);
+
+                for (tag_id, tag) in tags.iter() {
+                    if let Ok(file_id) = Self::internal_tag_id_get_file_id(conn, tag_id) {
+                        Self::internal_file_hash_add(
+                            conn,
+                            &algo_name.to_string(),
+                            &tag.name,
+                            &file_id,
+                        )?;
+                    }
+                }
+
+                Self::internal_tag_bulk_delete(conn, &tag_ids)?;
+
+                ns_ids_to_remove.insert(ns_id);
+            }
+        }
+
+        Self::internal_namespace_bulk_delete(conn, &ns_ids_to_remove)?;
+
+        let mut stmt = conn.prepare("UPDATE File SET size_bytes = ?1 WHERE id = ?2;")?;
+
+        for file_id in Self::internal_file_id_get_all(conn)? {
+            if let Ok(Some(file_path)) = Self::internal_file_get_physical_path(conn, &file_id)
+                && let Ok(metadata) = std::fs::metadata(file_path)
+            {
+                stmt.execute(params![metadata.len(), file_id]);
+            }
+        }
+
+        Self::internal_db_version_set(conn, 5)
     }
 }

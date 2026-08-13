@@ -5,11 +5,11 @@ use log::info;
 use parking_lot::RwLock;
 use r2d2_sqlite::rusqlite::OptionalExtension;
 use r2d2_sqlite::rusqlite::{self, Connection, Row, params};
-use rusqlite::{ToSql, Transaction};
+use rusqlite::{ToSql, Transaction, params_from_iter};
 use shared_types::{
-    AuditLogEntry, DbJobRecreation, DbJobsObj, DbSettingsObj, FileInternal, FileTagAction,
-    GenericNamespaceObj, HashesSupported, PluginJob, PluginTag, ScraperDataReturn, ScraperParam,
-    SearchHolder, SearchObj, SkipIf, Tag, TagOperation, TagSearch, TagType,
+    AuditLogEntry, DbJobRecreation, DbJobsObj, DbSettingsObj, FileInternal, FileManager,
+    FileTagAction, GenericNamespaceObj, HashesSupported, PluginJob, PluginTag, ScraperDataReturn,
+    ScraperParam, SearchHolder, SearchObj, SkipIf, Tag, TagOperation, TagSearch, TagType,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
@@ -34,6 +34,18 @@ pub trait DbJobsObjExt {
     fn from_row(row: &Row) -> rusqlite::Result<Self>
     where
         Self: Sized;
+}
+
+fn hashessupportedtoinner(hash: &HashesSupported) -> (&str, &String) {
+    match hash {
+        HashesSupported::Md5(md5) => ("MD5", md5),
+        HashesSupported::Sha1(hash) => ("SHA1", hash),
+        HashesSupported::Sha256(hash) => ("SHA256", hash),
+        HashesSupported::Sha512(hash) => ("SHA512", hash),
+        HashesSupported::IPFSCID(hash) => ("IPFSCID", hash),
+        HashesSupported::IPFSCID1(hash) => ("IPFSCID1", hash),
+        HashesSupported::ImageHash(hash) => ("ImageHash", hash),
+    }
 }
 
 impl DbJobsObjExt for DbJobsObj {
@@ -988,12 +1000,13 @@ CREATE TABLE IF NOT EXISTS FileStorageLocations (id INTEGER PRIMARY KEY , locati
     ///
     /// Creates the default File table
     ///
-    pub(in crate::db) fn internal_table_create_file_v1(conn: &Connection) {
+    pub(in crate::db) fn internal_table_create_file_v2(conn: &Connection) {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS File 
             (id INTEGER PRIMARY KEY  NOT NULL, 
             hash TEXT UNIQUE, 
             extension TEXT, 
             storage_id INTEGER, 
+            size_bytes INTEGER
 
             CHECK (
                 (hash IS NOT NULL AND extension IS NOT NULL) OR
@@ -1005,6 +1018,30 @@ CREATE TABLE IF NOT EXISTS FileStorageLocations (id INTEGER PRIMARY KEY , locati
 
 CREATE INDEX IF NOT EXISTS idx_file_hash ON File (hash);
 ").unwrap();
+    }
+
+    /// Creates the filehash table
+    pub(in crate::db) fn internal_table_create_file_hashes_v1(conn: &Connection) {
+        conn.execute_batch(
+            "
+CREATE TABLE IF NOT EXISTS FileHashes (
+    file_id INTEGER NOT NULL,
+    algorithm TEXT NOT NULL,
+    digest TEXT NOT NULL,
+
+    PRIMARY KEY (file_id, algorithm),
+
+    FOREIGN KEY (file_id)
+        REFERENCES File(id)
+        ON DELETE CASCADE
+        ON UPDATE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_file_hashes_algorithm_digest
+ON FileHashes (algorithm, digest);
+",
+        )
+        .unwrap();
     }
 
     ///
@@ -1195,14 +1232,16 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
     ///
     pub(in crate::db) fn internal_file_get_all(
         conn: &Connection,
-    ) -> Result<Vec<FileInternal>, rusqlite::Error> {
-        let mut stmt = conn.prepare("select id, hash, extension, storage_id FROM File")?;
+    ) -> Result<HashSet<FileInternal>, rusqlite::Error> {
+        let mut stmt =
+            conn.prepare("select id, hash, extension, storage_id, size_bytes FROM File")?;
         let rows = stmt.query_map([], |row| {
             Ok(FileInternal {
                 id: row.get(0)?,
                 hash: row.get(1)?,
                 extension: row.get(2)?,
                 storage_id: row.get(3)?,
+                size_bytes: row.get(4)?,
             })
         })?;
 
@@ -1327,7 +1366,7 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
     ///
     pub(in crate::db) fn internal_file_id_get_all(
         conn: &Connection,
-    ) -> Result<Vec<u64>, rusqlite::Error> {
+    ) -> Result<HashSet<u64>, rusqlite::Error> {
         let mut stmt = conn.prepare("SELECT id FROM File;").unwrap();
         let out = stmt.query_map([], |row| row.get(0))?;
 
@@ -1339,40 +1378,22 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
     /// TODO need to pull this data dynamically
     ///
     pub fn contains_hash_sync(&self, hash: &HashesSupported) -> Option<FileInternal> {
-        let tag = match hash {
-            HashesSupported::Md5(name) => Tag {
-                name: name.to_string(),
-                namespace: GenericNamespaceObj {
-                    name: "FileHash-MD5".into(),
-                    description: None,
-                },
-            },
-            HashesSupported::Sha1(name) => Tag {
-                name: name.to_string(),
-                namespace: GenericNamespaceObj {
-                    name: "FileHash-SHA1".into(),
-                    description: None,
-                },
-            },
-            HashesSupported::Sha256(name) => Tag {
-                name: name.to_string(),
-                namespace: GenericNamespaceObj {
-                    name: "FileHash-SHA256".into(),
-                    description: None,
-                },
-            },
-            HashesSupported::Sha512(name) => Tag {
-                name: name.to_string(),
-                namespace: GenericNamespaceObj {
-                    name: "FileHash-SHA512".into(),
-                    description: None,
-                },
-            },
-            _ => return None,
-        };
-
         let conn = self.pool.get().unwrap();
-        Self::internal_tag_get_fileinternal(&conn, &tag)
+
+        let (algo, hash) = hashessupportedtoinner(hash);
+        let file_id: Option<u64> = conn
+            .query_row(
+                "SELECT file_id FROM FileHashes WHERE algorithm = ?1 AND digest = ?2;",
+                params![algo, hash],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if let Some(file_id) = &file_id {
+            Self::internal_file_id_get(&conn, file_id).ok()
+        } else {
+            None
+        }
     }
 
     ///
@@ -1505,7 +1526,7 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
     ///
     #[must_use]
     #[ipc(name = "get_file_ids_all", request = "GetFileListId")]
-    pub fn file_id_get_all_sync(&self) -> Vec<u64> {
+    pub fn file_id_get_all_sync(&self) -> HashSet<u64> {
         let conn = self.pool.get().unwrap();
 
         Self::internal_file_id_get_all(&conn).unwrap_or_default()
@@ -2505,6 +2526,71 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         }
         self.reload_tag_search_cache(conn);
     }
+
+    /// Deletes from db where id in
+    pub(in crate::db) fn internal_tag_bulk_delete(
+        conn: &Connection,
+        tag_ids: &HashSet<u64>,
+    ) -> Result<usize, r2d2_sqlite::rusqlite::Error> {
+        if tag_ids.is_empty() {
+            return Ok(0);
+        }
+
+        // Generate a comma-separated list of placeholders: "?, ?, ?"
+        let placeholders: Vec<String> = tag_ids.iter().map(|_| "?".to_string()).collect();
+        let query = format!(
+            "DELETE FROM Tags WHERE id IN ({});",
+            placeholders.join(", ")
+        );
+
+        // Execute the query, binding each element in the HashSet as a separate parameter
+        conn.execute(&query, params_from_iter(tag_ids))
+    }
+
+    /// Removes namespaces where id in list
+    pub(in crate::db) fn internal_namespace_bulk_delete(
+        conn: &Connection,
+        ns_ids: &HashSet<u64>,
+    ) -> Result<(), r2d2_sqlite::rusqlite::Error> {
+        if ns_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Generate a comma-separated list of placeholders: "?, ?, ?"
+        let placeholders: Vec<String> = ns_ids.iter().map(|_| "?".to_string()).collect();
+        let query = format!(
+            "DELETE FROM Namespace WHERE id IN ({});",
+            placeholders.join(", ")
+        );
+
+        // Execute the query, binding each element in the HashSet as a separate parameter
+        conn.execute(&query, params_from_iter(ns_ids))?;
+
+        for ns_id in ns_ids {
+            let query = format!("DROP TABLE IF EXISTS Relationship_{};", ns_id);
+            conn.execute(&query, [])?;
+        }
+
+        Ok(())
+    }
+
+    /// Adds a filehash to the db
+    pub(in crate::db) fn internal_file_hash_add(
+        conn: &Connection,
+        algo: &String,
+        hash: &String,
+        file_id: &u64,
+    ) -> Result<usize, r2d2_sqlite::rusqlite::Error> {
+        if !algo.is_empty() && !hash.is_empty() {
+            conn.execute(
+            "INSERT OR IGNORE INTO FileHashes (algorithm, digest, file_id) VALUES (?1, ?2, ?3);",
+            params![algo, hash, file_id],
+        )
+        } else {
+            Ok(0)
+        }
+    }
+
     ///
     /// Bulk adds relationship into DB with chunking to prevent parameter limit overflow
     ///
@@ -2666,7 +2752,8 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         }
 
         let parents_vec: Vec<&shared_types::FileInternal> = parents.iter().collect();
-        let mut query = String::from("INSERT INTO File (hash, extension, storage_id) VALUES ");
+        let mut query =
+            String::from("INSERT INTO File (hash, extension, storage_id, size_bytes) VALUES ");
         let mut params_vector: Vec<&dyn rusqlite::types::ToSql> =
             Vec::with_capacity(parents_vec.len() * 3);
 
@@ -2675,10 +2762,17 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             if i > 0 {
                 query.push_str(", ");
             }
-            query.push_str(&format!("(?{}, ?{}, ?{})", i * 3 + 1, i * 3 + 2, i * 3 + 3));
+            query.push_str(&format!(
+                "(?{}, ?{}, ?{}, ?{})",
+                i * 4 + 1,
+                i * 4 + 2,
+                i * 4 + 3,
+                i * 4 + 4
+            ));
             params_vector.push(&parent.hash);
             params_vector.push(&parent.extension);
             params_vector.push(&parent.storage_id);
+            params_vector.push(&parent.size_bytes);
         }
 
         // FIX: Combined into a single DO UPDATE SET clause separated by a comma
@@ -3026,7 +3120,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     ///
     pub async fn process_scraper(
         self: Arc<Self>,
-        map: HashMap<FileInternal, Vec<FileTagAction>>,
+        map: HashMap<FileManager, Vec<FileTagAction>>,
         jobs: Vec<ScraperDataReturn>,
         audit_reason: String,
     ) {
@@ -3054,8 +3148,35 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 Self::internal_jobs_add(&conn, &scraperdatareturn.job);
             }
 
-            let unique_files: HashSet<FileInternal> = map.keys().cloned().collect();
+            let unique_files: HashSet<FileInternal> =
+                map.keys().map(|f| f.internal.clone()).collect();
             let resolved_files = Self::internal_file_bulk_add(&conn, unique_files);
+
+            let mapped_files: Vec<_> = map
+                .keys()
+                .filter_map(|file_manager| {
+                    // Find the matching resolved file
+                    let matching_res = resolved_files
+                        .iter()
+                        .find(|res| res.hash == file_manager.internal.hash)?;
+
+                    let mut temp = file_manager.clone();
+                    temp.internal = matching_res.clone();
+                    Some(temp)
+                })
+                .collect();
+
+            for file in mapped_files {
+                if let Some(file_id) = file.internal.id {
+                    for hash in &file.identifying_hashes {
+                        // If hash is your HashesSupported enum, you can extract the algorithm/string depending on your signature:
+                        // let (algo, hash_str) = ...;
+                        let (algo, hash_str) = hashessupportedtoinner(hash);
+
+                        Self::internal_file_hash_add(&conn, &algo.to_string(), hash_str, &file_id);
+                    }
+                }
+            }
 
             // Build a quick, zero-allocation lookup mapping: FileInternal -> Database u64 ID
             let mut file_cache = HashMap::with_capacity(resolved_files.len());
@@ -3090,7 +3211,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             }
 
             for (file_internal, tag_list) in &map {
-                let file_id = match file_cache.get(&file_internal.hash) {
+                let file_id = match file_cache.get(&file_internal.internal.hash) {
                     Some(&id) => id,
                     None => continue,
                 };

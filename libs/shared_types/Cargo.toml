@@ -7,11 +7,10 @@ edition = "2024"
 redact = { git = "https://github.com/git4unrealnondev/redact", features = ["serde", "bitcode"] }
 serde = { workspace = true }
 bitcode = { workspace = true }
+strum_macros = {optional=true, workspace=true}
+strum = {optional=true, workspace=true}
 
 [features]
-default = ["exe_build"]
-exe_build = ["regex", "clap", "serde"]
-# Enables sending and recieving regex
-regex = []
-clap = []
-serde = []
+default = []
+
+strum = ["dep:strum_macros", "dep:strum"]

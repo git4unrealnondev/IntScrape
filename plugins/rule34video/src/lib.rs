@@ -47,6 +47,7 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
             }),
             PluginProperties::Ratelimit(4, std::time::Duration::from_secs(1)),
             PluginProperties::Sites(vec!["rule34video.com".into(), "rule34video".into()]),
+            PluginProperties::ThreadNum(10),
         ],
         ..Default::default()
     }]

@@ -375,7 +375,7 @@ pub fn parser_call(
                 if let Some(hash) = md5 {
                     files.insert(FileObject {
                         source,
-                        hash: Some(HashesSupported::Md5(hash.to_string())),
+                        hash: vec![HashesSupported::Md5(hash.to_string())],
                         tag_list: vec![FileTagAction {
                             tags: tag_vec,
                             ..Default::default()

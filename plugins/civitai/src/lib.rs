@@ -438,7 +438,7 @@ pub fn parser_call(
                 {
                     file = Some(FileObject {
                         source: Some(FileSource::Url(generate_image_url(url_key, name))),
-                        hash: None,
+                        hash: vec![],
                         tag_list: vec![],
                         skip_if: vec![],
                     });

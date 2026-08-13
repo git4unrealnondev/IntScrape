@@ -113,7 +113,7 @@ pub fn put_tags_to_files(
 /// Gets all file ids inside of the db.
 /// #Safety Returns None if an error occurs
 ///
-pub fn get_file_ids_all() -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+pub fn get_file_ids_all() -> Result<HashSet<u64>, Box<dyn std::error::Error>> {
     crate::init_data_request(&crate::SupportedDBRequests::GetFileListId())
 }
 ///

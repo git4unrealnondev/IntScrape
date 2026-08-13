@@ -154,6 +154,7 @@ PRAGMA cache_size = -64000;
                             1 => Self::internal_update_db_1_to_2(&conn)?,
                             2 => Self::internal_update_db_2_to_3(&conn)?,
                             3 => Self::internal_update_db_3_to_4(&conn)?,
+                            4 => Self::internal_update_db_4_to_5(&conn)?,
                             _ => break,
                         }
                     } else {
@@ -197,7 +198,8 @@ PRAGMA cache_size = -64000;
         Self::internal_table_create_settings_v1(conn);
 
         Self::internal_table_create_file_storage_locations_v1(conn);
-        Self::internal_table_create_file_v1(conn);
+        Self::internal_table_create_file_v2(conn);
+        Self::internal_table_create_file_hashes_v1(conn);
 
         Self::internal_table_create_jobs_v1(conn);
         RelationshipStorage::internal_table_relationship_cache_create_v1(conn);

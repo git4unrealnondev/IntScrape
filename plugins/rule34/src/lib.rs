@@ -267,9 +267,14 @@ pub fn parser_call(
                 };
 
                 // Rule34 hash object mappings are stored lowercase
-                let hash = post["hash"]
+                let mut hash = Vec::new();
+
+                if let Some(md5_hash) = post["hash"]
                     .as_str()
-                    .map(|h| HashesSupported::Md5(h.to_string()));
+                    .map(|h| HashesSupported::Md5(h.to_string()))
+                {
+                    hash.push(md5_hash);
+                }
 
                 files.insert(FileObject {
                     source,

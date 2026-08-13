@@ -280,7 +280,7 @@ pub fn parser_call(
                 {
                     files.insert(FileObject {
                         source: Some(FileSource::Url(file_url.clone())),
-                        hash: Some(HashesSupported::Sha256(raw_file_name.to_uppercase())),
+                        hash: vec![HashesSupported::Sha256(raw_file_name.to_uppercase())],
                         tag_list: vec![FileTagAction {
                             operation: shared_types::TagOperation::Add,
                             tags,
