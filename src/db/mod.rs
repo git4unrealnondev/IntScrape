@@ -13,10 +13,13 @@ use crate::{
 pub mod main;
 mod old_code;
 pub mod roaring;
+pub(crate) mod system_jobs;
 mod tag_search;
 mod update_handler;
 
-pub const SYSTEM_DATABASE_BACKUP_SITE: &str = "__system_database_backup__";
+pub const SYSTEM_DATABASE_BACKUP_SITE: &str = "SYSTEM_BACKUP";
+pub const SYSTEM_FILE_SIZE_SITE: &str = "SYSTEM_FILE_SIZE";
+pub const SYSTEM_FILE_HASH_SITE: &str = "SYSTEM_FILE_HASH";
 
 pub enum CacheType {
     // Will be use to query the DB directly. No caching. DEFAULT OPTION
@@ -32,7 +35,6 @@ pub struct MainDatabase {
     tag_cache: Arc<RwLock<HashMap<u64, shared_types::Tag>>>,
     cache_type: Arc<RwLock<CacheType>>,
     relationship_roaring_storage: Arc<RwLock<Option<RelationshipStorage>>>,
-    tag_search_cache: Arc<RwLock<tag_search::TagSearchCache>>,
     plugin_manager: Arc<RwLock<Option<Arc<PluginManager>>>>,
 }
 
@@ -70,7 +72,6 @@ PRAGMA cache_size = -64000;
             tag_cache: Arc::new(RwLock::new(HashMap::new())),
             cache_type: Arc::new(RwLock::new(CacheType::Bare)),
             relationship_roaring_storage: Arc::new(RwLock::new(None)),
-            tag_search_cache: Arc::new(RwLock::new(tag_search::TagSearchCache::default())),
             writer_conn,
             plugin_manager: Arc::new(RwLock::new(None)),
         }
@@ -137,8 +138,8 @@ PRAGMA cache_size = -64000;
 
     /// Checks to see if the DB exists
     fn check_db(self: Arc<Self>) -> Result<(), Box<dyn std::error::Error>> {
-        let mut conn = self.pool.get()?;
-        let conn = conn.transaction().unwrap();
+        let mut pool = self.writer_conn.lock();
+        let mut conn = pool.transaction().unwrap();
 
         loop {
             if let Ok(Some(db_version_setting)) =
@@ -155,8 +156,12 @@ PRAGMA cache_size = -64000;
                             2 => Self::internal_update_db_2_to_3(&conn)?,
                             3 => Self::internal_update_db_3_to_4(&conn)?,
                             4 => Self::internal_update_db_4_to_5(&conn)?,
+                            5 => Self::internal_update_db_5_to_6(&conn)?,
                             _ => break,
                         }
+                        conn.commit()?;
+                        pool.execute("VACUUM;", [])?;
+                        conn = pool.transaction().unwrap();
                     } else {
                         break;
                     }
@@ -170,12 +175,13 @@ PRAGMA cache_size = -64000;
         // Ensure additive schema changes are applied to databases already at the
         // current version as well as databases upgraded through a version step.
         Self::internal_table_create_relationship_v1(&conn);
+        Self::internal_table_create_tag_search_fts_v6(&conn).unwrap();
         Self::internal_file_download_location_set_default(&conn).unwrap();
 
         // Resetting is_running to false
         Self::internal_jobs_reset_isrunning(&conn).unwrap();
 
-        Self::internal_load_caching(self, &conn);
+        Self::internal_load_caching(self.clone(), &conn);
 
         conn.commit().unwrap();
 

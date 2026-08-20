@@ -1,10 +1,17 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, fs};
 
 use rusqlite::{Connection, params};
 
 use crate::db::MainDatabase;
 
 impl MainDatabase {
+    pub(in crate::db) fn internal_update_db_5_to_6(
+        conn: &Connection,
+    ) -> Result<(), r2d2_sqlite::rusqlite::Error> {
+        Self::internal_table_create_tag_search_fts_v6(conn)?;
+        Self::internal_db_version_set(conn, 6)
+    }
+
     ///
     /// Updates the db from Version 1 to Version 2
     ///
@@ -101,35 +108,60 @@ impl MainDatabase {
             ("FileHash-IPFSCID", "IPFSCID"),
         ] {
             if let Some(ns_id) = Self::internal_namespace_get_id(conn, ns_name) {
-                let tag_ids = Self::internal_tag_id_get_namespace_id(conn, &ns_id)?;
-                let tags = Self::internal_tag_id_get_tag(conn, &tag_ids);
-
-                for (tag_id, tag) in tags.iter() {
-                    if let Ok(file_id) = Self::internal_tag_id_get_file_id(conn, tag_id) {
-                        Self::internal_file_hash_add(
-                            conn,
-                            &algo_name.to_string(),
-                            &tag.name,
-                            &file_id,
-                        )?;
-                    }
-                }
-
-                Self::internal_tag_bulk_delete(conn, &tag_ids)?;
-
+                let relationship_table = Self::relationship_partition_name(ns_id);
+                let query = format!(
+                    "INSERT OR IGNORE INTO FileHashes (file_id, algorithm, digest)
+                     SELECT MIN(r.file_id), ?1, t.name
+                     FROM {relationship_table} r
+                     JOIN Tags t ON t.id = r.tag_id
+                     WHERE t.namespace = ?2
+                     GROUP BY r.tag_id"
+                );
+                conn.execute(&query, params![algo_name, ns_id])?;
                 ns_ids_to_remove.insert(ns_id);
             }
         }
 
         Self::internal_namespace_bulk_delete(conn, &ns_ids_to_remove)?;
 
-        let mut stmt = conn.prepare("UPDATE File SET size_bytes = ?1 WHERE id = ?2;")?;
+        let file_storage_map = Self::internal_file_storage_get_all(conn)?;
+        let mut files = conn.prepare(
+            "SELECT id, hash, extension, storage_id
+             FROM File
+             WHERE hash IS NOT NULL AND extension IS NOT NULL",
+        )?;
+        let file_rows = files.query_map([], |row| {
+            Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, u64>(3)?,
+            ))
+        })?;
+        let mut size_stmt = conn.prepare("UPDATE File SET size_bytes = ?1 WHERE id = ?2")?;
 
-        for file_id in Self::internal_file_id_get_all(conn)? {
-            if let Ok(Some(file_path)) = Self::internal_file_get_physical_path(conn, &file_id)
-                && let Ok(metadata) = std::fs::metadata(file_path)
+        for row in file_rows {
+            let (file_id, hash, extension, storage_id) = row?;
+            let file = shared_types::FileInternal {
+                id: Some(file_id),
+                hash,
+                extension,
+                storage_id,
+                size_bytes: None,
+            };
+            let mut path = file_storage_map
+                .get(&storage_id)
+                .and_then(|base_path| Self::get_file_location(&file, base_path));
+            if path.is_none() {
+                path = file_storage_map
+                    .iter()
+                    .filter(|(storage, _)| **storage != storage_id)
+                    .find_map(|(_, base_path)| Self::get_file_location(&file, base_path));
+            }
+            if let Some(path) = path
+                && let Ok(metadata) = fs::metadata(path)
             {
-                stmt.execute(params![metadata.len(), file_id]);
+                size_stmt.execute(params![metadata.len(), file_id])?;
             }
         }
 

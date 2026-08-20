@@ -112,7 +112,7 @@ pub async fn main(db: Arc<MainDatabase>) {
                         recreation,
                     };
 
-                    db.jobs_add_single(job).await;
+                    db.jobs_add_single_sync(job);
 
                     /*  let mut system_data = BTreeMap::new();
                     for each in addstruct.system_data.chunks(2) {
@@ -497,6 +497,13 @@ pub async fn main(db: Arc<MainDatabase>) {
             },
             cli_structs::TasksStruct::Database(db_action) => {
                 match db_action {
+                    Database::DbSlurp(slurp) => {
+                        let counts = db.db_slurp(Path::new(&slurp.source)).unwrap();
+                        println!(
+                            "Imported {} namespaces, {} tags, and {} files",
+                            counts.0, counts.1, counts.2
+                        );
+                    }
                     Database::CheckFiles(action) => {
                         db.fix_internal_files(action).unwrap();
                     }
@@ -504,10 +511,10 @@ pub async fn main(db: Arc<MainDatabase>) {
                         db.recache_roaring_db();
                     }
                     Database::ScheduleBackup(backup) => {
-                        db.jobs_add_single(shared_types::PluginJob {
+                        db.jobs_add_single_sync(shared_types::PluginJob {
                             time: helper_functions::get_sys_time_in_secs(),
                             reptime: time_conv(&backup.time),
-                            priority: u64::MAX,
+                            priority: i64::MAX as u64,
                             site: crate::db::SYSTEM_DATABASE_BACKUP_SITE.to_string(),
                             param: vec![shared_types::ScraperParam::Normal(
                                 backup.destination.clone(),
@@ -517,8 +524,21 @@ pub async fn main(db: Arc<MainDatabase>) {
                                 backup.every,
                                 backup.count,
                             )),
-                        })
-                        .await;
+                        });
+                    }
+                    Database::ScheduleHashMissing(hash_job) => {
+                        db.jobs_add_single_sync(shared_types::PluginJob {
+                            time: helper_functions::get_sys_time_in_secs(),
+                            reptime: time_conv(&hash_job.time),
+                            priority: i64::MAX as u64,
+                            site: crate::db::SYSTEM_FILE_HASH_SITE.to_string(),
+                            param: Vec::new(),
+                            user_data: BTreeMap::new(),
+                            recreation: Some(shared_types::DbJobRecreation::AlwaysTime(
+                                hash_job.every,
+                                hash_job.count,
+                            )),
+                        });
                     }
                     _ => {}
                 }

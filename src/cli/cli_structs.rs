@@ -120,6 +120,8 @@ pub enum CheckFilesEnum {
 
 #[derive(Debug, Subcommand)]
 pub enum Database {
+    /// Imports tags, files, hashes, and relationships from another SQLite DB.
+    DbSlurp(DbSlurp),
     #[clap(subcommand)]
     Remove(NamespaceInfo),
     #[clap(subcommand)]
@@ -145,6 +147,15 @@ pub enum Database {
     RecacheRoaring,
     /// Schedules recurring database backups through the standard job system.
     ScheduleBackup(ScheduleBackup),
+    /// Schedules recurring hashing of missing file hashes.
+    ScheduleHashMissing(ScheduleHashMissing),
+}
+
+#[derive(Debug, Parser)]
+pub struct DbSlurp {
+    /// SQLite database to import from.
+    #[arg(long)]
+    pub source: String,
 }
 
 #[derive(Debug, Parser)]
@@ -152,6 +163,19 @@ pub struct ScheduleBackup {
     /// Root folder for backups. Each backup is written to root/year/month/day/main.db.
     #[arg(long)]
     pub destination: String,
+    /// First execution delay, such as `now`, `1h`, or `1d`.
+    #[arg(long)]
+    pub time: String,
+    /// Recurrence interval in seconds.
+    #[arg(long)]
+    pub every: u64,
+    /// Number of additional executions. Omit for unlimited recursion.
+    #[arg(long)]
+    pub count: Option<u64>,
+}
+
+#[derive(Debug, Parser)]
+pub struct ScheduleHashMissing {
     /// First execution delay, such as `now`, `1h`, or `1d`.
     #[arg(long)]
     pub time: String,

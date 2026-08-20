@@ -1,9 +1,8 @@
 use shared_types::TagSearch;
 use std::cmp::Ordering;
-use std::collections::HashSet;
-use strsim::levenshtein;
+use std::collections::{BinaryHeap, HashSet};
 
-const HIGH_VALUE_TAG_COUNT: u64 = 5;
+pub(crate) const FTS_CANDIDATE_LIMIT: usize = 4096;
 
 pub(crate) struct TagEntry {
     pub(crate) tag_id: u64,
@@ -11,102 +10,40 @@ pub(crate) struct TagEntry {
     pub(crate) count: u64,
 }
 
-struct CompactTagEntry {
-    tag_id: u64,
-    name_start: usize,
-    name_len: usize,
+struct SearchMatch<T> {
+    entry: T,
+    score: usize,
     count: u64,
+    tag_id: u64,
 }
 
-#[derive(Default)]
-pub(crate) struct TagSearchCache {
-    entries: Vec<CompactTagEntry>,
-    names: Vec<u8>,
-}
-
-impl TagSearchCache {
-    pub(crate) fn from_entries(entries: Vec<TagEntry>) -> Self {
-        let mut compact_entries = Vec::with_capacity(entries.len());
-        let mut names = Vec::new();
-        for entry in entries {
-            let name_start = names.len();
-            names.extend_from_slice(entry.normalized_name.as_bytes());
-            compact_entries.push(CompactTagEntry {
-                tag_id: entry.tag_id,
-                name_start,
-                name_len: entry.normalized_name.len(),
-                count: entry.count,
-            });
-        }
-        Self {
-            entries: compact_entries,
-            names,
-        }
-    }
-
-    pub(crate) fn search(&self, query: &str, limit: usize) -> Vec<TagSearch> {
-        let normalized_query = normalize(query);
-        if normalized_query.is_empty() || limit == 0 {
-            return Vec::new();
-        }
-
-        let mut matches = Vec::with_capacity(limit);
-        for entry in &self.entries {
-            let Some(name) = self.entry_name(entry) else {
-                continue;
-            };
-            if let Some(score) = match_score(&normalized_query, name) {
-                if matches.len() < limit {
-                    matches.push((entry, score));
-                } else {
-                    let mut worst_index = 0;
-                    for index in 1..matches.len() {
-                        if is_worse(matches[index], matches[worst_index]) {
-                            worst_index = index;
-                        }
-                    }
-                    if is_better(score, entry, matches[worst_index]) {
-                        matches[worst_index] = (entry, score);
-                    }
-                }
-            }
-        }
-
-        matches.sort_unstable_by(|(left, left_distance), (right, right_distance)| {
-            left_distance
-                .cmp(right_distance)
-                .then_with(|| right.count.cmp(&left.count))
-                .then_with(|| left.tag_id.cmp(&right.tag_id))
-        });
-        matches
-            .into_iter()
-            .take(limit)
-            .map(|(entry, _)| TagSearch {
-                tag_id: entry.tag_id,
-                count: entry.count,
-            })
-            .collect()
-    }
-
-    fn entry_name<'a>(&'a self, entry: &CompactTagEntry) -> Option<&'a str> {
-        let end = entry.name_start.checked_add(entry.name_len)?;
-        let bytes = self.names.get(entry.name_start..end)?;
-        std::str::from_utf8(bytes).ok()
+impl<T> PartialEq for SearchMatch<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.score == other.score && self.count == other.count && self.tag_id == other.tag_id
     }
 }
 
-fn is_worse(left: (&CompactTagEntry, usize), right: (&CompactTagEntry, usize)) -> bool {
-    left.1 > right.1
-        || (left.1 == right.1
-            && (left.0.count < right.0.count
-                || (left.0.count == right.0.count && left.0.tag_id > right.0.tag_id)))
+impl<T> Eq for SearchMatch<T> {}
+
+impl<T> PartialOrd for SearchMatch<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
-fn is_better(score: usize, entry: &CompactTagEntry, worst: (&CompactTagEntry, usize)) -> bool {
-    score < worst.1
-        || (score == worst.1
-            && (entry.count > worst.0.count
-                || (entry.count == worst.0.count && entry.tag_id < worst.0.tag_id)))
+impl<T> Ord for SearchMatch<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .cmp(&other.score)
+            .then_with(|| other.count.cmp(&self.count))
+            .then_with(|| self.tag_id.cmp(&other.tag_id))
+    }
+}
+
+fn is_better<T>(score: usize, count: u64, tag_id: u64, worst: &SearchMatch<T>) -> bool {
+    score < worst.score
+        || (score == worst.score
+            && (count > worst.count || (count == worst.count && tag_id < worst.tag_id)))
 }
 
 /// Searches a streamed set of entries without materializing the full set.
@@ -124,7 +61,7 @@ where
         return Vec::new();
     }
 
-    let mut matches: Vec<(TagEntry, usize)> = Vec::with_capacity(limit);
+    let mut matches = BinaryHeap::with_capacity(limit);
     for entry in entries {
         if excluded_ids.contains(&entry.tag_id) {
             continue;
@@ -135,46 +72,37 @@ where
         };
 
         if matches.len() < limit {
-            matches.push((entry, score));
+            let count = entry.count;
+            let tag_id = entry.tag_id;
+            matches.push(SearchMatch {
+                entry,
+                score,
+                count,
+                tag_id,
+            });
             continue;
         }
 
-        let mut worst_index = 0;
-        for index in 1..matches.len() {
-            let (_, candidate_score) = &matches[index];
-            let (_, worst_score) = &matches[worst_index];
-            if candidate_score > worst_score
-                || (candidate_score == worst_score
-                    && (matches[index].0.count < matches[worst_index].0.count
-                        || (matches[index].0.count == matches[worst_index].0.count
-                            && matches[index].0.tag_id > matches[worst_index].0.tag_id)))
-            {
-                worst_index = index;
-            }
-        }
-
-        let (_, worst_score) = &matches[worst_index];
-        let is_better = score < *worst_score
-            || (score == *worst_score
-                && (entry.count > matches[worst_index].0.count
-                    || (entry.count == matches[worst_index].0.count
-                        && entry.tag_id < matches[worst_index].0.tag_id)));
-        if is_better {
-            matches[worst_index] = (entry, score);
+        if is_better(score, entry.count, entry.tag_id, matches.peek().unwrap()) {
+            matches.pop();
+            let count = entry.count;
+            let tag_id = entry.tag_id;
+            matches.push(SearchMatch {
+                entry,
+                score,
+                count,
+                tag_id,
+            });
         }
     }
 
-    matches.sort_unstable_by(|(left, left_score), (right, right_score)| {
-        left_score
-            .cmp(right_score)
-            .then_with(|| right.count.cmp(&left.count))
-            .then_with(|| left.tag_id.cmp(&right.tag_id))
-    });
+    let mut matches = matches.into_vec();
+    matches.sort_unstable_by(|left, right| left.cmp(right));
     matches
         .into_iter()
-        .map(|(entry, _)| TagSearch {
-            tag_id: entry.tag_id,
-            count: entry.count,
+        .map(|candidate| TagSearch {
+            tag_id: candidate.entry.tag_id,
+            count: candidate.entry.count,
         })
         .collect()
 }
@@ -195,6 +123,37 @@ pub(crate) fn normalize(value: &str) -> String {
         .collect()
 }
 
+/// Builds a safe FTS5 query from the user's words. Individual words preserve
+/// substring matching while OR keeps typo candidates available for ranking.
+pub(crate) fn fts_query(value: &str) -> Option<String> {
+    let normalized = normalize(value);
+    let mut terms = Vec::new();
+    if normalized.chars().count() >= 3 {
+        terms.push(format!("\"{normalized}\""));
+    }
+    terms.extend(
+        value
+            .split(|character: char| !character.is_alphanumeric())
+            .map(normalize)
+            .filter(|term| term.chars().count() >= 3)
+            .flat_map(|term| {
+                let mut queries = vec![format!("\"{}\"", term.replace('"', ""))];
+                let characters: Vec<char> = term.chars().collect();
+                for window in characters.windows(3) {
+                    queries.push(window.iter().collect());
+                    queries.push(format!("{}{}{}", window[1], window[0], window[2]));
+                }
+                for index in 0..characters.len().saturating_sub(1) {
+                    let mut swapped = characters.clone();
+                    swapped.swap(index, index + 1);
+                    queries.push(swapped.into_iter().collect());
+                }
+                queries
+            }),
+    );
+    (!terms.is_empty()).then(|| terms.join(" OR "))
+}
+
 fn allowed_distance(length: usize) -> usize {
     match length {
         0..=4 => 1,
@@ -204,7 +163,36 @@ fn allowed_distance(length: usize) -> usize {
 }
 
 fn fuzzy_distance(left: &str, right: &str) -> usize {
-    levenshtein(left, right)
+    let cutoff = allowed_distance(left.chars().count());
+    if left.chars().count().abs_diff(right.chars().count()) > cutoff {
+        return usize::MAX;
+    }
+
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    let unreachable = cutoff + 1;
+    let mut previous = vec![unreachable; right.len() + 1];
+    let mut current = vec![unreachable; right.len() + 1];
+    for index in 0..=right.len().min(cutoff) {
+        previous[index] = index;
+    }
+
+    for (left_index, left_char) in left.iter().enumerate() {
+        current.fill(unreachable);
+        let start = left_index.saturating_sub(cutoff);
+        let end = (left_index + cutoff + 1).min(right.len());
+        if start == 0 {
+            current[0] = left_index + 1;
+        }
+        for right_index in start..end {
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + usize::from(left_char != &right[right_index]));
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[right.len()]
 }
 
 fn match_score(query: &str, candidate: &str) -> Option<usize> {
@@ -216,14 +204,7 @@ fn match_score(query: &str, candidate: &str) -> Option<usize> {
     }
 
     let distance = fuzzy_distance(query, candidate);
-    (distance <= allowed_distance(query.len())).then_some(distance + 2)
-}
-
-pub(crate) fn compare_results(left: &TagSearch, right: &TagSearch) -> Ordering {
-    right
-        .count
-        .cmp(&left.count)
-        .then_with(|| left.tag_id.cmp(&right.tag_id))
+    (distance != usize::MAX).then_some(distance + 2)
 }
 
 #[cfg(test)]
@@ -241,21 +222,17 @@ mod tests {
     }
 
     #[test]
-    fn compact_cache_ignores_invalid_name_ranges() {
-        let cache = TagSearchCache {
-            entries: vec![CompactTagEntry {
-                tag_id: 42,
-                name_start: usize::MAX,
-                name_len: 312,
-                count: 1,
-            }],
-            names: b"valid".to_vec(),
-        };
-
-        assert!(cache.search("valid", 1).is_empty());
+    fn fuzzy_distance_returns_cutoff_matches_without_full_matrix() {
+        assert_eq!(fuzzy_distance("raer", "rare"), 2);
+        assert_eq!(fuzzy_distance("female", "females"), 1);
+        assert_eq!(fuzzy_distance("cat", "long-unrelated-tag"), usize::MAX);
     }
-}
 
-pub(crate) const fn high_value_count() -> u64 {
-    HIGH_VALUE_TAG_COUNT
+    #[test]
+    fn fts_query_includes_substring_and_transposition_candidates() {
+        let query = fts_query("raer creatur").unwrap();
+        assert!(query.contains("raer"));
+        assert!(query.contains("rare"));
+        assert!(query.contains("creatur"));
+    }
 }

@@ -19,7 +19,7 @@ use std::time::Instant;
 use walkdir::WalkDir;
 
 use crate::db::roaring::InternalCacheType;
-use crate::db::tag_search::{self, TagSearchCache};
+use crate::db::tag_search;
 use crate::db::{CacheType, RelationshipStorage};
 use crate::web::manager::hash_bytes;
 use crate::{db::MainDatabase, helper_functions::get_sys_time_in_secs};
@@ -122,43 +122,53 @@ impl MainDatabase {
 
     pub(in crate::db) fn internal_relationship_migrate_legacy(conn: &Connection) {
         let legacy_exists: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'Relationship')",
-                [],
-                |row| row.get(0),
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'Relationship')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+        if !legacy_exists {
+            return;
+        }
+
+        // Rename the table and create an index on tag_id to avoid full table scans
+        // across the loop, executing directly on the active connection/transaction.
+        conn.execute_batch(
+            "ALTER TABLE Relationship RENAME TO Relationship_legacy;
+         CREATE INDEX idx_relationship_legacy_tag_id ON Relationship_legacy(tag_id);",
+        )
+        .unwrap();
+
+        let namespaces: Vec<u64> = conn
+            .prepare("SELECT DISTINCT id FROM Namespace;")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .flatten()
+            .collect();
+
+        for namespace_id in namespaces {
+            dbg!(&namespace_id);
+            Self::internal_relationship_partition_create(conn, namespace_id);
+            let table = Self::relationship_partition_name(namespace_id);
+
+            conn.execute(
+                &format!(
+                    "INSERT OR IGNORE INTO {table} (file_id, tag_id)
+                 SELECT r.file_id, r.tag_id FROM Relationship_legacy r
+                 JOIN Tags t ON t.id = r.tag_id WHERE t.namespace = ?1"
+                ),
+                [namespace_id],
             )
             .unwrap();
-        if legacy_exists {
-            conn.execute_batch("ALTER TABLE Relationship RENAME TO Relationship_legacy")
-                .unwrap();
-            let namespaces: Vec<u64> = conn
-                .prepare(
-                    "SELECT DISTINCT t.namespace
-                     FROM Relationship_legacy r JOIN Tags t ON t.id = r.tag_id",
-                )
-                .unwrap()
-                .query_map([], |row| row.get(0))
-                .unwrap()
-                .flatten()
-                .collect();
-            for namespace_id in namespaces {
-                Self::internal_relationship_partition_create(conn, namespace_id);
-                let table = Self::relationship_partition_name(namespace_id);
-                conn.execute(
-                    &format!(
-                        "INSERT OR IGNORE INTO {table} (file_id, tag_id)
-                         SELECT r.file_id, r.tag_id FROM Relationship_legacy r
-                         JOIN Tags t ON t.id = r.tag_id WHERE t.namespace = ?1"
-                    ),
-                    [namespace_id],
-                )
-                .unwrap();
-            }
-            conn.execute("DROP TABLE Relationship_legacy", []).unwrap();
         }
+
+        conn.execute("DROP TABLE Relationship_legacy", []).unwrap();
     }
 
-    fn relationship_partition_name(namespace_id: u64) -> String {
+    pub(in crate::db) fn relationship_partition_name(namespace_id: u64) -> String {
         format!("Relationship_{namespace_id}")
     }
 
@@ -519,7 +529,6 @@ impl MainDatabase {
             rel.load_relationship_cache(conn);
         }
         self.reload_tag_cache(conn);
-        self.reload_tag_search_cache(conn);
     }
 
     fn reload_tag_cache(&self, conn: &Connection) {
@@ -546,28 +555,6 @@ impl MainDatabase {
             .flatten()
             .collect();
         *self.tag_cache.write() = entries;
-    }
-
-    fn reload_tag_search_cache(&self, conn: &Connection) {
-        let mut stmt = conn
-            .prepare(
-                "SELECT t.id, t.name, t.count
-                 FROM Tags t
-                 WHERE t.count >= ?1",
-            )
-            .unwrap();
-        let entries = stmt
-            .query_map([tag_search::high_value_count()], |row| {
-                Ok(tag_search::tag_entry(
-                    row.get(0)?,
-                    row.get::<_, String>(1)?.as_str(),
-                    row.get(2)?,
-                ))
-            })
-            .unwrap()
-            .flatten()
-            .collect();
-        *self.tag_search_cache.write() = TagSearchCache::from_entries(entries);
     }
 
     /// Sets up internal cache structure
@@ -629,11 +616,13 @@ impl MainDatabase {
     #[must_use]
     #[ipc(name = "search_tag_fts", request = "SearchTags")]
     pub fn search_db_tags_fts(&self, tag: &str, limit: &Option<u64>) -> Vec<TagSearch> {
-        let max_rows = limit.unwrap_or(10) as usize;
-        let mut results = self.tag_search_cache.read().search(tag, max_rows);
-        if results.len() >= max_rows {
-            return results;
+        let max_rows = limit.unwrap_or(10).min(usize::MAX as u64) as usize;
+        if max_rows == 0 {
+            return Vec::new();
         }
+        let Some(fts_query) = tag_search::fts_query(tag) else {
+            return Vec::new();
+        };
 
         let conn = self.pool.get().unwrap();
         let mut stmt = conn
@@ -642,33 +631,26 @@ impl MainDatabase {
     t.id, 
     t.name, 
     t.count
- FROM Tags t
- WHERE t.count < ?1",
+ FROM Tags_Search_fts f
+ JOIN Tags t ON t.id = f.rowid
+ WHERE Tags_Search_fts MATCH ?1
+ ORDER BY f.rank
+ LIMIT ?2",
             )
             .unwrap();
 
         let tag_iter = stmt
-            .query_map([tag_search::high_value_count()], |row| {
-                let tag_id: u64 = row.get(0)?;
-                let tag_name: String = row.get(1)?;
-                let count: u64 = row.get(2)?;
-                Ok(tag_search::tag_entry(tag_id, &tag_name, count))
-            })
+            .query_map(
+                rusqlite::params![fts_query, tag_search::FTS_CANDIDATE_LIMIT],
+                |row| {
+                    let tag_id: u64 = row.get(0)?;
+                    let tag_name: String = row.get(1)?;
+                    let count: u64 = row.get(2)?;
+                    Ok(tag_search::tag_entry(tag_id, &tag_name, count))
+                },
+            )
             .unwrap();
-        let existing_ids = results.iter().map(|result| result.tag_id).collect();
-        for candidate in
-            tag_search::search_entries(tag_iter.flatten(), tag, max_rows, &existing_ids)
-        {
-            if !results
-                .iter()
-                .any(|result| result.tag_id == candidate.tag_id)
-            {
-                results.push(candidate);
-            }
-        }
-        results.sort_unstable_by(tag_search::compare_results);
-        results.truncate(max_rows);
-        results
+        tag_search::search_entries(tag_iter.flatten(), tag, max_rows, &HashSet::new())
     }
 
     /// Resolves tag names across namespaces and searches for files matching
@@ -802,6 +784,42 @@ END;
 ",
         )
         .unwrap();
+        Self::internal_table_create_tag_search_fts_v6(conn).unwrap();
+    }
+
+    pub(in crate::db) fn internal_table_create_tag_search_fts_v6(
+        conn: &Connection,
+    ) -> Result<(), r2d2_sqlite::rusqlite::Error> {
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS Tags_Search_fts USING fts5(
+                 name,
+                 content='Tags',
+                 content_rowid='id',
+                 tokenize='trigram'
+             );
+             CREATE TRIGGER IF NOT EXISTS tags_search_ai AFTER INSERT ON Tags BEGIN
+                 INSERT INTO Tags_Search_fts(rowid, name) VALUES (new.id, new.name);
+             END;
+             CREATE TRIGGER IF NOT EXISTS tags_search_ad AFTER DELETE ON Tags BEGIN
+                 INSERT INTO Tags_Search_fts(Tags_Search_fts, rowid, name)
+                 VALUES ('delete', old.id, old.name);
+             END;
+             CREATE TRIGGER IF NOT EXISTS tags_search_au AFTER UPDATE OF name ON Tags BEGIN
+                 INSERT INTO Tags_Search_fts(Tags_Search_fts, rowid, name)
+                 VALUES ('delete', old.id, old.name);
+                 INSERT INTO Tags_Search_fts(rowid, name) VALUES (new.id, new.name);
+             END;",
+        )?;
+        let indexed: u64 =
+            conn.query_row("SELECT count(*) FROM Tags_Search_fts", [], |row| row.get(0))?;
+        let tags: u64 = conn.query_row("SELECT count(*) FROM Tags", [], |row| row.get(0))?;
+        if indexed != tags {
+            conn.execute(
+                "INSERT INTO Tags_Search_fts(Tags_Search_fts) VALUES ('rebuild')",
+                [],
+            )?;
+        }
+        Ok(())
     }
     ///
     /// Creates the current default Namespace table
@@ -1129,7 +1147,7 @@ ON Jobs (time, reptime, site, param);
         let param = serde_json::to_string(&job.config.param).unwrap();
         let user_data = serde_json::to_string(&job.config.user_data).unwrap();
 
-        conn.execute(
+        let _ = conn.execute(
             "UPDATE Jobs 
          SET time = ?1, 
              reptime = ?2, 
@@ -1151,8 +1169,7 @@ ON Jobs (time, reptime, site, param);
                 user_data,
                 job.id
             ],
-        )
-        .unwrap();
+        );
     }
 
     ///
@@ -1760,49 +1777,51 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
             return out;
         }
 
-        // 1️⃣ Convert HashSet to a Vec for predictable ordering during mapping
+        // Convert HashSet to a Vec for chunking and predictable ordering
         let tag_ids: Vec<&u64> = tags.iter().collect();
 
-        // 2️⃣ Build a dynamic query containing query parameters: (?1, ?2, ?3...)
-        let mut query = format!(
-            "SELECT t.id, t.name, n.name, n.description \
-         FROM Tags t \
-         JOIN Namespace n ON t.namespace = n.id \
-         WHERE t.id IN (",
-        );
+        for chunk in tag_ids.chunks(SQL_CHUNK_SIZE) {
+            // Build a dynamic query containing query parameters for the current chunk: (?1, ?2, ?3...)
+            let mut query = String::from(
+                "SELECT t.id, t.name, n.name, n.description \
+             FROM Tags t \
+             JOIN Namespace n ON t.namespace = n.id \
+             WHERE t.id IN (",
+            );
 
-        let mut params_vector: Vec<&dyn ToSql> = Vec::with_capacity(tag_ids.len());
+            let mut params_vector: Vec<&dyn ToSql> = Vec::with_capacity(chunk.len());
 
-        for (i, &id) in tag_ids.iter().enumerate() {
-            if i > 0 {
-                query.push_str(", ");
+            for (i, &id) in chunk.iter().enumerate() {
+                if i > 0 {
+                    query.push_str(", ");
+                }
+                query.push_str(&format!("?{}", i + 1));
+                params_vector.push(id);
             }
-            query.push_str(&format!("?{}", i + 1));
-            params_vector.push(id);
-        }
-        query.push(')');
+            query.push(')');
 
-        // 3️⃣ Prepare the statement and map rows back into your structs
-        let mut stmt = conn.prepare(&query).unwrap();
-        let mut rows = stmt
-            .query(rusqlite::params_from_iter(params_vector))
-            .unwrap();
+            // Prepare the statement and map rows back into your structs for this chunk
+            let mut stmt = conn.prepare(&query).unwrap();
+            let mut rows = stmt
+                .query(rusqlite::params_from_iter(params_vector))
+                .unwrap();
 
-        while let Some(row) = rows.next().unwrap() {
-            let id: u64 = row.get(0).unwrap();
-            let tag_name: String = row.get(1).unwrap();
-            let namespace_name: String = row.get(2).unwrap();
-            let namespace_desc: Option<String> = row.get(3).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                let id: u64 = row.get(0).unwrap();
+                let tag_name: String = row.get(1).unwrap();
+                let namespace_name: String = row.get(2).unwrap();
+                let namespace_desc: Option<String> = row.get(3).unwrap();
 
-            let tag = Tag {
-                name: tag_name,
-                namespace: GenericNamespaceObj {
-                    name: namespace_name,
-                    description: namespace_desc,
-                },
-            };
+                let tag = Tag {
+                    name: tag_name,
+                    namespace: GenericNamespaceObj {
+                        name: namespace_name,
+                        description: namespace_desc,
+                    },
+                };
 
-            out.insert(id, tag);
+                out.insert(id, tag);
+            }
         }
 
         out
@@ -2205,6 +2224,313 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         )
     }
 
+    /// Copies the supported data from another SQLite database without loading
+    /// the source tables into memory. Source rows are read-only through ATTACH.
+    pub fn db_slurp(&self, source: &std::path::Path) -> Result<(u64, u64, u64), rusqlite::Error> {
+        if !source.is_file() {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "source must be a file".into(),
+            ));
+        }
+        let conn = self.writer_conn.lock();
+        let source = source.to_string_lossy();
+        conn.execute("ATTACH DATABASE ?1 AS slurp_source", [source.as_ref()])?;
+        let result = self.internal_db_slurp_attached(&conn);
+        let detach = conn.execute_batch("DETACH DATABASE slurp_source");
+        match (result, detach) {
+            (Ok(counts), Ok(())) => Ok(counts),
+            (Err(error), _) => Err(error),
+            (_, Err(error)) => Err(error),
+        }
+    }
+
+    fn internal_db_slurp_attached(
+        &self,
+        conn: &Connection,
+    ) -> Result<(u64, u64, u64), rusqlite::Error> {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS slurp_namespaces (
+                 source_id INTEGER PRIMARY KEY, target_id INTEGER NOT NULL
+             );
+             CREATE TEMP TABLE IF NOT EXISTS slurp_tags (
+                 source_id INTEGER PRIMARY KEY, target_id INTEGER NOT NULL
+             );
+             DELETE FROM slurp_namespaces;
+             DELETE FROM slurp_tags;",
+        )?;
+
+        tx.execute(
+            "INSERT OR IGNORE INTO FileStorageLocations(location)
+             SELECT location FROM slurp_source.FileStorageLocations",
+            [],
+        )?;
+        let namespaces = tx
+            .prepare("SELECT name, description FROM slurp_source.Namespace")?
+            .query_map([], |row| {
+                Ok(GenericNamespaceObj {
+                    name: row.get(0)?,
+                    description: row.get(1)?,
+                })
+            })?
+            .collect::<Result<HashSet<_>, _>>()?;
+        Self::internal_namespace_bulk_add(&tx, &namespaces);
+        tx.execute(
+            "INSERT INTO slurp_namespaces(source_id, target_id)
+             SELECT s.id, n.id
+             FROM slurp_source.Namespace s
+             JOIN Namespace n ON n.name = s.name",
+            [],
+        )?;
+        let mut last_tag_id = 0_u64;
+        loop {
+            let mut stmt = tx.prepare(
+                "SELECT s.id, s.name, n.name, n.description
+                 FROM slurp_source.Tags s
+                 JOIN slurp_source.Namespace n ON n.id = s.namespace
+                 WHERE s.id > ?1
+                 ORDER BY s.id
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![last_tag_id, SQL_CHUNK_SIZE], |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?;
+            let batch: Vec<_> = rows.collect::<Result<_, _>>()?;
+            drop(stmt);
+            let Some((last_id, _, _, _)) = batch.last() else {
+                break;
+            };
+            let actions = batch
+                .iter()
+                .map(|(_, name, namespace, description)| FileTagAction {
+                    operation: TagOperation::Add,
+                    tags: vec![PluginTag {
+                        tag: Tag {
+                            name: name.clone(),
+                            namespace: GenericNamespaceObj {
+                                name: namespace.clone(),
+                                description: description.clone(),
+                            },
+                        },
+                        tag_type: TagType::NormalNoRegex,
+                        relates_to: None,
+                    }],
+                })
+                .collect::<Vec<_>>();
+            Self::internal_tag_bulk_add(&tx, &actions, self.plugin_manager.clone());
+            last_tag_id = *last_id;
+        }
+        tx.execute(
+            "INSERT INTO slurp_tags(source_id, target_id)
+             SELECT s.id, t.id
+             FROM slurp_source.Tags s
+             JOIN slurp_namespaces ns ON ns.source_id = s.namespace
+             JOIN Tags t ON t.name = s.name AND t.namespace = ns.target_id",
+            [],
+        )?;
+
+        let namespace_count = tx.query_row("SELECT count(*) FROM slurp_namespaces", [], |row| {
+            row.get(0)
+        })?;
+        let tag_count = tx.query_row("SELECT count(*) FROM slurp_tags", [], |row| row.get(0))?;
+
+        let file_schema: String = tx.query_row(
+            "SELECT sql FROM slurp_source.sqlite_master
+             WHERE type = 'table' AND name = 'File'",
+            [],
+            |row| row.get(0),
+        )?;
+        let has_size_bytes = file_schema
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .any(|column| column.eq_ignore_ascii_case("size_bytes"));
+        let size_column = if has_size_bytes {
+            "f.size_bytes"
+        } else {
+            "NULL"
+        };
+        let mut last_file_id = 0_u64;
+        loop {
+            let file_query = format!(
+                "SELECT f.id, f.hash, f.extension, {size_column}, s.location
+                 FROM slurp_source.File f
+                 LEFT JOIN slurp_source.FileStorageLocations s ON s.id = f.storage_id
+                 WHERE f.id > ?1 AND f.hash IS NOT NULL
+                 ORDER BY f.id
+                 LIMIT ?2"
+            );
+            let mut stmt = tx.prepare(&file_query)?;
+            let rows = stmt.query_map(params![last_file_id, SQL_CHUNK_SIZE], |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<u64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?;
+            let batch: Vec<_> = rows.collect::<Result<_, _>>()?;
+            drop(stmt);
+            let Some((last_id, _, _, _, _)) = batch.last() else {
+                break;
+            };
+            let files = batch
+                .iter()
+                .map(|(_, hash, extension, size_bytes, location)| {
+                    let storage_id = location
+                        .as_deref()
+                        .map(|location| {
+                            Self::internal_file_storage_location_get_or_create(&tx, location)
+                        })
+                        .transpose()?
+                        .unwrap_or_default();
+                    Ok(FileInternal {
+                        id: None,
+                        hash: hash.clone(),
+                        extension: extension.clone(),
+                        storage_id,
+                        size_bytes: *size_bytes,
+                    })
+                })
+                .collect::<Result<HashSet<_>, rusqlite::Error>>()?;
+            Self::internal_file_bulk_add(&tx, files);
+            last_file_id = *last_id;
+        }
+        let has_file_hashes: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM slurp_source.sqlite_master
+                 WHERE type = 'table' AND name = 'FileHashes'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_file_hashes {
+            tx.execute(
+                "INSERT OR IGNORE INTO FileHashes(file_id, algorithm, digest)
+                 SELECT d.id, h.algorithm, h.digest
+                 FROM slurp_source.FileHashes h
+                 JOIN slurp_source.File sf ON sf.id = h.file_id
+                 JOIN File d ON d.hash = sf.hash",
+                [],
+            )?;
+        }
+        let file_count = tx.query_row(
+            "SELECT count(*) FROM slurp_source.File WHERE hash IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let has_legacy_relationship: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM slurp_source.sqlite_master
+                 WHERE type = 'table' AND name = 'Relationship'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let mut namespaces = tx.prepare("SELECT source_id, target_id FROM slurp_namespaces")?;
+        let namespace_rows =
+            namespaces.query_map([], |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)))?;
+        for row in namespace_rows {
+            let (source_namespace, _target_namespace) = row?;
+            let source_table = format!("Relationship_{source_namespace}");
+            let has_partition: bool = tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM slurp_source.sqlite_master
+                     WHERE type = 'table' AND name = ?1
+                 )",
+                [&source_table],
+                |row| row.get(0),
+            )?;
+            let source_table = if has_partition {
+                Some(source_table)
+            } else if has_legacy_relationship {
+                Some("Relationship".to_string())
+            } else {
+                None
+            };
+            let Some(source_table) = source_table else {
+                continue;
+            };
+            let mut last_file_id = 0_u64;
+            let mut last_tag_id = 0_u64;
+            loop {
+                let query = format!(
+                    "SELECT d.id, tags.target_id, r.file_id, r.tag_id
+                     FROM slurp_source.{source_table} r
+                     JOIN slurp_tags tags ON tags.source_id = r.tag_id
+                     JOIN slurp_source.File sf ON sf.id = r.file_id
+                     JOIN File d ON d.hash = sf.hash
+                     JOIN slurp_source.Tags source_tag ON source_tag.id = r.tag_id
+                         AND source_tag.namespace = ?4
+                     WHERE r.file_id > ?1 OR (r.file_id = ?1 AND r.tag_id > ?2)
+                     ORDER BY r.file_id, r.tag_id
+                     LIMIT ?3"
+                );
+                let mut stmt = tx.prepare(&query)?;
+                let rows = stmt.query_map(
+                    params![last_file_id, last_tag_id, SQL_CHUNK_SIZE, source_namespace],
+                    |row| {
+                        Ok((
+                            row.get::<_, u64>(0)?,
+                            row.get::<_, u64>(1)?,
+                            row.get::<_, u64>(2)?,
+                            row.get::<_, u64>(3)?,
+                        ))
+                    },
+                )?;
+                let batch: Vec<_> = rows.collect::<Result<_, _>>()?;
+                drop(stmt);
+                let Some((_, _, source_file_id, source_tag_id)) = batch.last() else {
+                    break;
+                };
+                let relationships = batch
+                    .iter()
+                    .map(|(file_id, tag_id, _, _)| (*file_id, *tag_id))
+                    .collect();
+                Self::internal_relationship_bulk_add(Arc::new(self.clone()), &tx, &relationships);
+                last_file_id = *source_file_id;
+                last_tag_id = *source_tag_id;
+            }
+        }
+        drop(namespaces);
+
+        let has_parents: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM slurp_source.sqlite_master
+                 WHERE type = 'table' AND name = 'Parents'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_parents {
+            let mut parents = tx.prepare(
+                "SELECT child.target_id, parent.target_id, limit_to.target_id
+                 FROM slurp_source.Parents p
+                 JOIN slurp_tags child ON child.source_id = p.tag_id
+                 JOIN slurp_tags parent ON parent.source_id = p.relate_tag_id
+                 LEFT JOIN slurp_tags limit_to ON limit_to.source_id = p.limit_to",
+            )?;
+            let parent_rows = parents.query_map([], |row| {
+                Ok(shared_types::TagParents {
+                    tag_id: row.get(0)?,
+                    relate_tag_id: row.get(1)?,
+                    limit_to: row.get(2)?,
+                })
+            })?;
+            let parent_batch = parent_rows.collect::<Result<HashSet<_>, _>>()?;
+            Self::internal_parents_bulk_add(&tx, &parent_batch);
+        }
+        tx.execute_batch("DROP TABLE slurp_tags; DROP TABLE slurp_namespaces;")?;
+        tx.commit()?;
+        Ok((namespace_count, tag_count, file_count))
+    }
+
     ///
     /// Used internally to add a relationship to a db
     ///
@@ -2524,7 +2850,6 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                 }
             }
         }
-        self.reload_tag_search_cache(conn);
     }
 
     /// Deletes from db where id in
@@ -2536,15 +2861,19 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             return Ok(0);
         }
 
-        // Generate a comma-separated list of placeholders: "?, ?, ?"
-        let placeholders: Vec<String> = tag_ids.iter().map(|_| "?".to_string()).collect();
-        let query = format!(
-            "DELETE FROM Tags WHERE id IN ({});",
-            placeholders.join(", ")
-        );
+        // Collect IDs into a Vec
+        let ids: Vec<u64> = tag_ids.iter().copied().collect();
+        let mut total_deleted = 0;
 
-        // Execute the query, binding each element in the HashSet as a separate parameter
-        conn.execute(&query, params_from_iter(tag_ids))
+        for chunk in ids.chunks(SQL_CHUNK_SIZE) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let query = format!("DELETE FROM Tags WHERE id IN ({});", placeholders);
+
+            let affected = conn.execute(&query, r2d2_sqlite::rusqlite::params_from_iter(chunk))?;
+            total_deleted += affected;
+        }
+
+        Ok(total_deleted)
     }
 
     /// Removes namespaces where id in list
@@ -2664,8 +2993,6 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                     roaring.relationship_roaring_add(conn, *file_id, *tag_id);
                 }
             }
-
-            self.reload_tag_search_cache(conn);
         }
     }
 
@@ -3370,6 +3697,56 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             self.job_remove(job).await;
         }
     }
+
+    pub async fn update_missing_file_sizes(&self) -> Result<u64, rusqlite::Error> {
+        let writer_conn = self.writer_conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = writer_conn.lock();
+            let storage = Self::internal_file_storage_get_all(&conn)?;
+            let mut files = conn.prepare(
+                "SELECT id, hash, extension, storage_id
+                 FROM File WHERE size_bytes IS NULL AND hash IS NOT NULL",
+            )?;
+            let rows = files.query_map([], |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u64>(3)?,
+                ))
+            })?;
+            let mut update = conn.prepare("UPDATE File SET size_bytes = ?1 WHERE id = ?2")?;
+            let mut updated = 0;
+            for row in rows {
+                let (id, hash, extension, storage_id) = row?;
+                let file = FileInternal {
+                    id: Some(id),
+                    hash,
+                    extension,
+                    storage_id,
+                    size_bytes: None,
+                };
+                let path = storage
+                    .get(&storage_id)
+                    .and_then(|base| Self::get_file_location(&file, base))
+                    .or_else(|| {
+                        storage
+                            .iter()
+                            .filter(|(id, _)| **id != storage_id)
+                            .find_map(|(_, base)| Self::get_file_location(&file, base))
+                    });
+                if let Some(path) = path
+                    && let Ok(metadata) = std::fs::metadata(path)
+                {
+                    update.execute(params![metadata.len(), id])?;
+                    updated += 1;
+                }
+            }
+            Ok(updated)
+        })
+        .await
+        .unwrap()
+    }
     ///
     /// Checks if we should download the file or not
     ///
@@ -3440,23 +3817,13 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             return;
         }
 
-        let pool = self.pool.clone();
-
         tokio::task::spawn_blocking(move || {
-            let mut conn = match pool.get() {
-                Ok(c) => c,
-                Err(e) => {
-                    log::error!("Failed to acquire DB connection from pool: {e:?}");
-                    panic!();
-                }
-            };
-            let tn = conn
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .unwrap();
-
-            Self::internal_audit_context_set(&tn, "relationship added").unwrap();
-            Self::internal_relationship_bulk_add(self, &tn, &rel_list);
-            tn.commit().unwrap();
+            let self_clone = self.clone();
+            let mut writer_conn = self_clone.writer_conn.lock();
+            let conn = writer_conn.transaction().unwrap();
+            Self::internal_audit_context_set(&conn, "relationship added").unwrap();
+            Self::internal_relationship_bulk_add(self, &conn, &rel_list);
+            conn.commit().unwrap();
         })
         .await
         .unwrap();
@@ -3469,23 +3836,13 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             return;
         }
 
-        let pool = self.pool.clone();
-
         tokio::task::spawn_blocking(move || {
-            let mut conn = match pool.get() {
-                Ok(c) => c,
-                Err(e) => {
-                    log::error!("Failed to acquire DB connection from pool: {e:?}");
-                    panic!();
-                }
-            };
-            let tn = conn
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .unwrap();
-
-            Self::internal_audit_context_set(&tn, "relationship removed").unwrap();
-            Self::internal_relationship_bulk_delete(self, &tn, &rel_list);
-            tn.commit().unwrap();
+            let self_clone = self.clone();
+            let mut writer_conn = self_clone.writer_conn.lock();
+            let conn = writer_conn.transaction().unwrap();
+            Self::internal_audit_context_set(&conn, "relationship removed").unwrap();
+            Self::internal_relationship_bulk_delete(self, &conn, &rel_list);
+            conn.commit().unwrap();
         })
         .await
         .unwrap();
@@ -3943,9 +4300,11 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     #[must_use]
     #[ipc(name = "setting_set", request = "SettingsSet")]
     pub fn setting_set_sync(&self, obj: &DbSettingsObj) -> bool {
-        let pool = self.pool.clone();
-        if let Ok(conn) = pool.get() {
+        let mut writer_conn = self.writer_conn.lock();
+        if let Ok(conn) = writer_conn.transaction() {
             let _ = Self::internal_setting_set(&conn, obj);
+
+            conn.commit();
         }
         false
     }
@@ -4066,7 +4425,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         conn.commit().unwrap();
         out
     }
-
+    /*
     ///
     /// Adds job into db asynchronously.
     ///
@@ -4085,7 +4444,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         })
         .await
         .unwrap()
-    }
+    }*/
 
     ///
     /// Adds tags into db in bulk. Also adds parents
@@ -5306,6 +5665,173 @@ mod tests {
 
         let slow = db.search_db_tags_fts("raer creatur", &Some(1));
         assert_eq!(slow[0].tag_id, rare_creature);
+    }
+
+    #[test]
+    fn test_db_slurp_imports_supported_rows_and_relationships() {
+        let source_path = std::env::temp_dir().join("intscrape-db-slurp-source.sqlite");
+        let destination_path = std::env::temp_dir().join("intscrape-db-slurp-destination.sqlite");
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&destination_path);
+
+        let source = MainDatabase::new(&source_path);
+        let destination = MainDatabase::new(&destination_path);
+        let source_conn = source.pool.get().unwrap();
+        let destination_conn = destination.pool.get().unwrap();
+        destination_conn
+            .execute(
+                "INSERT INTO Namespace(name, description) VALUES ('existing', 'existing')",
+                [],
+            )
+            .unwrap();
+        for index in 0..49 {
+            destination_conn
+                .execute(
+                    "INSERT INTO Tags(name, namespace) VALUES (?1, 1)",
+                    [format!("existing-{index}")],
+                )
+                .unwrap();
+        }
+        drop(destination_conn);
+        source_conn
+            .execute(
+                "INSERT INTO FileStorageLocations(location) VALUES ('/tmp')",
+                [],
+            )
+            .unwrap();
+        source_conn
+            .execute(
+                "INSERT INTO Namespace(name, description) VALUES ('source', 'test')",
+                [],
+            )
+            .unwrap();
+        source_conn
+            .execute(
+                "INSERT INTO Tags(name, namespace) VALUES
+                 ('female', 1), ('large_female', 1)",
+                [],
+            )
+            .unwrap();
+        source_conn
+            .execute(
+                "INSERT INTO Parents(tag_id, relate_tag_id, limit_to)
+                 VALUES (1, 2, NULL)",
+                [],
+            )
+            .unwrap();
+        source_conn
+            .execute(
+                "INSERT INTO File(hash, extension, storage_id, size_bytes)
+                 VALUES ('slurp-hash', 'jpg', 1, 42)",
+                [],
+            )
+            .unwrap();
+        source_conn
+            .execute_batch(
+                "CREATE TABLE File_legacy (
+                     id INTEGER PRIMARY KEY NOT NULL,
+                     hash TEXT UNIQUE,
+                     extension TEXT,
+                     storage_id INTEGER
+                 );
+                 INSERT INTO File_legacy SELECT id, hash, extension, storage_id FROM File;
+                 DROP TABLE File;
+                 ALTER TABLE File_legacy RENAME TO File;",
+            )
+            .unwrap();
+        MainDatabase::internal_relationship_partition_create(&source_conn, 1);
+        source_conn
+            .execute(
+                "INSERT INTO Relationship_1(file_id, tag_id) VALUES (1, 1), (1, 2)",
+                [],
+            )
+            .unwrap();
+        drop(source_conn);
+
+        assert_eq!(destination.db_slurp(&source_path).unwrap(), (1, 2, 1));
+        let conn = destination.pool.get().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM Tags WHERE count = 1", [], |row| row
+                .get::<_, u64>(
+                0
+            ))
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM Parents", [], |row| row
+                .get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+        let female_id: u64 = conn
+            .query_row(
+                "SELECT id FROM Tags WHERE name = 'female' AND namespace = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let large_female_id: u64 = conn
+            .query_row(
+                "SELECT id FROM Tags WHERE name = 'large_female' AND namespace = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(female_id, 50);
+        assert_eq!(large_female_id, 51);
+        assert_eq!(
+            conn.query_row("SELECT tag_id, relate_tag_id FROM Parents", [], |row| Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, u64>(1)?
+            )),)
+                .unwrap(),
+            (female_id, large_female_id)
+        );
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(destination_path);
+    }
+
+    #[tokio::test]
+    async fn test_update_missing_file_sizes_updates_only_existing_files() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let hash = "size-job-hash";
+        let path = directory
+            .path()
+            .join(&hash[0..2])
+            .join(&hash[2..4])
+            .join(&hash[4..6])
+            .join(hash)
+            .with_extension("jpg");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"file-size").unwrap();
+        MainDatabase::internal_file_storage_location_set(&conn, directory.path().to_str().unwrap())
+            .unwrap();
+        MainDatabase::internal_file_bulk_add(
+            &conn,
+            HashSet::from([FileInternal {
+                id: None,
+                hash: hash.into(),
+                extension: "jpg".into(),
+                storage_id: 1,
+                size_bytes: None,
+            }]),
+        );
+        drop(conn);
+
+        assert_eq!(db.update_missing_file_sizes().await.unwrap(), 1);
+        let conn = db.pool.get().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT size_bytes FROM File WHERE hash = ?1",
+                [hash],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap(),
+            9
+        );
     }
 
     #[test]
