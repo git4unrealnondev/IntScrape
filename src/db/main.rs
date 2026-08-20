@@ -528,33 +528,37 @@ impl MainDatabase {
         if let Some(rel) = guard.as_mut() {
             rel.load_relationship_cache(conn);
         }
-        self.reload_tag_cache(conn);
-    }
+        drop(guard);
 
-    fn reload_tag_cache(&self, conn: &Connection) {
         let mut stmt = conn
             .prepare(
-                "SELECT t.id, t.name, n.name, n.description
-                 FROM Tags t JOIN Namespace n ON n.id = t.namespace",
+                "SELECT id, name, count
+                 FROM Tags
+                 ORDER BY count DESC, id
+                 LIMIT ?1",
             )
             .unwrap();
         let entries = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, u64>(0)?,
-                    Tag {
-                        name: row.get(1)?,
-                        namespace: GenericNamespaceObj {
-                            name: row.get(2)?,
-                            description: row.get(3)?,
-                        },
-                    },
-                ))
+            .query_map([tag_search::POPULAR_TAG_CACHE_LIMIT], |row| {
+                let tag_id = row.get(0)?;
+                let name: String = row.get(1)?;
+                let count = row.get(2)?;
+                Ok(tag_search::tag_entry(tag_id, &name, count))
             })
             .unwrap()
-            .flatten()
-            .collect();
-        *self.tag_cache.write() = entries;
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let cached_tag_count: u64 = conn
+            .query_row("SELECT count(*) FROM Tags", [], |row| row.get(0))
+            .unwrap();
+        let data_version: u64 = conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .unwrap();
+        *self.tag_search_cache.write() = tag_search::TagSearchCache::from_entries_at_version(
+            entries,
+            data_version,
+            cached_tag_count <= tag_search::POPULAR_TAG_CACHE_LIMIT as u64,
+        );
     }
 
     /// Sets up internal cache structure
@@ -620,11 +624,48 @@ impl MainDatabase {
         if max_rows == 0 {
             return Vec::new();
         }
+        let conn = self.pool.get().unwrap();
+        let data_version: u64 = conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .unwrap();
+        if !self.tag_search_cache.read().is_current(data_version) {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, name, count
+                     FROM Tags
+                     ORDER BY count DESC, id
+                     LIMIT ?1",
+                )
+                .unwrap();
+            let entries = stmt
+                .query_map([tag_search::POPULAR_TAG_CACHE_LIMIT], |row| {
+                    let tag_id = row.get(0)?;
+                    let name: String = row.get(1)?;
+                    let count = row.get(2)?;
+                    Ok(tag_search::tag_entry(tag_id, &name, count))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let cached_tag_count: u64 = conn
+                .query_row("SELECT count(*) FROM Tags", [], |row| row.get(0))
+                .unwrap();
+            *self.tag_search_cache.write() = tag_search::TagSearchCache::from_entries_at_version(
+                entries,
+                data_version,
+                cached_tag_count <= tag_search::POPULAR_TAG_CACHE_LIMIT as u64,
+            );
+        }
+
+        let mut results = self.tag_search_cache.read().search(tag, max_rows);
+        if self.tag_search_cache.read().is_complete() {
+            return results;
+        }
+
         let Some(fts_query) = tag_search::fts_query(tag) else {
-            return Vec::new();
+            return results;
         };
 
-        let conn = self.pool.get().unwrap();
         let mut stmt = conn
             .prepare(
                 "SELECT 
@@ -634,7 +675,6 @@ impl MainDatabase {
  FROM Tags_Search_fts f
  JOIN Tags t ON t.id = f.rowid
  WHERE Tags_Search_fts MATCH ?1
- ORDER BY f.rank
  LIMIT ?2",
             )
             .unwrap();
@@ -650,7 +690,20 @@ impl MainDatabase {
                 },
             )
             .unwrap();
-        tag_search::search_entries(tag_iter.flatten(), tag, max_rows, &HashSet::new())
+        let existing_ids = results.iter().map(|result| result.tag_id).collect();
+        for candidate in
+            tag_search::search_entries(tag_iter.flatten(), tag, max_rows, &existing_ids)
+        {
+            if !results
+                .iter()
+                .any(|result| result.tag_id == candidate.tag_id)
+            {
+                results.push(candidate);
+            }
+        }
+        results.sort_unstable_by(tag_search::compare_results);
+        results.truncate(max_rows);
+        results
     }
 
     /// Resolves tag names across namespaces and searches for files matching
@@ -1652,16 +1705,37 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
     #[must_use]
     #[ipc(name = "get_tag_id_bulk", request = "GetTagIds")]
     pub fn tag_id_get_tag_sync(&self, tags: &HashSet<u64>) -> HashMap<u64, Tag> {
-        let tag_cache = self.tag_cache.read();
-        if tags.iter().all(|tag_id| tag_cache.contains_key(tag_id)) {
-            return tags
-                .iter()
-                .filter_map(|tag_id| tag_cache.get(tag_id).cloned().map(|tag| (*tag_id, tag)))
-                .collect();
+        if tags.is_empty() {
+            return HashMap::new();
+        }
+
+        let mut out = HashMap::with_capacity(tags.len());
+        let mut missing = HashSet::new();
+        {
+            let mut tag_cache = self.tag_cache.write();
+            for tag_id in tags {
+                if let Some(tag) = tag_cache.get(*tag_id) {
+                    out.insert(*tag_id, tag);
+                } else {
+                    missing.insert(*tag_id);
+                }
+            }
+        }
+
+        if missing.is_empty() {
+            return out;
         }
 
         let conn = self.pool.get().unwrap();
-        Self::internal_tag_id_get_tag(&conn, tags)
+        let fetched = Self::internal_tag_id_get_tag(&conn, &missing);
+        {
+            let mut tag_cache = self.tag_cache.write();
+            for (tag_id, tag) in &fetched {
+                tag_cache.insert(*tag_id, tag.clone());
+            }
+        }
+        out.extend(fetched);
+        out
     }
 
     ///

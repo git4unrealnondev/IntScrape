@@ -2,11 +2,18 @@ use core::{convert::Into, option::Option::Some};
 use parking_lot::{Mutex, RwLock};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::{SqliteConnectionManager, rusqlite::Connection};
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::Path,
+    time::Duration,
+};
 
 use crate::{
     Arc, DB_VERSION,
-    db::roaring::{InternalCacheType, RelationshipStorage},
+    db::{
+        roaring::{InternalCacheType, RelationshipStorage},
+        tag_search::TagSearchCache,
+    },
     plugins::PluginManager,
 };
 
@@ -32,19 +39,96 @@ pub struct MainDatabase {
     pool: Pool<SqliteConnectionManager>,
     writer_conn: Arc<Mutex<PooledConnection<SqliteConnectionManager>>>,
     namespace_cache: Arc<RwLock<HashMap<String, u64>>>,
-    tag_cache: Arc<RwLock<HashMap<u64, shared_types::Tag>>>,
+    tag_cache: Arc<RwLock<TagCache>>,
+    tag_search_cache: Arc<RwLock<TagSearchCache>>,
     cache_type: Arc<RwLock<CacheType>>,
     relationship_roaring_storage: Arc<RwLock<Option<RelationshipStorage>>>,
     plugin_manager: Arc<RwLock<Option<Arc<PluginManager>>>>,
+}
+
+const TAG_CACHE_LIMIT: usize = 100_000;
+
+pub(crate) struct TagCache {
+    entries: HashMap<u64, (shared_types::Tag, u64)>,
+    order: VecDeque<(u64, u64)>,
+    next_generation: u64,
+}
+
+impl TagCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            next_generation: 0,
+        }
+    }
+
+    fn get(&mut self, tag_id: u64) -> Option<shared_types::Tag> {
+        let tag = self.entries.get(&tag_id).map(|(tag, _)| tag.clone());
+        if let Some(tag) = tag {
+            self.insert(tag_id, tag.clone());
+            Some(tag)
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, tag_id: u64, tag: shared_types::Tag) {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.entries.insert(tag_id, (tag, generation));
+        self.order.push_back((tag_id, generation));
+        while self.order.len() > TAG_CACHE_LIMIT {
+            if let Some((oldest_id, oldest_generation)) = self.order.pop_front()
+                && self
+                    .entries
+                    .get(&oldest_id)
+                    .is_some_and(|(_, generation)| *generation == oldest_generation)
+            {
+                self.entries.remove(&oldest_id);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tag_cache_tests {
+    use super::{TAG_CACHE_LIMIT, TagCache};
+    use shared_types::{GenericNamespaceObj, Tag};
+
+    fn tag(name: &str) -> Tag {
+        Tag {
+            name: name.into(),
+            namespace: GenericNamespaceObj {
+                name: "test".into(),
+                description: None,
+            },
+        }
+    }
+
+    #[test]
+    fn cache_is_bounded_and_keeps_recent_entries() {
+        let mut cache = TagCache::new();
+        cache.insert(1, tag("one"));
+        assert_eq!(cache.get(1).unwrap().name, "one");
+
+        for id in 2..=(TAG_CACHE_LIMIT as u64) {
+            cache.insert(id, tag("tag"));
+        }
+
+        assert!(cache.get(1).is_some());
+        cache.insert(TAG_CACHE_LIMIT as u64 + 1, tag("new"));
+        assert!(cache.get(2).is_none());
+    }
 }
 
 impl MainDatabase {
     #[must_use]
     pub fn new(db_path: &Path) -> Arc<Self> {
         let manager = SqliteConnectionManager::file(db_path).with_init(|c| {
-            /*c.trace(Some(|statement: &str| {
+            c.trace(Some(|statement: &str| {
                 log::info!("Executing SQL: {}", statement);
-            }));*/
+            }));
             c.busy_timeout(Duration::from_secs(1))?;
             c.execute_batch(
                 "
@@ -69,7 +153,8 @@ PRAGMA cache_size = -64000;
         let main_db: Arc<Self> = Self {
             pool,
             namespace_cache: Arc::new(RwLock::new(HashMap::new())),
-            tag_cache: Arc::new(RwLock::new(HashMap::new())),
+            tag_cache: Arc::new(RwLock::new(TagCache::new())),
+            tag_search_cache: Arc::new(RwLock::new(TagSearchCache::default())),
             cache_type: Arc::new(RwLock::new(CacheType::Bare)),
             relationship_roaring_storage: Arc::new(RwLock::new(None)),
             writer_conn,
