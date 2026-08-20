@@ -29,6 +29,7 @@ const DB_PATH: &str = "main.db";
 const LOG_PATH: &str = "log.txt";
 pub const PLUGINS_PATH: &str = "compiled_plugins";
 const DB_VERSION: u64 = 6;
+const JOB_PROCESSING_CHUNK_SIZE: usize = 256;
 
 ///
 /// Sets up logging in the environment
@@ -117,7 +118,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             sites.push(SYSTEM_DATABASE_BACKUP_SITE.to_string());
             sites.push(SYSTEM_FILE_SIZE_SITE.to_string());
             sites.push(SYSTEM_FILE_HASH_SITE.to_string());
-            let jobs_to_run = db_spawn.jobs_get_torun(sites).await;
+            let jobs_to_run = db_spawn
+                .jobs_get_torun_chunk(sites, JOB_PROCESSING_CHUNK_SIZE)
+                .await;
 
             for job in jobs_to_run
                 .iter()

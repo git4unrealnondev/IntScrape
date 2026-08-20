@@ -415,6 +415,21 @@ impl RelationshipStorage {
         out
     }
 
+    /// Returns tag relationships without touching SQLite when the tag bitmap
+    /// is already resident in an in-memory cache.
+    pub(in crate::db) fn relationship_search_fileid_roaring_in_memory(
+        &self,
+        tag_id: u64,
+    ) -> Option<Vec<u64>> {
+        if !matches!(self.internal_cache, InternalCacheType::Full | InternalCacheType::Popular(_)) {
+            return None;
+        }
+
+        self.tag_id
+            .get(tag_id)
+            .map(|bitmap| bitmap.iter().collect())
+    }
+
     ///
     /// Returns the tagids associated with a fileid
     ///

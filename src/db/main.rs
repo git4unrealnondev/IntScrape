@@ -820,11 +820,25 @@ CREATE VIRTUAL TABLE Tags_Popular_fts USING fts5(
 );
 
 -- OPTIMIZATION: Only insert if it meets the threshold
-CREATE TRIGGER IF NOT EXISTS tags_ai AFTER INSERT ON Tags 
+ CREATE TRIGGER IF NOT EXISTS tags_ai AFTER INSERT ON Tags
 WHEN new.count = 5
 BEGIN
     INSERT INTO Tags_Popular_fts(rowid, name, namespace) 
     VALUES (new.id, new.name, new.namespace);
+END;
+
+CREATE TRIGGER IF NOT EXISTS tags_count_au AFTER UPDATE OF count ON Tags
+WHEN old.count < 5 AND new.count >= 5
+BEGIN
+    INSERT INTO Tags_Popular_fts(rowid, name, namespace)
+    VALUES (new.id, new.name, new.namespace);
+END;
+
+CREATE TRIGGER IF NOT EXISTS tags_count_ad AFTER UPDATE OF count ON Tags
+WHEN old.count >= 5 AND new.count < 5
+BEGIN
+    INSERT INTO Tags_Popular_fts(Tags_Popular_fts, rowid, name, namespace)
+    VALUES ('delete', old.id, old.name, old.namespace);
 END;
 
 -- OPTIMIZATION: Only attempt FTS delete if the old row actually qualified to be in there
@@ -1342,6 +1356,16 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
         true
     }
 
+    pub(in crate::db) fn tag_has_files_cached(&self, conn: &Connection, tag_id: u64) -> bool {
+        if let Some(guard) = self.relationship_roaring_storage.read().as_ref()
+            && let Some(file_ids) = guard.relationship_search_fileid_roaring_in_memory(tag_id)
+        {
+            return !file_ids.is_empty();
+        }
+
+        Self::internal_tag_has_files(conn, tag_id)
+    }
+
     ///
     /// Gets a single `file_id` from a tag
     ///
@@ -1379,11 +1403,14 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
         conn: &Connection,
         tag_id: &u64,
     ) -> Result<u64, rusqlite::Error> {
+        let namespace_id: u64 = conn.query_row(
+            "SELECT namespace FROM Tags WHERE id = ?1",
+            [tag_id],
+            |row| row.get(0),
+        )?;
+        let table = Self::relationship_partition_name(namespace_id);
         conn.query_row(
-            &format!(
-                "SELECT file_id FROM {} WHERE tag_id = ?1 LIMIT 1;",
-                Self::relationship_union_source(conn, "r")
-            ),
+            &format!("SELECT file_id FROM {table} WHERE tag_id = ?1 LIMIT 1;"),
             params![tag_id],
             |row| row.get(0),
         )
@@ -1628,6 +1655,12 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
     ///
     #[ipc(name = "relationship_get_fileid", request = "RelationshipGetTagid")]
     pub fn relationship_get_file_id_sync(&self, tag_id: &u64) -> HashSet<u64> {
+        if let Some(guard) = self.relationship_roaring_storage.read().as_ref()
+            && let Some(file_ids) = guard.relationship_search_fileid_roaring_in_memory(*tag_id)
+        {
+            return file_ids.into_iter().collect();
+        }
+
         let conn = self.pool.get().unwrap();
 
         let mut out = HashSet::new();
@@ -1977,11 +2010,16 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
     /// Checks if a tag has a relationship with files
     ///
     pub(in crate::db) fn internal_tag_has_files(conn: &Connection, tag_id: u64) -> bool {
+        let Ok(namespace_id) = conn.query_row(
+            "SELECT namespace FROM Tags WHERE id = ?1",
+            [tag_id],
+            |row| row.get::<_, u64>(0),
+        ) else {
+            return false;
+        };
+        let table = Self::relationship_partition_name(namespace_id);
         let mut stmt = conn
-            .prepare(&format!(
-                "SELECT EXISTS(SELECT 1 FROM {} WHERE tag_id = ?1)",
-                Self::relationship_union_source(conn, "r")
-            ))
+            .prepare(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE tag_id = ?1)"))
             .unwrap();
 
         stmt.query_row(params![tag_id], |row| row.get(0))
@@ -2070,16 +2108,34 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
         conn: &Connection,
         sites: Vec<String>,
     ) -> Result<Vec<DbJobsObj>, rusqlite::Error> {
+        Self::internal_jobs_get_torun_chunk(conn, sites, usize::MAX)
+    }
+
+    pub(in crate::db) fn internal_jobs_get_torun_chunk(
+        conn: &Connection,
+        sites: Vec<String>,
+        chunk_size: usize,
+    ) -> Result<Vec<DbJobsObj>, rusqlite::Error> {
+        if chunk_size == 0 {
+            return Ok(Vec::new());
+        }
+
         let mut out = Vec::new();
-        //for site in Self::internal_jobs_get_all_sites(conn)? {
         for site in sites {
-            for job in Self::internal_jobs_get_site(conn, &site)? {
-                // Filters the jobs so we only run jobs that should be run
-                if job.config.time + job.config.reptime <= get_sys_time_in_secs() && !job.isrunning
-                {
-                    out.push(job);
-                }
-            }
+            let mut stmt = conn.prepare(
+                "SELECT id, time, reptime, priority, recreation, site, param, user_data, is_running
+                 FROM Jobs
+                 WHERE site = ?1
+                   AND is_running IS false
+                   AND time + reptime <= ?2
+                 ORDER BY priority DESC, time, id
+                 LIMIT ?3",
+            )?;
+            let jobs = stmt.query_map(
+                params![site, get_sys_time_in_secs(), chunk_size],
+                shared_types::DbJobsObj::from_row,
+            )?;
+            out.extend(jobs.collect::<Result<Vec<_>, _>>()?);
         }
 
         Ok(out)
@@ -3397,7 +3453,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     ///
     /// Should we skip doing something
     ///
-    fn should_skip_item(conn: &Connection, skip_conditions: SkipIf) -> bool {
+    fn should_skip_item(&self, conn: &Connection, skip_conditions: SkipIf) -> bool {
         match skip_conditions {
             SkipIf::ParentsRelateLimitto((relate_to, limit_to)) => {
                 if let Ok(status) =
@@ -3422,7 +3478,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             SkipIf::FileTagRelationship(tag) => {
                 if let Some(ns_id) = Self::internal_namespace_get_id(conn, &tag.namespace.name)
                     && let Some(tag_id) = Self::internal_tag_get_id(conn, &tag.name, ns_id)
-                    && Self::internal_tag_has_files(conn, tag_id)
+                    && self.tag_has_files_cached(conn, tag_id)
                 {
                     info!(
                         "DB Skipping adding job due to FileTagRelationship tag_id: {tag_id} having files."
@@ -3507,7 +3563,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 }
             };
             for skip_condition in skip_conditions {
-                if Self::should_skip_item(&conn, skip_condition) {
+                if self.should_skip_item(&conn, skip_condition) {
                     return true;
                 }
             }
@@ -3541,7 +3597,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
 
             'ScraperLoop: for scraperdatareturn in jobs {
                 for skip_conditions in scraperdatareturn.skip_conditions {
-                    if Self::should_skip_item(&conn, skip_conditions) {
+                    if self.should_skip_item(&conn, skip_conditions) {
                         continue 'ScraperLoop;
                     }
                 }
@@ -3720,10 +3776,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 Self::internal_relationship_bulk_add(self.clone(), &conn, &rels_to_add);
             }
 
-            // Updaring fts table
-            let _ = Self::internal_update_fts_table(self, &conn);
-
-            conn.commit().unwrap();
+             conn.commit().unwrap();
         })
         .await
         .unwrap();
@@ -3826,6 +3879,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     ///
     pub async fn should_download_file(&self, url: String) -> bool {
         let pool = self.pool.clone();
+        let roaring = self.relationship_roaring_storage.clone();
 
         tokio::task::spawn_blocking(move || {
             let conn = match pool.get() {
@@ -3836,7 +3890,16 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 }
             };
 
-            Self::internal_should_download_file(&conn, &url)
+            let source_url_nsid = Self::internal_namespace_sourceurl_get(&conn);
+            let Some(tag_id) = Self::internal_tag_get_id(&conn, &url, source_url_nsid) else {
+                return true;
+            };
+            if let Some(guard) = roaring.read().as_ref()
+                && let Some(file_ids) = guard.relationship_search_fileid_roaring_in_memory(tag_id)
+            {
+                return file_ids.is_empty();
+            }
+            !Self::internal_tag_has_files(&conn, tag_id)
         })
         .await
         .unwrap()
@@ -4465,6 +4528,14 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     /// Gets all jobs that can run
     ///
     pub async fn jobs_get_torun(&self, sites: Vec<String>) -> Vec<DbJobsObj> {
+        self.jobs_get_torun_chunk(sites, usize::MAX).await
+    }
+
+    pub async fn jobs_get_torun_chunk(
+        &self,
+        sites: Vec<String>,
+        chunk_size: usize,
+    ) -> Vec<DbJobsObj> {
         let pool = self.pool.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -4475,7 +4546,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                     return Vec::new();
                 }
             };
-            match Self::internal_jobs_get_torun(&conn, sites) {
+            match Self::internal_jobs_get_torun_chunk(&conn, sites, chunk_size) {
                 Ok(jobs) => jobs,
                 Err(e) => {
                     log::error!("Database error fetching jobs: {e:?}");
