@@ -21,6 +21,10 @@ use super::{
 impl MainDatabase {
     /// Runs system jobs
     pub async fn run_system_job(&self, job: &DbJobsObj) -> bool {
+        if self.should_exit.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+
         let success = match job.config.site.as_str() {
             SYSTEM_DATABASE_BACKUP_SITE => self.run_backup_job(job).await,
             SYSTEM_DATABASE_SLURP_SITE => self.run_slurp_job(job).await,
@@ -40,6 +44,11 @@ impl MainDatabase {
             },
             _ => return false,
         };
+
+        if self.should_exit.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+
         self.complete_system_job(job).await;
         success
     }
@@ -138,6 +147,8 @@ impl MainDatabase {
              ) LIMIT {} OFFSET {};", SQL_CHUNK_SIZE, cnt),
                 )?;
 
+                    info!("System file hasher has hashed: {} files.", &cnt);
+
 
                     let file_ids_to_work_on: Vec<u64> = stmt
                     .query_map([], |row| Ok(row.get::<_, u64>(0)?))?
@@ -146,6 +157,10 @@ impl MainDatabase {
                     cnt += SQL_CHUNK_SIZE;
 
                     if file_ids_to_work_on.is_empty() {
+                        break;
+                    }
+
+                    if should_exit_clone.load(std::sync::atomic::Ordering::SeqCst) {
                         break;
                     }
 

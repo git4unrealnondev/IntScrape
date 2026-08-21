@@ -1,7 +1,7 @@
+use nohash_hasher::IntMap;
 use shared_types::TagSearch;
 use std::cmp::Ordering;
 use std::collections::HashSet;
-use nohash_hasher::IntMap;
 use strsim::levenshtein;
 
 pub(crate) const POPULAR_TAG_CACHE_LIMIT: usize = 100_000;
@@ -188,9 +188,7 @@ impl TagSearchCache {
                 );
                 heap_grams.as_mut_slice()
             };
-            grams.sort_unstable_by_key(|&key| {
-                self.gram_offsets[key + 1] - self.gram_offsets[key]
-            });
+            grams.sort_unstable_by_key(|&key| self.gram_offsets[key + 1] - self.gram_offsets[key]);
             let mut unique_count = 0;
             for index in 0..grams.len() {
                 if unique_count == 0 || grams[index] != grams[unique_count - 1] {
@@ -199,7 +197,9 @@ impl TagSearchCache {
                 }
             }
             for &key in &grams[..unique_count] {
-                for &entry_index in &self.gram_postings[self.gram_offsets[key]..self.gram_offsets[key + 1]] {
+                for &entry_index in
+                    &self.gram_postings[self.gram_offsets[key]..self.gram_offsets[key + 1]]
+                {
                     if !candidate_marks[entry_index] {
                         candidate_marks[entry_index] = true;
                         candidates.push(entry_index);
@@ -270,7 +270,6 @@ impl TagSearchCache {
             })
             .collect()
     }
-
 }
 
 fn add_candidate_match<'a>(
@@ -331,11 +330,7 @@ fn prefix_key(bytes: &[u8]) -> u32 {
     u32::from_be_bytes([0, bytes[0], bytes[1], bytes[2]])
 }
 
-fn match_score_ascii(
-    query: &[u8],
-    candidate: &[u8],
-    workspace: &mut [usize],
-) -> Option<usize> {
+fn match_score_ascii(query: &[u8], candidate: &[u8], workspace: &mut [usize]) -> Option<usize> {
     if candidate.starts_with(query) {
         return Some(0);
     }
@@ -636,7 +631,10 @@ mod tests {
 
         let results = cache.search("fem", 2);
         assert_eq!(
-            results.iter().map(|result| result.tag_id).collect::<Vec<_>>(),
+            results
+                .iter()
+                .map(|result| result.tag_id)
+                .collect::<Vec<_>>(),
             vec![2, 3]
         );
     }

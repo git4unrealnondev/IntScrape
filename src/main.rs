@@ -134,7 +134,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .iter()
                 .filter(|job| crate::db::system_jobs::is_system_job(job))
             {
+                if should_exit.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
                 db_spawn.run_system_job(job).await;
+            }
+
+            if should_exit.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
             }
 
             let jobs_to_run: Vec<_> = jobs_to_run

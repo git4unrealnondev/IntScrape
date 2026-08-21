@@ -3861,6 +3861,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                  FROM File WHERE size_bytes IS NULL AND hash IS NOT NULL LIMIT {} OFFSET {}",
                     SQL_CHUNK_SIZE, cnt
                 ))?;
+                    info!("System file size checker is fixing: {} files.", &cnt);
                 let rows: Vec<_> = files
                     .query_map([], |row| {
                         Ok((
@@ -5105,15 +5106,10 @@ mod tests {
         ];
         let conn = db.pool.get().unwrap();
 
-        let tag_map = MainDatabase::internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
-        let first_id = tag_map
-            .get(&actions[0].tags[0].tag)
-            .copied()
-            .unwrap();
-        let second_id = tag_map
-            .get(&actions[1].tags[0].tag)
-            .copied()
-            .unwrap();
+        let tag_map =
+            MainDatabase::internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
+        let first_id = tag_map.get(&actions[0].tags[0].tag).copied().unwrap();
+        let second_id = tag_map.get(&actions[1].tags[0].tag).copied().unwrap();
 
         let first_namespace_id: u64 = conn
             .query_row(
@@ -5131,16 +5127,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            conn.query_row("SELECT namespace FROM Tags WHERE id = ?1", [first_id], |row| {
-                row.get::<_, u64>(0)
-            })
+            conn.query_row(
+                "SELECT namespace FROM Tags WHERE id = ?1",
+                [first_id],
+                |row| { row.get::<_, u64>(0) }
+            )
             .unwrap(),
             first_namespace_id
         );
         assert_eq!(
-            conn.query_row("SELECT namespace FROM Tags WHERE id = ?1", [second_id], |row| {
-                row.get::<_, u64>(0)
-            })
+            conn.query_row(
+                "SELECT namespace FROM Tags WHERE id = ?1",
+                [second_id],
+                |row| { row.get::<_, u64>(0) }
+            )
             .unwrap(),
             second_namespace_id
         );
