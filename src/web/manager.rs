@@ -166,7 +166,7 @@ pub struct DownloadsManager {
     jobs: RwLock<HashMap<String, InternalStorage>>,
     downloading_urls: RwLock<HashSet<String>>,
     heavy_processing_pool: Arc<ThreadPool>,
-    job_limiter: Arc<Semaphore>,
+    //job_limiter: Arc<Semaphore>,
     processing_limiter: Arc<Semaphore>,
     should_exit: Arc<AtomicBool>,
     active_file_processing: Arc<AtomicUsize>,
@@ -1235,7 +1235,7 @@ impl DownloadsManager {
             jobs: HashMap::new().into(),
             downloading_urls: HashSet::new().into(),
             heavy_processing_pool,
-            job_limiter: Arc::new(Semaphore::new(3)),
+            //job_limiter: Arc::new(Semaphore::new(3)),
             processing_limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_PROCESSING)),
             should_exit,
             active_file_processing: Arc::new(AtomicUsize::new(0)),
@@ -1572,14 +1572,6 @@ impl DownloadsManager {
                 break;
             }
 
-            let permit = if let Ok(p) = self.job_limiter.clone().try_acquire_owned() {
-                p
-            } else {
-                drop(guard);
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                continue;
-            };
-
             // 2. Look for an idle job
             let job_to_run = if let Some(idx) = scraper_internal
                 .job_storage
@@ -1601,6 +1593,14 @@ impl DownloadsManager {
             drop(guard);
 
             if let Some((mut job, plugin, ratelimiter)) = job_to_run {
+                // Only claim a global slot when this site actually has work. An
+                // idle site must not starve other sites by holding a permit while
+                // it waits for one of its running jobs to finish.
+               // let permit = self.job_limiter.clone().acquire_owned().await;
+               // let Ok(permit) = permit else {
+               //     break;
+               // };
+
                 info!("DownloadManager: Setting job {} to running status.", job.id);
                 self.db.job_set_is_running(&job).await;
 
