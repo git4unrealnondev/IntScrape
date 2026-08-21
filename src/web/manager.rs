@@ -755,15 +755,6 @@ impl Scraper {
 
             let mut downloaded_bytes_count = 0;
             let mut stream_failed = false;
-            // let mut hasher = hash.as_ref().map(DownloadHasher::new);
-
-            let mut hasher: HashMap<_, _> = hash
-                .into_iter()
-                .map(|f| {
-                    return (f, DownloadHasher::new(&f));
-                })
-                .collect();
-
             // Stream network chunks straight to disk (Constantly uses ~8KB to 64KB max per active task)
             loop {
                 if self
@@ -793,10 +784,6 @@ impl Scraper {
                     Ok(Some(chunk)) => {
                         downloaded_bytes_count += chunk.len();
 
-                        // Updates hasher for all things
-                        hasher.values_mut().for_each(|f| f.update(&chunk));
-
-                        //hasher.into_iter().map(|f| f.1.update(&chunk));
                         if let Err(err) = file.write_all(&chunk).await {
                             log::error!("Failed to write chunk to disk: {err:?}");
                             stream_failed = true;
@@ -844,17 +831,20 @@ impl Scraper {
             };
 
             if size_matches {
-                let hash_vec: Vec<_> = hasher
-                    .into_iter()
-                    .map(|f| f.1.finish() != Some(expected_hash(f.0).to_string()))
-                    .collect();
-
-                let mut hash_matches = true;
-                for hash_bool in hash_vec {
-                    if hash_bool {
-                        hash_matches = false;
-                    }
-                }
+                let hash_inputs = hash.clone();
+                let hash_path = temp_file.path().to_path_buf();
+                let processing_pool = self.download_manager.heavy_processing_pool.clone();
+                let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+                processing_pool.spawn(move || {
+                    let hash_matches = std::fs::read(&hash_path)
+                        .map(|bytes| {
+                            let bytes = Bytes::from(bytes);
+                            hash_inputs.iter().all(|hash| hash_bytes(&bytes, hash).1)
+                        })
+                        .unwrap_or(false);
+                    let _ = result_sender.send(hash_matches);
+                });
+                let hash_matches = result_receiver.await.unwrap_or(false);
 
                 if hash_matches {
                     return Some(temp_file);
