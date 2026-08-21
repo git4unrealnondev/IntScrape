@@ -133,32 +133,55 @@ pub fn parser_call(
             name: post_id.clone(),
             namespace: pawchive_namespace("Pawchive_Post_Id", "A posts unique ID"),
         };
-        let limit_tag = Tag {
-            name: limit_to.clone(),
-            namespace: pawchive_namespace(
-                "Pawchive_Post_Edited",
-                "When a post was editied in Pawchive",
-            ),
-        };
         let tags: Vec<PluginTag> = comments
             .into_iter()
             .flat_map(|comment| {
-                let relation = RelationContext {
+                let comment_scope = Tag {
+                    name: format!(
+                        "{}_{}_{}",
+                        limit_to,
+                        comment.id,
+                        comment.published.map(|f| f.to_string()).unwrap_or("CANNOT PARSE".to_string())
+                    ),
+                    namespace: pawchive_namespace(
+                        "Pawchive_Post_Comment_Scope",
+                        "Unique comment revision scope",
+                    ),
+                };
+                let scope_relation = RelationContext {
                     tag: post_id_tag.clone(),
-                    limit_to: Some(limit_tag.clone()),
+                    limit_to: Some(Tag {
+                        name: limit_to.clone(),
+                        namespace: pawchive_namespace(
+                            "Pawchive_Post_Edited",
+                            "When a post was editied in Pawchive",
+                        ),
+                    }),
                     ..Default::default()
                 };
-                let mut comment_tags = vec![PluginTag {
-                    tag: Tag {
-                        name: comment.content,
-                        namespace: pawchive_namespace(
-                            "Pawchive_Post_Comment",
-                            "A comment on a Pawchive post",
-                        ),
-                    },
-                    relates_to: Some(relation.clone()),
+                let relation = RelationContext {
+                    tag: post_id_tag.clone(),
+                    limit_to: Some(comment_scope.clone()),
                     ..Default::default()
-                }];
+                };
+                let mut comment_tags = vec![
+                    PluginTag {
+                        tag: comment_scope,
+                        relates_to: Some(scope_relation),
+                        ..Default::default()
+                    },
+                    PluginTag {
+                        tag: Tag {
+                            name: comment.content,
+                            namespace: pawchive_namespace(
+                                "Pawchive_Post_Comment",
+                                "A comment on a Pawchive post",
+                            ),
+                        },
+                        relates_to: Some(relation.clone()),
+                        ..Default::default()
+                    },
+                ];
                 if !comment.id.is_empty() {
                     comment_tags.push(PluginTag {
                         tag: Tag {
@@ -350,7 +373,7 @@ pub fn parser_call(
             }
         }
 
-      /*  // Keep comments scoped to this post revision. A comment tag without
+        /*  // Keep comments scoped to this post revision. A comment tag without
         // the post revision limit would relate identically named comments
         // across different posts or edits.
         if let Some(comments) = post.comments.as_ref().and_then(comment_items) {
@@ -691,7 +714,6 @@ pub struct PostItem {
     pub poll: Option<serde_json::Value>,
     pub captions: Option<serde_json::Value>,
     pub tags: Option<String>,
-
 }
 
 fn comment_items(value: &serde_json::Value) -> Option<Vec<&serde_json::Value>> {
@@ -729,6 +751,8 @@ pub struct CommentItem {
     #[serde(default)]
     pub commenter_name: String,
     pub content: String,
+    #[serde(deserialize_with = "deserialize_datetime_to_timestamp")]
+    pub published: Option<i64>,
 }
 
 /// Helper function to parse ISO 8601 strings into Unix timestamps (i64)
