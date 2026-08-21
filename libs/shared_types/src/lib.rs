@@ -408,6 +408,8 @@ pub enum PluginProperties {
     Modifier(TargetModifier),
     /// Tells the system that we are going to ideally process a login type
     Login((LoginNeed, LoginType)),
+    /// The plugin handles fetching the input itself in `parser_call`.
+    NoTextDownload,
 }
 
 #[derive(

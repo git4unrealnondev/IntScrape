@@ -253,8 +253,6 @@ fn on_download(bytes: &[u8]) -> CallbackReturn {
 
                 match std::fs::write(&pa, thumb) {
                     Ok(_) => {
-                        let _ =
-                            client::log_silent(format!("{PLUGIN_NAME}: Thumbnail put at: {}", pa));
                         let _ = tags.insert(FileTagAction {
                             operation: shared_types::TagOperation::Set,
                             tags: vec![PluginTag {

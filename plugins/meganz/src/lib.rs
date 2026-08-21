@@ -12,6 +12,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use futures::{StreamExt, stream};
 use mega::{Client, ErrorCode, Node, Nodes};
 use regex::Regex;
 use shared_types::{
@@ -31,8 +32,19 @@ const NS_PARENT: &str = "MEGA_parent_handle";
 const NS_SOURCE_URL: &str = "MEGA_source_url";
 const NS_SNAPSHOT: &str = "MEGA_system_timestamp";
 const STARTUP_SETTING: &str = "PLUGIN_MegaNZ_ShouldCheckTags";
-const SOURCE_TAG_KEY: &str = "meganz_source_tag";
 const MEGA_URL_REGEX: &str = r#"(?i)\bhttps?://(?:www\.)?(?:mega\.nz|mega\.co\.nz)/(?:file|folder)/[A-Za-z0-9_-]+(?:#[A-Za-z0-9_-]+)?|https?://(?:www\.)?(?:mega\.nz|mega\.co\.nz)/#![A-Za-z0-9_-]+![A-Za-z0-9_-]+"#;
+const DOWNLOAD_CONCURRENCY: usize = 5;
+const MEGA_NAMESPACES: &[&str] = &[
+    NS_HANDLE,
+    NS_NAME,
+    NS_SIZE,
+    NS_CREATED,
+    NS_MODIFIED,
+    NS_PATH,
+    NS_PARENT,
+    NS_SOURCE_URL,
+    NS_SNAPSHOT,
+];
 
 fn namespace(name: &str) -> GenericNamespaceObj {
     GenericNamespaceObj {
@@ -188,12 +200,11 @@ async fn collect_files(
     output: &mut Vec<FileObject>,
     errors: &mut Vec<String>,
 ) {
-    for handle in handles {
+    let results = stream::iter(handles.iter().map(|handle| async move {
         let Some(node) = nodes.get_node_by_handle(handle) else {
-            errors.push(format!(
+            return Err(format!(
                 "MEGA handle {handle}: node was not found in the fetched node set"
             ));
-            continue;
         };
 
         let file_path = node_path(nodes, node);
@@ -212,12 +223,11 @@ async fn collect_files(
                 match existing_file.id {
                     Some(file_id) => {
                         if let Err(error) = client::put_tags_to_file(file_id, tag_list) {
-                            errors.push(format!(
+                            return Err(format!(
                                 "MEGA handle {handle}, path '{file_path}', \
                                  folder '{folder_path}': failed to update \
                                  metadata: {error}"
                             ));
-                            continue;
                         }
 
                         let _ = client::log_silent(format!(
@@ -228,7 +238,7 @@ async fn collect_files(
                     }
 
                     None => {
-                        errors.push(format!(
+                        return Err(format!(
                             "MEGA handle {handle}, path '{file_path}', \
                              folder '{folder_path}': existing database record \
                              has no file ID"
@@ -236,17 +246,16 @@ async fn collect_files(
                     }
                 }
 
-                continue;
+                return Ok(None);
             }
 
             Ok(None) => {}
 
             Err(error) => {
-                errors.push(format!(
+                return Err(format!(
                     "MEGA handle {handle}, path '{file_path}', \
                      folder '{folder_path}': database lookup failed: {error}"
                 ));
-                continue;
             }
         }
 
@@ -266,34 +275,37 @@ async fn collect_files(
                      {downloaded_size}"
                 ));
 
-                output.push(FileObject {
+                Ok(Some(FileObject {
                     source: Some(FileSource::Bytes(bytes)),
                     tag_list,
                     skip_if: vec![SkipIf::FileTagRelationship(handle_tag)],
                     ..Default::default()
-                });
+                }))
             }
 
-            Err(error) => {
-                errors.push(format!(
-                    "MEGA handle {handle}, path '{file_path}', \
+            Err(error) => Err(format!(
+                "MEGA handle {handle}, path '{file_path}', \
                      folder '{folder_path}': download failed: {error}"
-                ));
+            )),
+        }
+    }))
+    .buffer_unordered(DOWNLOAD_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
 
-                let _ = client::log_silent(format!(
-                    "MEGA: failed to download handle {handle} with path \
-                     '{file_path}': {error}"
-                ));
-                break;
+    for result in results {
+        match result {
+            Ok(Some(file)) => output.push(file),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = client::log_silent(format!("MEGA: {error}"));
+                errors.push(error);
             }
         }
     }
 }
 
-fn add_source_job(url: &str, source_tag: &str) -> Result<(), Box<dyn Error>> {
-    let mut user_data = BTreeMap::new();
-    user_data.insert(SOURCE_TAG_KEY.into(), source_tag.into());
-
+fn add_source_job(url: &str) -> Result<(), Box<dyn Error>> {
     client::jobs_add_single(PluginJob {
         time: 0,
         reptime: 0,
@@ -304,7 +316,7 @@ fn add_source_job(url: &str, source_tag: &str) -> Result<(), Box<dyn Error>> {
             url: url.into(),
             local_modifiers: Vec::new(),
         })],
-        user_data,
+        user_data: BTreeMap::new(),
     })?;
 
     Ok(())
@@ -317,10 +329,12 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
 
     let url_regex = Regex::new(MEGA_URL_REGEX)?;
     let tags = client::get_tag_id_bulk(client::get_tag_ids_all()?)?;
-    for (tag_id, tag) in tags.iter().filter(|(_, tag)| {
-        !tag.namespace.name.starts_with("MEGA_")
-    }) {
+    for (tag_id, tag) in tags
+        .iter()
+        .filter(|(_, tag)| !MEGA_NAMESPACES.contains(&tag.namespace.name.as_str()))
+    {
         for matched in url_regex.find_iter(&tag.name) {
+            dbg!(&matched.as_str(), &tag.name, &tag, &tag_id);
             let callback_return = on_regex(matched.as_str(), &tag.name, tag, *tag_id);
             let tag_actions = callback_return.tags.into_iter().collect::<Vec<_>>();
             if !tag_actions.is_empty() && !client::tag_actions_add(tag_actions)? {
@@ -352,11 +366,29 @@ fn on_start() {
 #[unsafe(no_mangle)]
 fn on_regex(
     matched: &str,
-    full_tag: &str,
+    _full_tag: &str,
     tag_source: &Tag,
     _tag_source_id: u64,
 ) -> CallbackReturn {
-    if let Err(error) = add_source_job(matched, full_tag) {
+    if tag_source.namespace.name.starts_with("MEGA_") {
+        return CallbackReturn::default();
+    }
+
+    // Never create a MEGA source tag from the full source tag. The callback
+    // input must be the URL fragment matched by MEGA_URL_REGEX.
+    if !(matched.starts_with("http://mega.nz/")
+        || matched.starts_with("https://mega.nz/")
+        || matched.starts_with("http://www.mega.nz/")
+        || matched.starts_with("https://www.mega.nz/")
+        || matched.starts_with("http://mega.co.nz/")
+        || matched.starts_with("https://mega.co.nz/")
+        || matched.starts_with("http://www.mega.co.nz/")
+        || matched.starts_with("https://www.mega.co.nz/"))
+    {
+        return CallbackReturn::default();
+    }
+
+    if let Err(error) = add_source_job(matched) {
         let _ = client::log_silent(format!("MEGA: failed to queue tag source job: {error}"));
     }
 
@@ -388,14 +420,15 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
         properties: vec![
             PluginProperties::Sites(vec![SITE.into(), "mega.nz".into(), "mega".into()]),
             PluginProperties::Ratelimit(1, std::time::Duration::from_secs(1)),
-            PluginProperties::ThreadNum(1),
+            PluginProperties::ThreadNum(5),
+            PluginProperties::NoTextDownload,
         ],
         callbacks: vec![
             GlobalCallbacks::Start(shared_types::StartupThreadType::Spawn),
             GlobalCallbacks::Tag((
                 SearchType::Regex(MEGA_URL_REGEX.into()),
                 vec![],
-                vec![NS_SOURCE_URL.into()],
+                MEGA_NAMESPACES.iter().map(|name| (*name).into()).collect(),
             )),
         ],
     }]
@@ -417,12 +450,6 @@ pub fn url_dump(data: &ScraperDataReturn) -> Vec<ScraperDataReturn> {
 
 #[unsafe(no_mangle)]
 pub fn parser_call(_text: &str, source_url: &str, data: &ScraperDataReturn) -> Vec<ScraperReturn> {
-    let source_url = data
-        .job
-        .user_data
-        .get(SOURCE_TAG_KEY)
-        .map(String::as_str)
-        .unwrap_or(source_url);
     let Some(url) = public_url(&data.job.param) else {
         return vec![ScraperReturn::Nothing];
     };

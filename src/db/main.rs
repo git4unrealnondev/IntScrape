@@ -2799,7 +2799,8 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                 params_vector.push(ns_id);
             }
             query.push_str(
-                " ON CONFLICT(name, namespace) DO UPDATE SET name = excluded.name RETURNING id",
+                " ON CONFLICT(name, namespace) DO UPDATE SET name = excluded.name
+                  RETURNING id, name, namespace",
             );
 
             let mut stmt = conn.prepare(&query).unwrap();
@@ -2807,12 +2808,19 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                 .query(rusqlite::params_from_iter(params_vector))
                 .unwrap();
 
-            let mut idx = 0;
+            let pending_by_key: HashMap<(String, u64), shared_types::Tag> = chunk
+                .iter()
+                .map(|(tag, namespace)| ((tag.name.clone(), *namespace), tag.clone()))
+                .collect();
+
             while let Some(row) = rows.next().unwrap() {
                 let tag_id: u64 = row.get(0).unwrap();
-                let (tag_obj, _) = &chunk[idx];
+                let tag_name: String = row.get(1).unwrap();
+                let namespace_id: u64 = row.get(2).unwrap();
+                let Some(tag_obj) = pending_by_key.get(&(tag_name, namespace_id)) else {
+                    continue;
+                };
                 out.insert(tag_obj.clone(), tag_id);
-                idx += 1;
             }
         }
 
@@ -2902,19 +2910,22 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         }
 
         query.push_str(
-            " ON CONFLICT(name) DO UPDATE SET description = excluded.description RETURNING id",
+            " ON CONFLICT(name) DO UPDATE SET description = excluded.description
+              RETURNING id, name",
         );
 
         let mut stmt = conn.prepare(&query).unwrap();
         let mut rows = stmt.query(&*params_vector).unwrap();
 
-        let mut idx = 0;
         while let Some(row) = rows.next().unwrap() {
             let nsid: u64 = row.get(0).unwrap();
-            let namespace_obj = namespace_vec[idx];
-
-            out.insert((*namespace_obj).clone(), nsid);
-            idx += 1;
+            let namespace_name: String = row.get(1).unwrap();
+            if let Some(namespace_obj) = namespace_vec
+                .iter()
+                .find(|namespace| namespace.name == namespace_name)
+            {
+                out.insert((**namespace_obj).clone(), nsid);
+            }
         }
 
         for namespace_id in out.values().copied() {
@@ -5056,6 +5067,82 @@ mod tests {
         assert_eq!(
             tag_count, 1,
             "INSERT OR IGNORE failed to drop duplicate entry safely"
+        );
+    }
+
+    #[test]
+    fn test_internal_tag_bulk_add_keeps_namespace_mapping() {
+        let db = new_test();
+        let first_namespace = GenericNamespaceObj {
+            name: "first_namespace".to_string(),
+            description: None,
+        };
+        let second_namespace = GenericNamespaceObj {
+            name: "second_namespace".to_string(),
+            description: None,
+        };
+        let actions = [
+            FileTagAction {
+                tags: vec![PluginTag {
+                    tag: Tag {
+                        name: "same value".to_string(),
+                        namespace: first_namespace.clone(),
+                    },
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            FileTagAction {
+                tags: vec![PluginTag {
+                    tag: Tag {
+                        name: "same value".to_string(),
+                        namespace: second_namespace.clone(),
+                    },
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ];
+        let conn = db.pool.get().unwrap();
+
+        let tag_map = MainDatabase::internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
+        let first_id = tag_map
+            .get(&actions[0].tags[0].tag)
+            .copied()
+            .unwrap();
+        let second_id = tag_map
+            .get(&actions[1].tags[0].tag)
+            .copied()
+            .unwrap();
+
+        let first_namespace_id: u64 = conn
+            .query_row(
+                "SELECT id FROM Namespace WHERE name = 'first_namespace'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let second_namespace_id: u64 = conn
+            .query_row(
+                "SELECT id FROM Namespace WHERE name = 'second_namespace'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            conn.query_row("SELECT namespace FROM Tags WHERE id = ?1", [first_id], |row| {
+                row.get::<_, u64>(0)
+            })
+            .unwrap(),
+            first_namespace_id
+        );
+        assert_eq!(
+            conn.query_row("SELECT namespace FROM Tags WHERE id = ?1", [second_id], |row| {
+                row.get::<_, u64>(0)
+            })
+            .unwrap(),
+            second_namespace_id
         );
     }
 

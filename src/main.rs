@@ -6,7 +6,10 @@ use std::{
 };
 
 use crate::{
-    db::{MainDatabase, SYSTEM_DATABASE_BACKUP_SITE, SYSTEM_FILE_HASH_SITE, SYSTEM_FILE_SIZE_SITE},
+    db::{
+        MainDatabase, SYSTEM_DATABASE_BACKUP_SITE, SYSTEM_DATABASE_SLURP_SITE,
+        SYSTEM_FILE_HASH_SITE, SYSTEM_FILE_SIZE_SITE,
+    },
     ipc::IpcServer,
     plugins::PluginManager,
     web::manager::DownloadsManager,
@@ -120,6 +123,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             }
             let mut sites = plugin_manager_clone.get_storage_sites();
             sites.push(SYSTEM_DATABASE_BACKUP_SITE.to_string());
+            sites.push(SYSTEM_DATABASE_SLURP_SITE.to_string());
             sites.push(SYSTEM_FILE_SIZE_SITE.to_string());
             sites.push(SYSTEM_FILE_HASH_SITE.to_string());
             let jobs_to_run = db_spawn

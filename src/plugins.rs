@@ -285,40 +285,64 @@ impl PluginManager {
     }
 
     ///
-    /// After file downloading run callbacks for `on_download`
-    ///
+    /// Runs all `on_download` callbacks concurrently and merges their results.
     pub fn callback_on_download(
         &self,
         data: &Bytes,
         tags: &mut Vec<FileTagAction>,
         jobs: &mut Vec<ScraperDataReturn>,
     ) {
-        if let Some(plugin_name_list) = self
-            .storage_callbacks
-            .read()
-            .get(&GlobalCallbacks::Download)
-        {
-            for plugin_name in plugin_name_list {
-                if let Some(lib) = self.storage_libs.read().get(plugin_name) {
-                    let temp: libloading::Symbol<unsafe extern "C" fn(&[u8]) -> CallbackReturn> = {
-                        unsafe {
-                            match lib.get(b"on_download") {
-                                Err(err) => {
+        let callbacks: Vec<_> = {
+            let callback_names = self.storage_callbacks.read();
+            let libraries = self.storage_libs.read();
+            callback_names
+                .get(&GlobalCallbacks::Download)
+                .into_iter()
+                .flat_map(|names| names.iter())
+                .filter_map(|plugin_name| {
+                    libraries
+                        .get(plugin_name)
+                        .cloned()
+                        .map(|library| (plugin_name.clone(), library))
+                })
+                .collect()
+        };
+
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = callbacks
+                .into_iter()
+                .map(|(plugin_name, library)| {
+                    scope.spawn(move || {
+                        let callback: libloading::Symbol<
+                            unsafe extern "C" fn(&[u8]) -> CallbackReturn,
+                        > = unsafe {
+                            match library.get(b"on_download") {
+                                Err(error) => {
                                     error!(
-                                        "Plugins: {plugin_name} could not call 'on_download' got error: {err:?}"
+                                        "Plugins: {plugin_name} could not call 'on_download' got error: {error:?}"
                                     );
-                                    continue;
+                                    return None;
                                 }
-                                Ok(out) => out,
+                                Ok(callback) => callback,
                             }
-                        }
-                    };
-                    let return_data = unsafe { temp(data) };
-                    tags.extend(return_data.tags);
-                    jobs.extend(return_data.jobs);
+                        };
+
+                        Some(unsafe { callback(data) })
+                    })
+                })
+                .collect();
+
+            for handle in handles {
+                match handle.join() {
+                    Ok(Some(return_data)) => {
+                        tags.extend(return_data.tags);
+                        jobs.extend(return_data.jobs);
+                    }
+                    Ok(None) => {}
+                    Err(_) => error!("Plugins: on_download callback panicked"),
                 }
             }
-        }
+        });
     }
 
     /// Compiles regex if it doesnt exist in the local cache
@@ -369,9 +393,9 @@ impl PluginManager {
                 .collect()
         };
 
-        // Callbacks may add tags, which updates this cache. Do not hold its
-        // read lock while processing callback results.
-        let regex_tags = self.regex_tags_cache.read().clone();
+        // Drain the queue before processing. Callback results can add new tags,
+        // which are intentionally deferred until the next pass.
+        let regex_tags = std::mem::take(&mut *self.regex_tags_cache.write());
 
         for (search_type, namespace_allow, namespace_deny, plugins) in callbacks {
             let compiled_regex = match &search_type {
@@ -398,19 +422,24 @@ impl PluginManager {
                     continue;
                 }
 
-                let regex_match = match &search_type {
+                let regex_matches: Vec<&str> = match &search_type {
                     shared_types::SearchType::String(search_string) => regex_tag
                         .name
                         .find(search_string)
-                        .map(|start| &regex_tag.name[start..start + search_string.len()]),
-                    shared_types::SearchType::Regex(_) => {
-                        compiled_regex.as_ref().and_then(|regex| {
-                            regex.find(&regex_tag.name).map(|matched| matched.as_str())
+                        .map(|start| vec![&regex_tag.name[start..start + search_string.len()]])
+                        .unwrap_or_default(),
+                    shared_types::SearchType::Regex(_) => compiled_regex
+                        .as_ref()
+                        .map(|regex| {
+                            regex
+                                .find_iter(&regex_tag.name)
+                                .map(|matched| matched.as_str())
+                                .collect()
                         })
-                    }
+                        .unwrap_or_default(),
                 };
 
-                if let Some(regex_match) = regex_match {
+                for regex_match in regex_matches {
                     for plugin in &plugins {
                         let Some(lib) = self.storage_libs.read().get(plugin).cloned() else {
                             continue;

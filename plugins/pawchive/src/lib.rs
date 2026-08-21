@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
 };
 
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use shared_types::{
     DEFAULT_PRIORITY, DownloadModifiers, FileObject, FileSource, FileTagAction,
     GenericNamespaceObj, HashesSupported, ModifierTarget, PluginJob, PluginProperties, PluginTag,
-    RelationContext, ScraperDataReturn, ScraperParam, ScraperReturn, SkipIf, Tag, TargetModifier,
+    RelationContext, ScraperDataReturn, ScraperParam, ScraperReturn, Tag, TargetModifier,
 };
 
 // root of site incase it changes
@@ -71,7 +71,22 @@ pub fn url_dump(
         .collect();
 
     for url in urls.iter() {
-        for url in generate_api_request(&filter_url(url)) {
+        let properties = filter_url(url);
+        let requests = if url.contains("/api/v1/") {
+            vec![url.clone()]
+        } else {
+            generate_api_request(&properties)
+        };
+        for url in requests {
+            let mut user_data = BTreeMap::new();
+            if let Some(post_id) = comments_post_id(&properties).or_else(|| {
+                url.strip_suffix("/comments")
+                    .and_then(|base| base.rsplit("/post/").next())
+                    .map(str::to_owned)
+            }) {
+                user_data.insert("comments_post_id".into(), post_id.clone());
+                user_data.insert("comments_limit_to".into(), format!("{post_id}_comments"));
+            }
             out.push(ScraperDataReturn {
                 job: shared_types::PluginJob {
                     site: scraperdata.job.site.clone(),
@@ -80,6 +95,7 @@ pub fn url_dump(
                         url,
                         ..Default::default()
                     })],
+                    user_data,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -106,12 +122,95 @@ pub fn parser_call(
         .get("recursion")
         .is_none_or(|f| f != "false");
 
+    if let Some(post_id) = scraperdata.job.user_data.get("comments_post_id") {
+        let Some(limit_to) = scraperdata.job.user_data.get("comments_limit_to") else {
+            return vec![ScraperReturn::Nothing];
+        };
+        let Ok(comments) = serde_json::from_str::<Vec<CommentItem>>(text_input) else {
+            return vec![ScraperReturn::Nothing];
+        };
+        let post_id_tag = Tag {
+            name: post_id.clone(),
+            namespace: pawchive_namespace("Pawchive_Post_Id", "A posts unique ID"),
+        };
+        let limit_tag = Tag {
+            name: limit_to.clone(),
+            namespace: pawchive_namespace(
+                "Pawchive_Post_Edited",
+                "When a post was editied in Pawchive",
+            ),
+        };
+        let tags: Vec<PluginTag> = comments
+            .into_iter()
+            .flat_map(|comment| {
+                let relation = RelationContext {
+                    tag: post_id_tag.clone(),
+                    limit_to: Some(limit_tag.clone()),
+                    ..Default::default()
+                };
+                let mut comment_tags = vec![PluginTag {
+                    tag: Tag {
+                        name: comment.content,
+                        namespace: pawchive_namespace(
+                            "Pawchive_Post_Comment",
+                            "A comment on a Pawchive post",
+                        ),
+                    },
+                    relates_to: Some(relation.clone()),
+                    ..Default::default()
+                }];
+                if !comment.id.is_empty() {
+                    comment_tags.push(PluginTag {
+                        tag: Tag {
+                            name: comment.id,
+                            namespace: pawchive_namespace(
+                                "Pawchive_Post_Comment_Id",
+                                "A comment's unique ID",
+                            ),
+                        },
+                        relates_to: Some(relation.clone()),
+                        ..Default::default()
+                    });
+                }
+                if !comment.commenter.is_empty() {
+                    comment_tags.push(PluginTag {
+                        tag: Tag {
+                            name: comment.commenter,
+                            namespace: pawchive_namespace(
+                                "Pawchive_Post_Comment_User",
+                                "The user who made a comment",
+                            ),
+                        },
+                        relates_to: Some(relation.clone()),
+                        ..Default::default()
+                    });
+                }
+                if !comment.commenter_name.is_empty() {
+                    comment_tags.push(PluginTag {
+                        tag: Tag {
+                            name: comment.commenter_name,
+                            namespace: pawchive_namespace(
+                                "Pawchive_Post_Comment_User_Name",
+                                "The display name of a comment author",
+                            ),
+                        },
+                        relates_to: Some(relation),
+                        ..Default::default()
+                    });
+                }
+                comment_tags
+            })
+            .collect();
+        return vec![ScraperReturn::Data(shared_types::ScraperObject {
+            tags: tags.into_iter().collect(),
+            ..Default::default()
+        })];
+    }
+
     // Handles individual and groups of posts the same
     let mut posts = Vec::new();
     if let Ok(post_list) = serde_json::from_str::<Vec<PostItem>>(text_input) {
         posts.extend(post_list);
-    } else {
-        dbg!(serde_json::from_str::<Vec<PostItem>>(text_input));
     }
     if let Ok(post) = serde_json::from_str::<PostItem>(text_input) {
         posts.push(post);
@@ -149,6 +248,31 @@ pub fn parser_call(
             },
             ..Default::default()
         };
+
+        if recursion {
+            let mut user_data = BTreeMap::new();
+            user_data.insert("comments_post_id".into(), post.id.clone());
+            user_data.insert(
+                "comments_limit_to".into(),
+                format!("{}_{}", post.id, correct_timestamp),
+            );
+            jobs.insert(ScraperDataReturn {
+                job: PluginJob {
+                    priority: DEFAULT_PRIORITY - 2,
+                    site: scraperdata.job.site.clone(),
+                    param: vec![ScraperParam::Url(shared_types::Url {
+                        url: format!(
+                            "https://{SITE_ROOT}/api/v1/{}/user/{}/post/{}/comments",
+                            post.service, post.user, post.id
+                        ),
+                        ..Default::default()
+                    })],
+                    user_data,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
 
         // Adds title into tags
         tags.insert(PluginTag {
@@ -225,6 +349,67 @@ pub fn parser_call(
                 });
             }
         }
+
+      /*  // Keep comments scoped to this post revision. A comment tag without
+        // the post revision limit would relate identically named comments
+        // across different posts or edits.
+        if let Some(comments) = post.comments.as_ref().and_then(comment_items) {
+            for comment in comments {
+                let Some(content) = json_string(comment, &["content", "body", "text"]) else {
+                    continue;
+                };
+                let comment_relate = RelationContext {
+                    tag: Tag {
+                        name: post.id.to_string(),
+                        namespace: GenericNamespaceObj {
+                            name: "Pawchive_Post_Id".into(),
+                            description: Some("A posts unique ID".into()),
+                        },
+                    },
+                    limit_to: Some(post_edited.clone()),
+                    ..Default::default()
+                };
+
+                tags.insert(PluginTag {
+                    tag: Tag {
+                        name: content,
+                        namespace: GenericNamespaceObj {
+                            name: "Pawchive_Post_Comment".into(),
+                            description: Some("A comment on a Pawchive post".into()),
+                        },
+                    },
+                    relates_to: Some(comment_relate.clone()),
+                    ..Default::default()
+                });
+
+                for (namespace, keys, description) in [
+                    (
+                        "Pawchive_Post_Comment_Id",
+                        &["id", "comment_id"][..],
+                        "A comment's unique ID",
+                    ),
+                    (
+                        "Pawchive_Post_Comment_User",
+                        &["user", "username", "author"][..],
+                        "The user who made a comment",
+                    ),
+                ] {
+                    if let Some(value) = json_string(comment, keys) {
+                        tags.insert(PluginTag {
+                            tag: Tag {
+                                name: value,
+                                namespace: GenericNamespaceObj {
+                                    name: namespace.into(),
+                                    description: Some(description.into()),
+                                },
+                            },
+                            relates_to: Some(comment_relate.clone()),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }*/
 
         for (idx, attachment) in post.attachments.iter().enumerate() {
             if let Some(ref attachment_path) = attachment.path {
@@ -309,6 +494,7 @@ fn generate_api_request(url_properties: &[UrlProperties]) -> Vec<String> {
     let mut service = None;
     let mut user_id = None;
     let mut post_id = None;
+    let mut comments = false;
 
     // Extract what we need from the properties list
     for prop in url_properties {
@@ -316,7 +502,17 @@ fn generate_api_request(url_properties: &[UrlProperties]) -> Vec<String> {
             UrlProperties::Service(s) => service = Some(s),
             UrlProperties::UserId(id) => user_id = Some(id),
             UrlProperties::PostId(id) => post_id = Some(id),
+            UrlProperties::Comments => comments = true,
         }
+    }
+
+    if comments {
+        return match (service, user_id, post_id) {
+            (Some(s), Some(u), Some(p)) => vec![format!(
+                "https://{SITE_ROOT}/api/v1/{s}/user/{u}/post/{p}/comments"
+            )],
+            _ => vec![],
+        };
     }
 
     match (service, user_id, post_id) {
@@ -331,6 +527,23 @@ fn generate_api_request(url_properties: &[UrlProperties]) -> Vec<String> {
 
         _ => vec![],
     }
+}
+
+fn comments_post_id(url_properties: &[UrlProperties]) -> Option<String> {
+    if !url_properties
+        .iter()
+        .any(|property| matches!(property, UrlProperties::Comments))
+    {
+        return None;
+    }
+
+    url_properties.iter().find_map(|property| {
+        if let UrlProperties::PostId(post_id) = property {
+            Some(post_id.clone())
+        } else {
+            None
+        }
+    })
 }
 
 fn filter_url(url: &str) -> Vec<UrlProperties> {
@@ -373,6 +586,10 @@ fn filter_url(url: &str) -> Vec<UrlProperties> {
         if let Some(&post_id) = segments.get(absolute_post_idx + 1) {
             out.push(UrlProperties::PostId(post_id.to_string()));
         }
+    }
+
+    if segments.last() == Some(&"comments") {
+        out.push(UrlProperties::Comments);
     }
 
     out
@@ -441,6 +658,14 @@ enum UrlProperties {
     UserId(String),
     PostId(String),
     Service(String),
+    Comments,
+}
+
+fn pawchive_namespace(name: &str, description: &str) -> GenericNamespaceObj {
+    GenericNamespaceObj {
+        name: name.into(),
+        description: Some(description.into()),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -466,18 +691,44 @@ pub struct PostItem {
     pub poll: Option<serde_json::Value>,
     pub captions: Option<serde_json::Value>,
     pub tags: Option<String>,
-    pub origin: String,
-    pub preview_state: String,
-    pub has_full: bool,
-    pub preview_attempts: u32,
-    pub detail_fetched: bool,
-    pub import_size_cap_gb: Option<u64>,
+
+}
+
+fn comment_items(value: &serde_json::Value) -> Option<Vec<&serde_json::Value>> {
+    match value {
+        serde_json::Value::Array(items) => Some(items.iter().collect()),
+        serde_json::Value::Object(object) => ["comments", "items", "data"]
+            .iter()
+            .find_map(|key| object.get(*key).and_then(comment_items)),
+        _ => None,
+    }
+}
+
+fn json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        let value = value.get(*key)?;
+        match value {
+            serde_json::Value::String(value) if !value.is_empty() => Some(value.clone()),
+            serde_json::Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        }
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileInfo {
     pub name: Option<String>,
     pub path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommentItem {
+    pub id: String,
+    #[serde(default)]
+    pub commenter: String,
+    #[serde(default)]
+    pub commenter_name: String,
+    pub content: String,
 }
 
 /// Helper function to parse ISO 8601 strings into Unix timestamps (i64)

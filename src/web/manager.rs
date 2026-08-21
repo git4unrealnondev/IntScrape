@@ -38,7 +38,7 @@ use tokio::{
 };
 
 const MAX_CONCURRENT_DOWNLOADS: usize = 5;
-const MAX_CONCURRENT_PROCESSING: usize = 2;
+const MAX_CONCURRENT_PROCESSING: usize = 20;
 const MAX_DOWNLOAD_RETRIES: u8 = 3;
 
 fn retry_delay(attempt: u8) -> Duration {
@@ -269,6 +269,11 @@ impl Scraper {
         }
 
         let semaphore = Arc::new(Semaphore::new(max_concurrent_downloads));
+        let plugin_handles_text = self
+            .plugin
+            .properties
+            .iter()
+            .any(|property| matches!(property, PluginProperties::NoTextDownload));
 
         'scraperloop: for scrap_data in scraper_data_return.iter() {
             let file_id_tag_map = Arc::new(Mutex::new(HashMap::new()));
@@ -311,16 +316,27 @@ impl Scraper {
                     break 'scraperloop;
                 }
 
-                let scraper = self.clone();
-                let param_clone = param.clone();
-                let should_remove_job_clone = should_remove_job.clone();
-                if let Ok(Some((text, source_url))) = tokio::spawn(async move {
-                    scraper
-                        .dltext(param_clone, should_remove_job_clone.clone())
-                        .await
-                })
-                .await
-                {
+                let text_result = if plugin_handles_text {
+                    match param {
+                        ScraperParam::Url(url) => Some((String::new(), url.url.clone())),
+                        ScraperParam::UrlPost(url) => Some((String::new(), url.url.clone())),
+                        _ => None,
+                    }
+                } else {
+                    let scraper = self.clone();
+                    let param_clone = param.clone();
+                    let should_remove_job_clone = should_remove_job.clone();
+                    tokio::spawn(async move {
+                        scraper
+                            .dltext(param_clone, should_remove_job_clone.clone())
+                            .await
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                };
+
+                if let Some((text, source_url)) = text_result {
                     let local_scrap_data = scrap_data.clone();
                     let scraper = self.clone();
                     let mut data_all = tokio::task::spawn_blocking(move || {
@@ -890,6 +906,11 @@ impl Scraper {
     ) -> Result<Option<FileReturn>, Box<dyn Error>> {
         let plugin_manager = self.download_manager.plugin_manager.clone();
         let self_clone = self.clone();
+        let should_exit = self.download_manager.should_exit.clone();
+
+        if should_exit.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
 
         if let Some(file_url) = file.source.as_ref().and_then(|source| match source {
             FileSource::Url(file_url) => Some(file_url.clone()),
@@ -900,6 +921,9 @@ impl Scraper {
 
         // Skips downloading file IF we have tag x associated with file_id
         for skip in &file.skip_if {
+            if should_exit.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
             if let SkipIf::FileTagRelationship(tag) = skip
                 && let Some(file_id) = self.download_manager.db.tag_get_file_id(tag).await
                 && let Some(file_internal) = self.download_manager.db.file_id_get(file_id).await
@@ -917,6 +941,9 @@ impl Scraper {
 
         // Associates file hashes with a file object
         for hash in file.hash.iter() {
+            if should_exit.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
             if let Some(file_internal) = self.download_manager.db.contains_hash_sync(hash) {
                 info!(
                     "Scraper: {} JobId: {} Skipping file_id {} because hash: {:?} already in db.",
@@ -984,6 +1011,9 @@ impl Scraper {
                     // If bytes are fed instantly, spill them out to a temporary file right away
                     // to maintain identical architectural tracking shapes.
                     FileSource::Bytes(file_bytes) => {
+                        if should_exit.load(Ordering::SeqCst) {
+                            return Ok(None);
+                        }
                         let mut temp_file = tempfile::NamedTempFile::new_in(temp_dir())?;
                         temp_file.write_all(&file_bytes)?;
                         TrackedFile::Temp(temp_file)
@@ -1000,25 +1030,40 @@ impl Scraper {
 
         let temp_file_path = temp_file.path().to_path_buf();
         let processing_file_path = temp_file_path.clone();
-        let processing_permit = self
-            .download_manager
-            .processing_limiter
-            .clone()
-            .acquire_owned()
-            .await?;
+        let processing_permit = tokio::select! {
+            permit = self
+                .download_manager
+                .processing_limiter
+                .clone()
+                .acquire_owned() => permit?,
+            _ = async {
+                while !should_exit.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            } => return Ok(None),
+        };
         let processing_pool = self.download_manager.heavy_processing_pool.clone();
         let db = self.download_manager.db.clone();
+        let should_exit_for_processing = should_exit.clone();
         let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
 
         // Run CPU-heavy hashing and plugin callbacks on the bounded Rayon pool.
         processing_pool.spawn(move || {
             let _processing_permit = processing_permit;
             let result = (|| {
+                if should_exit_for_processing.load(Ordering::SeqCst) {
+                    return Err("shutdown requested".to_string());
+                }
+
                 // Read the temporary file once for hashing, format detection, and callbacks.
                 let bytes = Bytes::from(
                     std::fs::read(&processing_file_path)
                         .map_err(|error| format!("failed to read temporary file: {error}"))?,
                 );
+
+                if should_exit_for_processing.load(Ordering::SeqCst) {
+                    return Err("shutdown requested".to_string());
+                }
 
                 // 2. Compute format and layout
                 let hash = hash_bytes(&bytes, &HashesSupported::Sha512(String::new())).0;
@@ -1030,11 +1075,19 @@ impl Scraper {
 
                 let file_download_location = db.file_download_location_get_sync(&hash, &extension);
 
+                if should_exit_for_processing.load(Ordering::SeqCst) {
+                    return Err("shutdown requested".to_string());
+                }
+
                 // Callback plugins
                 plugin_manager.callback_on_download(&bytes, &mut tags_owned, &mut jobs_owned);
 
                 // Adds hash for other types onto hash if they dont exist
                 for hash_type in HashesSupported::iter() {
+                    if should_exit_for_processing.load(Ordering::SeqCst) {
+                        return Err("shutdown requested".to_string());
+                    }
+
                     // Check if the file's list contains this specific variant type
                     let exists = file_hash_local
                         .clone()
@@ -1066,6 +1119,9 @@ impl Scraper {
                 }
 
                 // 4. Save file out to its designated destination location path context
+                if should_exit_for_processing.load(Ordering::SeqCst) {
+                    return Err("shutdown requested".to_string());
+                }
                 if let Some((file_storage_path, storage_id_db)) = file_download_location
                     && let Some(parent_dir) = file_storage_path.parent()
                 {
@@ -1101,7 +1157,16 @@ impl Scraper {
         // The temp file is no longer needed after the processing task completes.
         // This also covers storage/callback errors instead of relying only on Drop.
         let _ = tokio::fs::remove_file(&temp_file_path).await;
-        let processed = processed??;
+        let processed = match processed {
+            Ok(Ok(processed)) => processed,
+            Ok(Err(_error)) if should_exit.load(Ordering::SeqCst) => return Ok(None),
+            Ok(Err(error)) => return Err(error.into()),
+            Err(error) => return Err(error.into()),
+        };
+
+        if should_exit.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
 
         let (hash, extension, storage_id_result, final_tags, final_jobs, size_bytes) = processed;
 
@@ -1625,7 +1690,7 @@ pub fn hash_bytes(bytes: &Bytes, hash: &HashesSupported) -> (String, bool) {
             let digest = md5::compute(bytes);
 
             // let sharedtypes::HashesSupported(hashe, _) => hash;
-            if &format!("{digest:x}") != hash {
+            if !hash.is_empty() && &format!("{digest:x}") != hash {
                 info!("Parser returned: {hash} Got: {digest:?}");
             }
             (format!("{digest:x}"), &format!("{digest:x}") == hash)

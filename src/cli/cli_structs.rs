@@ -304,7 +304,9 @@ pub struct TagClap {
 /// Holder of job adding.
 #[derive(Debug, Parser, Clone)]
 pub struct JobAddStruct {
-    /// Webite, Setup by nickname or by url base
+    /// Website, set up by nickname or by URL base. Use `db-slurp` or
+    /// `SYSTEM_DB_SLURP` to schedule a database import; in that case this
+    /// is the source SQLite database path.
     #[arg(exclusive = false, required = true)]
     pub site: String,
     /// Tag query for multiple items use " " and a space to seperate tags

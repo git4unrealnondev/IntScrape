@@ -8,6 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 chrono = "0.4.45"
+futures = "0.3"
 regex = "1.13.1"
 mega = {path="mega"}
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }

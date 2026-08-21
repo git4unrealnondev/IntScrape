@@ -27,6 +27,7 @@ mod tag_search;
 mod update_handler;
 
 pub const SYSTEM_DATABASE_BACKUP_SITE: &str = "SYSTEM_BACKUP";
+pub const SYSTEM_DATABASE_SLURP_SITE: &str = "SYSTEM_DB_SLURP";
 pub const SYSTEM_FILE_SIZE_SITE: &str = "SYSTEM_FILE_SIZE";
 pub const SYSTEM_FILE_HASH_SITE: &str = "SYSTEM_FILE_HASH";
 

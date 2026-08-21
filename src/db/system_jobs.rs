@@ -14,7 +14,8 @@ use shared_types::{DbJobRecreation, DbJobsObj, HashesSupported, SQL_CHUNK_SIZE, 
 use strum::IntoEnumIterator;
 
 use super::{
-    MainDatabase, SYSTEM_DATABASE_BACKUP_SITE, SYSTEM_FILE_HASH_SITE, SYSTEM_FILE_SIZE_SITE,
+    MainDatabase, SYSTEM_DATABASE_BACKUP_SITE, SYSTEM_DATABASE_SLURP_SITE, SYSTEM_FILE_HASH_SITE,
+    SYSTEM_FILE_SIZE_SITE,
 };
 
 impl MainDatabase {
@@ -22,6 +23,7 @@ impl MainDatabase {
     pub async fn run_system_job(&self, job: &DbJobsObj) -> bool {
         let success = match job.config.site.as_str() {
             SYSTEM_DATABASE_BACKUP_SITE => self.run_backup_job(job).await,
+            SYSTEM_DATABASE_SLURP_SITE => self.run_slurp_job(job).await,
             SYSTEM_FILE_SIZE_SITE => match self.update_missing_file_sizes().await {
                 Ok(_) => true,
                 Err(error) => {
@@ -60,6 +62,30 @@ impl MainDatabase {
                     job.id,
                     destination
                 );
+                false
+            }
+        }
+    }
+
+    async fn run_slurp_job(&self, job: &DbJobsObj) -> bool {
+        let Some(ScraperParam::Normal(source)) = job.config.param.first() else {
+            log::error!("Database slurp job {} has no source path", job.id);
+            return false;
+        };
+
+        match self.db_slurp(Path::new(source)) {
+            Ok((namespaces, tags, files)) => {
+                log::info!(
+                    "Database slurp job {} imported {} namespaces, {} tags, and {} files",
+                    job.id,
+                    namespaces,
+                    tags,
+                    files
+                );
+                true
+            }
+            Err(error) => {
+                log::error!("Database slurp job {} failed: {error}", job.id);
                 false
             }
         }
@@ -340,7 +366,10 @@ impl MainDatabase {
 pub(crate) fn is_system_job(job: &DbJobsObj) -> bool {
     matches!(
         job.config.site.as_str(),
-        SYSTEM_DATABASE_BACKUP_SITE | SYSTEM_FILE_SIZE_SITE | SYSTEM_FILE_HASH_SITE
+        SYSTEM_DATABASE_BACKUP_SITE
+            | SYSTEM_DATABASE_SLURP_SITE
+            | SYSTEM_FILE_SIZE_SITE
+            | SYSTEM_FILE_HASH_SITE
     ) || matches!(
         job.config.recreation,
         Some(DbJobRecreation::AlwaysTime(_, _))

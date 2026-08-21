@@ -2,7 +2,10 @@ extern crate clap;
 
 use crate::cli::cli_structs::Database;
 use crate::helper_functions;
-use crate::{db::MainDatabase, web::manager::hash_bytes};
+use crate::{
+    db::{MainDatabase, SYSTEM_DATABASE_SLURP_SITE},
+    web::manager::hash_bytes,
+};
 use bytes::Bytes;
 use memmap2::Mmap;
 use shared_types::DbJobRecreation;
@@ -18,6 +21,8 @@ use clap::Parser;
 use std::sync::Arc;
 
 pub mod cli_structs;
+
+const DB_SLURP_JOB_ALIAS: &str = "db-slurp";
 
 ///
 /// Parses strings into NORMAL inputs as scraperparam
@@ -102,12 +107,24 @@ pub async fn main(db: Arc<MainDatabase>) {
                         _ => None,
                     });
 
+                    let site = if addstruct.site == DB_SLURP_JOB_ALIAS {
+                        SYSTEM_DATABASE_SLURP_SITE.to_string()
+                    } else {
+                        addstruct.site.clone()
+                    };
                     let job = shared_types::PluginJob {
                         time: helper_functions::get_sys_time_in_secs(),
                         reptime: time_conv(&addstruct.time),
                         priority: 10,
-                        site: addstruct.site.clone(),
-                        param: parse_string_to_scraperparam(&addstruct.query),
+                        site,
+                        param: if addstruct.site == DB_SLURP_JOB_ALIAS
+                            || addstruct.site == SYSTEM_DATABASE_SLURP_SITE
+                        {
+                            // A database path is one value, including when it contains spaces.
+                            vec![shared_types::ScraperParam::Normal(addstruct.query.clone())]
+                        } else {
+                            parse_string_to_scraperparam(&addstruct.query)
+                        },
                         user_data: BTreeMap::new(),
                         recreation,
                     };
