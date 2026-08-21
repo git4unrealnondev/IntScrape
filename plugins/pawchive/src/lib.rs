@@ -141,7 +141,10 @@ pub fn parser_call(
                         "{}_{}_{}",
                         limit_to,
                         comment.id,
-                        comment.published.map(|f| f.to_string()).unwrap_or("CANNOT PARSE".to_string())
+                        comment
+                            .published
+                            .map(|f| f.to_string())
+                            .unwrap_or("CANNOT PARSE".to_string())
                     ),
                     namespace: pawchive_namespace(
                         "Pawchive_Post_Comment_Scope",

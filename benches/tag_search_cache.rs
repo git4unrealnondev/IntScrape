@@ -2,8 +2,8 @@
 mod tag_search;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use tag_search::{TagSearchCache, tag_entry};
 use rusqlite::Connection;
+use tag_search::{TagSearchCache, tag_entry};
 
 const REAL_QUERIES: &[&str] = &[
     "female",

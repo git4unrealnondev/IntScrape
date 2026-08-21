@@ -3861,7 +3861,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                  FROM File WHERE size_bytes IS NULL AND hash IS NOT NULL LIMIT {} OFFSET {}",
                     SQL_CHUNK_SIZE, cnt
                 ))?;
-                    info!("System file size checker is fixing: {} files.", &cnt);
+                info!("System file size checker is fixing: {} files.", &cnt);
                 let rows: Vec<_> = files
                     .query_map([], |row| {
                         Ok((

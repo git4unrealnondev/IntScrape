@@ -131,11 +131,15 @@ impl MainDatabase {
                     })
                     .collect();
 
-                let conn = pool.get()?;
 
     let mut cnt = 0;
                 loop {
 
+                    let file_ids_to_work_on: Vec<u64>;
+let file_id_file_paths: HashMap<u64, String>;
+                    {
+
+                let conn = pool.get()?;
 // Safe to assume that if we're missing one hash then we need everything else
                 let mut stmt = conn.prepare(
                     &format!("SELECT id 
@@ -147,10 +151,10 @@ impl MainDatabase {
              ) LIMIT {} OFFSET {};", SQL_CHUNK_SIZE, cnt),
                 )?;
 
-                    info!("System file hasher has hashed: {} files.", &cnt);
+                    log::info!("System file hasher has hashed: {} files.", &cnt);
 
 
-                    let file_ids_to_work_on: Vec<u64> = stmt
+                    file_ids_to_work_on = stmt
                     .query_map([], |row| Ok(row.get::<_, u64>(0)?))?
                     .flatten()
                     .collect();
@@ -164,7 +168,7 @@ impl MainDatabase {
                         break;
                     }
 
-                    let file_id_file_paths: HashMap<u64, String> = file_ids_to_work_on
+                   file_id_file_paths  = file_ids_to_work_on
                         .iter()
                         .filter_map(|f| {
                             if let Some(file_path) =
@@ -179,6 +183,7 @@ impl MainDatabase {
                         })
                         .collect();
 
+                    }
                     let processed = file_id_file_paths
                         .par_iter()
                         .try_fold(Vec::new, |mut pending, (file_id, file_path)| {
