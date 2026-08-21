@@ -29,7 +29,7 @@ pub struct PluginManager {
     db: Arc<MainDatabase>,
     threads: RwLock<Vec<JoinHandle<()>>>,
     should_exit: Arc<AtomicBool>,
-    regex_tags_cache: RwLock<HashSet<Tag>>,
+    regex_tags_cache: RwLock<HashMap<Tag, u64>>,
     regex_cache: RwLock<HashMap<String, Arc<Regex>>>,
 }
 
@@ -57,7 +57,7 @@ impl PluginManager {
             db,
             threads: Vec::new().into(),
             should_exit,
-            regex_tags_cache: HashSet::new().into(),
+            regex_tags_cache: HashMap::new().into(),
             regex_cache: HashMap::new().into(),
         };
 
@@ -79,7 +79,7 @@ impl PluginManager {
 
     /// Adds tags to cache will let system process later.
     /// called from db needs to be relatively fast and non-blocking
-    pub fn add_regex_tags(&self, tags: HashSet<Tag>) {
+    pub fn add_regex_tags(&self, tags: HashMap<Tag, u64>) {
         let mut regex_tags_cache = self.regex_tags_cache.write();
         regex_tags_cache.extend(tags);
     }
@@ -369,7 +369,9 @@ impl PluginManager {
                 .collect()
         };
 
-        let regex_tags = self.regex_tags_cache.read();
+        // Callbacks may add tags, which updates this cache. Do not hold its
+        // read lock while processing callback results.
+        let regex_tags = self.regex_tags_cache.read().clone();
 
         for (search_type, namespace_allow, namespace_deny, plugins) in callbacks {
             let compiled_regex = match &search_type {
@@ -385,7 +387,7 @@ impl PluginManager {
                 shared_types::SearchType::String(_) => None,
             };
 
-            for regex_tag in regex_tags.iter() {
+            for (regex_tag, source_id) in regex_tags.iter() {
                 let namespace = &regex_tag.namespace.name;
 
                 if namespace_deny.contains(namespace) {
@@ -396,21 +398,55 @@ impl PluginManager {
                     continue;
                 }
 
-                let matched = match &search_type {
-                    shared_types::SearchType::String(search_string) => {
-                        regex_tag.name.contains(search_string)
+                let regex_match = match &search_type {
+                    shared_types::SearchType::String(search_string) => regex_tag
+                        .name
+                        .find(search_string)
+                        .map(|start| &regex_tag.name[start..start + search_string.len()]),
+                    shared_types::SearchType::Regex(_) => {
+                        compiled_regex.as_ref().and_then(|regex| {
+                            regex.find(&regex_tag.name).map(|matched| matched.as_str())
+                        })
                     }
-
-                    shared_types::SearchType::Regex(_) => compiled_regex
-                        .as_ref()
-                        .is_some_and(|regex| regex.is_match(&regex_tag.name)),
                 };
 
-                if matched {
+                if let Some(regex_match) = regex_match {
                     for plugin in &plugins {
-                        dbg!(plugin, regex_tag);
+                        let Some(lib) = self.storage_libs.read().get(plugin).cloned() else {
+                            continue;
+                        };
 
-                        // Invoke the plugin callback here.
+                        // ABI: on_regex(matched, full_tag, tag_source, tag_source_id).
+                        let callback: libloading::Symbol<
+                            unsafe extern "C" fn(&str, &str, &Tag, u64) -> CallbackReturn,
+                        > = unsafe {
+                            match lib.get(b"on_regex") {
+                                Err(error) => {
+                                    log::error!(
+                                        "Plugins: {plugin} could not call 'on_regex' got error: {error:?}"
+                                    );
+                                    continue;
+                                }
+                                Ok(callback) => callback,
+                            }
+                        };
+
+                        // The source is the full tag object; source_id is its database ID.
+                        let return_data = unsafe {
+                            callback(regex_match, &regex_tag.name, regex_tag, *source_id)
+                        };
+
+                        if !return_data.tags.is_empty()
+                            && !self.db.tag_actions_add_sync(
+                                &return_data.tags.into_iter().collect::<Vec<FileTagAction>>(),
+                            )
+                        {
+                            log::error!("Plugins: {plugin} failed to process on_regex tags");
+                        }
+
+                        for job in return_data.jobs {
+                            let _ = self.db.jobs_add_single_sync(job.job);
+                        }
                     }
                 }
             }

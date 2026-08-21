@@ -4,18 +4,12 @@
 //!
 //! Example:
 //! ```
-//! use thumbnailer::{create_thumbnails, Thumbnail, ThumbnailSize};
+//! use thumbnailer::{create_thumbnails_dynamic, ThumbnailSize};
 //! use std::fs::File;
 //! use std::io::BufReader;
-//! use std::io::Cursor;
-//! use file_format::FileFormat;
 //! let file = File::open("tests/assets/test.png").unwrap();
 //! let reader = BufReader::new(file);
-//! let mut  thumbnails = create_thumbnails(reader, FileFormat::PortableNetworkGraphics, [ThumbnailSize::Small, ThumbnailSize::Medium]).unwrap();
-//!
-//! let thumbnail = thumbnails.pop().unwrap();
-//! let mut buf = Cursor::new(Vec::new());
-//! thumbnail.write_png(&mut buf).unwrap();
+//! let thumbnail = create_thumbnails_dynamic(reader, &ThumbnailSize::Small).unwrap();
 //! ```
 use crate::error::{ThumbError, ThumbResult};
 //use crate::formats::get_base_image;
@@ -24,9 +18,12 @@ use avio::{HardwareAccel, PixelFormat, VideoDecoder};
 use file_format::{FileFormat, Kind};
 use image::{DynamicImage, EncodableLayout, GenericImageView, ImageFormat};
 pub use size::ThumbnailSize;
-use std::io::{self, BufRead, ErrorKind, Seek, Write};
-use std::sync::Once;
-use std::time::Duration;
+use std::{
+    io::{self, BufRead, ErrorKind, Seek, Write},
+    path::Path,
+    sync::Once,
+    time::Duration,
+};
 use tempfile::NamedTempFile;
 use webp_animation::EncodingConfig;
 
@@ -106,6 +103,14 @@ pub fn create_thumbnails_dynamic<R: BufRead + Seek>(
     mut reader: R,
     size: &ThumbnailSize,
 ) -> ThumbResult<Vec<u8>> {
+    create_thumbnails_dynamic_in(&mut reader, size, Path::new("/tmp"))
+}
+
+fn create_thumbnails_dynamic_in<R: BufRead + Seek>(
+    mut reader: R,
+    size: &ThumbnailSize,
+    temp_dir: &Path,
+) -> ThumbResult<Vec<u8>> {
     suppress_ffmpeg_logging();
 
     let frate = 4;
@@ -159,14 +164,14 @@ pub fn create_thumbnails_dynamic<R: BufRead + Seek>(
         Format::Video => {
             let total_frames = 50;
 
-            let mut video_file = NamedTempFile::new()?;
+            let mut video_file = NamedTempFile::new_in(temp_dir)?;
 
             let mut buffer = Vec::new();
             reader.read_to_end(&mut buffer)?;
             video_file.write_all(&buffer)?;
 
             frames = Vec::with_capacity(total_frames);
-            let video_file_path = video_file.into_temp_path().keep().unwrap();
+            let video_file_path = video_file.path().to_path_buf();
             let step = 4;
 
             let mut decoder = VideoDecoder::open(&video_file_path)
@@ -253,4 +258,23 @@ pub fn create_thumbnails_dynamic<R: BufRead + Seek>(
         Format::Other => {}
     }
     ThumbResult::Err(error::ThumbError::Unsupported(mime))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn video_temp_file_is_removed_after_processing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let result = create_thumbnails_dynamic_in(
+            Cursor::new(include_bytes!("../tests/assets/test.mp4")),
+            &ThumbnailSize::Custom((32, 32)),
+            temp_dir.path(),
+        );
+
+        assert!(result.is_ok() || matches!(result, Err(ThumbError::Unsupported(_))));
+        assert_eq!(std::fs::read_dir(temp_dir.path()).unwrap().count(), 0);
+    }
 }

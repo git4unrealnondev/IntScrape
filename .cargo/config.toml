@@ -2,4 +2,8 @@
 build-plugins = "run --package xtask"
 
 [build]
-rustflags = ["--cfg", "tokio_unstable"]
+rustflags = [
+  "--cfg", "tokio_unstable",
+  # Required by the cpu-profiling and memory-profiling features:
+  "-C", "force-frame-pointers=yes"
+]

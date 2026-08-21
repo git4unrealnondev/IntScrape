@@ -34,7 +34,7 @@ const JOB_PROCESSING_CHUNK_SIZE: usize = 256;
 ///
 /// Sets up logging in the environment
 ///
-fn setup_log() -> Result<(), Box<dyn Error>> {
+fn setup_log() -> Result<(), Box<dyn Error + Send + Sync>> {
     let log_path = Path::new(LOG_PATH);
 
     // Clears log
@@ -56,8 +56,8 @@ fn setup_log() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // ctrl C handler
     let should_exit = Arc::new(AtomicBool::new(false));
 
@@ -72,7 +72,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .build()?,
     );
 
-    let db = MainDatabase::new(Path::new(DB_PATH));
+    let db = MainDatabase::new(
+        Path::new(DB_PATH),
+        heavy_processing_pool.clone(),
+        should_exit.clone(),
+    );
 
     let plugins_path =
         std::env::var("INTSCRAPE_PLUGINS_PATH").unwrap_or_else(|_| PLUGINS_PATH.to_owned());
@@ -154,7 +158,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Ctrl-C stops new work first; allow active downloads to finish and release
     // their in-progress URL guards before the manager is dropped.
-    while !download_manager.downloads_complete().await {
+    while !download_manager.downloads_complete().await
+        || !download_manager.all_jobs_complete().await
+    {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 

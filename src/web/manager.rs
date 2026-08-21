@@ -8,7 +8,10 @@ use std::{
     env::temp_dir,
     io::{Cursor, Write, stdin, stdout},
     mem::discriminant,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use strum::IntoEnumIterator;
@@ -166,6 +169,17 @@ pub struct DownloadsManager {
     job_limiter: Arc<Semaphore>,
     processing_limiter: Arc<Semaphore>,
     should_exit: Arc<AtomicBool>,
+    active_file_processing: Arc<AtomicUsize>,
+}
+
+struct FileProcessingGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for FileProcessingGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Scraper {
@@ -370,7 +384,17 @@ impl Scraper {
                                     let semaphore_clone = semaphore.clone();
                                     let plugin_name = plugin_name.clone();
                                     let permit = semaphore_clone.acquire_owned().await?;
+                                    scraper
+                                        .download_manager
+                                        .active_file_processing
+                                        .fetch_add(1, Ordering::SeqCst);
                                     set.spawn(async move {
+                                        let _processing_guard = FileProcessingGuard {
+                                            active: scraper
+                                                .download_manager
+                                                .active_file_processing
+                                                .clone(),
+                                        };
                                         let mut download_issue = false;
                                         let mut jobs = Vec::new();
 
@@ -975,6 +999,7 @@ impl Scraper {
         let file_hash_local = file_hash_owned.clone();
 
         let temp_file_path = temp_file.path().to_path_buf();
+        let processing_file_path = temp_file_path.clone();
         let processing_permit = self
             .download_manager
             .processing_limiter
@@ -991,7 +1016,7 @@ impl Scraper {
             let result = (|| {
                 // Read the temporary file once for hashing, format detection, and callbacks.
                 let bytes = Bytes::from(
-                    std::fs::read(&temp_file_path)
+                    std::fs::read(&processing_file_path)
                         .map_err(|error| format!("failed to read temporary file: {error}"))?,
                 );
 
@@ -1048,8 +1073,8 @@ impl Scraper {
                         .map_err(|error| format!("failed to create storage directory: {error}"))?;
 
                     let staging_path = file_storage_path.with_extension("part");
-                    if std::fs::rename(&temp_file_path, &staging_path).is_err() {
-                        std::fs::copy(&temp_file_path, &staging_path)
+                    if std::fs::rename(&processing_file_path, &staging_path).is_err() {
+                        std::fs::copy(&processing_file_path, &staging_path)
                             .map_err(|error| format!("failed to stage file: {error}"))?;
                     }
                     std::fs::rename(&staging_path, &file_storage_path)
@@ -1072,7 +1097,11 @@ impl Scraper {
 
         let processed = result_receiver
             .await
-            .map_err(|_| "file processing task failed: processing pool stopped")??;
+            .map_err(|_| "file processing task failed: processing pool stopped");
+        // The temp file is no longer needed after the processing task completes.
+        // This also covers storage/callback errors instead of relying only on Drop.
+        let _ = tokio::fs::remove_file(&temp_file_path).await;
+        let processed = processed??;
 
         let (hash, extension, storage_id_result, final_tags, final_jobs, size_bytes) = processed;
 
@@ -1140,6 +1169,7 @@ impl DownloadsManager {
             job_limiter: Arc::new(Semaphore::new(3)),
             processing_limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_PROCESSING)),
             should_exit,
+            active_file_processing: Arc::new(AtomicUsize::new(0)),
         };
 
         dm.into()
@@ -1201,6 +1231,9 @@ impl DownloadsManager {
 
         if remove_plugin {
             self.jobs.write().await.remove(&plugin.name);
+
+            // Rebuild counts and entries once the final queued job has finished.
+            self.db.refresh_tag_search_cache();
         }
     }
 
@@ -1213,6 +1246,7 @@ impl DownloadsManager {
 
     pub async fn downloads_complete(&self) -> bool {
         self.downloading_urls.read().await.is_empty()
+            && self.active_file_processing.load(Ordering::SeqCst) == 0
     }
 
     ///
@@ -1566,6 +1600,21 @@ mod tests {
         assert_eq!(file.tag_list[0].tags.len(), 1);
         assert_eq!(file.tag_list[0].tags[0].tag.name, url);
         assert_eq!(file.tag_list[0].tags[0].tag.namespace.name, "source_url");
+    }
+
+    #[test]
+    fn file_processing_guard_tracks_shutdown_work() {
+        let active = Arc::new(AtomicUsize::new(0));
+        active.fetch_add(1, Ordering::SeqCst);
+
+        {
+            let _guard = FileProcessingGuard {
+                active: active.clone(),
+            };
+            assert_eq!(active.load(Ordering::SeqCst), 1);
+        }
+
+        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 }
 

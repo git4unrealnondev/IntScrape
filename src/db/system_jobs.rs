@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::time::SystemTime;
 use std::{
     collections::{HashMap, HashSet},
@@ -8,7 +9,8 @@ use crate::backup_path::dated_backup_destination;
 use crate::web::manager::hash_bytes;
 use bytes::Bytes;
 use rayon::prelude::*;
-use shared_types::{DbJobRecreation, DbJobsObj, HashesSupported, ScraperParam};
+use rusqlite::{params, params_from_iter};
+use shared_types::{DbJobRecreation, DbJobsObj, HashesSupported, SQL_CHUNK_SIZE, ScraperParam};
 use strum::IntoEnumIterator;
 
 use super::{
@@ -21,20 +23,14 @@ impl MainDatabase {
         let success = match job.config.site.as_str() {
             SYSTEM_DATABASE_BACKUP_SITE => self.run_backup_job(job).await,
             SYSTEM_FILE_SIZE_SITE => match self.update_missing_file_sizes().await {
-                Ok(updated) => {
-                    log::info!("File-size system job {} updated {} files", job.id, updated);
-                    true
-                }
+                Ok(_) => true,
                 Err(error) => {
                     log::error!("File-size system job {} failed: {error}", job.id);
                     false
                 }
             },
             SYSTEM_FILE_HASH_SITE => match self.hash_missing_file_hashes().await {
-                Ok(updated) => {
-                    log::info!("File-hash system job {} updated {} files", job.id, updated);
-                    true
-                }
+                Ok(_) => true,
                 Err(error) => {
                     log::error!("File-hash system job {} failed: {error}", job.id);
                     false
@@ -69,6 +65,159 @@ impl MainDatabase {
         }
     }
 
+    pub async fn hash_missing_file_hashes(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let pool = self.pool.clone();
+        let should_exit_clone = self.should_exit.clone();
+        let writer_conn_clone = self.writer_conn.clone();
+
+        let result = tokio::task::spawn_blocking(
+            move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                let algorithms: Vec<(&'static str, HashesSupported)> = HashesSupported::iter()
+                    .map(|hash| match hash {
+                        HashesSupported::Md5(_) => ("MD5", HashesSupported::Md5(String::new())),
+                        HashesSupported::Sha1(_) => ("SHA1", HashesSupported::Sha1(String::new())),
+                        HashesSupported::Sha256(_) => {
+                            ("SHA256", HashesSupported::Sha256(String::new()))
+                        }
+                        HashesSupported::Sha512(_) => {
+                            ("SHA512", HashesSupported::Sha512(String::new()))
+                        }
+                        HashesSupported::IPFSCID(_) => {
+                            ("IPFSCID", HashesSupported::IPFSCID(String::new()))
+                        }
+                        HashesSupported::IPFSCID1(_) => {
+                            ("IPFSCID1", HashesSupported::IPFSCID1(String::new()))
+                        }
+                        HashesSupported::ImageHash(_) => {
+                            ("ImageHash", HashesSupported::ImageHash(String::new()))
+                        }
+                    })
+                    .collect();
+
+                let conn = pool.get()?;
+
+    let mut cnt = 0;
+                loop {
+
+// Safe to assume that if we're missing one hash then we need everything else
+                let mut stmt = conn.prepare(
+                    &format!("SELECT id 
+             FROM File f 
+             WHERE NOT EXISTS (
+                 SELECT 1 
+                 FROM FileHashes fh 
+                 WHERE fh.file_id = f.id
+             ) LIMIT {} OFFSET {};", SQL_CHUNK_SIZE, cnt),
+                )?;
+
+
+                    let file_ids_to_work_on: Vec<u64> = stmt
+                    .query_map([], |row| Ok(row.get::<_, u64>(0)?))?
+                    .flatten()
+                    .collect();
+                    cnt += SQL_CHUNK_SIZE;
+
+                    if file_ids_to_work_on.is_empty() {
+                        break;
+                    }
+
+                    let file_id_file_paths: HashMap<u64, String> = file_ids_to_work_on
+                        .iter()
+                        .filter_map(|f| {
+                            if let Some(file_path) =
+                                Self::internal_file_get_physical_path(&conn, f)
+                                    .ok()
+                                    .flatten()
+                            {
+                                Some((*f, file_path))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    let processed = file_id_file_paths
+                        .par_iter()
+                        .try_fold(Vec::new, |mut pending, (file_id, file_path)| {
+                            if should_exit_clone.load(std::sync::atomic::Ordering::SeqCst) {
+                                return Err(());
+                            }
+                            if let Ok(bytes) = std::fs::read(file_path) {
+                                let bytes = Bytes::from(bytes);
+
+                                for (algorithm_name, hashessupported) in algorithms.iter() {
+                                    pending.push((
+                                        *file_id,
+                                        algorithm_name,
+                                        hash_bytes(&bytes, hashessupported).0,
+                                    ));
+                                }
+                            }
+
+                            Ok(pending)
+                        })
+                        .try_reduce(Vec::new, |mut left, mut right| {
+                            left.append(&mut right);
+                            Ok(left)
+                        });
+                    let pending = match processed {
+                        Ok(pending) => pending,
+                        Err(()) => {
+                            break;
+                        }
+                    };
+
+                    // This is just to make sure that we're not going over some chunk size
+                    for pending_list in pending.chunks(SQL_CHUNK_SIZE.try_into().unwrap()) {
+                        if pending_list.is_empty() {
+                            continue;
+                        }
+
+                        let mut writer = writer_conn_clone.lock();
+                        let conn = writer.transaction()?;
+
+                        let placeholders: String = pending_list
+                            .iter()
+                            .map(|_| "(?, ?, ?)")
+                            .collect::<Vec<_>>()
+                            .join(", ");
+
+                        let sql = format!(
+                            "INSERT OR IGNORE INTO FileHashes (file_id, algorithm, digest) VALUES {}",
+                            placeholders
+                        );
+
+                        let mut flat_params: Vec<&dyn rusqlite::ToSql> =
+                            Vec::with_capacity(pending_list.len() * 3);
+                        for (file_id, algorithm, digest) in pending_list {
+                            flat_params.push(file_id);
+                            flat_params.push(algorithm);
+                            flat_params.push(digest);
+                        }
+
+                        {
+                            let mut stmt = conn.prepare(&sql)?;
+                            stmt.execute(rusqlite::params_from_iter(flat_params))?;
+                        }
+                        conn.commit()?;
+                    }
+                    log::info!("File-hash system updated {} files", pending.len());
+                }
+
+                Ok(())
+            },
+        )
+        .await;
+
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(Box::new(e)),
+        }
+    }
+    /*
     /// Computes supported secondary hashes for files missing them in FileHashes.
     pub async fn hash_missing_file_hashes(&self) -> Result<u64, r2d2_sqlite::rusqlite::Error> {
         let pool = self.pool.clone();
@@ -185,7 +334,7 @@ impl MainDatabase {
         }
         tx.commit()?;
         Ok(updated)
-    }
+    }*/
 }
 
 pub(crate) fn is_system_job(job: &DbJobsObj) -> bool {

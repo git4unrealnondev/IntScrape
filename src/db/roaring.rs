@@ -421,7 +421,10 @@ impl RelationshipStorage {
         &self,
         tag_id: u64,
     ) -> Option<Vec<u64>> {
-        if !matches!(self.internal_cache, InternalCacheType::Full | InternalCacheType::Popular(_)) {
+        if !matches!(
+            self.internal_cache,
+            InternalCacheType::Full | InternalCacheType::Popular(_)
+        ) {
             return None;
         }
 
@@ -651,11 +654,17 @@ impl RelationshipStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rayon::ThreadPoolBuilder;
+    use std::sync::atomic::AtomicBool;
     use tempfile::NamedTempFile;
 
     fn test_storage(cache_type: InternalCacheType) -> (RelationshipStorage, Connection) {
         let database_file = NamedTempFile::new().unwrap();
-        let db = MainDatabase::new(database_file.path());
+        let db = MainDatabase::new(
+            database_file.path(),
+            std::sync::Arc::new(ThreadPoolBuilder::new().build().unwrap()),
+            std::sync::Arc::new(AtomicBool::new(false)),
+        );
         let conn = Connection::open_in_memory().unwrap();
         RelationshipStorage::internal_table_relationship_cache_create_v1(&conn);
 

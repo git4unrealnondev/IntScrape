@@ -47,7 +47,11 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
                 total_file_ids.retain(|f| !namespace_file_ids.contains(f));
             }
         }
-        Ok(None) => {}
+        Ok(None) => {
+          let _ =  client::namespace_set(GenericNamespaceObj { name: "file_thumbnail".into(), 
+                                        description: Some("A thumbnail hash.".into()),
+ });
+        }
         Err(e) => {
             return Err(e);
         }

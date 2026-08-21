@@ -2,9 +2,11 @@ use core::{convert::Into, option::Option::Some};
 use parking_lot::{Mutex, RwLock};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::{SqliteConnectionManager, rusqlite::Connection};
+use rayon::ThreadPool;
 use std::{
     collections::{HashMap, VecDeque},
     path::Path,
+    sync::atomic::AtomicBool,
     time::Duration,
 };
 
@@ -44,6 +46,8 @@ pub struct MainDatabase {
     cache_type: Arc<RwLock<CacheType>>,
     relationship_roaring_storage: Arc<RwLock<Option<RelationshipStorage>>>,
     plugin_manager: Arc<RwLock<Option<Arc<PluginManager>>>>,
+    heavy_processing_pool: Arc<ThreadPool>,
+    should_exit: Arc<AtomicBool>,
 }
 
 const TAG_CACHE_LIMIT: usize = 100_000;
@@ -124,18 +128,24 @@ mod tag_cache_tests {
 
 impl MainDatabase {
     #[must_use]
-    pub fn new(db_path: &Path) -> Arc<Self> {
+    pub fn new(
+        db_path: &Path,
+        heavy_processing_pool: Arc<ThreadPool>,
+        should_exit: Arc<AtomicBool>,
+    ) -> Arc<Self> {
         let manager = SqliteConnectionManager::file(db_path).with_init(|c| {
-          /*  c.trace(Some(|statement: &str| {
+            /*  c.trace(Some(|statement: &str| {
                 log::info!("Executing SQL: {}", statement);
             }));*/
-            c.busy_timeout(Duration::from_secs(1))?;
+            // Bound genuine lockups without turning ordinary writer contention
+            // into an immediate database failure.
+            c.busy_timeout(Duration::from_secs(30))?;
             c.execute_batch(
                 "
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
-PRAGMA busy_timeout = 1000;
+ PRAGMA busy_timeout = 30000;
 PRAGMA cache_size = -64000;
 ",
             )
@@ -159,6 +169,8 @@ PRAGMA cache_size = -64000;
             relationship_roaring_storage: Arc::new(RwLock::new(None)),
             writer_conn,
             plugin_manager: Arc::new(RwLock::new(None)),
+            heavy_processing_pool,
+            should_exit,
         }
         .into();
 

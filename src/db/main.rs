@@ -530,6 +530,10 @@ impl MainDatabase {
         }
         drop(guard);
 
+        self.refresh_tag_search_cache_with_connection(conn);
+    }
+
+    fn refresh_tag_search_cache_with_connection(&self, conn: &Connection) {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, count
@@ -551,14 +555,16 @@ impl MainDatabase {
         let cached_tag_count: u64 = conn
             .query_row("SELECT count(*) FROM Tags", [], |row| row.get(0))
             .unwrap();
-        let data_version: u64 = conn
-            .query_row("PRAGMA data_version", [], |row| row.get(0))
-            .unwrap();
-        *self.tag_search_cache.write() = tag_search::TagSearchCache::from_entries_at_version(
+        *self.tag_search_cache.write() = tag_search::TagSearchCache::from_entries_with_completeness(
             entries,
-            data_version,
             cached_tag_count <= tag_search::POPULAR_TAG_CACHE_LIMIT as u64,
         );
+    }
+
+    /// Refreshes the in-memory tag search index after queued work changes tags.
+    pub fn refresh_tag_search_cache(&self) {
+        let conn = self.pool.get().unwrap();
+        self.refresh_tag_search_cache_with_connection(&conn);
     }
 
     /// Sets up internal cache structure
@@ -588,8 +594,9 @@ impl MainDatabase {
     /// Recaches db internally
     ///
     pub fn recache_roaring_db(&self) {
-        let mut roaring_guard = self.relationship_roaring_storage.write();
         let mut write_guard = self.writer_conn.lock();
+        // Mutation paths acquire writer_conn before this cache lock.
+        let mut roaring_guard = self.relationship_roaring_storage.write();
         if let Some(roaring) = roaring_guard.as_mut() {
             let conn = write_guard.transaction().unwrap();
             roaring.recache_roaring(&conn).unwrap();
@@ -624,61 +631,26 @@ impl MainDatabase {
         if max_rows == 0 {
             return Vec::new();
         }
-        let conn = self.pool.get().unwrap();
-        let data_version: u64 = conn
-            .query_row("PRAGMA data_version", [], |row| row.get(0))
-            .unwrap();
-        if !self.tag_search_cache.read().is_current(data_version) {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, name, count
-                     FROM Tags
-                     ORDER BY count DESC, id
-                     LIMIT ?1",
-                )
-                .unwrap();
-            let entries = stmt
-                .query_map([tag_search::POPULAR_TAG_CACHE_LIMIT], |row| {
-                    let tag_id = row.get(0)?;
-                    let name: String = row.get(1)?;
-                    let count = row.get(2)?;
-                    Ok(tag_search::tag_entry(tag_id, &name, count))
-                })
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-            let cached_tag_count: u64 = conn
-                .query_row("SELECT count(*) FROM Tags", [], |row| row.get(0))
-                .unwrap();
-            *self.tag_search_cache.write() = tag_search::TagSearchCache::from_entries_at_version(
-                entries,
-                data_version,
-                cached_tag_count <= tag_search::POPULAR_TAG_CACHE_LIMIT as u64,
-            );
-        }
-
-        let mut results = self.tag_search_cache.read().search(tag, max_rows);
-        if self.tag_search_cache.read().is_complete() {
+        let cache = self.tag_search_cache.read();
+        let mut results = cache.search(tag, max_rows);
+        if cache.is_complete() {
             return results;
         }
+        drop(cache);
 
         let Some(fts_query) = tag_search::fts_query(tag) else {
             return results;
         };
-
+        let conn = self.pool.get().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT 
-    t.id, 
-    t.name, 
-    t.count
- FROM Tags_Search_fts f
- JOIN Tags t ON t.id = f.rowid
- WHERE Tags_Search_fts MATCH ?1
- LIMIT ?2",
+                "SELECT t.id, t.name, t.count
+                 FROM Tags_Search_fts f
+                 JOIN Tags t ON t.id = f.rowid
+                 WHERE Tags_Search_fts MATCH ?1
+                 LIMIT ?2",
             )
             .unwrap();
-
         let tag_iter = stmt
             .query_map(
                 rusqlite::params![fts_query, tag_search::FTS_CANDIDATE_LIMIT],
@@ -1502,6 +1474,19 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
         Self::internal_tag_id_get_namespace_id(&conn, namespace_id).unwrap_or_default()
     }
 
+    /// Gets every tag id in the database.
+    #[ipc(name = "get_tag_ids_all", request = "GetTagIDsAll")]
+    pub fn tag_id_get_all(&self) -> HashSet<u64> {
+        let conn = self.pool.get().unwrap();
+        let Ok(mut statement) = conn.prepare("SELECT id FROM Tags") else {
+            return HashSet::new();
+        };
+        let Ok(rows) = statement.query_map([], |row| row.get(0)) else {
+            return HashSet::new();
+        };
+        rows.filter_map(Result::ok).collect()
+    }
+
     ///
     /// Gets a file if a tag is associated with it
     ///
@@ -1578,6 +1563,25 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
         }
 
         true
+    }
+
+    /// Adds tag actions without creating a file/tag relationship.
+    ///
+    /// This is used by tag callbacks that create structural tag relationships.
+    #[ipc(name = "tag_actions_add", request = "TagActionsAdd")]
+    pub fn tag_actions_add_sync(&self, tag_actions: &[FileTagAction]) -> bool {
+        if tag_actions.is_empty() {
+            return true;
+        }
+
+        let mut guard = self.writer_conn.lock();
+        let Ok(conn) = guard.transaction() else {
+            return false;
+        };
+
+        Self::internal_audit_context_set(&conn, "tag callback processed").unwrap();
+        Self::internal_tag_bulk_add(&conn, tag_actions, self.plugin_manager.clone());
+        conn.commit().is_ok()
     }
 
     /// Adds tags to multiple files in one SQLite transaction.
@@ -2019,7 +2023,9 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
         };
         let table = Self::relationship_partition_name(namespace_id);
         let mut stmt = conn
-            .prepare(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE tag_id = ?1)"))
+            .prepare(&format!(
+                "SELECT EXISTS(SELECT 1 FROM {table} WHERE tag_id = ?1)"
+            ))
             .unwrap();
 
         stmt.query_row(params![tag_id], |row| row.get(0))
@@ -2814,10 +2820,10 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         {
             let plugin_manager = plugin_manager.write();
             if let Some(plugin_manager) = &*plugin_manager {
-                let mut tags_to_add = HashSet::new();
+                let mut tags_to_add = HashMap::new();
                 for (tag, tag_id) in out.iter() {
                     if tag_id > &max_tag_id {
-                        tags_to_add.insert(tag.clone());
+                        tags_to_add.insert(tag.clone(), *tag_id);
                     }
                 }
                 plugin_manager.add_regex_tags(tags_to_add);
@@ -3776,7 +3782,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 Self::internal_relationship_bulk_add(self.clone(), &conn, &rels_to_add);
             }
 
-             conn.commit().unwrap();
+            conn.commit().unwrap();
         })
         .await
         .unwrap();
@@ -3825,51 +3831,80 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         }
     }
 
-    pub async fn update_missing_file_sizes(&self) -> Result<u64, rusqlite::Error> {
+    pub async fn update_missing_file_sizes(&self) -> Result<(), rusqlite::Error> {
+        let pool = self.pool.clone();
         let writer_conn = self.writer_conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = writer_conn.lock();
-            let storage = Self::internal_file_storage_get_all(&conn)?;
-            let mut files = conn.prepare(
-                "SELECT id, hash, extension, storage_id
-                 FROM File WHERE size_bytes IS NULL AND hash IS NOT NULL",
-            )?;
-            let rows = files.query_map([], |row| {
-                Ok((
-                    row.get::<_, u64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, u64>(3)?,
-                ))
-            })?;
-            let mut update = conn.prepare("UPDATE File SET size_bytes = ?1 WHERE id = ?2")?;
-            let mut updated = 0;
-            for row in rows {
-                let (id, hash, extension, storage_id) = row?;
-                let file = FileInternal {
-                    id: Some(id),
-                    hash,
-                    extension,
-                    storage_id,
-                    size_bytes: None,
-                };
-                let path = storage
-                    .get(&storage_id)
-                    .and_then(|base| Self::get_file_location(&file, base))
-                    .or_else(|| {
-                        storage
-                            .iter()
-                            .filter(|(id, _)| **id != storage_id)
-                            .find_map(|(_, base)| Self::get_file_location(&file, base))
-                    });
-                if let Some(path) = path
-                    && let Ok(metadata) = std::fs::metadata(path)
-                {
-                    update.execute(params![metadata.len(), id])?;
-                    updated += 1;
+            // Resolve paths and inspect files without holding the serialized
+            // writer. A storage scan can otherwise stall all database writes.
+
+            let mut cnt = 0;
+            loop {
+                let conn = pool
+                    .get()
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?;
+                let storage = Self::internal_file_storage_get_all(&conn)?;
+
+                let mut files = conn.prepare(&format!(
+                    "SELECT id, hash, extension, storage_id
+                 FROM File WHERE size_bytes IS NULL AND hash IS NOT NULL LIMIT {} OFFSET {}",
+                    SQL_CHUNK_SIZE, cnt
+                ))?;
+                let rows: Vec<_> = files
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, u64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, u64>(3)?,
+                        ))
+                    })?
+                    .collect();
+
+                if rows.is_empty() {
+                    break;
                 }
+
+                cnt += SQL_CHUNK_SIZE;
+                let mut updates = Vec::new();
+                for row in rows {
+                    let (id, hash, extension, storage_id) = row?;
+                    let file = FileInternal {
+                        id: Some(id),
+                        hash,
+                        extension,
+                        storage_id,
+                        size_bytes: None,
+                    };
+                    let path = storage
+                        .get(&storage_id)
+                        .and_then(|base| Self::get_file_location(&file, base))
+                        .or_else(|| {
+                            storage
+                                .iter()
+                                .filter(|(id, _)| **id != storage_id)
+                                .find_map(|(_, base)| Self::get_file_location(&file, base))
+                        });
+                    if let Some(path) = path
+                        && let Ok(metadata) = std::fs::metadata(path)
+                    {
+                        updates.push((id, metadata.len()));
+                    }
+                }
+                drop(files);
+                drop(conn);
+
+                let mut writer = writer_conn.lock();
+                let tx = writer.transaction()?;
+                {
+                    let mut update = tx.prepare("UPDATE File SET size_bytes = ?1 WHERE id = ?2")?;
+                    for (id, size) in &updates {
+                        update.execute(params![size, id])?;
+                    }
+                }
+                tx.commit()?;
             }
-            Ok(updated)
+            Ok(())
         })
         .await
         .unwrap()
@@ -4656,11 +4691,21 @@ SELECT id, name, namespace FROM High_Value_Tags;",
 mod tests {
     use super::*;
     use crate::DB_VERSION;
+    use rayon::ThreadPoolBuilder;
     use shared_types::*;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+
+    fn database_for_path(path: &std::path::Path) -> Arc<MainDatabase> {
+        let processing_pool = Arc::new(ThreadPoolBuilder::new().build().unwrap());
+        MainDatabase::new(
+            path,
+            processing_pool,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
 
     pub fn new_test() -> Arc<MainDatabase> {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -4669,7 +4714,7 @@ mod tests {
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("sqlite-wal"));
         let _ = fs::remove_file(path.with_extension("sqlite-shm"));
-        MainDatabase::new(&path)
+        database_for_path(&path)
     }
 
     fn namespace(name: &str, description: Option<&str>) -> GenericNamespaceObj {
@@ -4766,7 +4811,7 @@ mod tests {
     fn test_v2_database_upgrades_to_v3_audit_log() {
         let path = std::env::temp_dir().join("intscrape-db-v2-upgrade.sqlite");
         let _ = fs::remove_file(&path);
-        let db = MainDatabase::new(&path);
+        let db = database_for_path(&path);
         let conn = db.pool.get().unwrap();
         conn.execute(
             "INSERT INTO File (hash, extension, storage_id) VALUES ('upgrade-hash', 'jpg', 1)",
@@ -4801,7 +4846,7 @@ mod tests {
         drop(conn);
         drop(db);
 
-        let db = MainDatabase::new(&path);
+        let db = database_for_path(&path);
         let conn = db.pool.get().unwrap();
         let version = MainDatabase::internal_setting_get(&conn, "SYSTEM_VERSION")
             .unwrap()
@@ -5819,8 +5864,8 @@ mod tests {
         let _ = fs::remove_file(&source_path);
         let _ = fs::remove_file(&destination_path);
 
-        let source = MainDatabase::new(&source_path);
-        let destination = MainDatabase::new(&destination_path);
+        let source = database_for_path(&source_path);
+        let destination = database_for_path(&destination_path);
         let source_conn = source.pool.get().unwrap();
         let destination_conn = destination.pool.get().unwrap();
         destination_conn
@@ -5966,7 +6011,7 @@ mod tests {
         );
         drop(conn);
 
-        assert_eq!(db.update_missing_file_sizes().await.unwrap(), 1);
+        db.update_missing_file_sizes().await.unwrap();
         let conn = db.pool.get().unwrap();
         assert_eq!(
             conn.query_row(

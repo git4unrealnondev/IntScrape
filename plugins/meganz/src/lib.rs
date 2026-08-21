@@ -6,15 +6,18 @@
 //! as `RelationContext::limit_to` values for metadata relations.
 //! Slop coded by GPT5.6-Luna with himan supervision
 
-use std::{collections::HashSet, error::Error};
+use std::{
+    collections::{BTreeMap, HashSet},
+    error::Error,
+};
 
 use chrono::{DateTime, Utc};
 use mega::{Client, ErrorCode, Node, Nodes};
-use reqwest::header::HeaderMap;
+use regex::Regex;
 use shared_types::{
-    FileObject, FileSource, FileTagAction, GenericNamespaceObj, GlobalCallbacks, PluginProperties,
-    PluginTag, RelationContext, ScraperDataReturn, ScraperParam, ScraperReturn, SearchType, SkipIf,
-    Tag, TagOperation,
+    CallbackReturn, DbSettingsObj, FileObject, FileSource, FileTagAction, GenericNamespaceObj,
+    GlobalCallbacks, PluginJob, PluginProperties, PluginTag, RelationContext, ScraperDataReturn,
+    ScraperParam, ScraperReturn, SearchType, SkipIf, Tag, TagOperation, Url,
 };
 
 const SITE: &str = "meganz";
@@ -27,6 +30,9 @@ const NS_PATH: &str = "MEGA_path";
 const NS_PARENT: &str = "MEGA_parent_handle";
 const NS_SOURCE_URL: &str = "MEGA_source_url";
 const NS_SNAPSHOT: &str = "MEGA_system_timestamp";
+const STARTUP_SETTING: &str = "PLUGIN_MegaNZ_ShouldCheckTags";
+const SOURCE_TAG_KEY: &str = "meganz_source_tag";
+const MEGA_URL_REGEX: &str = r#"(?i)\bhttps?://(?:www\.)?(?:mega\.nz|mega\.co\.nz)/(?:file|folder)/[A-Za-z0-9_-]+(?:#[A-Za-z0-9_-]+)?|https?://(?:www\.)?(?:mega\.nz|mega\.co\.nz)/#![A-Za-z0-9_-]+![A-Za-z0-9_-]+"#;
 
 fn namespace(name: &str) -> GenericNamespaceObj {
     GenericNamespaceObj {
@@ -284,8 +290,96 @@ async fn collect_files(
     }
 }
 
+fn add_source_job(url: &str, source_tag: &str) -> Result<(), Box<dyn Error>> {
+    let mut user_data = BTreeMap::new();
+    user_data.insert(SOURCE_TAG_KEY.into(), source_tag.into());
+
+    client::jobs_add_single(PluginJob {
+        time: 0,
+        reptime: 0,
+        priority: 10,
+        recreation: None,
+        site: SITE.into(),
+        param: vec![ScraperParam::Url(Url {
+            url: url.into(),
+            local_modifiers: Vec::new(),
+        })],
+        user_data,
+    })?;
+
+    Ok(())
+}
+
+fn handle_on_start() -> Result<(), Box<dyn Error>> {
+    if client::setting_get(STARTUP_SETTING.into())?.is_some() {
+        return Ok(());
+    }
+
+    let url_regex = Regex::new(MEGA_URL_REGEX)?;
+    let tags = client::get_tag_id_bulk(client::get_tag_ids_all()?)?;
+    for (tag_id, tag) in tags.iter().filter(|(_, tag)| {
+        !tag.namespace.name.starts_with("MEGA_")
+    }) {
+        for matched in url_regex.find_iter(&tag.name) {
+            let callback_return = on_regex(matched.as_str(), &tag.name, tag, *tag_id);
+            let tag_actions = callback_return.tags.into_iter().collect::<Vec<_>>();
+            if !tag_actions.is_empty() && !client::tag_actions_add(tag_actions)? {
+                return Err("failed to persist MEGA source tag relationship".into());
+            }
+            for job in callback_return.jobs {
+                client::jobs_add_single(job.job)?;
+            }
+        }
+    }
+
+    client::setting_set(DbSettingsObj {
+        name: STARTUP_SETTING.into(),
+        description: Some("Whether the MEGA plugin should scan existing tags on startup".into()),
+        num: None,
+        param: Some("False".into()),
+    })?;
+
+    Ok(())
+}
+
 #[unsafe(no_mangle)]
-fn on_start() {}
+fn on_start() {
+    if let Err(error) = handle_on_start() {
+        let _ = client::log_silent(format!("MEGA: startup tag scan failed: {error}"));
+    }
+}
+
+#[unsafe(no_mangle)]
+fn on_regex(
+    matched: &str,
+    full_tag: &str,
+    tag_source: &Tag,
+    _tag_source_id: u64,
+) -> CallbackReturn {
+    if let Err(error) = add_source_job(matched, full_tag) {
+        let _ = client::log_silent(format!("MEGA: failed to queue tag source job: {error}"));
+    }
+
+    let source_url_tag = PluginTag {
+        tag: tag(NS_SOURCE_URL, matched),
+        relates_to: Some(RelationContext {
+            tag: tag_source.clone(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let mut tags = HashSet::new();
+    tags.insert(FileTagAction {
+        operation: TagOperation::Add,
+        tags: vec![source_url_tag],
+    });
+
+    CallbackReturn {
+        tags,
+        ..Default::default()
+    }
+}
 
 #[unsafe(no_mangle)]
 fn get_plugin_info() -> Vec<shared_types::Plugin> {
@@ -296,10 +390,14 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
             PluginProperties::Ratelimit(1, std::time::Duration::from_secs(1)),
             PluginProperties::ThreadNum(1),
         ],
-        callbacks: vec![GlobalCallbacks::Start(
-            shared_types::StartupThreadType::Spawn,
-        ),
-        GlobalCallbacks::Tag((SearchType::Regex(r#"(?i)\bhttps?://(?:www\.)?(?:mega\.nz|mega\.co\.nz)/(?:file|folder)/[A-Za-z0-9_-]+(?:#[A-Za-z0-9_-]+)?|https?://(?:www\.)?(?:mega\.nz|mega\.co\.nz)/#![A-Za-z0-9_-]+![A-Za-z0-9_-]+"#.into()), vec![], vec![NS_SOURCE_URL.into()]))],
+        callbacks: vec![
+            GlobalCallbacks::Start(shared_types::StartupThreadType::Spawn),
+            GlobalCallbacks::Tag((
+                SearchType::Regex(MEGA_URL_REGEX.into()),
+                vec![],
+                vec![NS_SOURCE_URL.into()],
+            )),
+        ],
     }]
 }
 
@@ -319,6 +417,12 @@ pub fn url_dump(data: &ScraperDataReturn) -> Vec<ScraperDataReturn> {
 
 #[unsafe(no_mangle)]
 pub fn parser_call(_text: &str, source_url: &str, data: &ScraperDataReturn) -> Vec<ScraperReturn> {
+    let source_url = data
+        .job
+        .user_data
+        .get(SOURCE_TAG_KEY)
+        .map(String::as_str)
+        .unwrap_or(source_url);
     let Some(url) = public_url(&data.job.param) else {
         return vec![ScraperReturn::Nothing];
     };

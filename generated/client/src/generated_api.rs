@@ -62,6 +62,10 @@ pub fn get_tag_ids_namespace_id(
         namespace_id,
     ))
 }
+/// Gets every tag id in the database.
+pub fn get_tag_ids_all() -> Result<HashSet<u64>, Box<dyn std::error::Error>> {
+    crate::init_data_request(&crate::SupportedDBRequests::GetTagIDsAll())
+}
 ///
 /// Gets a file if a tag is associated with it
 ///
@@ -100,6 +104,14 @@ pub fn put_tags_to_file(
     crate::init_data_request(&crate::SupportedDBRequests::PutTagsRelationship(
         file_id, tag,
     ))
+}
+/// Adds tag actions without creating a file/tag relationship.
+///
+/// This is used by tag callbacks that create structural tag relationships.
+pub fn tag_actions_add(
+    tag_actions: Vec<FileTagAction>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    crate::init_data_request(&crate::SupportedDBRequests::TagActionsAdd(tag_actions))
 }
 /// Adds tags to multiple files in one SQLite transaction.
 pub fn put_tags_to_files(

@@ -10,7 +10,7 @@ r2d2 = "0.8.10"
 r2d2_sqlite = { version = "*", default-features=false, features = [] }
 reqwest = {version = "0.12.22", default-features=false,features=["cookies", "gzip", "deflate", "default", "native-tls"]}
 serde_rusqlite = "*"
-tokio = { version = "1.52.3", default-features=false, features = ["rt-multi-thread", "fs"] }
+tokio = { version = "1.52.3", default-features=false, features = ["rt-multi-thread", "macros", "fs"] }
 shared_types = {path = "./libs/shared_types", features=["strum"]}
 libloading = "0.9.0"
 parking_lot = "0.12.5"
@@ -49,6 +49,8 @@ strum = "0.28.0"
 ipfs-cid = {git="https://github.com/git4unrealnondev/ipfs-cid"}
 image_hasher = "3.1.1"
 image = "0.25.10"
+memchr = "2.8.3"
+nohash-hasher = "0.2.0"
 
 [workspace.dependencies]
 shared_types = { path = "./libs/shared_types" }
@@ -86,6 +88,13 @@ strip = false
 [features]
 dhat-heap = []    # if you are doing heap profiling
 dhat-ad-hoc = []  # if you are doing ad hoc profiling
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "tag_search_cache"
+harness = false
 
 ## Source: https://www.namtao.com/rust/
 #[lints.clippy]
