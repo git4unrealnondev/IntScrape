@@ -1620,7 +1620,7 @@ impl DownloadsManager {
                 );
 
                 tokio::task::spawn(async move {
-                    let _permit = permit;
+                    //let _permit = permit;
                     if let Err(err) = scraper.run_scraper().await {
                         log::error!(
                             "Worker: {} JobId: {} scraper had err: {}",
