@@ -939,12 +939,50 @@ impl Scraper {
             }
         }
 
+        // Check the source URL before doing hash lookups.
+        if let Some(file_url) = file.source.as_ref().and_then(|source| match source {
+            FileSource::Url(file_url) => Some(file_url),
+            FileSource::Bytes(_) => None,
+        }) && let Some(file_id) = self
+            .download_manager
+            .db
+            .tag_get_file_id(&Tag {
+                name: file_url.clone(),
+                namespace: GenericNamespaceObj {
+                    name: "source_url".into(),
+                    description: None,
+                },
+            })
+            .await
+        {
+            info!(
+                "Scraper: {} JobId: {} Skipping file_id {} because URL: {} already in db.",
+                self.plugin.name, self.job.id, file_id, file_url
+            );
+            return Ok(self
+                .download_manager
+                .db
+                .file_id_get(file_id)
+                .await
+                .map(|f| FileReturn::File(f.into())));
+        }
+
         // Associates file hashes with a file object
         for hash in file.hash.iter() {
             if should_exit.load(Ordering::SeqCst) {
                 return Ok(None);
             }
-            if let Some(file_internal) = self.download_manager.db.contains_hash_sync(hash) {
+            let db = self.download_manager.db.clone();
+            let lookup_hash = hash.clone();
+            let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+            self.download_manager.heavy_processing_pool.spawn(move || {
+                let _ = result_sender.send(db.contains_hash_sync(&lookup_hash));
+            });
+            let file_internal = result_receiver
+                .await
+                .map_err(|_| std::io::Error::other("hash lookup task failed"))?;
+
+            if let Some(file_internal) = file_internal {
                 info!(
                     "Scraper: {} JobId: {} Skipping file_id {} because hash: {:?} already in db.",
                     self.plugin.name,
@@ -962,50 +1000,26 @@ impl Scraper {
             Some(ref url_source) => {
                 match url_source {
                     FileSource::Url(file_url) => {
-                        if let Some(file_id) = self
-                            .download_manager
-                            .db
-                            .tag_get_file_id(&Tag {
-                                name: file_url.clone(),
-                                namespace: GenericNamespaceObj {
-                                    name: "source_url".into(),
-                                    description: None,
-                                },
-                            })
-                            .await
-                        {
-                            info!(
-                                "Scraper: {} JobId: {} Skipping file_id {} because URL: {} already in db.",
-                                self.plugin.name, self.job.id, file_id, file_url
-                            );
-                            return Ok(self
-                                .download_manager
-                                .db
-                                .file_id_get(file_id)
-                                .await
-                                .map(|f| FileReturn::File(f.into())));
-                        } else {
-                            if self.should_download_file(file_url).await {
-                                // Calls disk streaming download helper
-                                let downloaded = self_clone
-                                    .download_file(file_url, &file.hash, temp_dir().as_path())
-                                    .await;
-                                self.release_download_file(file_url).await;
-                                if let Some(path_out) = downloaded {
-                                    TrackedFile::Temp(path_out)
-                                } else {
-                                    *download_issue = true;
-                                    return Ok(None);
-                                }
+                        if self.should_download_file(file_url).await {
+                            // Calls disk streaming download helper
+                            let downloaded = self_clone
+                                .download_file(file_url, &file.hash, temp_dir().as_path())
+                                .await;
+                            self.release_download_file(file_url).await;
+                            if let Some(path_out) = downloaded {
+                                TrackedFile::Temp(path_out)
                             } else {
-                                log::info!(
-                                    "Worker: {} JobId: {} -- Skipping file download of url: {} due to already being in download queue.",
-                                    self.plugin.name,
-                                    self.job.id,
-                                    file_url
-                                );
-                                return Ok(Some(FileReturn::InDownloadQueue));
+                                *download_issue = true;
+                                return Ok(None);
                             }
+                        } else {
+                            log::info!(
+                                "Worker: {} JobId: {} -- Skipping file download of url: {} due to already being in download queue.",
+                                self.plugin.name,
+                                self.job.id,
+                                file_url
+                            );
+                            return Ok(Some(FileReturn::InDownloadQueue));
                         }
                     }
                     // If bytes are fed instantly, spill them out to a temporary file right away
