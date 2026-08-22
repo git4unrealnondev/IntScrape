@@ -33,7 +33,7 @@ const NS_SOURCE_URL: &str = "MEGA_source_url";
 const NS_SNAPSHOT: &str = "MEGA_system_timestamp";
 const STARTUP_SETTING: &str = "PLUGIN_MegaNZ_ShouldCheckTags";
 const MEGA_URL_REGEX: &str = r#"(?i)\bhttps?://(?:www\.)?(?:mega\.nz|mega\.co\.nz)/(?:file|folder)/[A-Za-z0-9_-]+(?:#[A-Za-z0-9_-]+)?|https?://(?:www\.)?(?:mega\.nz|mega\.co\.nz)/#![A-Za-z0-9_-]+![A-Za-z0-9_-]+"#;
-const DOWNLOAD_CONCURRENCY: usize = 5;
+const DOWNLOAD_CONCURRENCY: usize = 2;
 const MEGA_NAMESPACES: &[&str] = &[
     NS_HANDLE,
     NS_NAME,
@@ -200,106 +200,108 @@ async fn collect_files(
     output: &mut Vec<FileObject>,
     errors: &mut Vec<String>,
 ) {
-    let results = stream::iter(handles.iter().map(|handle| async move {
-        let Some(node) = nodes.get_node_by_handle(handle) else {
-            return Err(format!(
-                "MEGA handle {handle}: node was not found in the fetched node set"
-            ));
-        };
+    for batch in handles.chunks(DOWNLOAD_CONCURRENCY) {
+        let results = stream::iter(batch.iter().map(|handle| async move {
+            let Some(node) = nodes.get_node_by_handle(handle) else {
+                return Err(format!(
+                    "MEGA handle {handle}: node was not found in the fetched node set"
+                ));
+            };
 
-        let file_path = node_path(nodes, node);
-        let folder_path = node
-            .parent()
-            .and_then(|parent| nodes.get_node_by_handle(parent))
-            .map(|parent| node_path(nodes, parent))
-            .unwrap_or_else(|| "<root>".to_owned());
+            let file_path = node_path(nodes, node);
+            let folder_path = node
+                .parent()
+                .and_then(|parent| nodes.get_node_by_handle(parent))
+                .map(|parent| node_path(nodes, parent))
+                .unwrap_or_else(|| "<root>".to_owned());
 
-        let (tag_list, handle_tag) = metadata_tags(nodes, node, source_url, system_timestamp);
+            let (tag_list, handle_tag) = metadata_tags(nodes, node, source_url, system_timestamp);
 
-        // Existing files are not downloaded again. Their metadata is still
-        // updated using the current snapshot relation graph.
-        match client::get_tag_file(handle_tag.clone()) {
-            Ok(Some(existing_file)) => {
-                match existing_file.id {
-                    Some(file_id) => {
-                        if let Err(error) = client::put_tags_to_file(file_id, tag_list) {
-                            return Err(format!(
-                                "MEGA handle {handle}, path '{file_path}', \
+            // Existing files are not downloaded again. Their metadata is still
+            // updated using the current snapshot relation graph.
+            match client::get_tag_file(handle_tag.clone()) {
+                Ok(Some(existing_file)) => {
+                    match existing_file.id {
+                        Some(file_id) => {
+                            if let Err(error) = client::put_tags_to_file(file_id, tag_list) {
+                                return Err(format!(
+                                    "MEGA handle {handle}, path '{file_path}', \
                                  folder '{folder_path}': failed to update \
                                  metadata: {error}"
+                                ));
+                            }
+
+                            let _ = client::log_silent(format!(
+                                "MEGA: skipping handle {handle} because it exists \
+                             in the database; updated metadata for path \
+                             '{file_path}' in folder '{folder_path}'"
                             ));
                         }
 
-                        let _ = client::log_silent(format!(
-                            "MEGA: skipping handle {handle} because it exists \
-                             in the database; updated metadata for path \
-                             '{file_path}' in folder '{folder_path}'"
-                        ));
-                    }
-
-                    None => {
-                        return Err(format!(
-                            "MEGA handle {handle}, path '{file_path}', \
+                        None => {
+                            return Err(format!(
+                                "MEGA handle {handle}, path '{file_path}', \
                              folder '{folder_path}': existing database record \
                              has no file ID"
-                        ));
+                            ));
+                        }
                     }
+
+                    return Ok(None);
                 }
 
-                return Ok(None);
-            }
+                Ok(None) => {}
 
-            Ok(None) => {}
-
-            Err(error) => {
-                return Err(format!(
-                    "MEGA handle {handle}, path '{file_path}', \
+                Err(error) => {
+                    return Err(format!(
+                        "MEGA handle {handle}, path '{file_path}', \
                      folder '{folder_path}': database lookup failed: {error}"
-                ));
+                    ));
+                }
             }
-        }
 
-        let _ = client::log_silent(format!(
-            "MEGA: attempting download of handle {handle} with file path \
-             '{file_path}'"
-        ));
+            let _ = client::log_silent(format!(
+                "MEGA: attempting download of handle {handle} with file path \
+                 '{file_path}'"
+            ));
 
-        let mut bytes = Vec::new();
+            let mut bytes = Vec::new();
 
-        match client.download_node(node, &mut bytes).await {
-            Ok(()) => {
-                let downloaded_size = bytes.len();
+            match client.download_node(node, &mut bytes).await {
+                Ok(()) => {
+                    let downloaded_size = bytes.len();
 
-                let _ = client::log_silent(format!(
-                    "MEGA: downloaded handle {handle} with size \
+                    let _ = client::log_silent(format!(
+                        "MEGA: downloaded handle {handle} with size \
                      {downloaded_size}"
-                ));
+                    ));
 
-                Ok(Some(FileObject {
-                    source: Some(FileSource::Bytes(bytes)),
-                    tag_list,
-                    skip_if: vec![SkipIf::FileTagRelationship(handle_tag)],
-                    ..Default::default()
-                }))
-            }
+                    Ok(Some(FileObject {
+                        source: Some(FileSource::Bytes(bytes)),
+                        tag_list,
+                        skip_if: vec![SkipIf::FileTagRelationship(handle_tag)],
+                        ..Default::default()
+                    }))
+                }
 
-            Err(error) => Err(format!(
-                "MEGA handle {handle}, path '{file_path}', \
+                Err(error) => Err(format!(
+                    "MEGA handle {handle}, path '{file_path}', \
                      folder '{folder_path}': download failed: {error}"
-            )),
-        }
-    }))
-    .buffer_unordered(DOWNLOAD_CONCURRENCY)
-    .collect::<Vec<_>>()
-    .await;
+                )),
+            }
+        }))
+        .buffer_unordered(DOWNLOAD_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
 
-    for result in results {
-        match result {
-            Ok(Some(file)) => output.push(file),
-            Ok(None) => {}
-            Err(error) => {
-                let _ = client::log_silent(format!("MEGA: {error}"));
-                errors.push(error);
+        for result in results {
+            match result {
+                Ok(Some(file)) => output.push(file),
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = client::log_silent(format!("MEGA: {error}"));
+                    errors.push(error);
+                }
             }
         }
     }
