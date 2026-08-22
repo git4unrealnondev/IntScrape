@@ -1596,10 +1596,10 @@ impl DownloadsManager {
                 // Only claim a global slot when this site actually has work. An
                 // idle site must not starve other sites by holding a permit while
                 // it waits for one of its running jobs to finish.
-               // let permit = self.job_limiter.clone().acquire_owned().await;
-               // let Ok(permit) = permit else {
-               //     break;
-               // };
+                // let permit = self.job_limiter.clone().acquire_owned().await;
+                // let Ok(permit) = permit else {
+                //     break;
+                // };
 
                 info!("DownloadManager: Setting job {} to running status.", job.id);
                 self.db.job_set_is_running(&job).await;

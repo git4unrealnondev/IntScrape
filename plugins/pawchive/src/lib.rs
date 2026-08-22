@@ -20,6 +20,8 @@ const SERVICES: [&str; 2] = ["patreon", "pivix"];
 // How many max posts we can get from a creator currently 65500
 const URL_GEN_MAX: u8 = u8::MAX;
 
+
+
 #[unsafe(no_mangle)]
 fn get_plugin_info() -> Vec<shared_types::Plugin> {
     vec![shared_types::Plugin {
@@ -326,6 +328,20 @@ pub fn parser_call(
                 relates_to: Some(post_relate.clone()),
                 ..Default::default()
             });
+
+            if let Ok(normalized_content) = html2text::from_read(std::io::Cursor::new(&post.content),80) {
+                tags.insert(PluginTag {
+                    tag: Tag {
+                        name: normalized_content,
+                        namespace: GenericNamespaceObj {
+                            name: "Pawchive_Post_Content_Normalized".into(),
+                            description: Some("HTML text normalized for URL extraction".into()),
+                        },
+                    },
+                    relates_to: Some(post_relate.clone()),
+                    ..Default::default()
+                });
+            }
         }
 
         // Relates the post id to the service & user_id

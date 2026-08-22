@@ -508,11 +508,14 @@ pub fn parser_call(_text: &str, source_url: &str, data: &ScraperDataReturn) -> V
             {
                 let _ = client::dead_url_add(pub_url.to_string());
             }
-
-            vec![ScraperReturn::Stop(format!(
-                "MEGA: STOPPING due to error {:?}",
-                error
-            ))]
+            if let Some(mega::Error::InvalidPublicUrlFormat) = error.downcast_ref::<mega::Error>() {
+                vec![ScraperReturn::Nothing]
+            } else {
+                vec![ScraperReturn::Stop(format!(
+                    "MEGA: STOPPING due to error {:?}",
+                    error
+                ))]
+            }
         }
 
         Ok((files, errors)) => {

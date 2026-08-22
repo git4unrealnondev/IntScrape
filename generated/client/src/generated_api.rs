@@ -134,11 +134,75 @@ pub fn get_file_ids_all() -> Result<HashSet<u64>, Box<dyn std::error::Error>> {
 pub fn relationship_get_tagid(file_id: u64) -> Result<HashSet<u64>, Box<dyn std::error::Error>> {
     crate::init_data_request(&crate::SupportedDBRequests::RelationshipGetFileid(file_id))
 }
+/// Gets tag relationships for multiple files in one IPC request.
+pub fn relationship_get_tagid_many(
+    file_ids: HashSet<u64>,
+) -> Result<HashMap<u64, HashSet<u64>>, Box<dyn std::error::Error>> {
+    crate::init_data_request(&crate::SupportedDBRequests::RelationshipGetTagidMany(
+        file_ids,
+    ))
+}
 ///
 /// Gets all file ids associated with a tag_id
 ///
 pub fn relationship_get_fileid(tag_id: u64) -> Result<HashSet<u64>, Box<dyn std::error::Error>> {
     crate::init_data_request(&crate::SupportedDBRequests::RelationshipGetTagid(tag_id))
+}
+/// Gets file relationships for multiple tags in one IPC request.
+pub fn relationship_get_fileid_many(
+    tag_ids: HashSet<u64>,
+) -> Result<HashMap<u64, HashSet<u64>>, Box<dyn std::error::Error>> {
+    crate::init_data_request(&crate::SupportedDBRequests::RelationshipGetFileidMany(
+        tag_ids,
+    ))
+}
+/// Gets files whose tag is the related parent of the supplied structural tag.
+pub fn relationship_get_parent_fileid(
+    tag_id: u64,
+) -> Result<HashSet<u64>, Box<dyn std::error::Error>> {
+    crate::init_data_request(&crate::SupportedDBRequests::RelationshipGetParentFileid(
+        tag_id,
+    ))
+}
+/// Gets every parent relation declared by a child tag.
+pub fn parent_relationships_get(
+    tag_id: u64,
+) -> Result<Vec<shared_types::TagParents>, Box<dyn std::error::Error>> {
+    crate::init_data_request(&crate::SupportedDBRequests::ParentRelationshipsGet(tag_id))
+}
+/// Gets parent relations for multiple child tags in one IPC request.
+pub fn parent_relationships_get_many(
+    tag_ids: HashSet<u64>,
+) -> Result<HashMap<u64, Vec<shared_types::TagParents>>, Box<dyn std::error::Error>> {
+    crate::init_data_request(&crate::SupportedDBRequests::ParentRelationshipsGetMany(
+        tag_ids,
+    ))
+}
+/// Gets every child relation that points at a parent tag.
+pub fn child_relationships_get(
+    relate_tag_id: u64,
+) -> Result<Vec<shared_types::TagParents>, Box<dyn std::error::Error>> {
+    crate::init_data_request(&crate::SupportedDBRequests::ChildRelationshipsGet(
+        relate_tag_id,
+    ))
+}
+/// Gets child relations for multiple parent tags in one IPC request.
+pub fn child_relationships_get_many(
+    tag_ids: HashSet<u64>,
+) -> Result<HashMap<u64, Vec<shared_types::TagParents>>, Box<dyn std::error::Error>> {
+    crate::init_data_request(&crate::SupportedDBRequests::ChildRelationshipsGetMany(
+        tag_ids,
+    ))
+}
+/// Gets one exact child-parent relation, including its optional limit tag.
+pub fn parent_relationship_get(
+    tag_id: u64,
+    relate_tag_id: u64,
+) -> Result<Option<shared_types::TagParents>, Box<dyn std::error::Error>> {
+    crate::init_data_request(&crate::SupportedDBRequests::ParentRelationshipGet(
+        tag_id,
+        relate_tag_id,
+    ))
 }
 ///
 /// Adds tags into db in a bulk manner

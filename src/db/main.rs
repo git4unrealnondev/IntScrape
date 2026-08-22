@@ -1654,6 +1654,18 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
         out
     }
 
+    /// Gets tag relationships for multiple files in one IPC request.
+    #[ipc(name = "relationship_get_tagid_many", request = "RelationshipGetTagidMany")]
+    pub fn relationship_get_tag_id_many_sync(
+        &self,
+        file_ids: &HashSet<u64>,
+    ) -> HashMap<u64, HashSet<u64>> {
+        file_ids
+            .iter()
+            .map(|file_id| (*file_id, self.relationship_get_tag_id_sync(file_id)))
+            .collect()
+    }
+
     ///
     /// Gets all file ids associated with a tag_id
     ///
@@ -1672,6 +1684,145 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
             out.extend(file_ids);
         }
         out
+    }
+
+    /// Gets file relationships for multiple tags in one IPC request.
+    #[ipc(
+        name = "relationship_get_fileid_many",
+        request = "RelationshipGetFileidMany"
+    )]
+    pub fn relationship_get_file_id_many_sync(
+        &self,
+        tag_ids: &HashSet<u64>,
+    ) -> HashMap<u64, HashSet<u64>> {
+        tag_ids
+            .iter()
+            .map(|tag_id| (*tag_id, self.relationship_get_file_id_sync(tag_id)))
+            .collect()
+    }
+
+    /// Gets files whose tag is the related parent of the supplied structural tag.
+    #[ipc(
+        name = "relationship_get_parent_fileid",
+        request = "RelationshipGetParentFileid"
+    )]
+    pub fn relationship_get_parent_file_id_sync(&self, tag_id: &u64) -> HashSet<u64> {
+        let conn = self.pool.get().unwrap();
+        let relationships = Self::relationship_union_source(&conn, "relationships");
+        let query = format!(
+            "SELECT DISTINCT relationships.file_id
+             FROM {relationships}
+             WHERE relationships.tag_id = ?1
+                OR relationships.tag_id IN (
+                    SELECT Parents.relate_tag_id
+                    FROM Parents
+                    WHERE Parents.tag_id = ?1
+                )"
+        );
+        let Ok(mut statement) = conn.prepare(&query) else {
+            return HashSet::new();
+        };
+        statement
+            .query_map([tag_id], |row| row.get(0))
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
+    /// Gets every parent relation declared by a child tag.
+    #[ipc(name = "parent_relationships_get", request = "ParentRelationshipsGet")]
+    pub fn parent_relationships_get_sync(&self, tag_id: &u64) -> Vec<shared_types::TagParents> {
+        let conn = self.pool.get().unwrap();
+        let Ok(mut statement) =
+            conn.prepare("SELECT tag_id, relate_tag_id, limit_to FROM Parents WHERE tag_id = ?1")
+        else {
+            return Vec::new();
+        };
+        statement
+            .query_map([tag_id], |row| {
+                Ok(shared_types::TagParents {
+                    tag_id: row.get(0)?,
+                    relate_tag_id: row.get(1)?,
+                    limit_to: row.get(2)?,
+                })
+            })
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
+    /// Gets parent relations for multiple child tags in one IPC request.
+    #[ipc(
+        name = "parent_relationships_get_many",
+        request = "ParentRelationshipsGetMany"
+    )]
+    pub fn parent_relationships_get_many_sync(
+        &self,
+        tag_ids: &HashSet<u64>,
+    ) -> HashMap<u64, Vec<shared_types::TagParents>> {
+        tag_ids
+            .iter()
+            .map(|tag_id| (*tag_id, self.parent_relationships_get_sync(tag_id)))
+            .collect()
+    }
+
+    /// Gets every child relation that points at a parent tag.
+    #[ipc(name = "child_relationships_get", request = "ChildRelationshipsGet")]
+    pub fn child_relationships_get_sync(
+        &self,
+        relate_tag_id: &u64,
+    ) -> Vec<shared_types::TagParents> {
+        let conn = self.pool.get().unwrap();
+        let Ok(mut statement) = conn.prepare(
+            "SELECT tag_id, relate_tag_id, limit_to FROM Parents WHERE relate_tag_id = ?1",
+        ) else {
+            return Vec::new();
+        };
+        statement
+            .query_map([relate_tag_id], |row| {
+                Ok(shared_types::TagParents {
+                    tag_id: row.get(0)?,
+                    relate_tag_id: row.get(1)?,
+                    limit_to: row.get(2)?,
+                })
+            })
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
+    /// Gets child relations for multiple parent tags in one IPC request.
+    #[ipc(name = "child_relationships_get_many", request = "ChildRelationshipsGetMany")]
+    pub fn child_relationships_get_many_sync(
+        &self,
+        tag_ids: &HashSet<u64>,
+    ) -> HashMap<u64, Vec<shared_types::TagParents>> {
+        tag_ids
+            .iter()
+            .map(|tag_id| (*tag_id, self.child_relationships_get_sync(tag_id)))
+            .collect()
+    }
+
+    /// Gets one exact child-parent relation, including its optional limit tag.
+    #[ipc(name = "parent_relationship_get", request = "ParentRelationshipGet")]
+    pub fn parent_relationship_get_sync(
+        &self,
+        tag_id: &u64,
+        relate_tag_id: &u64,
+    ) -> Option<shared_types::TagParents> {
+        let conn = self.pool.get().unwrap();
+        conn.query_row(
+            "SELECT tag_id, relate_tag_id, limit_to
+             FROM Parents
+             WHERE tag_id = ?1 AND relate_tag_id = ?2
+             LIMIT 1",
+            rusqlite::params![tag_id, relate_tag_id],
+            |row| {
+                Ok(shared_types::TagParents {
+                    tag_id: row.get(0)?,
+                    relate_tag_id: row.get(1)?,
+                    limit_to: row.get(2)?,
+                })
+            },
+        )
+        .ok()
     }
 
     ///
