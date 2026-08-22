@@ -199,6 +199,7 @@ async fn collect_files(
     system_timestamp: Option<DateTime<Utc>>,
     output: &mut Vec<FileObject>,
     errors: &mut Vec<String>,
+    bandwidth_error: &mut bool,
 ) {
     for batch in handles.chunks(DOWNLOAD_CONCURRENCY) {
         let results = stream::iter(batch.iter().map(|handle| async move {
@@ -299,10 +300,17 @@ async fn collect_files(
                 Ok(Some(file)) => output.push(file),
                 Ok(None) => {}
                 Err(error) => {
+                    if is_bandwidth_error_message(&error) {
+                        *bandwidth_error = true;
+                    }
                     let _ = client::log_silent(format!("MEGA: {error}"));
                     errors.push(error);
                 }
             }
+        }
+
+        if *bandwidth_error {
+            break;
         }
     }
 }
@@ -457,54 +465,60 @@ pub fn parser_call(_text: &str, source_url: &str, data: &ScraperDataReturn) -> V
         return vec![ScraperReturn::Nothing];
     };
 
-    let result = (|| -> Result<(Vec<FileObject>, Vec<String>), Box<dyn std::error::Error>> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-
-        runtime.block_on(async {
-            let http = reqwest::Client::builder()
-                .use_rustls_tls()
-                .user_agent(
-                    "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0",
-                )
+    let result =
+        (|| -> Result<(Vec<FileObject>, Vec<String>, bool), Box<dyn std::error::Error>> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
                 .build()?;
 
-            let mega = Client::builder().build(http)?;
+            runtime.block_on(async {
+                let http = reqwest::Client::builder()
+                    .use_rustls_tls()
+                    .user_agent(
+                        "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0",
+                    )
+                    .build()?;
 
-            let nodes = if let Some(password) = password(&data.job.param) {
-                mega.fetch_protected_nodes(&url, &password).await?
-            } else {
-                mega.fetch_public_nodes(&url).await?
-            };
+                let mega = Client::builder().build(http)?;
 
-            let mut handles = Vec::new();
+                let nodes = if let Some(password) = password(&data.job.param) {
+                    mega.fetch_protected_nodes(&url, &password).await?
+                } else {
+                    mega.fetch_public_nodes(&url).await?
+                };
 
-            for root in nodes.roots() {
-                collect_file_nodes(&nodes, root, &mut handles);
-            }
+                let mut handles = Vec::new();
 
-            let system_timestamp = latest_system_timestamp(&nodes);
-            let mut files = Vec::new();
-            let mut errors = Vec::new();
+                for root in nodes.roots() {
+                    collect_file_nodes(&nodes, root, &mut handles);
+                }
 
-            collect_files(
-                &mega,
-                &nodes,
-                &handles,
-                source_url,
-                system_timestamp,
-                &mut files,
-                &mut errors,
-            )
-            .await;
+                let system_timestamp = latest_system_timestamp(&nodes);
+                let mut files = Vec::new();
+                let mut errors = Vec::new();
+                let mut bandwidth_error = false;
 
-            Ok((files, errors))
-        })
-    })();
+                collect_files(
+                    &mega,
+                    &nodes,
+                    &handles,
+                    source_url,
+                    system_timestamp,
+                    &mut files,
+                    &mut errors,
+                    &mut bandwidth_error,
+                )
+                .await;
+
+                Ok((files, errors, bandwidth_error))
+            })
+        })();
 
     match result {
         Err(error) => {
+            if is_bandwidth_error(error.as_ref()) {
+                return vec![ScraperReturn::RetryLater(3600)];
+            }
             // If we're blocked IE bad folder then dont try it
             if let Some(pub_url) = public_url(&data.job.param)
                 && is_mega_blocked(error.as_ref())
@@ -521,7 +535,15 @@ pub fn parser_call(_text: &str, source_url: &str, data: &ScraperDataReturn) -> V
             }
         }
 
-        Ok((files, errors)) => {
+        Ok((files, errors, bandwidth_error)) => {
+            if bandwidth_error {
+                let backoff = 3600;
+                let _ = client::log_silent(format!(
+                    "MEGA: bandwidth limit reached while processing {source_url}; retrying job in seconds: {backoff}."
+                ));
+                return vec![ScraperReturn::RetryLater(backoff)];
+            }
+
             let mut output = Vec::new();
 
             if !files.is_empty() {
@@ -572,4 +594,17 @@ fn is_mega_blocked(error: &(dyn Error + 'static)) -> bool {
                     }
                 )
             })
+}
+
+fn is_bandwidth_error(error: &(dyn Error + 'static)) -> bool {
+    matches!(
+        error.downcast_ref::<mega::Error>(),
+        Some(mega::Error::MegaError {
+            code: ErrorCode::EOVERQUOTA,
+        })
+    )
+}
+
+fn is_bandwidth_error_message(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("over quota")
 }
