@@ -4000,7 +4000,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             // Resolve paths and inspect files without holding the serialized
             // writer. A storage scan can otherwise stall all database writes.
 
-            let mut cnt = 0;
+            let mut last_file_id = 0;
             loop {
                 let conn = pool
                     .get()
@@ -4009,12 +4009,20 @@ SELECT id, name, namespace FROM High_Value_Tags;",
 
                 let mut files = conn.prepare(&format!(
                     "SELECT id, hash, extension, storage_id
-                 FROM File WHERE size_bytes IS NULL AND hash IS NOT NULL LIMIT {} OFFSET {}",
-                    SQL_CHUNK_SIZE, cnt
+                 FROM File
+                 WHERE size_bytes IS NULL
+                   AND hash IS NOT NULL
+                   AND id > ?1
+                 ORDER BY id
+                 LIMIT {}",
+                    SQL_CHUNK_SIZE
                 ))?;
-                info!("System file size checker is fixing: {} files.", &cnt);
+                info!(
+                    "System file size checker has processed files through id: {}",
+                    last_file_id
+                );
                 let rows: Vec<_> = files
-                    .query_map([], |row| {
+                    .query_map([last_file_id], |row| {
                         Ok((
                             row.get::<_, u64>(0)?,
                             row.get::<_, String>(1)?,
@@ -4028,10 +4036,12 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                     break;
                 }
 
-                cnt += SQL_CHUNK_SIZE;
                 let mut updates = Vec::new();
+                let mut missing_paths = 0;
+                let mut unreadable_files = 0;
                 for row in rows {
                     let (id, hash, extension, storage_id) = row?;
+                    last_file_id = id;
                     let file = FileInternal {
                         id: Some(id),
                         hash,
@@ -4048,10 +4058,13 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                                 .filter(|(id, _)| **id != storage_id)
                                 .find_map(|(_, base)| Self::get_file_location(&file, base))
                         });
-                    if let Some(path) = path
-                        && let Ok(metadata) = std::fs::metadata(path)
-                    {
-                        updates.push((id, metadata.len()));
+                    if let Some(path) = path {
+                        match std::fs::metadata(path) {
+                            Ok(metadata) => updates.push((id, metadata.len())),
+                            Err(_) => unreadable_files += 1,
+                        }
+                    } else {
+                        missing_paths += 1;
                     }
                 }
                 drop(files);
@@ -4066,6 +4079,17 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                     }
                 }
                 tx.commit()?;
+                if missing_paths > 0 || unreadable_files > 0 {
+                    log::warn!(
+                        "System file size checker skipped {} files with missing paths and {} unreadable files; they will be retried later",
+                        missing_paths,
+                        unreadable_files,
+                    );
+                }
+                info!(
+                    "System file size checker updated {} files",
+                    updates.len()
+                );
             }
             Ok(())
         })

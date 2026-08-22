@@ -1,15 +1,10 @@
-use std::error::Error;
 use std::time::SystemTime;
-use std::{
-    collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, path::Path};
 
 use crate::backup_path::dated_backup_destination;
 use crate::web::manager::hash_bytes;
 use bytes::Bytes;
 use rayon::prelude::*;
-use rusqlite::{params, params_from_iter};
 use shared_types::{DbJobRecreation, DbJobsObj, HashesSupported, SQL_CHUNK_SIZE, ScraperParam};
 use strum::IntoEnumIterator;
 
@@ -132,45 +127,50 @@ impl MainDatabase {
                     .collect();
 
 
-    let mut cnt = 0;
+                let mut last_file_id = 0;
                 loop {
 
                     let file_ids_to_work_on: Vec<u64>;
-let file_id_file_paths: HashMap<u64, String>;
+                    let mut missing_paths = 0;
+                    let file_id_file_paths: HashMap<u64, String>;
                     {
 
                 let conn = pool.get()?;
-// Safe to assume that if we're missing one hash then we need everything else
+// Select in primary-key order so inserts from the previous batch cannot
+// shift the next page underneath us.
                 let mut stmt = conn.prepare(
                     &format!("SELECT id 
              FROM File f 
              WHERE NOT EXISTS (
-                 SELECT 1 
-                 FROM FileHashes fh 
-                 WHERE fh.file_id = f.id
-             ) LIMIT {} OFFSET {};", SQL_CHUNK_SIZE, cnt),
+                  SELECT 1
+                  FROM FileHashes fh
+                  WHERE fh.file_id = f.id
+              ) AND id > ?1
+              ORDER BY id
+              LIMIT {} ;", SQL_CHUNK_SIZE),
                 )?;
 
-                    log::info!("System file hasher has hashed: {} files.", &cnt);
+                    log::info!("System file hasher has processed files through id: {}", last_file_id);
 
 
                     file_ids_to_work_on = stmt
-                    .query_map([], |row| Ok(row.get::<_, u64>(0)?))?
+                    .query_map([last_file_id], |row| Ok(row.get::<_, u64>(0)?))?
                     .flatten()
                     .collect();
-                    cnt += SQL_CHUNK_SIZE;
 
                     if file_ids_to_work_on.is_empty() {
                         break;
                     }
 
+                    last_file_id = *file_ids_to_work_on.last().unwrap();
+
                     if should_exit_clone.load(std::sync::atomic::Ordering::SeqCst) {
                         break;
                     }
 
-                   file_id_file_paths  = file_ids_to_work_on
-                        .iter()
-                        .filter_map(|f| {
+                    file_id_file_paths  = file_ids_to_work_on
+                         .iter()
+                         .filter_map(|f| {
                             if let Some(file_path) =
                                 Self::internal_file_get_physical_path(&conn, f)
                                     .ok()
@@ -178,15 +178,18 @@ let file_id_file_paths: HashMap<u64, String>;
                             {
                                 Some((*f, file_path))
                             } else {
+                                missing_paths += 1;
                                 None
                             }
-                        })
+                         })
                         .collect();
 
                     }
                     let processed = file_id_file_paths
                         .par_iter()
-                        .try_fold(Vec::new, |mut pending, (file_id, file_path)| {
+                        .try_fold(
+                            || (Vec::new(), 0usize),
+                            |(mut pending, mut unreadable), (file_id, file_path)| {
                             if should_exit_clone.load(std::sync::atomic::Ordering::SeqCst) {
                                 return Err(());
                             }
@@ -200,16 +203,21 @@ let file_id_file_paths: HashMap<u64, String>;
                                         hash_bytes(&bytes, hashessupported).0,
                                     ));
                                 }
+                            } else {
+                                unreadable += 1;
                             }
 
-                            Ok(pending)
+                            Ok((pending, unreadable))
                         })
-                        .try_reduce(Vec::new, |mut left, mut right| {
-                            left.append(&mut right);
-                            Ok(left)
-                        });
-                    let pending = match processed {
-                        Ok(pending) => pending,
+                        .try_reduce(
+                            || (Vec::new(), 0usize),
+                            |(mut left_pending, left_unreadable), (mut right_pending, right_unreadable)| {
+                                left_pending.append(&mut right_pending);
+                                Ok((left_pending, left_unreadable + right_unreadable))
+                            },
+                        );
+                    let (pending, unreadable) = match processed {
+                        Ok(processed) => processed,
                         Err(()) => {
                             break;
                         }
@@ -248,6 +256,13 @@ let file_id_file_paths: HashMap<u64, String>;
                             stmt.execute(rusqlite::params_from_iter(flat_params))?;
                         }
                         conn.commit()?;
+                    }
+                    if missing_paths > 0 || unreadable > 0 {
+                        log::warn!(
+                            "File-hash system skipped {} files with missing paths and {} unreadable files; they will be retried later",
+                            missing_paths,
+                            unreadable,
+                        );
                     }
                     log::info!("File-hash system updated {} files", pending.len());
                 }

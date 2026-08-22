@@ -1,7 +1,10 @@
 use std::{
     error::Error,
     path::Path,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -116,6 +119,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let plugin_manager_clone = plugin_manager.clone();
     let download_manager_clone = download_manager.clone();
     let db_spawn = db.clone();
+    let active_system_jobs = Arc::new(AtomicUsize::new(0));
+    let active_system_jobs_clone = active_system_jobs.clone();
     let spawner = tokio::task::spawn(async move {
         loop {
             if should_exit.load(std::sync::atomic::Ordering::SeqCst) {
@@ -137,7 +142,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 if should_exit.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
-                db_spawn.run_system_job(job).await;
+                // Claim the job before spawning it. This prevents the next
+                // polling pass from launching a duplicate maintenance run.
+                db_spawn.job_set_is_running(job).await;
+                active_system_jobs_clone.fetch_add(1, Ordering::SeqCst);
+                let db = db_spawn.clone();
+                let active_system_jobs = active_system_jobs_clone.clone();
+                let job = job.clone();
+                tokio::spawn(async move {
+                    db.run_system_job(&job).await;
+                    active_system_jobs.fetch_sub(1, Ordering::SeqCst);
+                });
             }
 
             if should_exit.load(std::sync::atomic::Ordering::SeqCst) {
@@ -155,6 +170,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
             if download_manager_clone.all_jobs_complete().await
                 && jobs_to_run.is_empty()
+                && active_system_jobs_clone.load(Ordering::SeqCst) == 0
                 && plugin_manager_clone.are_start_threads_closed()
             {
                 break;
@@ -166,6 +182,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     });
 
     spawner.await?;
+
+    // Maintenance tasks are independent of the download manager, but still
+    // need to finish before the database and process resources are dropped.
+    while active_system_jobs.load(Ordering::SeqCst) != 0 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     // Ctrl-C stops new work first; allow active downloads to finish and release
     // their in-progress URL guards before the manager is dropped.
