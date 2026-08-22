@@ -1090,6 +1090,13 @@ impl Scraper {
 
                 // Adds hash for other types onto hash if they dont exist
                 for hash_type in HashesSupported::iter() {
+                    if matches!(
+                        hash_type,
+                        HashesSupported::IPFSCID(_) | HashesSupported::IPFSCID1(_)
+                    ) {
+                        continue;
+                    }
+
                     if should_exit_for_processing.load(Ordering::SeqCst) {
                         return Err("shutdown requested".to_string());
                     }
