@@ -602,9 +602,12 @@ fn is_bandwidth_error(error: &(dyn Error + 'static)) -> bool {
         Some(mega::Error::MegaError {
             code: ErrorCode::EOVERQUOTA,
         })
-    )
+    ) || is_bandwidth_error_message(&error.to_string())
 }
 
 fn is_bandwidth_error_message(error: &str) -> bool {
-    error.to_ascii_lowercase().contains("over quota")
+    let error = error.to_ascii_lowercase();
+    error.contains("over quota")
+        || error.contains("509 bandwidth limit exceeded")
+        || error.contains("bandwidth limit exceeded")
 }
