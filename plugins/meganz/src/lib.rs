@@ -536,14 +536,6 @@ pub fn parser_call(_text: &str, source_url: &str, data: &ScraperDataReturn) -> V
         }
 
         Ok((files, errors, bandwidth_error)) => {
-            if bandwidth_error {
-                let backoff = 3600;
-                let _ = client::log_silent(format!(
-                    "MEGA: bandwidth limit reached while processing {source_url}; retrying job in seconds: {backoff}."
-                ));
-                return vec![ScraperReturn::RetryLater(backoff)];
-            }
-
             let mut output = Vec::new();
 
             if !files.is_empty() {
@@ -553,7 +545,13 @@ pub fn parser_call(_text: &str, source_url: &str, data: &ScraperDataReturn) -> V
                 }));
             }
 
-            if !errors.is_empty() {
+            if bandwidth_error {
+                let backoff = 3600;
+                let _ = client::log_silent(format!(
+                    "MEGA: bandwidth limit reached while processing {source_url}; retrying job in seconds: {backoff}."
+                ));
+                output.push(ScraperReturn::RetryLater(backoff));
+            } else if !errors.is_empty() {
                 let backoff = 3600;
                 let _ = client::log_silent(format!(
                     "MEGA: Got error(s) {:?} while processing {source_url} will retry this job in seconds: {backoff}.",

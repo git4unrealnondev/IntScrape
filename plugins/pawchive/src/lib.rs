@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fmt,
+     time::Duration,
 };
 
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -41,6 +41,7 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
                     format!("https://{SITE_ROOT}/"),
                 )),
             }),
+            PluginProperties::Modifier(TargetModifier { target: ModifierTarget::Media, modifier: DownloadModifiers::Timeout(Some(Duration::from_mins(4))) })
             /* PluginProperties::Modifier(TargetModifier {
             target: ModifierTarget::Media,
             modifier: DownloadModifiers::Header((
@@ -687,14 +688,6 @@ fn parse_custom_format(input: &str) -> Result<Vec<String>, String> {
     Ok(fields)
 }
 
-fn main() {
-    let raw = r#""{\"Alternative Versions\",FEET,Fluttershy,Solo's}""#;
-    match parse_custom_format(raw) {
-        Ok(res) => println!("{:#?}", res),
-        Err(e) => eprintln!("Error: {}", e),
-    }
-}
-
 #[derive(Debug)]
 enum UrlProperties {
     UserId(String),
@@ -733,27 +726,6 @@ pub struct PostItem {
     pub poll: Option<serde_json::Value>,
     pub captions: Option<serde_json::Value>,
     pub tags: Option<String>,
-}
-
-fn comment_items(value: &serde_json::Value) -> Option<Vec<&serde_json::Value>> {
-    match value {
-        serde_json::Value::Array(items) => Some(items.iter().collect()),
-        serde_json::Value::Object(object) => ["comments", "items", "data"]
-            .iter()
-            .find_map(|key| object.get(*key).and_then(comment_items)),
-        _ => None,
-    }
-}
-
-fn json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| {
-        let value = value.get(*key)?;
-        match value {
-            serde_json::Value::String(value) if !value.is_empty() => Some(value.clone()),
-            serde_json::Value::Number(value) => Some(value.to_string()),
-            _ => None,
-        }
-    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
