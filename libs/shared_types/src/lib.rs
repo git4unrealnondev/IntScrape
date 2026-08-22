@@ -404,6 +404,8 @@ pub enum PluginProperties {
     Sites(Vec<String>),
     /// Sets the number of concurrent downloads for text and file
     ThreadNum(u64),
+    /// Sets the number of jobs that may run concurrently for the plugin
+    JobNum(u64),
     /// Changes the text or file downloading
     Modifier(TargetModifier),
     /// Tells the system that we are going to ideally process a login type

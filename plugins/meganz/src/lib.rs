@@ -421,6 +421,7 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
             PluginProperties::Sites(vec![SITE.into(), "mega.nz".into(), "mega".into()]),
             PluginProperties::Ratelimit(1, std::time::Duration::from_secs(1)),
             PluginProperties::ThreadNum(5),
+            PluginProperties::JobNum(1),
             PluginProperties::NoTextDownload,
         ],
         callbacks: vec![

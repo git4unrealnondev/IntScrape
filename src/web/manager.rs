@@ -38,6 +38,7 @@ use tokio::{
 };
 
 const MAX_CONCURRENT_DOWNLOADS: usize = 5;
+const MAX_CONCURRENT_JOBS: usize = 1000;
 const MAX_CONCURRENT_PROCESSING: usize = 20;
 const MAX_DOWNLOAD_RETRIES: u8 = 3;
 
@@ -156,6 +157,7 @@ struct InternalStorage {
     job_storage: Vec<DbJobsObj>,
     completed_job_storage: Vec<DbJobsObj>,
     ratelimiter: Arc<DefaultDirectRateLimiter>,
+    job_limiter: Arc<Semaphore>,
     //Stores file urls that we're downloading
     file_urls: HashSet<String>,
 }
@@ -1396,6 +1398,15 @@ impl DownloadsManager {
                 // Check if we need to load login data
                 let _ = self.handle_login_db(plugin);
 
+                let max_concurrent_jobs = plugin
+                    .properties
+                    .iter()
+                    .find_map(|property| match property {
+                        PluginProperties::JobNum(job_num) => (*job_num).try_into().ok(),
+                        _ => None,
+                    })
+                    .unwrap_or(MAX_CONCURRENT_JOBS);
+
                 // Loads login parameters from db into job
                 let mut job_storage = job_storage.clone();
                 for job in &mut job_storage {
@@ -1410,6 +1421,7 @@ impl DownloadsManager {
                         plugin: plugin.clone(),
                         job_storage: job_storage.clone(),
                         ratelimiter: Arc::new(governor::RateLimiter::direct(ratelimit.unwrap())),
+                        job_limiter: Arc::new(Semaphore::new(max_concurrent_jobs)),
                         completed_job_storage: vec![],
                         file_urls: HashSet::new(),
                     },
@@ -1593,13 +1605,14 @@ impl DownloadsManager {
             drop(guard);
 
             if let Some((mut job, plugin, ratelimiter)) = job_to_run {
-                // Only claim a global slot when this site actually has work. An
-                // idle site must not starve other sites by holding a permit while
-                // it waits for one of its running jobs to finish.
-                // let permit = self.job_limiter.clone().acquire_owned().await;
-                // let Ok(permit) = permit else {
-                //     break;
-                // };
+                let job_limiter = {
+                    let guard = self.jobs.read().await;
+                    let Some(internal_storage) = guard.get(&scraper_name) else {
+                        break;
+                    };
+                    internal_storage.job_limiter.clone()
+                };
+                let job_permit = job_limiter.acquire_owned().await;
 
                 info!("DownloadManager: Setting job {} to running status.", job.id);
                 self.db.job_set_is_running(&job).await;
@@ -1620,7 +1633,7 @@ impl DownloadsManager {
                 );
 
                 tokio::task::spawn(async move {
-                    //let _permit = permit;
+                    let _job_permit = job_permit;
                     if let Err(err) = scraper.run_scraper().await {
                         log::error!(
                             "Worker: {} JobId: {} scraper had err: {}",
