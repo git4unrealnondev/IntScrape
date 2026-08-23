@@ -11,3 +11,4 @@ compiled_plugins
 .vscode/*.json
 thumbnail
 *.sh
+dumpster*

@@ -10,7 +10,7 @@ use strum::IntoEnumIterator;
 
 use super::{
     MainDatabase, SYSTEM_DATABASE_BACKUP_SITE, SYSTEM_DATABASE_SLURP_SITE, SYSTEM_FILE_HASH_SITE,
-    SYSTEM_FILE_SIZE_SITE,
+    SYSTEM_FILE_SIZE_SITE, SYSTEM_STORAGE_CHECK_SITE,
 };
 
 impl MainDatabase {
@@ -37,6 +37,28 @@ impl MainDatabase {
                     false
                 }
             },
+            SYSTEM_STORAGE_CHECK_SITE => {
+                let result = tokio::task::spawn_blocking({
+                    let database = self.clone();
+                    move || {
+                        database
+                            .fix_internal_files(&crate::cli::cli_structs::CheckFilesEnum::StorageCheck)
+                            .map_err(|error| error.to_string())
+                    }
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => true,
+                    Ok(Err(error)) => {
+                        log::error!("Storage-check system job {} failed: {error}", job.id);
+                        false
+                    }
+                    Err(error) => {
+                        log::error!("Storage-check system job {} panicked: {error}", job.id);
+                        false
+                    }
+                }
+            }
             _ => return false,
         };
 
@@ -405,6 +427,7 @@ pub(crate) fn is_system_job(job: &DbJobsObj) -> bool {
             | SYSTEM_DATABASE_SLURP_SITE
             | SYSTEM_FILE_SIZE_SITE
             | SYSTEM_FILE_HASH_SITE
+            | SYSTEM_STORAGE_CHECK_SITE
     ) || matches!(
         job.config.recreation,
         Some(DbJobRecreation::AlwaysTime(_, _))

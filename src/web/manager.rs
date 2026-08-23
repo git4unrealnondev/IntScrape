@@ -66,6 +66,7 @@ use crate::{
     plugins::PluginManager,
     web::FileReturn,
 };
+use crate::db::main::SourceUrlFileStatus;
 
 enum TrackedFile {
     Temp(tempfile::NamedTempFile),
@@ -913,7 +914,7 @@ impl Scraper {
         file: &mut FileObject,
         jobs: &mut Vec<ScraperDataReturn>,
         download_issue: &mut bool,
-        existing_source_files: &HashMap<String, FileInternal>,
+        existing_source_files: &HashMap<String, SourceUrlFileStatus>,
     ) -> Result<Option<FileReturn>, Box<dyn Error>> {
         let plugin_manager = self.download_manager.plugin_manager.clone();
         let self_clone = self.clone();
@@ -955,7 +956,17 @@ impl Scraper {
             FileSource::Url(file_url) => Some(file_url),
             FileSource::Bytes(_) => None,
         }) {
-            if let Some(file_internal) = existing_source_files.get(file_url) {
+            if let Some(source_status) = existing_source_files.get(file_url) {
+                if source_status.dead {
+                    info!(
+                        "Scraper: {} JobId: {} Skipping dead URL: {}",
+                        self.plugin.name, self.job.id, file_url
+                    );
+                    return Ok(None);
+                }
+                let Some(file_internal) = source_status.file.as_ref() else {
+                    return Ok(None);
+                };
                 info!(
                     "Scraper: {} JobId: {} Skipping file_id {} because URL: {} already in db.",
                     self.plugin.name,

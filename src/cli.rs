@@ -611,7 +611,15 @@ pub async fn main(db: Arc<MainDatabase>) {
                     cli_structs::Database::CheckFiles(action) => {
                         match action {
                             CheckFilesEnum::StorageCheck => {
-                                data.fix_storage_locations();
+                                data.jobs_add_single_sync(shared_types::PluginJob {
+                                    time: helper_functions::get_sys_time_in_secs(),
+                                    reptime: 0,
+                                    priority: 10,
+                                    site: crate::db::SYSTEM_STORAGE_CHECK_SITE.to_string(),
+                                    param: Vec::new(),
+                                    user_data: BTreeMap::new(),
+                                    recreation: None,
+                                });
                             }
                             _ => {}
                         }

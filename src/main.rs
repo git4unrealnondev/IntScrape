@@ -11,7 +11,7 @@ use std::{
 use crate::{
     db::{
         MainDatabase, SYSTEM_DATABASE_BACKUP_SITE, SYSTEM_DATABASE_SLURP_SITE,
-        SYSTEM_FILE_HASH_SITE, SYSTEM_FILE_SIZE_SITE,
+        SYSTEM_FILE_HASH_SITE, SYSTEM_FILE_SIZE_SITE, SYSTEM_STORAGE_CHECK_SITE,
     },
     ipc::IpcServer,
     plugins::PluginManager,
@@ -131,6 +131,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             sites.push(SYSTEM_DATABASE_SLURP_SITE.to_string());
             sites.push(SYSTEM_FILE_SIZE_SITE.to_string());
             sites.push(SYSTEM_FILE_HASH_SITE.to_string());
+            sites.push(SYSTEM_STORAGE_CHECK_SITE.to_string());
             let jobs_to_run = db_spawn
                 .jobs_get_torun_chunk(sites, JOB_PROCESSING_CHUNK_SIZE)
                 .await;

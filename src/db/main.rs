@@ -30,6 +30,12 @@ use ipc_macro::export_ipc;
 // https://sqlite.org/limits.html
 const SQL_CHUNK_SIZE: usize = 800;
 
+#[derive(Debug, Default, PartialEq)]
+pub struct SourceUrlFileStatus {
+    pub file: Option<FileInternal>,
+    pub dead: bool,
+}
+
 pub trait DbJobsObjExt {
     fn from_row(row: &Row) -> rusqlite::Result<Self>
     where
@@ -3613,7 +3619,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                             }
                         } else {
                             let mut default_file_location =
-                                default_file_location.0.with_file_name("files_missing");
+                                default_file_location.0.with_file_name("dumpster");
 
                             info!("File {} does not exist in db.", entry.path().display());
 
@@ -4133,7 +4139,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     pub async fn source_url_files_get(
         &self,
         url_set: HashSet<String>,
-    ) -> HashMap<String, FileInternal> {
+    ) -> HashMap<String, SourceUrlFileStatus> {
         let pool = self.pool.clone();
         tokio::task::spawn_blocking(move || {
             let conn = match pool.get() {
@@ -4144,7 +4150,29 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 }
             };
 
-            let mut out = HashMap::new();
+            let mut out: HashMap<String, SourceUrlFileStatus> = HashMap::new();
+            let urls = url_set.into_iter().collect::<Vec<_>>();
+            for urls in urls.chunks(SQL_CHUNK_SIZE) {
+                if urls.is_empty() {
+                    continue;
+                }
+                let placeholders = std::iter::repeat_n("?", urls.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let query = format!(
+                    "SELECT url FROM dead_urls WHERE url IN ({placeholders})"
+                );
+                let mut stmt = conn.prepare(&query).unwrap();
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(urls.iter()), |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .unwrap();
+                for url in rows.flatten() {
+                    out.entry(url).or_default().dead = true;
+                }
+            }
+
             let source_url_namespace_id = Self::internal_namespace_get_id(&conn, "source_url");
             let Some(source_url_namespace_id) = source_url_namespace_id else {
                 return out;
@@ -4153,7 +4181,6 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             let relationship_table =
                 Self::relationship_partition_name(source_url_namespace_id);
 
-            let urls = url_set.into_iter().collect::<Vec<_>>();
             for urls in urls.chunks(SQL_CHUNK_SIZE) {
                 if urls.is_empty() {
                     continue;
@@ -4194,7 +4221,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                     })
                     .unwrap();
                 for row in rows.flatten() {
-                    out.entry(row.0).or_insert(row.1);
+                    out.entry(row.0).or_default().file = Some(row.1);
                 }
             }
             out
@@ -5683,6 +5710,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_source_url_files_get_marks_dead_urls() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        let url = "https://example.test/dead".to_string();
+        MainDatabase::internal_dead_url_add(&conn, &url).unwrap();
+        drop(conn);
+
+        let statuses = db.source_url_files_get(HashSet::from([url.clone()])).await;
+        let status = statuses.get(&url).expect("dead URL should be returned");
+        assert!(status.dead);
+        assert!(status.file.is_none());
+    }
+
+    #[tokio::test]
     async fn test_source_url_files_get_returns_existing_files() {
         let db = new_test();
         let conn = db.pool.get().unwrap();
@@ -5712,6 +5753,7 @@ mod tests {
             .source_url_files_get(HashSet::from([url.to_string()]))
             .await;
         let existing_file = existing.get(url).expect("source URL file should exist");
+        let existing_file = existing_file.file.as_ref().expect("file should exist");
         assert_eq!(existing_file.hash, "source-url-hash");
         assert_eq!(existing_file.extension, "jpg");
         assert_eq!(existing_file.id, Some(file_id));
@@ -5733,6 +5775,20 @@ mod tests {
             db.source_url_files_get(HashSet::from([url.to_string()])).await,
             HashMap::new()
         );
+    }
+
+    #[test]
+    fn test_storage_check_is_recognized_as_system_job() {
+        let job = DbJobsObj {
+            id: 0,
+            isrunning: false,
+            config: PluginJob {
+                site: crate::db::SYSTEM_STORAGE_CHECK_SITE.into(),
+                ..Default::default()
+            },
+        };
+
+        assert!(crate::db::system_jobs::is_system_job(&job));
     }
 
     #[test]
