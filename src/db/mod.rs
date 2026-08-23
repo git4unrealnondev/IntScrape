@@ -222,15 +222,15 @@ PRAGMA cache_size = -64000;
     ///
     fn load_cache(&self) {
         let conn = self.pool.get().unwrap();
-        for ns_id in 1..u64::MAX {
-            match Self::internal_namespace_get_generic(&conn, &ns_id) {
-                None => {
-                    break;
-                }
-                Some(namespace) => {
-                    self.namespace_cache.write().insert(namespace.name, ns_id);
-                }
-            }
+        let mut stmt = conn.prepare("SELECT id, name FROM Namespace").unwrap();
+        let namespaces = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap();
+        let mut cache = self.namespace_cache.write();
+        for namespace in namespaces.flatten() {
+            cache.insert(namespace.1, namespace.0);
         }
     }
 

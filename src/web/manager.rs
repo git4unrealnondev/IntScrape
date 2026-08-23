@@ -393,9 +393,26 @@ impl Scraper {
                                 job_list.lock().await.extend(scraper_object.jobs);
                                 tag_list.lock().await.extend(scraper_object.tags);
 
+                                let existing_source_files = Arc::new(
+                                    self.download_manager
+                                        .db
+                                        .source_url_files_get(
+                                            scraper_object
+                                                .files
+                                                .iter()
+                                                .filter_map(|file| match &file.source {
+                                                    Some(FileSource::Url(url)) => Some(url.clone()),
+                                                    _ => None,
+                                                })
+                                             .collect::<HashSet<_>>(),
+                                        )
+                                        .await,
+                                );
+
                                 let mut set = JoinSet::new();
                                 for mut file in scraper_object.files {
                                     let scraper = self.clone();
+                                    let existing_source_files = existing_source_files.clone();
                                     let file_id_tag_map_clone = file_id_tag_map.clone();
                                     let should_remove_job_clone = should_remove_job.clone();
                                     let job_list_clone = job_list.clone();
@@ -420,11 +437,12 @@ impl Scraper {
                                         let _permit = permit;
 
                                         let file_result = scraper
-                                            .file_download_logic(
-                                                &mut file,
-                                                &mut jobs,
-                                                &mut download_issue,
-                                            )
+                                             .file_download_logic(
+                                                 &mut file,
+                                                 &mut jobs,
+                                                 &mut download_issue,
+                                                 &existing_source_files,
+                                             )
                                             .await.map_err(|err| err.to_string());
                                         match file_result
                                         {
@@ -895,6 +913,7 @@ impl Scraper {
         file: &mut FileObject,
         jobs: &mut Vec<ScraperDataReturn>,
         download_issue: &mut bool,
+        existing_source_files: &HashMap<String, FileInternal>,
     ) -> Result<Option<FileReturn>, Box<dyn Error>> {
         let plugin_manager = self.download_manager.plugin_manager.clone();
         let self_clone = self.clone();
@@ -935,28 +954,17 @@ impl Scraper {
         if let Some(file_url) = file.source.as_ref().and_then(|source| match source {
             FileSource::Url(file_url) => Some(file_url),
             FileSource::Bytes(_) => None,
-        }) && let Some(file_id) = self
-            .download_manager
-            .db
-            .tag_get_file_id(&Tag {
-                name: file_url.clone(),
-                namespace: GenericNamespaceObj {
-                    name: "source_url".into(),
-                    description: None,
-                },
-            })
-            .await
-        {
-            info!(
-                "Scraper: {} JobId: {} Skipping file_id {} because URL: {} already in db.",
-                self.plugin.name, self.job.id, file_id, file_url
-            );
-            return Ok(self
-                .download_manager
-                .db
-                .file_id_get(file_id)
-                .await
-                .map(|f| FileReturn::File(f.into())));
+        }) {
+            if let Some(file_internal) = existing_source_files.get(file_url) {
+                info!(
+                    "Scraper: {} JobId: {} Skipping file_id {} because URL: {} already in db.",
+                    self.plugin.name,
+                    self.job.id,
+                    file_internal.id.unwrap_or(0),
+                    file_url
+                );
+                return Ok(Some(FileReturn::File(file_internal.clone().into())));
+            }
         }
 
         // Associates file hashes with a file object

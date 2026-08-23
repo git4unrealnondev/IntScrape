@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-     time::Duration,
+    time::Duration,
 };
 
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -19,8 +19,6 @@ const SERVICES: [&str; 2] = ["patreon", "pivix"];
 
 // How many max posts we can get from a creator currently 65500
 const URL_GEN_MAX: u8 = u8::MAX;
-
-
 
 #[unsafe(no_mangle)]
 fn get_plugin_info() -> Vec<shared_types::Plugin> {
@@ -41,11 +39,13 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
                     format!("https://{SITE_ROOT}/"),
                 )),
             }),
-            PluginProperties::Modifier(TargetModifier { target: ModifierTarget::Media, modifier: DownloadModifiers::Timeout(Some(Duration::from_mins(4))) })
-            /* PluginProperties::Modifier(TargetModifier {
-            target: ModifierTarget::Media,
-            modifier: DownloadModifiers::Header((
-                "Accept".into(),
+            PluginProperties::Modifier(TargetModifier {
+                target: ModifierTarget::Media,
+                modifier: DownloadModifiers::Timeout(Some(Duration::from_mins(4))),
+            }), /* PluginProperties::Modifier(TargetModifier {
+                target: ModifierTarget::Media,
+                modifier: DownloadModifiers::Header((
+                    "Accept".into(),
                     "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5".into(),
                 )),
             }),*/
@@ -330,7 +330,9 @@ pub fn parser_call(
                 ..Default::default()
             });
 
-            if let Ok(normalized_content) = html2text::from_read(std::io::Cursor::new(&post.content),80) {
+            if let Ok(normalized_content) =
+                html2text::from_read(std::io::Cursor::new(&post.content), 80)
+            {
                 tags.insert(PluginTag {
                     tag: Tag {
                         name: normalized_content,

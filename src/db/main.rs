@@ -633,9 +633,6 @@ impl MainDatabase {
         }
         let cache = self.tag_search_cache.read();
         let mut results = cache.search(tag, max_rows);
-        if cache.is_complete() {
-            return results;
-        }
         drop(cache);
 
         let Some(fts_query) = tag_search::fts_query(tag) else {
@@ -651,7 +648,7 @@ impl MainDatabase {
                  LIMIT ?2",
             )
             .unwrap();
-        let tag_iter = stmt
+        let candidates = stmt
             .query_map(
                 rusqlite::params![fts_query, tag_search::FTS_CANDIDATE_LIMIT],
                 |row| {
@@ -662,10 +659,23 @@ impl MainDatabase {
                 },
             )
             .unwrap();
+        let mut candidates = candidates.flatten().collect::<Vec<_>>();
+        drop(stmt);
+        if candidates.is_empty() {
+            let mut stmt = conn.prepare("SELECT id, name, count FROM Tags").unwrap();
+            candidates = stmt
+                .query_map([], |row| {
+                    let tag_id: u64 = row.get(0)?;
+                    let tag_name: String = row.get(1)?;
+                    let count: u64 = row.get(2)?;
+                    Ok(tag_search::tag_entry(tag_id, &tag_name, count))
+                })
+                .unwrap()
+                .flatten()
+                .collect();
+        }
         let existing_ids = results.iter().map(|result| result.tag_id).collect();
-        for candidate in
-            tag_search::search_entries(tag_iter.flatten(), tag, max_rows, &existing_ids)
-        {
+        for candidate in tag_search::search_entries(candidates, tag, max_rows, &existing_ids) {
             if !results
                 .iter()
                 .any(|result| result.tag_id == candidate.tag_id)
@@ -1318,8 +1328,12 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
     ///
     /// Checks if we should download a file
     ///
-    pub(in crate::db) fn internal_should_download_file(conn: &Connection, url: &str) -> bool {
-        let source_url_nsid = Self::internal_namespace_sourceurl_get(conn);
+    pub(in crate::db) fn internal_should_download_file(
+        &self,
+        conn: &Connection,
+        url: &str,
+    ) -> bool {
+        let source_url_nsid = self.internal_namespace_sourceurl_get(conn);
 
         if let Some(tag_id) = Self::internal_tag_get_id(conn, url, source_url_nsid) {
             return !Self::internal_tag_has_files(conn, tag_id);
@@ -1655,7 +1669,10 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
     }
 
     /// Gets tag relationships for multiple files in one IPC request.
-    #[ipc(name = "relationship_get_tagid_many", request = "RelationshipGetTagidMany")]
+    #[ipc(
+        name = "relationship_get_tagid_many",
+        request = "RelationshipGetTagidMany"
+    )]
     pub fn relationship_get_tag_id_many_sync(
         &self,
         file_ids: &HashSet<u64>,
@@ -1789,7 +1806,10 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
     }
 
     /// Gets child relations for multiple parent tags in one IPC request.
-    #[ipc(name = "child_relationships_get_many", request = "ChildRelationshipsGetMany")]
+    #[ipc(
+        name = "child_relationships_get_many",
+        request = "ChildRelationshipsGetMany"
+    )]
     pub fn child_relationships_get_many_sync(
         &self,
         tag_ids: &HashSet<u64>,
@@ -2151,8 +2171,8 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
     ///
     /// Adds the source url or gets it
     ///
-    pub(in crate::db) fn internal_namespace_sourceurl_get(conn: &Connection) -> u64 {
-        Self::internal_namespace_get_or_create(
+    pub(in crate::db) fn internal_namespace_sourceurl_get(&self, conn: &Connection) -> u64 {
+        self.internal_namespace_get_or_create(
             conn,
             &GenericNamespaceObj {
                 name: "source_url".into(),
@@ -2241,9 +2261,14 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
     /// Gets or creates a namespace
     ///
     pub(in crate::db) fn internal_namespace_get_or_create(
+        &self,
         conn: &Connection,
         namespace: &GenericNamespaceObj,
     ) -> u64 {
+        if let Some(&namespace_id) = self.namespace_cache.read().get(&namespace.name) {
+            return namespace_id;
+        }
+
         let mut stmt = conn
             .prepare(
                 "INSERT INTO Namespace (name, description) VALUES (?1, ?2)
@@ -2252,10 +2277,16 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
             )
             .unwrap();
 
-        stmt.query_row(params![namespace.name, namespace.description], |row| {
-            row.get(0)
-        })
-        .unwrap()
+        let namespace_id = stmt
+            .query_row(params![namespace.name, namespace.description], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        self.namespace_cache
+            .write()
+            .insert(namespace.name.clone(), namespace_id);
+        namespace_id
     }
 
     ///
@@ -2276,6 +2307,7 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
         if chunk_size == 0 {
             return Ok(Vec::new());
         }
+        let chunk_size = i64::try_from(chunk_size).unwrap_or(i64::MAX);
 
         let mut out = Vec::new();
         for site in sites {
@@ -4096,10 +4128,86 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         .await
         .unwrap()
     }
+
+    /// Gets existing files associated with source URLs in one database query.
+    pub async fn source_url_files_get(
+        &self,
+        url_set: HashSet<String>,
+    ) -> HashMap<String, FileInternal> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = match pool.get() {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("Failed to acquire DB connection from pool: {e:?}");
+                    panic!();
+                }
+            };
+
+            let mut out = HashMap::new();
+            let source_url_namespace_id = Self::internal_namespace_get_id(&conn, "source_url");
+            let Some(source_url_namespace_id) = source_url_namespace_id else {
+                return out;
+            };
+            Self::internal_relationship_partition_create(&conn, source_url_namespace_id);
+            let relationship_table =
+                Self::relationship_partition_name(source_url_namespace_id);
+
+            let urls = url_set.into_iter().collect::<Vec<_>>();
+            for urls in urls.chunks(SQL_CHUNK_SIZE) {
+                if urls.is_empty() {
+                    continue;
+                }
+                let placeholders = (1..=urls.len())
+                    .map(|index| format!("?{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let query = format!(
+                    "SELECT t.name, f.id, f.hash, f.extension, f.storage_id, f.size_bytes
+                     FROM Tags t
+                     JOIN (
+                         SELECT tag_id, MIN(file_id) AS file_id
+                         FROM {relationship_table}
+                         GROUP BY tag_id
+                     ) r ON r.tag_id = t.id
+                     JOIN File f ON f.id = r.file_id
+                     WHERE t.namespace = ?{namespace_param}
+                       AND t.name IN ({placeholders})",
+                    namespace_param = urls.len() + 1,
+                );
+                let mut stmt = conn.prepare(&query).unwrap();
+                let mut query_params: Vec<&dyn rusqlite::ToSql> =
+                    urls.iter().map(|url| url as &dyn rusqlite::ToSql).collect();
+                query_params.push(&source_url_namespace_id);
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(query_params), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            FileInternal {
+                                id: row.get(1)?,
+                                hash: row.get(2)?,
+                                extension: row.get(3)?,
+                                storage_id: row.get(4)?,
+                                size_bytes: row.get(5)?,
+                            },
+                        ))
+                    })
+                    .unwrap();
+                for row in rows.flatten() {
+                    out.entry(row.0).or_insert(row.1);
+                }
+            }
+            out
+        })
+        .await
+        .unwrap()
+    }
+
     ///
     /// Checks if we should download the file or not
     ///
     pub async fn should_download_file(&self, url: String) -> bool {
+        let database = self.clone();
         let pool = self.pool.clone();
         let roaring = self.relationship_roaring_storage.clone();
 
@@ -4112,7 +4220,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 }
             };
 
-            let source_url_nsid = Self::internal_namespace_sourceurl_get(&conn);
+            let source_url_nsid = database.internal_namespace_sourceurl_get(&conn);
             let Some(tag_id) = Self::internal_tag_get_id(&conn, &url, source_url_nsid) else {
                 return true;
             };
@@ -4241,7 +4349,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     pub fn namespace_add_sync(&self, namespace: &GenericNamespaceObj) -> u64 {
         let mut guard = self.writer_conn.lock();
         let conn = guard.transaction().unwrap();
-        let out = Self::internal_namespace_get_or_create(&conn, namespace);
+        let out = self.internal_namespace_get_or_create(&conn, namespace);
         conn.commit().unwrap();
         out
     }
@@ -4897,7 +5005,10 @@ mod tests {
     pub fn new_test() -> Arc<MainDatabase> {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!("intscrape-db-test-{id}.sqlite"));
+        let path = std::env::temp_dir().join(format!(
+            "intscrape-db-test-{}-{id}.sqlite",
+            std::process::id()
+        ));
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("sqlite-wal"));
         let _ = fs::remove_file(path.with_extension("sqlite-shm"));
@@ -4996,10 +5107,15 @@ mod tests {
 
     #[test]
     fn test_v2_database_upgrades_to_v3_audit_log() {
-        let path = std::env::temp_dir().join("intscrape-db-v2-upgrade.sqlite");
+        let path = std::env::temp_dir().join(format!(
+            "intscrape-db-v2-upgrade-{}.sqlite",
+            std::process::id()
+        ));
         let _ = fs::remove_file(&path);
         let db = database_for_path(&path);
         let conn = db.pool.get().unwrap();
+        conn.execute("ALTER TABLE File DROP COLUMN size_bytes", [])
+            .unwrap();
         conn.execute(
             "INSERT INTO File (hash, extension, storage_id) VALUES ('upgrade-hash', 'jpg', 1)",
             [],
@@ -5038,7 +5154,7 @@ mod tests {
         let version = MainDatabase::internal_setting_get(&conn, "SYSTEM_VERSION")
             .unwrap()
             .unwrap();
-        assert_eq!(version.num, Some(4));
+        assert_eq!(version.num, Some(DB_VERSION));
         assert_eq!(
             conn.query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'AuditLog'",
@@ -5540,7 +5656,8 @@ mod tests {
         );
 
         let original = namespace("edge", Some("first"));
-        let id = MainDatabase::internal_namespace_get_or_create(&conn, &original);
+        let id = db.internal_namespace_get_or_create(&conn, &original);
+        assert_eq!(db.namespace_cache.read().get("edge"), Some(&id));
         assert_eq!(
             MainDatabase::internal_namespace_get_id(&conn, "edge"),
             Some(id)
@@ -5551,13 +5668,70 @@ mod tests {
         );
 
         let updated = namespace("edge", Some("updated"));
+        assert_eq!(db.internal_namespace_get_or_create(&conn, &updated), id);
+    }
+
+    #[tokio::test]
+    async fn test_source_url_files_get_omits_missing_urls() {
+        let db = new_test();
+        let url = "https://example.test/missing".to_string();
+
         assert_eq!(
-            MainDatabase::internal_namespace_get_or_create(&conn, &updated),
-            id
+            db.source_url_files_get(HashSet::from([url.clone()])).await,
+            HashMap::new()
         );
+    }
+
+    #[tokio::test]
+    async fn test_source_url_files_get_returns_existing_files() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        let url = "https://example.test/existing";
+        let actions = [file_action(
+            TagOperation::Add,
+            vec![plugin_tag(url, "source_url")],
+        )];
+        let tags = MainDatabase::internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
+        let tag_id = tags[&tag(url, "source_url")];
+        let file_id = MainDatabase::internal_file_bulk_add(
+            &conn,
+            HashSet::from([file("source-url-hash", "jpg")]),
+        )
+        .into_iter()
+        .next()
+        .and_then(|file| file.id)
+        .unwrap();
+        MainDatabase::internal_relationship_bulk_add(
+            db.clone(),
+            &conn,
+            &HashSet::from([(file_id, tag_id)]),
+        );
+        drop(conn);
+
+        let existing = db
+            .source_url_files_get(HashSet::from([url.to_string()]))
+            .await;
+        let existing_file = existing.get(url).expect("source URL file should exist");
+        assert_eq!(existing_file.hash, "source-url-hash");
+        assert_eq!(existing_file.extension, "jpg");
+        assert_eq!(existing_file.id, Some(file_id));
+    }
+
+    #[tokio::test]
+    async fn test_source_url_files_get_omits_urls_without_files() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+        let url = "https://example.test/known";
+        let actions = [file_action(
+            TagOperation::Add,
+            vec![plugin_tag(url, "source_url")],
+        )];
+        MainDatabase::internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
+        drop(conn);
+
         assert_eq!(
-            MainDatabase::internal_namespace_get_generic(&conn, &id),
-            Some(updated)
+            db.source_url_files_get(HashSet::from([url.to_string()])).await,
+            HashMap::new()
         );
     }
 
