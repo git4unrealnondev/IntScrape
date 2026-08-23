@@ -58,6 +58,7 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
             properties: vec![
                 PluginProperties::Ratelimit(1, std::time::Duration::from_secs(1)),
                 PluginProperties::Sites(vec!["e6".into(), "E621".into(), "e621.com".into()]),
+                PluginProperties::JobNum(5),
                 PluginProperties::Login((LoginNeed::Optional, LoginType::Api("Put API key first then username. Can find more info here: https://e621.net/api_keys".into(), None) ))
             ],
             ..Default::default()
@@ -66,6 +67,7 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
             name: "E6AI".into(),
             properties: vec![
                 PluginProperties::Ratelimit(1, std::time::Duration::from_secs(1)),
+                PluginProperties::JobNum(5),
                 PluginProperties::Sites(vec!["e6ai".into(), "E6AI".into(), "e6ai.com".into()]),
             ],
             ..Default::default()
