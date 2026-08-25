@@ -473,10 +473,9 @@ pub fn parser_call(
                                 let mut local_params: Vec<_> = login_params.to_vec();
                                 local_params.push(ScraperParam::Normal(format!("id:{}", post_id)));
                                 if let Some(parse_url) = build_url(&local_params, None, &site) {
+                                    let mut user_data = scraperdata.job.user_data.clone();
+                                    user_data.insert("recursion".into(), "false".into());
 
-            let mut user_data = scraperdata.job.user_data.clone();
-            user_data.insert("recursion".into(), "false".into());
-                                    
                                     jobs.insert(ScraperDataReturn {
                                         job: PluginJob {
                                             site: scraperdata.job.site.clone(),

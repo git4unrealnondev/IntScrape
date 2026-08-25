@@ -4033,6 +4033,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
 
     pub async fn update_missing_file_sizes(&self) -> Result<(), rusqlite::Error> {
         let pool = self.pool.clone();
+        let should_exit = self.should_exit.clone();
         let writer_conn = self.writer_conn.clone();
         tokio::task::spawn_blocking(move || {
             // Resolve paths and inspect files without holding the serialized
@@ -4040,6 +4041,9 @@ SELECT id, name, namespace FROM High_Value_Tags;",
 
             let mut last_file_id = 0;
             loop {
+               if should_exit.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
                 let conn = pool
                     .get()
                     .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?;
@@ -4159,9 +4163,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 let placeholders = std::iter::repeat_n("?", urls.len())
                     .collect::<Vec<_>>()
                     .join(", ");
-                let query = format!(
-                    "SELECT url FROM dead_urls WHERE url IN ({placeholders})"
-                );
+                let query = format!("SELECT url FROM dead_urls WHERE url IN ({placeholders})");
                 let mut stmt = conn.prepare(&query).unwrap();
                 let rows = stmt
                     .query_map(rusqlite::params_from_iter(urls.iter()), |row| {
@@ -4178,8 +4180,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 return out;
             };
             Self::internal_relationship_partition_create(&conn, source_url_namespace_id);
-            let relationship_table =
-                Self::relationship_partition_name(source_url_namespace_id);
+            let relationship_table = Self::relationship_partition_name(source_url_namespace_id);
 
             for urls in urls.chunks(SQL_CHUNK_SIZE) {
                 if urls.is_empty() {
@@ -5772,7 +5773,8 @@ mod tests {
         drop(conn);
 
         assert_eq!(
-            db.source_url_files_get(HashSet::from([url.to_string()])).await,
+            db.source_url_files_get(HashSet::from([url.to_string()]))
+                .await,
             HashMap::new()
         );
     }

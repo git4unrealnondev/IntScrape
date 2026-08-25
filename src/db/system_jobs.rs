@@ -42,7 +42,9 @@ impl MainDatabase {
                     let database = self.clone();
                     move || {
                         database
-                            .fix_internal_files(&crate::cli::cli_structs::CheckFilesEnum::StorageCheck)
+                            .fix_internal_files(
+                                &crate::cli::cli_structs::CheckFilesEnum::StorageCheck,
+                            )
                             .map_err(|error| error.to_string())
                     }
                 })

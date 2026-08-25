@@ -17,7 +17,13 @@ use crate::{
     plugins::PluginManager,
     web::manager::DownloadsManager,
 };
-use fast_log::{consts::LogSize, plugin::{file_split::{KeepType, Rolling, RollingType}, packer::LogPacker}};
+use fast_log::{
+    consts::LogSize,
+    plugin::{
+        file_split::{KeepType, Rolling, RollingType},
+        packer::LogPacker,
+    },
+};
 use rayon::ThreadPoolBuilder;
 
 pub mod backup_path;

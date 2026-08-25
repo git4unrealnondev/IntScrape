@@ -60,13 +60,13 @@ fn is_retryable_status(status: StatusCode) -> bool {
     )
 }
 
+use crate::db::main::SourceUrlFileStatus;
 use crate::{
     db::MainDatabase,
     helper_functions::{self, get_sys_time_in_secs, memory_manage},
     plugins::PluginManager,
     web::FileReturn,
 };
-use crate::db::main::SourceUrlFileStatus;
 
 enum TrackedFile {
     Temp(tempfile::NamedTempFile),
@@ -405,7 +405,7 @@ impl Scraper {
                                                     Some(FileSource::Url(url)) => Some(url.clone()),
                                                     _ => None,
                                                 })
-                                             .collect::<HashSet<_>>(),
+                                                .collect::<HashSet<_>>(),
                                         )
                                         .await,
                                 );
