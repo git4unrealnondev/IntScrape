@@ -17,6 +17,7 @@ use crate::{
     plugins::PluginManager,
     web::manager::DownloadsManager,
 };
+use fast_log::{consts::LogSize, plugin::{file_split::{KeepType, Rolling, RollingType}, packer::LogPacker}};
 use rayon::ThreadPoolBuilder;
 
 pub mod backup_path;
@@ -52,10 +53,13 @@ fn setup_log() -> Result<(), Box<dyn Error + Send + Sync>> {
     fast_log::init(
         fast_log::Config::new()
             .level(log::LevelFilter::Info)
-            .file(
+            .file_split(
                 log_path
                     .to_str()
                     .ok_or("Failed to convert log_path to string")?,
+                Rolling::new(RollingType::BySize(LogSize::GB(1))), // Split log when it hits 1 GB
+                KeepType::KeepNum(10), // Keep exactly 10 chunks (10 x 1 GB = 10 GB)
+                LogPacker {},
             )
             .chan_len(Some(4096)),
     )?;
