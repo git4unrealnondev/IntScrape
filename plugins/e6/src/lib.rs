@@ -473,7 +473,10 @@ pub fn parser_call(
                                 let mut local_params: Vec<_> = login_params.to_vec();
                                 local_params.push(ScraperParam::Normal(format!("id:{}", post_id)));
                                 if let Some(parse_url) = build_url(&local_params, None, &site) {
-                                    //posts_to_search.push(post_id);
+
+            let mut user_data = scraperdata.job.user_data.clone();
+            user_data.insert("recursion".into(), "false".into());
+                                    
                                     jobs.insert(ScraperDataReturn {
                                         job: PluginJob {
                                             site: scraperdata.job.site.clone(),
@@ -482,6 +485,7 @@ pub fn parser_call(
                                                 ..Default::default()
                                             })],
                                             priority: DEFAULT_PRIORITY - 2,
+                                            user_data,
                                             ..Default::default()
                                         },
                                         skip_conditions: vec![SkipIf::FileTagRelationship(Tag {
@@ -533,6 +537,9 @@ pub fn parser_call(
             });
             local_params.push(ScraperParam::Normal("+status:any".into()));
 
+            let mut user_data = scraperdata.job.user_data.clone();
+            user_data.insert("recursion".into(), "false".into());
+
             if recursion && let Some(url) = build_url(&local_params, None, &site) {
                 jobs.insert(ScraperDataReturn {
                     job: PluginJob {
@@ -542,6 +549,7 @@ pub fn parser_call(
                             ..Default::default()
                         })],
                         priority: DEFAULT_PRIORITY - 2,
+                        user_data,
 
                         ..Default::default()
                     },
