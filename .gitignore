@@ -11,6 +11,5 @@ compiled_plugins
 .vscode/*.json
 thumbnail
 *.sh
-!/build-docker.sh
 dumpster*
 tor-serve
