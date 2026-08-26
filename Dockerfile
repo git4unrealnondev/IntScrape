@@ -23,6 +23,7 @@ COPY . .
 # build script stages the stripped plugin libraries in compiled_plugins.
 RUN rm -rf compiled_plugins \
     && cargo build --release --workspace \
+    && cargo build --release \
     && mkdir -p compiled_plugins \
     && find target/release -type f -name '*.so' -exec cp {} compiled_plugins/ \; \
     && strip compiled_plugins/*.so \
