@@ -28,11 +28,13 @@ COPY --from=planner /src/recipe.json recipe.json
 
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
+ARG BUILD_REVISION=unknown
 
 # Add these mount flags to your cargo build step
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    rm -rf compiled_plugins bin \
+    echo "Building revision ${BUILD_REVISION}" \
+    && rm -rf compiled_plugins bin \
     && cargo build --release --workspace \
     && mkdir -p compiled_plugins bin \
     && cp target/release/intscrape bin/intscrape \
@@ -43,6 +45,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM archlinux:base
 WORKDIR /app
 
+ARG BUILD_REVISION=unknown
+LABEL org.opencontainers.image.revision=$BUILD_REVISION
+
 # Keep only the runtime dependencies in the final image.
 RUN pacman -Syu --noconfirm \
     ca-certificates \
@@ -50,8 +55,6 @@ RUN pacman -Syu --noconfirm \
     openssl \
     sqlite \
     && pacman -Scc --noconfirm
-
-RUN ls . /src /src/target /src/target/release
 
 COPY --from=builder /src/bin/intscrape /app/intscrape
 COPY --from=builder /src/compiled_plugins /app/compiled_plugins

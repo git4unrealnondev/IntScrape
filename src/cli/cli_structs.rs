@@ -116,6 +116,8 @@ pub enum CheckFilesEnum {
     Redownload,
     /// Checks the storage locations of the files and fixes them
     StorageCheck,
+    /// Checks storage files by filename without reading file contents
+    StorageCheckFileName,
 }
 
 #[derive(Debug, Subcommand)]

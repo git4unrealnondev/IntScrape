@@ -5,6 +5,7 @@ use log::info;
 use parking_lot::RwLock;
 use r2d2_sqlite::rusqlite::OptionalExtension;
 use r2d2_sqlite::rusqlite::{self, Connection, Row, params};
+use rayon::prelude::*;
 use rusqlite::{ToSql, Transaction, params_from_iter};
 use shared_types::{
     AuditLogEntry, DbJobRecreation, DbJobsObj, DbSettingsObj, FileInternal, FileManager,
@@ -16,7 +17,6 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use walkdir::WalkDir;
 
 use crate::db::roaring::InternalCacheType;
 use crate::db::tag_search;
@@ -29,6 +29,124 @@ use ipc_macro::export_ipc;
 // Max is 1000 vs 800
 // https://sqlite.org/limits.html
 const SQL_CHUNK_SIZE: usize = 800;
+
+fn process_storage_check_chunk(
+    paths: &[PathBuf],
+    file_hash: &HashMap<String, FileInternal>,
+    file_storage_map: &HashMap<u64, String>,
+    default_file_location: &(PathBuf, u64),
+) {
+    // Reading and hashing are independent for each misplaced file. Keep the
+    // filesystem mutations below sequential, but use all available CPU cores
+    // for the expensive part of the storage check.
+    let misplaced_files: Vec<_> = paths
+        .par_iter()
+        .filter_map(|path| {
+            let file = std::fs::read(path).ok()?;
+            let bytes = Bytes::from(file);
+            let (hash, _) = hash_bytes(&bytes, &HashesSupported::Sha512(String::new()));
+            Some((path, hash))
+        })
+        .collect();
+
+    misplaced_files.par_iter().for_each(|(path, hash)| {
+        if let Some(file_internal) = file_hash.get(hash.as_str())
+            && let Some(base_file_path) = file_storage_map.get(&file_internal.storage_id)
+        {
+            let mut path_buf = Path::new(base_file_path).to_path_buf();
+            path_buf.push(&hash[0..2]);
+            path_buf.push(&hash[2..4]);
+            path_buf.push(&hash[4..6]);
+            path_buf.push(&hash);
+
+            let target_path = path_buf.with_extension(&file_internal.extension);
+            if path.exists()
+                && !target_path.exists()
+                && std::fs::create_dir_all(target_path.parent().unwrap()).is_ok()
+                && std::fs::copy(path, &target_path).is_ok()
+                && std::fs::remove_file(path).is_ok()
+            {
+                info!(
+                    "Moved file: {} to: {}",
+                    path.display(),
+                    target_path.display()
+                );
+            }
+        } else {
+            let mut dumpster = default_file_location.0.with_file_name("dumpster");
+
+            info!("File {} does not exist in db.", path.display());
+
+            dumpster.push(path);
+            if std::fs::create_dir_all(dumpster.parent().unwrap()).is_ok()
+                && std::fs::copy(path, &dumpster).is_ok()
+                && std::fs::remove_file(path).is_ok()
+            {
+                info!("Moved file: {} to: {}", path.display(), dumpster.display());
+            }
+        }
+    });
+}
+
+fn process_storage_check_filename_chunk(
+    paths: &[PathBuf],
+    file_hash: &HashMap<String, FileInternal>,
+    file_storage_map: &HashMap<u64, String>,
+    default_file_location: &(PathBuf, u64),
+) {
+    paths.par_iter().for_each(|path| {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        let Some(file_internal) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| file_hash.get(stem))
+        else {
+            move_to_storage_dumpster(path, default_file_location);
+            return;
+        };
+        let Some(base_file_path) = file_storage_map.get(&file_internal.storage_id) else {
+            return;
+        };
+
+        let target_path = Path::new(base_file_path)
+            .join(&file_internal.hash[0..2])
+            .join(&file_internal.hash[2..4])
+            .join(&file_internal.hash[4..6])
+            .join(file_name);
+        move_to_expected_path(path, &target_path);
+    });
+}
+
+fn move_to_expected_path(path: &Path, target_path: &Path) {
+    if path == target_path || !path.exists() || target_path.exists() {
+        return;
+    }
+    if std::fs::create_dir_all(target_path.parent().unwrap()).is_ok()
+        && std::fs::copy(path, target_path).is_ok()
+        && std::fs::remove_file(path).is_ok()
+    {
+        info!(
+            "Moved file: {} to: {}",
+            path.display(),
+            target_path.display()
+        );
+    }
+}
+
+fn move_to_storage_dumpster(path: &Path, default_file_location: &(PathBuf, u64)) {
+    let Some(file_name) = path.file_name() else {
+        return;
+    };
+    move_to_expected_path(
+        path,
+        &default_file_location
+            .0
+            .with_file_name("dumpster")
+            .join(file_name),
+    );
+}
 
 #[derive(Debug, Default, PartialEq)]
 pub struct SourceUrlFileStatus {
@@ -3573,7 +3691,12 @@ SELECT id, name, namespace FROM High_Value_Tags;",
 
         info!("Missing {} files from db.", file_storage_missing.len());
 
-        if !file_storage_missing.is_empty() || *action == CheckFilesEnum::StorageCheck {
+        if !file_storage_missing.is_empty()
+            || matches!(
+                action,
+                CheckFilesEnum::StorageCheck | CheckFilesEnum::StorageCheckFileName
+            )
+        {
             info!("Scanning file locations");
 
             let file_hash: HashMap<String, FileInternal> = files
@@ -3587,72 +3710,61 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 for (hash, _) in file_hash {
                     info!("Just printing the missing file: {hash}");
                 }
-            } else if CheckFilesEnum::StorageCheck == *action {
-                for (_storage_id, storage_loc) in &file_storage_map {
-                    for entry in WalkDir::new(storage_loc)
+            } else if matches!(
+                action,
+                CheckFilesEnum::StorageCheck | CheckFilesEnum::StorageCheckFileName
+            ) {
+                let mut files_to_scan = Vec::with_capacity(SQL_CHUNK_SIZE);
+                let filename_only = *action == CheckFilesEnum::StorageCheckFileName;
+                for storage_loc in file_storage_map.values() {
+                    for entry in jwalk::WalkDir::new(storage_loc)
                         .into_iter()
                         .filter_map(std::result::Result::ok)
+                        .filter(|entry| entry.file_type().is_file())
+                        .filter(|entry| !valid_paths.contains(&entry.path()))
                     {
-                        // Skips existing files
-                        if valid_paths.contains(&entry.path().to_path_buf()) {
-                            continue;
-                        }
-
-                        let file = match std::fs::read(entry.path()) {
-                            Ok(out) => out,
-                            Err(_) => {
-                                continue;
-                            }
-                        };
-                        let bytes = &Bytes::from(file);
-                        let (hash, _) = hash_bytes(bytes, &HashesSupported::Sha512(String::new()));
-
-                        if let Some(file_internal) = file_hash.get(&hash)
-                            && let Some(base_file_path) =
-                                file_storage_map.get(&file_internal.storage_id)
-                        {
-                            let mut path_buf = Path::new(base_file_path).to_path_buf();
-                            path_buf.push(&hash[0..2]);
-                            path_buf.push(&hash[2..4]);
-                            path_buf.push(&hash[4..6]);
-                            path_buf.push(&hash);
-
-                            let target_path = path_buf.with_extension(&file_internal.extension);
-                            if entry.path().exists()
-                                && !target_path.exists()
-                                && std::fs::create_dir_all(target_path.parent().unwrap()).is_ok()
-                                && std::fs::copy(entry.path(), &target_path).is_ok()
-                                && std::fs::remove_file(entry.path()).is_ok()
-                            {
-                                info!(
-                                    "Moved file: {} to: {}",
-                                    entry.path().display(),
-                                    target_path.display()
+                        files_to_scan.push(entry.path());
+                        if files_to_scan.len() == SQL_CHUNK_SIZE {
+                            if filename_only {
+                                process_storage_check_filename_chunk(
+                                    &files_to_scan,
+                                    &file_hash,
+                                    &file_storage_map,
+                                    &default_file_location,
+                                );
+                            } else {
+                                process_storage_check_chunk(
+                                    &files_to_scan,
+                                    &file_hash,
+                                    &file_storage_map,
+                                    &default_file_location,
                                 );
                             }
-                        } else {
-                            let mut default_file_location =
-                                default_file_location.0.with_file_name("dumpster");
-
-                            info!("File {} does not exist in db.", entry.path().display());
-
-                            default_file_location.push(entry.path());
-                            if std::fs::create_dir_all(default_file_location.parent().unwrap())
-                                .is_ok()
-                                && std::fs::copy(entry.path(), &default_file_location).is_ok()
-                                && std::fs::remove_file(entry.path()).is_ok()
-                            {
-                                info!(
-                                    "Moved file: {} to: {}",
-                                    entry.path().display(),
-                                    default_file_location.display()
-                                );
-                            }
+                            files_to_scan.clear();
                         }
                     }
+                }
+                if !files_to_scan.is_empty() {
+                    if filename_only {
+                        process_storage_check_filename_chunk(
+                            &files_to_scan,
+                            &file_hash,
+                            &file_storage_map,
+                            &default_file_location,
+                        );
+                    } else {
+                        process_storage_check_chunk(
+                            &files_to_scan,
+                            &file_hash,
+                            &file_storage_map,
+                            &default_file_location,
+                        );
+                    }
+                }
 
-                    for entry in WalkDir::new(storage_loc)
-                        .contents_first(true)
+                for storage_loc in file_storage_map.values() {
+                    for entry in jwalk::WalkDir::new(storage_loc)
+                        .sort(false)
                         .into_iter()
                         .filter_map(std::result::Result::ok)
                         .filter(|entry| entry.file_type().is_dir())
@@ -6679,6 +6791,55 @@ mod tests {
             .join(&hash[4..6])
             .join(&hash)
             .with_extension(&file.extension);
+        assert!(!source_path.exists());
+        assert_eq!(std::fs::read(target_path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn test_fix_internal_files_filename_mode_moves_by_name_without_hashing() {
+        let db = new_test();
+        let source_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let source_location = source_dir.path().to_string_lossy().into_owned();
+        let target_location = target_dir.path().to_string_lossy().into_owned();
+        let file = file("abcdef123456", "bin");
+        let bytes = Bytes::from_static(b"content does not match the filename hash");
+
+        let conn = db.pool.get().unwrap();
+        conn.execute("DELETE FROM FileStorageLocations", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE Settings SET param = ?1 WHERE name = 'SYSTEM_file_location'",
+            params![&target_location],
+        )
+        .unwrap();
+        MainDatabase::internal_file_storage_location_set(&conn, &source_location).unwrap();
+        let target_storage_id =
+            MainDatabase::internal_file_storage_location_get_or_create(&conn, &target_location)
+                .unwrap();
+        conn.execute(
+            "INSERT INTO File (hash, extension, storage_id) VALUES (?1, ?2, ?3)",
+            params![&file.hash, &file.extension, target_storage_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_path = Path::new(&source_location)
+            .join("misplaced")
+            .join(file.hash.clone() + "." + &file.extension);
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(&source_path, &bytes).unwrap();
+
+        // Keep the source storage alive in the database, but do not associate the
+        // file record with it. The checker must identify the file by its filename.
+        db.fix_internal_files(&CheckFilesEnum::StorageCheckFileName)
+            .unwrap();
+
+        let target_path = Path::new(&target_location)
+            .join("ab")
+            .join("cd")
+            .join("ef")
+            .join(file.hash.clone() + "." + &file.extension);
         assert!(!source_path.exists());
         assert_eq!(std::fs::read(target_path).unwrap(), bytes);
     }

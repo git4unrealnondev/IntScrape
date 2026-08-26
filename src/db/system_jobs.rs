@@ -10,7 +10,7 @@ use strum::IntoEnumIterator;
 
 use super::{
     MainDatabase, SYSTEM_DATABASE_BACKUP_SITE, SYSTEM_DATABASE_SLURP_SITE, SYSTEM_FILE_HASH_SITE,
-    SYSTEM_FILE_SIZE_SITE, SYSTEM_STORAGE_CHECK_SITE,
+    SYSTEM_FILE_SIZE_SITE, SYSTEM_STORAGE_CHECK_FILENAME_MODE, SYSTEM_STORAGE_CHECK_SITE,
 };
 
 impl MainDatabase {
@@ -38,13 +38,19 @@ impl MainDatabase {
                 }
             },
             SYSTEM_STORAGE_CHECK_SITE => {
+                let action = match job.config.param.first() {
+                    Some(ScraperParam::Normal(mode))
+                        if mode == SYSTEM_STORAGE_CHECK_FILENAME_MODE =>
+                    {
+                        crate::cli::cli_structs::CheckFilesEnum::StorageCheckFileName
+                    }
+                    _ => crate::cli::cli_structs::CheckFilesEnum::StorageCheck,
+                };
                 let result = tokio::task::spawn_blocking({
                     let database = self.clone();
                     move || {
                         database
-                            .fix_internal_files(
-                                &crate::cli::cli_structs::CheckFilesEnum::StorageCheck,
-                            )
+                            .fix_internal_files(&action)
                             .map_err(|error| error.to_string())
                     }
                 })
