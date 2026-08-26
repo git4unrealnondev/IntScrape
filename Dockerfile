@@ -23,6 +23,9 @@ COPY . .
 # build script stages the stripped plugin libraries in compiled_plugins.
 RUN rm -rf compiled_plugins \
     && cargo build --release --workspace \
+    && mkdir -p compiled_plugins \
+    && find target/release -type f -name '*.so' -exec cp {} compiled_plugins/ \; \
+    && strip compiled_plugins/*.so \
     && test -n "$(find compiled_plugins -maxdepth 1 -type f -name '*.so' -print -quit)"
 
 FROM archlinux:base
