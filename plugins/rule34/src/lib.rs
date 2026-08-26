@@ -38,6 +38,7 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
     vec![shared_types::Plugin {
         name: "Rule34".into(),
         properties: vec![
+            PluginProperties::JobNum(10),
             PluginProperties::Ratelimit(1, std::time::Duration::from_secs(1)),
             PluginProperties::Sites(vec!["r34".into(), "rule34".into(), "rule34.xxx".into()]),
             PluginProperties::Login((
