@@ -12,3 +12,4 @@ compiled_plugins
 thumbnail
 *.sh
 dumpster*
+tor-serve

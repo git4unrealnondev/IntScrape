@@ -9,6 +9,7 @@ shared_types = {workspace=true}
 bitcode = { workspace = true }
 interprocess = { workspace = true }
 serde = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "rt", "rt-multi-thread"] }
 
 [build-dependencies]
 proc-macro2 = "1.0"

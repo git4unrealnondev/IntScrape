@@ -44,16 +44,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             continue;
         }
 
-        // Dynamically watch each plugin's folder changes
-        let plugin_path = entry.path();
-        println!("cargo:rerun-if-changed={}", plugin_path.to_string_lossy());
-        if plugin_path.join("src").exists() {
-            println!(
-                "cargo:rerun-if-changed={}/src",
-                plugin_path.to_string_lossy()
-            );
-        }
-
         println!("cargo:warning=Building plugin workspace member: {plugin_name}");
 
         // 1. Build the plugin into the intermediate directory

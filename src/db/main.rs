@@ -1485,6 +1485,19 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
         }
     }
 
+    #[ipc(name = "get_file_hashes", request = "GetFileHashes")]
+    pub fn file_hashes_get(&self, file_id: &u64) -> HashMap<String, String> {
+        let conn = self.pool.get().unwrap();
+        let mut statement = conn
+            .prepare("SELECT algorithm, digest FROM FileHashes WHERE file_id = ?1")
+            .unwrap();
+        statement
+            .query_map([file_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .flatten()
+            .collect()
+    }
+
     ///
     /// Gets all tag ids assocated with a namespace id
     ///

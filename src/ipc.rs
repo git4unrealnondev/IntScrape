@@ -1,15 +1,14 @@
 use crate::db::MainDatabase;
 use crate::plugins::PluginManager;
 use interprocess::local_socket::ToFsName;
-use interprocess::local_socket::traits::Listener;
-use interprocess::local_socket::{GenericFilePath, ListenerOptions};
+use interprocess::local_socket::{GenericFilePath, ListenerOptions, tokio::prelude::*};
 use log::info;
-use std::io::BufReader;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::thread;
-use std::thread::JoinHandle;
-use std::{sync::Arc, sync::Mutex};
+use tokio::io::BufReader;
+use tokio::task::JoinHandle;
 pub struct IpcServer {
     local_server: Mutex<Option<JoinHandle<()>>>,
     should_exit: Arc<AtomicBool>,
@@ -22,9 +21,8 @@ impl Drop for IpcServer {
         self.should_exit
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
-        let mut local_server = self.local_server.lock().unwrap();
-        if let Some(local_server) = local_server.take() {
-            local_server.join().unwrap();
+        if let Some(local_server) = self.local_server.lock().unwrap().take() {
+            local_server.abort();
         }
     }
 }
@@ -42,12 +40,12 @@ impl IpcServer {
             plugin_manager,
         });
 
-        out.clone().startup().unwrap();
+        out.clone().startup();
         out
     }
 
     /// Starts up the api
-    pub fn startup(self: Arc<Self>) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn startup(self: Arc<Self>) {
         let name = "/tmp/rusthydrus/rusthydrus.sock"
             .to_fs_name::<GenericFilePath>()
             .unwrap();
@@ -55,43 +53,52 @@ impl IpcServer {
 
         let _ = std::fs::remove_file("/tmp/rusthydrus/rusthydrus.sock");
 
-        let listener = ListenerOptions::new()
-            .name(name)
-            .create_sync() // Synchronous backend
-            .unwrap();
+        let listener = match ListenerOptions::new().name(name).create_tokio() {
+            Ok(listener) => listener,
+            Err(error) => {
+                log::error!("Failed to start Tokio IPC listener: {error}");
+                return;
+            }
+        };
 
         let self_clone = self.clone();
 
-        let handle = thread::spawn(move || {
-            while !self_clone.should_exit.load(Ordering::Relaxed) {
-                match listener.accept() {
+        let handle = tokio::spawn(async move {
+            loop {
+                if self_clone.should_exit.load(Ordering::Relaxed) {
+                    break;
+                }
+                tokio::select! {
+                    result = listener.accept() => match result {
                     Ok(conn) => {
                         // Clone the Arc for the new connection thread
                         let self_for_conn = self_clone.clone();
 
                         // Spawn a dedicated thread for each client connection
-                        thread::spawn(move || {
+                        tokio::spawn(async move {
                             let mut reader = BufReader::new(conn);
-                            if let Ok(recieved_data) = client::recieve(&mut reader) {
-                                let response = self_for_conn.conn_to_function(recieved_data);
-                                client::send_preserialize(&response, &mut reader);
-                            }
+                            let received_data = match client::recieve(&mut reader).await {
+                                Ok(data) => data,
+                                Err(_) => return,
+                            };
+                            let response = tokio::task::block_in_place(|| {
+                                self_for_conn.conn_to_function(received_data)
+                            });
+                            let _ = client::send_preserialize(&response, &mut reader).await;
                         });
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(std::time::Duration::from_millis(50));
                     }
                     Err(e) => {
                         log::error!("Incoming connection failed: {e}");
                     }
+                    },
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
                 }
             }
         });
 
         // Store the thread handle so the host application can join it later on shutdown
+        // The task is aborted by Drop, which also releases the listener.
         *self.local_server.lock().unwrap() = Some(handle);
-
-        Ok(())
     }
 
     ///

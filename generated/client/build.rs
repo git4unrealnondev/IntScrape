@@ -42,7 +42,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     ]);
 
     let tokens = quote! {
-        #[derive(Debug, serde::Serialize, serde::Deserialize, bitcode::Encode, bitcode::Decode)]
+        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, bitcode::Encode, bitcode::Decode)]
         pub enum SupportedDBRequests {
             #(#variants),*
         }

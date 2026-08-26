@@ -220,11 +220,13 @@ async fn collect_files(
 
             // Existing files are not downloaded again. Their metadata is still
             // updated using the current snapshot relation graph.
-            match client::get_tag_file(handle_tag.clone()) {
+            match client::get_tag_file_async(handle_tag.clone()).await {
                 Ok(Some(existing_file)) => {
                     match existing_file.id {
                         Some(file_id) => {
-                            if let Err(error) = client::put_tags_to_file(file_id, tag_list) {
+                            if let Err(error) =
+                                client::put_tags_to_file_async(file_id, tag_list).await
+                            {
                                 return Err(format!(
                                     "MEGA handle {handle}, path '{file_path}', \
                                  folder '{folder_path}': failed to update \
@@ -232,11 +234,12 @@ async fn collect_files(
                                 ));
                             }
 
-                            let _ = client::log_silent(format!(
+                            let _ = client::log_silent_async(format!(
                                 "MEGA: skipping handle {handle} because it exists \
                              in the database; updated metadata for path \
                              '{file_path}' in folder '{folder_path}'"
-                            ));
+                            ))
+                            .await;
                         }
 
                         None => {
@@ -261,10 +264,11 @@ async fn collect_files(
                 }
             }
 
-            let _ = client::log_silent(format!(
+            let _ = client::log_silent_async(format!(
                 "MEGA: attempting download of handle {handle} with file path \
                  '{file_path}'"
-            ));
+            ))
+            .await;
 
             let mut bytes = Vec::new();
 
@@ -272,10 +276,11 @@ async fn collect_files(
                 Ok(()) => {
                     let downloaded_size = bytes.len();
 
-                    let _ = client::log_silent(format!(
+                    let _ = client::log_silent_async(format!(
                         "MEGA: downloaded handle {handle} with size \
                      {downloaded_size}"
-                    ));
+                    ))
+                    .await;
 
                     Ok(Some(FileObject {
                         source: Some(FileSource::Bytes(bytes)),
@@ -303,7 +308,7 @@ async fn collect_files(
                     if is_bandwidth_error_message(&error) {
                         *bandwidth_error = true;
                     }
-                    let _ = client::log_silent(format!("MEGA: {error}"));
+                    let _ = client::log_silent_async(format!("MEGA: {error}")).await;
                     errors.push(error);
                 }
             }

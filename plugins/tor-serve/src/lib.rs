@@ -1,9 +1,10 @@
 use anyhow::Result;
-use arti_client::{TorClient, TorClientConfig};
+use arti_client::{TorClient, config::TorClientConfigBuilder};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
-use axum::response::IntoResponse;
+use axum::middleware::{Next, from_fn_with_state};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
@@ -34,14 +35,23 @@ const API_VERSION: u64 = 1;
 const RATE_LIMIT: Duration = Duration::from_secs(10);
 const POW_DIFFICULTY: usize = 5;
 const POW_MAX_AGE: Duration = Duration::from_secs(300);
+const CLOCK_SKEW: Duration = Duration::from_secs(30);
+const TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_TRACKED_TOKENS: usize = 10_000;
+const STORAGE_SETTING: &str = "TOR_SERVE_FILE_LOCATION";
+const DEFAULT_STORAGE_LOCATION: &str = "./tor-serve";
+const MAX_CONCURRENT_REQUESTS_SETTING: &str = "TOR_SERVE_MAX_CONCURRENT_REQUESTS";
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 4;
 
 #[derive(Clone)]
 struct AppState {
     rate: Arc<Mutex<HashMap<String, SystemTime>>>,
-    issued_tokens: Arc<Mutex<HashSet<String>>>,
+    issued_tokens: Arc<Mutex<HashMap<String, SystemTime>>>,
     http: reqwest::Client,
     admin_token: Option<String>,
     token_secret: [u8; 32],
+    request_limits: Arc<Mutex<HashMap<String, (Arc<tokio::sync::Semaphore>, SystemTime)>>>,
+    max_concurrent_requests: usize,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -74,6 +84,13 @@ struct SearchResult {
 }
 
 #[derive(Debug, Serialize)]
+struct FileMetadata {
+    extension: String,
+    tags: Vec<Tag>,
+    hashes: HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
 struct ProofChallenge {
     challenge: String,
     difficulty: usize,
@@ -102,10 +119,66 @@ fn policy_name(token: &str) -> String {
     format!("tor-serve.policy.{}", token_key(token))
 }
 
-fn load_policy(token: &str) -> SearchPolicy {
-    client::setting_get(policy_name(token))
-        .ok()
-        .flatten()
+fn storage_location() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let configured = client::setting_get(STORAGE_SETTING.to_owned())?;
+    let location = configured
+        .as_ref()
+        .and_then(|setting| setting.param.as_deref())
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or(DEFAULT_STORAGE_LOCATION)
+        .to_owned();
+    if configured.is_none() {
+        client::setting_set(DbSettingsObj {
+            name: STORAGE_SETTING.to_owned(),
+            description: Some("Directory used by tor-serve for local file storage.".to_owned()),
+            num: None,
+            param: Some(location.clone()),
+        })?;
+    }
+    std::fs::create_dir_all(&location)?;
+    Ok(PathBuf::from(location))
+}
+
+fn max_concurrent_requests() -> Result<usize, Box<dyn std::error::Error>> {
+    let configured = client::setting_get(MAX_CONCURRENT_REQUESTS_SETTING.to_owned())?;
+    let value = configured
+        .as_ref()
+        .and_then(|setting| setting.param.as_deref())
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS);
+
+    if configured.is_none() {
+        client::setting_set(DbSettingsObj {
+            name: MAX_CONCURRENT_REQUESTS_SETTING.to_owned(),
+            description: Some(
+                "Maximum number of concurrent requests allowed per client token.".to_owned(),
+            ),
+            num: None,
+            param: Some(value.to_string()),
+        })?;
+    }
+
+    Ok(value)
+}
+
+fn create_private_directory(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    Ok(())
+}
+
+async fn load_policy(
+    token: &str,
+) -> Result<SearchPolicy, Box<dyn std::error::Error + Send + Sync>> {
+    client::setting_get_async(policy_name(token))
+        .await?
         .and_then(|setting| {
             setting
                 .param
@@ -128,12 +201,22 @@ fn load_policy(token: &str) -> SearchPolicy {
                 .into_iter()
                 .map(|tag| tag.to_ascii_lowercase())
                 .collect();
-            policy
+            Ok(policy)
         })
-        .unwrap_or_default()
+        .unwrap_or_else(|| Ok(SearchPolicy::default()))
 }
 
-fn permitted(policy: &SearchPolicy, file_id: u64, extension: &str, tags: &HashSet<Tag>) -> bool {
+async fn permitted(
+    policy: &SearchPolicy,
+    file_id: u64,
+    extension: &str,
+    tags: &HashSet<Tag>,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let allowed = permitted_tags(policy, extension, tags);
+    Ok(allowed && client::get_file_path_async(file_id).await?.is_some())
+}
+
+fn permitted_tags(policy: &SearchPolicy, extension: &str, tags: &HashSet<Tag>) -> bool {
     if let Some(allowed) = &policy.allowed_extensions
         && !allowed.contains(&extension.to_ascii_lowercase())
     {
@@ -143,15 +226,14 @@ fn permitted(policy: &SearchPolicy, file_id: u64, extension: &str, tags: &HashSe
         .iter()
         .map(|tag| tag.name.to_ascii_lowercase())
         .collect::<HashSet<_>>();
-    let denied = policy
-        .denied_tags
-        .iter()
-        .any(|tag| names.contains(&tag.to_ascii_lowercase()));
+    // A file is denied when any of its tags is blacklisted, regardless of
+    // whether the tag was also part of the search query.
+    let denied = policy.denied_tags.iter().any(|tag| names.contains(tag));
     let required = policy
         .required_tags
         .iter()
         .all(|tag| names.contains(&tag.to_ascii_lowercase()));
-    !denied && required && client::get_file_path(file_id).ok().flatten().is_some()
+    !denied && required
 }
 
 fn check_access(
@@ -164,15 +246,19 @@ fn check_access(
             "missing bearer token; solve a challenge and call /api/v1/auth/token",
         ));
     };
+    let now = SystemTime::now();
     let known_token = state
         .admin_token
         .as_deref()
         .is_some_and(|admin| admin == token)
-        || state
-            .issued_tokens
-            .lock()
-            .expect("issued-token lock poisoned")
-            .contains(&token);
+        || {
+            let mut tokens = state
+                .issued_tokens
+                .lock()
+                .expect("issued-token lock poisoned");
+            tokens.retain(|_, issued| now.duration_since(*issued).unwrap_or_default() < TOKEN_TTL);
+            tokens.contains_key(&token)
+        };
     if !known_token {
         return Err(json_error(StatusCode::UNAUTHORIZED, "unknown bearer token"));
     }
@@ -181,8 +267,8 @@ fn check_access(
         .and_then(|value| value.to_str().ok())
         .is_some_and(valid_proof);
     if !pow {
-        let now = SystemTime::now();
         let mut rate = state.rate.lock().expect("rate limiter lock poisoned");
+        rate.retain(|_, previous| now.duration_since(*previous).unwrap_or_default() < RATE_LIMIT);
         if let Some(previous) = rate.get(&token)
             && now.duration_since(*previous).unwrap_or_default() < RATE_LIMIT
         {
@@ -199,6 +285,61 @@ fn check_access(
     Ok((token, pow))
 }
 
+async fn per_token_concurrency(
+    State(state): axum::extract::State<AppState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let Some(token) = bearer_token(request.headers()) else {
+        return next.run(request).await;
+    };
+
+    let now = SystemTime::now();
+    let semaphore = {
+        let mut limits = state
+            .request_limits
+            .lock()
+            .expect("request-limit lock poisoned");
+        limits.retain(|_, (semaphore, last_used)| {
+            now.duration_since(*last_used).unwrap_or_default() < TOKEN_TTL
+                || semaphore.available_permits() < state.max_concurrent_requests
+        });
+        if limits.len() >= MAX_TRACKED_TOKENS && !limits.contains_key(&token) {
+            if let Some(oldest) = limits
+                .iter()
+                .filter(|(_, (semaphore, _))| {
+                    semaphore.available_permits() == state.max_concurrent_requests
+                })
+                .min_by_key(|(_, (_, last_used))| *last_used)
+                .map(|(token, _)| token.clone())
+            {
+                limits.remove(&oldest);
+            } else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        }
+        limits
+            .entry(token)
+            .and_modify(|(_, last_used)| *last_used = now)
+            .or_insert_with(|| {
+                (
+                    Arc::new(tokio::sync::Semaphore::new(state.max_concurrent_requests)),
+                    now,
+                )
+            })
+            .0
+            .clone()
+    };
+
+    let permit = match semaphore.acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let response = next.run(request).await;
+    drop(permit);
+    response
+}
+
 fn valid_proof(value: &str) -> bool {
     value.split_once(':').is_some_and(|(challenge, nonce)| {
         let Ok(timestamp) = u128::from_str_radix(challenge, 16) else {
@@ -208,11 +349,23 @@ fn valid_proof(value: &str) -> bool {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        if timestamp > now || now - timestamp > POW_MAX_AGE.as_nanos() {
+        let skew = CLOCK_SKEW.as_nanos();
+        if timestamp > now.saturating_add(skew)
+            || now
+                > timestamp
+                    .saturating_add(POW_MAX_AGE.as_nanos())
+                    .saturating_add(skew)
+        {
             return false;
         }
-        let digest = Sha256::digest(format!("{challenge}{nonce}").as_bytes());
-        hex::encode(digest).starts_with(&"0".repeat(POW_DIFFICULTY))
+        let mut hasher = Sha256::new();
+        hasher.update(challenge.as_bytes());
+        hasher.update(nonce.as_bytes());
+        let digest = hasher.finalize();
+        let full_bytes = POW_DIFFICULTY / 2;
+        let remaining_nibbles = POW_DIFFICULTY % 2;
+        digest[..full_bytes].iter().all(|byte| *byte == 0)
+            && (remaining_nibbles == 0 || digest[full_bytes] >> 4 == 0)
     })
 }
 
@@ -245,11 +398,22 @@ async fn issue_token(headers: HeaderMap, State(state): State<AppState>) -> impl 
     let mut material = state.token_secret.to_vec();
     material.extend_from_slice(proof.as_bytes());
     let token = hex::encode(Sha256::digest(material));
-    state
+    let mut issued_tokens = state
         .issued_tokens
         .lock()
-        .expect("issued-token lock poisoned")
-        .insert(token.clone());
+        .expect("issued-token lock poisoned");
+    let now = SystemTime::now();
+    issued_tokens.retain(|_, issued| now.duration_since(*issued).unwrap_or_default() < TOKEN_TTL);
+    if issued_tokens.len() >= MAX_TRACKED_TOKENS {
+        if let Some(oldest) = issued_tokens
+            .iter()
+            .min_by_key(|(_, issued)| *issued)
+            .map(|(token, _)| token.clone())
+        {
+            issued_tokens.remove(&oldest);
+        }
+    }
+    issued_tokens.insert(token.clone(), now);
     Json(serde_json::json!({
         "access_token": token,
         "token_type": "Bearer",
@@ -267,7 +431,13 @@ async fn search(
         Ok(access) => access,
         Err(error) => return error.into_response(),
     };
-    let policy = load_policy(&token);
+    let policy = match load_policy(&token).await {
+        Ok(policy) => policy,
+        Err(error) => {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                .into_response();
+        }
+    };
     if query.tags.as_deref().unwrap_or_default().trim().is_empty() {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -283,23 +453,46 @@ async fn search(
         .filter(|tag| !tag.is_empty())
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let ids = client::search_db_files_by_tags(tags, Some(limit)).unwrap_or_default();
+    let ids = match client::search_db_files_by_tags_async(tags, Some(limit)).await {
+        Ok(ids) => ids,
+        Err(error) => {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                .into_response();
+        }
+    };
     let mut results = Vec::new();
     for file_id in ids {
-        let Some(path) = client::get_file_path(file_id).ok().flatten() else {
-            continue;
+        let path = match client::get_file_path_async(file_id).await {
+            Ok(Some(path)) => path,
+            Ok(None) => continue,
+            Err(error) => {
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                    .into_response();
+            }
         };
         let extension = PathBuf::from(&path)
             .extension()
             .and_then(|extension| extension.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        let tag_ids = client::relationship_get_tagid(file_id).unwrap_or_default();
-        let file_tags = client::get_tag_id_bulk(tag_ids)
-            .unwrap_or_default()
-            .into_values()
-            .collect();
-        if permitted(&policy, file_id, &extension, &file_tags) {
+        let tag_ids = match client::relationship_get_tagid_async(file_id).await {
+            Ok(tag_ids) => tag_ids,
+            Err(error) => {
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                    .into_response();
+            }
+        };
+        let file_tags = match client::get_tag_id_bulk_async(tag_ids).await {
+            Ok(tags) => tags.into_values().collect(),
+            Err(error) => {
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                    .into_response();
+            }
+        };
+        if permitted(&policy, file_id, &extension, &file_tags)
+            .await
+            .unwrap_or(false)
+        {
             results.push(SearchResult {
                 file_id,
                 extension: Some(extension),
@@ -321,7 +514,13 @@ async fn booru_search(
         Ok(access) => access,
         Err(error) => return error.into_response(),
     };
-    let policy = load_policy(&token);
+    let policy = match load_policy(&token).await {
+        Ok(policy) => policy,
+        Err(error) => {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                .into_response();
+        }
+    };
     let tags = query.tags.unwrap_or_default();
     let requested_tags = tags
         .split_whitespace()
@@ -398,7 +597,12 @@ async fn settings_get(headers: HeaderMap, State(state): State<AppState>) -> impl
         Ok(access) => access,
         Err(error) => return error.into_response(),
     };
-    Json(load_policy(&token)).into_response()
+    match load_policy(&token).await {
+        Ok(policy) => Json(policy).into_response(),
+        Err(error) => {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    }
 }
 
 async fn settings_set(
@@ -410,17 +614,27 @@ async fn settings_set(
         Ok(access) => access,
         Err(error) => return error.into_response(),
     };
-    let saved = client::setting_set(DbSettingsObj {
+    let saved = match client::setting_set_async(DbSettingsObj {
         name: policy_name(&token),
         description: Some("tor-serve search policy".into()),
         num: None,
         param: Some(serde_json::to_string(&policy).unwrap_or_default()),
     })
-    .unwrap_or(false);
-    let persisted = client::setting_get(policy_name(&token))
-        .ok()
-        .flatten()
-        .is_some();
+    .await
+    {
+        Ok(saved) => saved,
+        Err(error) => {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                .into_response();
+        }
+    };
+    let persisted = match client::setting_get_async(policy_name(&token)).await {
+        Ok(setting) => setting.is_some(),
+        Err(error) => {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                .into_response();
+        }
+    };
     Json(serde_json::json!({ "saved": saved || persisted, "policy": policy })).into_response()
 }
 
@@ -456,22 +670,38 @@ async fn get_file_tags(
         Ok(access) => access,
         Err(error) => return error.into_response(),
     };
-    let tag_ids = client::relationship_get_tagid(file_id).unwrap_or_default();
-    let tags = client::get_tag_id_bulk(tag_ids)
-        .unwrap_or_default()
-        .into_values()
-        .collect();
+    let tag_ids = match client::relationship_get_tagid_async(file_id).await {
+        Ok(tag_ids) => tag_ids,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let tags = match client::get_tag_id_bulk_async(tag_ids).await {
+        Ok(tags) => tags.into_values().collect(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
 
-    let policy = load_policy(&token);
-    if let Ok(Some(path)) = client::get_file_path(file_id) {
-        let extension = PathBuf::from(path)
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if permitted(&policy, file_id, &extension, &tags) {
-            return Json(tags).into_response();
+    let policy = match load_policy(&token).await {
+        Ok(policy) => policy,
+        Err(error) => {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                .into_response();
         }
+    };
+    match client::get_file_path_async(file_id).await {
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Ok(Some(path)) => {
+            let extension = PathBuf::from(path)
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if permitted(&policy, file_id, &extension, &tags)
+                .await
+                .unwrap_or(false)
+            {
+                return Json(tags).into_response();
+            }
+        }
+        Ok(None) => {}
     }
     StatusCode::NOT_FOUND.into_response()
 }
@@ -486,29 +716,91 @@ async fn get_file_tag_ids(
         Ok(access) => access,
         Err(error) => return error.into_response(),
     };
-    let tag_ids = client::relationship_get_tagid(file_id).unwrap_or_default();
+    let tag_ids = match client::relationship_get_tagid_async(file_id).await {
+        Ok(tag_ids) => tag_ids,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
 
-    let policy = load_policy(&token);
-    let allowed = client::get_file_path(file_id)
-        .ok()
-        .flatten()
-        .and_then(|path| {
-            PathBuf::from(path)
-                .extension()
-                .and_then(|value| value.to_str().map(str::to_string))
-        })
-        .is_some_and(|extension| {
-            let tags = client::get_tag_id_bulk(tag_ids.clone())
-                .unwrap_or_default()
-                .into_values()
-                .collect();
-            permitted(&policy, file_id, &extension, &tags)
-        });
+    let policy = match load_policy(&token).await {
+        Ok(policy) => policy,
+        Err(error) => {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                .into_response();
+        }
+    };
+    let allowed = if let Some(path) = match client::get_file_path_async(file_id).await {
+        Ok(path) => path,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    } {
+        let extension = PathBuf::from(path)
+            .extension()
+            .and_then(|value| value.to_str().map(str::to_string));
+        let tags = match client::get_tag_id_bulk_async(tag_ids.clone()).await {
+            Ok(tags) => tags.into_values().collect(),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        extension.is_some_and(|extension| permitted_tags(&policy, &extension, &tags))
+    } else {
+        false
+    };
     if allowed {
         Json(tag_ids).into_response()
     } else {
         StatusCode::NOT_FOUND.into_response()
     }
+}
+
+async fn get_file_metadata(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(file_id): Path<u64>,
+) -> impl IntoResponse {
+    let (token, _) = match check_access(&headers, &state) {
+        Ok(access) => access,
+        Err(error) => return error.into_response(),
+    };
+    let policy = match load_policy(&token).await {
+        Ok(policy) => policy,
+        Err(error) => {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                .into_response();
+        }
+    };
+    let path = match client::get_file_path_async(file_id).await {
+        Ok(Some(path)) => path,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let tag_ids = match client::relationship_get_tagid_async(file_id).await {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let tags: Vec<Tag> = match client::get_tag_id_bulk_async(tag_ids).await {
+        Ok(tags) => tags.into_values().collect(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let file_path = PathBuf::from(path);
+    let extension = file_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let tag_set = tags.iter().cloned().collect();
+    if !permitted(&policy, file_id, extension, &tag_set)
+        .await
+        .unwrap_or(false)
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let hashes = match client::get_file_hashes_async(file_id).await {
+        Ok(hashes) => hashes,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    Json(FileMetadata {
+        extension: extension.to_owned(),
+        tags,
+        hashes,
+    })
+    .into_response()
 }
 
 /// Gets a file directly from disk
@@ -522,18 +814,31 @@ async fn get_file(
         Ok(access) => access,
         Err(error) => return error.into_response(),
     };
-    if let Some(filepath) = client::get_file_path(file_id).unwrap() {
+    if let Some(filepath) = match client::get_file_path_async(file_id).await {
+        Ok(filepath) => filepath,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    } {
         let path = PathBuf::from(&filepath);
         let extension = path
             .extension()
             .and_then(|value| value.to_str())
             .unwrap_or_default();
-        let tag_ids = client::relationship_get_tagid(file_id).unwrap_or_default();
-        let tags = client::get_tag_id_bulk(tag_ids)
-            .unwrap_or_default()
-            .into_values()
-            .collect();
-        if !permitted(&load_policy(&token), file_id, extension, &tags) {
+        let tag_ids = match client::relationship_get_tagid_async(file_id).await {
+            Ok(tag_ids) => tag_ids,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let tags = match client::get_tag_id_bulk_async(tag_ids).await {
+            Ok(tags) => tags.into_values().collect(),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let policy = match load_policy(&token).await {
+            Ok(policy) => policy,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        if !permitted(&policy, file_id, extension, &tags)
+            .await
+            .unwrap_or(false)
+        {
             return StatusCode::NOT_FOUND.into_response();
         }
 
@@ -555,24 +860,42 @@ async fn get_file(
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    let storage_location = match storage_location() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("unable to initialize tor-serve storage directory: {error}");
+            return;
+        }
+    };
+    let max_concurrent_requests = match max_concurrent_requests() {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("unable to load tor-serve concurrency setting: {error}");
+            return;
+        }
+    };
+
     let admin_token = std::env::var("TOR_SERVE_AUTH_TOKEN")
         .ok()
         .filter(|token| !token.is_empty());
     let state = AppState {
         rate: Arc::new(Mutex::new(HashMap::new())),
-        issued_tokens: Arc::new(Mutex::new(HashSet::new())),
+        issued_tokens: Arc::new(Mutex::new(HashMap::new())),
         http: reqwest::Client::builder()
             .user_agent("IntScrape tor-serve/1")
             .build()
             .unwrap(),
         admin_token,
         token_secret: random(),
+        request_limits: Arc::new(Mutex::new(HashMap::new())),
+        max_concurrent_requests,
     };
 
     let router = Router::new()
         .route("/api/v1/file/{file_id}", get(get_file))
         .route("/api/v1/file/{file_id}/tag_ids", get(get_file_tag_ids))
         .route("/api/v1/file/{file_id}/tags", get(get_file_tags))
+        .route("/api/v1/file/{file_id}/metadata", get(get_file_metadata))
         .route("/api/v1/challenge", get(challenge))
         .route("/api/v1/auth/token", post(issue_token))
         .route("/api/v1/search", get(search))
@@ -582,11 +905,28 @@ async fn main() {
             "/",
             get(|| async { format!("Hello from version: {}", API_VERSION) }),
         )
-        .with_state(state);
+        .with_state(state.clone())
+        .layer(from_fn_with_state(state, per_token_concurrency));
 
-    let config = TorClientConfig::default();
+    let arti_state = storage_location.join("arti-state");
+    let arti_cache = storage_location.join("arti-cache");
+    if let Err(error) =
+        create_private_directory(&arti_state).and_then(|_| create_private_directory(&arti_cache))
+    {
+        eprintln!("unable to initialize Arti directories: {error}");
+        return;
+    }
+    let config = TorClientConfigBuilder::from_directories(&arti_state, &arti_cache)
+        .build()
+        .expect("valid Arti storage directories");
 
-    let client = TorClient::create_bootstrapped(config).await.unwrap();
+    let client = match TorClient::create_bootstrapped(config).await {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("unable to bootstrap Arti: {error}");
+            return;
+        }
+    };
 
     let svc_cfg = OnionServiceConfigBuilder::default()
         .nickname("intscrape-server".parse().unwrap())
@@ -594,7 +934,7 @@ async fn main() {
         .unwrap();
 
     let Some((service, request_stream)) = client.launch_onion_service(svc_cfg).unwrap() else {
-        let _ = client::log_silent(format!("onion service was disabled in config"));
+        let _ = client::log_silent_async(format!("onion service was disabled in config")).await;
         return;
     };
 
@@ -602,10 +942,12 @@ async fn main() {
 
     tokio::spawn(async move {
         loop {
-            let should_exit = match client::should_exit() {
+            let should_exit = match client::should_exit_async().await {
                 Ok(value) => value,
                 Err(error) => {
-                    let _ = client::log_silent(format!("could not check exit status: {error}"));
+                    let _ =
+                        client::log_silent_async(format!("could not check exit status: {error}"))
+                            .await;
                     true // Treat an error as a shutdown request, if appropriate.
                 }
             };
@@ -626,7 +968,7 @@ async fn main() {
             status = status_events.next() => {
                 match status {
                     Some(status) => {
-                  let _ =      client::log_silent(format!("onion service status: {:?}", status.state()));
+                  let _ =      client::log_silent_async(format!("onion service status: {:?}", status.state())).await;
 
                         if status.state().is_fully_reachable() {
                             break;
@@ -634,7 +976,7 @@ async fn main() {
                     }
 
                     None => {
-                     let _ =   client::log_silent(format!("onion service status stream ended"));
+                     let _ =   client::log_silent_async(format!("onion service status stream ended")).await;
                         return;
                     }
                 }
@@ -643,7 +985,7 @@ async fn main() {
             result = shutdown_rx.changed() => {
                 match result {
                     Ok(()) if *shutdown_rx.borrow() => {
-                    let _ =    client::log_silent(format!("shutting down before service became reachable"));
+                    let _ =    client::log_silent_async(format!("shutting down before service became reachable")).await;
                         drop(service);
                         return;
                     }
@@ -651,7 +993,7 @@ async fn main() {
                     Ok(()) => {}
 
                     Err(_) => {
-                  let _ =      client::log_silent(format!("shutdown sender was dropped"));
+                  let _ =      client::log_silent_async(format!("shutdown sender was dropped")).await;
                         drop(service);
                         return;
                     }
@@ -660,10 +1002,11 @@ async fn main() {
         }
     }
 
-    let _ = client::log_silent(format!(
+    let _ = client::log_silent_async(format!(
         "ready to serve connections on: {}",
         service.onion_address().unwrap().display_unredacted()
-    ));
+    ))
+    .await;
     let stream_requests = tor_hsservice::handle_rend_requests(request_stream);
     tokio::pin!(stream_requests);
 
@@ -682,18 +1025,18 @@ async fn main() {
                     if let Err(err) =
                         handle_stream_request(stream_request, router).await
                     {
-                     let _ =   client::log_silent(format!(
+                      let _ =   client::log_silent_async(format!(
                             "error serving connection {:?}: {}",
                             sensitive(request),
                             err
-                        ));
+                        )).await;
                     }
                 });
             }
 
             result = shutdown_rx.changed() => {
                 if result.is_ok() && *shutdown_rx.borrow() {
-                  let _ =  client::log_silent(format!("shutting down onion service"));
+                  let _ =  client::log_silent_async(format!("shutting down onion service")).await;
                     break;
                 }
             }
@@ -702,7 +1045,7 @@ async fn main() {
 
     // Dropping the service and request stream stops accepting new requests.
     drop(service);
-    let _ = client::log_silent(format!("onion service exited cleanly"));
+    let _ = client::log_silent_async(format!("onion service exited cleanly")).await;
 }
 
 async fn handle_stream_request(stream_request: StreamRequest, router: Router) -> Result<()> {
@@ -726,4 +1069,38 @@ async fn handle_stream_request(stream_request: StreamRequest, router: Router) ->
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tag(name: &str) -> Tag {
+        Tag {
+            name: name.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn blacklisted_file_tag_is_denied() {
+        let policy = SearchPolicy {
+            denied_tags: HashSet::from(["unsafe".to_owned()]),
+            ..Default::default()
+        };
+        let tags = HashSet::from([tag("safe"), tag("unsafe")]);
+
+        assert!(!permitted_tags(&policy, "jpg", &tags));
+    }
+
+    #[test]
+    fn unrelated_file_tags_are_allowed() {
+        let policy = SearchPolicy {
+            denied_tags: HashSet::from(["unsafe".to_owned()]),
+            ..Default::default()
+        };
+        let tags = HashSet::from([tag("safe")]);
+
+        assert!(permitted_tags(&policy, "jpg", &tags));
+    }
 }

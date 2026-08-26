@@ -247,6 +247,13 @@ fn client_return_type(output: &ReturnType) -> TokenStream2 {
     }
 }
 
+fn async_client_return_type(output: &ReturnType) -> TokenStream2 {
+    match output {
+        ReturnType::Default => quote! { Result<(), Box<dyn std::error::Error + Send + Sync>> },
+        ReturnType::Type(_, ty) => quote! { Result<#ty, Box<dyn std::error::Error + Send + Sync>> },
+    }
+}
+
 fn documentation(attributes: &[Attribute]) -> Vec<Attribute> {
     attributes
         .iter()
@@ -292,17 +299,28 @@ fn write_client_file(path: &str, methods: &[(ImplItemFn, IpcOptions)]) -> syn::R
         let default_variant = pascal_case(&method.sig.ident);
         let variant = options.request_variant.as_ref().unwrap_or(&default_variant);
         let args = method_arguments(method).expect("validated IPC method");
-        let definitions = args.iter().map(|(name, ty)| {
-            let ty = owned_type(ty);
-            quote! { #name: #ty }
-        });
+        let definitions = args
+            .iter()
+            .map(|(name, ty)| {
+                let ty = owned_type(ty);
+                quote! { #name: #ty }
+            })
+            .collect::<Vec<_>>();
         let names = args.iter().map(|(name, _)| name).collect::<Vec<_>>();
         let ret = client_return_type(&method.sig.output);
+        let async_ret = async_client_return_type(&method.sig.output);
+        let async_name = format_ident!("{}_async", name);
         let request = quote! { crate::SupportedDBRequests::#variant(#(#names),*) };
+        let async_request = quote! { crate::SupportedDBRequests::#variant(#(#names),*) };
         quote! {
             #(#docs)*
             pub fn #name(#(#definitions),*) -> #ret {
-                crate::init_data_request(&#request)
+                crate::init_data_request(#request)
+            }
+
+            #(#docs)*
+            pub fn #async_name(#(#definitions),*) -> impl std::future::Future<Output = #async_ret> {
+                crate::init_data_request_async(#async_request)
             }
         }
     });
@@ -319,12 +337,22 @@ fn write_client_file(path: &str, methods: &[(ImplItemFn, IpcOptions)]) -> syn::R
         /// This lifecycle request is generated alongside the database client
         /// because plugins use it to stop long-running work cleanly.
         pub fn should_exit() -> Result<bool, Box<dyn std::error::Error>> {
-            crate::init_data_request(&crate::SupportedDBRequests::ShouldExit)
+            crate::init_data_request(crate::SupportedDBRequests::ShouldExit)
         }
 
         /// Writes to the host log without printing to stdout.
         pub fn log_silent(log: String) -> Result<bool, Box<dyn std::error::Error>> {
-            crate::init_data_request(&crate::SupportedDBRequests::LoggingNoPrint(log))
+            crate::init_data_request(crate::SupportedDBRequests::LoggingNoPrint(log))
+        }
+
+        /// Asynchronously returns whether the host application is shutting down.
+        pub fn should_exit_async() -> impl std::future::Future<Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>> {
+            crate::init_data_request_async(crate::SupportedDBRequests::ShouldExit)
+        }
+
+        /// Asynchronously writes to the host log without printing to stdout.
+        pub fn log_silent_async(log: String) -> impl std::future::Future<Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>> {
+            crate::init_data_request_async(crate::SupportedDBRequests::LoggingNoPrint(log))
         }
     };
     let source_file: File = syn::parse2(source_tokens).map_err(|error| {
