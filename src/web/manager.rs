@@ -41,6 +41,7 @@ const MAX_CONCURRENT_DOWNLOADS: usize = 5;
 const MAX_CONCURRENT_JOBS: usize = 1000;
 const MAX_CONCURRENT_PROCESSING: usize = 20;
 const MAX_DOWNLOAD_RETRIES: u8 = 3;
+const HASH_MISMATCH_ACCEPT_THRESHOLD: u8 = 3;
 
 fn retry_delay(attempt: u8) -> Duration {
     let backoff_seconds = 1u64 << attempt.min(4);
@@ -675,6 +676,8 @@ impl Scraper {
         temp_dir: &std::path::Path,
     ) -> Option<NamedTempFile> {
         let mut cnt = 0;
+        let mut last_mismatch_hashes: Option<Vec<String>> = None;
+        let mut repeated_mismatch_count = 0;
 
         let url = match Url::parse(file_url) {
             Ok(u) => u,
@@ -857,19 +860,44 @@ impl Scraper {
                 let processing_pool = self.download_manager.heavy_processing_pool.clone();
                 let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
                 processing_pool.spawn(move || {
-                    let hash_matches = std::fs::read(&hash_path)
+                    let hash_result = std::fs::read(&hash_path)
                         .map(|bytes| {
                             let bytes = Bytes::from(bytes);
-                            hash_inputs.iter().all(|hash| hash_bytes(&bytes, hash).1)
+                            let actual_hashes = hash_inputs
+                                .iter()
+                                .map(|hash| hash_bytes(&bytes, hash).0)
+                                .collect::<Vec<_>>();
+                            let hash_matches = hash_inputs
+                                .iter()
+                                .zip(&actual_hashes)
+                                .all(|(hash, actual)| actual == expected_hash(hash));
+                            (actual_hashes, hash_matches)
                         })
-                        .unwrap_or(false);
-                    let _ = result_sender.send(hash_matches);
+                        .unwrap_or_default();
+                    let _ = result_sender.send(hash_result);
                 });
-                let hash_matches = result_receiver.await.unwrap_or(false);
+                let (actual_hashes, hash_matches) = result_receiver.await.unwrap_or_default();
 
                 if hash_matches {
                     return Some(temp_file);
                 } else {
+                    if last_mismatch_hashes.as_ref() == Some(&actual_hashes) {
+                        repeated_mismatch_count += 1;
+                    } else {
+                        last_mismatch_hashes = Some(actual_hashes);
+                        repeated_mismatch_count = 1;
+                    }
+
+                    if repeated_mismatch_count >= HASH_MISMATCH_ACCEPT_THRESHOLD {
+                        log::warn!(
+                            "Scraper: {} JobId: {} Hash mismatch repeated {} times; accepting stable download.",
+                            self.plugin.name,
+                            self.job.id,
+                            repeated_mismatch_count
+                        );
+                        return Some(temp_file);
+                    }
+
                     log::warn!(
                         "Scraper: {} JobId: {} Hash mismatch detected. Retrying. Attempt: {}",
                         self.plugin.name,

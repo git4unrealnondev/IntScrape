@@ -1,4 +1,4 @@
-FROM archlinux:base AS builder
+FROM archlinux:base AS chef
 
 WORKDIR /src
 
@@ -15,22 +15,32 @@ RUN pacman -Syu --noconfirm \
     pkgconf \
     rust \
     sqlite \
-    && pacman -Scc --noconfirm
+    && pacman -Scc --noconfirm \
+    && cargo install cargo-chef --locked
 
+FROM chef AS planner
 COPY . .
 
-# Build the main binary and every cdylib plugin in the workspace. The root
-# build script stages the stripped plugin libraries in compiled_plugins.
-RUN rm -rf compiled_plugins \
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /src/recipe.json recipe.json
+
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY . .
+
+# Add these mount flags to your cargo build step
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    rm -rf compiled_plugins bin \
     && cargo build --release --workspace \
-    && cargo build --release \
-    && mkdir -p compiled_plugins \
+    && mkdir -p compiled_plugins bin \
+    && cp target/release/intscrape bin/intscrape \
     && find target/release -type f -name '*.so' -exec cp {} compiled_plugins/ \; \
     && strip compiled_plugins/*.so \
     && test -n "$(find compiled_plugins -maxdepth 1 -type f -name '*.so' -print -quit)"
 
 FROM archlinux:base
-
 WORKDIR /app
 
 # Keep only the runtime dependencies in the final image.
@@ -41,7 +51,9 @@ RUN pacman -Syu --noconfirm \
     sqlite \
     && pacman -Scc --noconfirm
 
-COPY --from=builder /src/target/release/intscrape /app/intscrape
+RUN ls . /src /src/target /src/target/release
+
+COPY --from=builder /src/bin/intscrape /app/intscrape
 COPY --from=builder /src/compiled_plugins /app/compiled_plugins
 # The plugins are linked against the FFmpeg libraries from the builder image.
 COPY --from=builder /usr/lib/libav*.so* /usr/lib/
