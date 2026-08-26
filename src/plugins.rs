@@ -136,7 +136,16 @@ impl PluginManager {
                     info!("🚚 Found plugin candidate: {:?}", path.file_name().unwrap());
 
                     unsafe {
-                        let lib = Arc::new(Library::new(&path).unwrap());
+                        let lib = match Library::new(&path) {
+                            Ok(lib) => Arc::new(lib),
+                            Err(error) => {
+                                error!(
+                                    "Skipping plugin {} because it could not be loaded: {error}",
+                                    path.display()
+                                );
+                                continue;
+                            }
+                        };
 
                         if let Some(plugins) = self.get_info(&lib, path) {
                             for plugin in plugins {

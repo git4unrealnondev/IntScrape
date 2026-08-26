@@ -11,6 +11,7 @@ RUN pacman -Syu --noconfirm \
     cmake \
     ffmpeg \
     git \
+    libbluray \
     openssl \
     pkgconf \
     rust \
@@ -52,6 +53,7 @@ LABEL org.opencontainers.image.revision=$BUILD_REVISION
 RUN pacman -Syu --noconfirm \
     ca-certificates \
     ffmpeg \
+    libbluray \
     openssl \
     sqlite \
     && pacman -Scc --noconfirm
