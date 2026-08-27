@@ -39,7 +39,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cargo build --release --workspace \
     && mkdir -p compiled_plugins bin \
     && cp target/release/intscrape bin/intscrape \
-    && find target/release -type f -name '*.so' -exec cp {} compiled_plugins/ \; \
+    && find target/release -maxdepth 1 -type f -name '*.so' -exec cp {} compiled_plugins/ \; \
     && strip compiled_plugins/*.so \
     && test -n "$(find compiled_plugins -maxdepth 1 -type f -name '*.so' -print -quit)"
 

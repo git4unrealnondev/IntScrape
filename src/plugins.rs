@@ -133,7 +133,7 @@ impl PluginManager {
                         continue;
                     }
 
-                    info!("🚚 Found plugin candidate: {:?}", path.file_name().unwrap());
+                    info!("Found plugin candidate: {:?}", path.file_name().unwrap());
 
                     unsafe {
                         let lib = match Library::new(&path) {
