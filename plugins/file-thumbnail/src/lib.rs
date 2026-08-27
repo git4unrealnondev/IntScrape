@@ -151,9 +151,49 @@ fn file_thumbnail_generate_thumbnail_fid(
         && callback.data.len() >= index
         && let Some(custom_data) = callback.data.get(index)
         && let shared_types::CallbackCustomDataReturning::U64(file_id) = custom_data
-        && let Ok(Some(file_path)) = client::get_file_path(*file_id)
-        && let Ok(bytes) = std::fs::read(&file_path)
     {
+        let tags = client::namespace_get("file_thumbnail".into())
+            .ok()
+            .flatten()
+            .and_then(|namespace_id| client::get_tags_filtered(*file_id, namespace_id).ok())
+            .unwrap_or_default();
+
+        let thumbnail_tags =
+            client::get_tag_id_bulk(tags.iter().copied().collect()).unwrap_or_default();
+        if let Ok(thumbpath) = process_thumb_location() {
+            for (idx, thumbnail_id) in tags.iter().enumerate() {
+                let Some(thumbnail_tag) = thumbnail_tags.get(thumbnail_id) else {
+                    continue;
+                };
+                if thumbnail_tag.name.len() < 6 {
+                    continue;
+                }
+                let path = thumbpath
+                    .join(&thumbnail_tag.name[0..2])
+                    .join(&thumbnail_tag.name[2..4])
+                    .join(&thumbnail_tag.name[4..6])
+                    .join(format!("{}.webp", thumbnail_tag.name));
+                if path.is_file() {
+                    out.insert(
+                        format!("ReturnPath_{}", idx),
+                        shared_types::CallbackCustomDataReturning::String(
+                            path.to_string_lossy().into_owned(),
+                        ),
+                    );
+                }
+            }
+        }
+
+        if !out.is_empty() {
+            return out;
+        }
+
+        let Some(Ok(file_path)) = client::get_file_path(*file_id).transpose() else {
+            return out;
+        };
+        let Ok(bytes) = std::fs::read(&file_path) else {
+            return out;
+        };
         let tags = on_download(&bytes).tags;
         let tags: Vec<FileTagAction> = tags.iter().cloned().collect();
 
