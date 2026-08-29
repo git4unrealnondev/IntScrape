@@ -148,7 +148,7 @@ fn file_thumbnail_generate_thumbnail_fid(
     let mut out = HashMap::new();
     let index = callback.data_name.iter().position(|x| x == "file_id");
     if let Some(index) = index
-        && callback.data.len() >= index
+        && callback.data.len() > index
         && let Some(custom_data) = callback.data.get(index)
         && let shared_types::CallbackCustomDataReturning::U64(file_id) = custom_data
     {
@@ -161,21 +161,15 @@ fn file_thumbnail_generate_thumbnail_fid(
         let thumbnail_tags =
             client::get_tag_id_bulk(tags.iter().copied().collect()).unwrap_or_default();
         if let Ok(thumbpath) = process_thumb_location() {
-            for (idx, thumbnail_id) in tags.iter().enumerate() {
-                let Some(thumbnail_tag) = thumbnail_tags.get(thumbnail_id) else {
+            for thumbnail_id in tags {
+                let Some(thumbnail_tag) = thumbnail_tags.get(&thumbnail_id) else {
                     continue;
                 };
-                if thumbnail_tag.name.len() < 6 {
-                    continue;
-                }
-                let path = thumbpath
-                    .join(&thumbnail_tag.name[0..2])
-                    .join(&thumbnail_tag.name[2..4])
-                    .join(&thumbnail_tag.name[4..6])
-                    .join(format!("{}.webp", thumbnail_tag.name));
-                if path.is_file() {
+                if let Some(path) = thumbnail_path(&thumbpath, &thumbnail_tag.name)
+                    && path.is_file()
+                {
                     out.insert(
-                        format!("ReturnPath_{}", idx),
+                        "ReturnPath".to_string(),
                         shared_types::CallbackCustomDataReturning::String(
                             path.to_string_lossy().into_owned(),
                         ),
@@ -197,20 +191,23 @@ fn file_thumbnail_generate_thumbnail_fid(
         let tags = on_download(&bytes).tags;
         let tags: Vec<FileTagAction> = tags.iter().cloned().collect();
 
-        for tag_action in tags.iter() {
-            for (idx, tag) in tag_action.tags.iter().enumerate() {
-                if let Ok(mut thumbpath) = process_thumb_location() {
-                    let thumb_hash = tag.tag.name.as_str();
-                    thumbpath.push(&thumb_hash[0..2]);
-                    thumbpath.push(&thumb_hash[2..4]);
-                    thumbpath.push(&thumb_hash[4..6]);
-                    let thpath = thumbpath.join(thumb_hash).with_added_extension("webp");
-                    let pa = thpath.to_string_lossy().to_string();
-
-                    out.insert(
-                        format!("ReturnPath_{}", idx),
-                        shared_types::CallbackCustomDataReturning::String(pa),
-                    );
+        if let Ok(thumbpath) = process_thumb_location() {
+            for tag_action in &tags {
+                for tag in &tag_action.tags {
+                    if let Some(path) = thumbnail_path(&thumbpath, &tag.tag.name)
+                        && path.is_file()
+                    {
+                        out.insert(
+                            "ReturnPath".to_string(),
+                            shared_types::CallbackCustomDataReturning::String(
+                                path.to_string_lossy().into_owned(),
+                            ),
+                        );
+                        break;
+                    }
+                }
+                if out.contains_key("ReturnPath") {
+                    break;
                 }
             }
         }
@@ -218,6 +215,19 @@ fn file_thumbnail_generate_thumbnail_fid(
     }
 
     out
+}
+
+fn thumbnail_path(base: &Path, hash: &str) -> Option<PathBuf> {
+    if hash.len() < 6 || !hash.is_ascii() {
+        return None;
+    }
+
+    Some(
+        base.join(&hash[0..2])
+            .join(&hash[2..4])
+            .join(&hash[4..6])
+            .join(format!("{hash}.webp")),
+    )
 }
 
 #[unsafe(no_mangle)]
