@@ -264,7 +264,8 @@ fn process_thumb_location() -> Result<PathBuf, Box<dyn Error>> {
             .parent()
             .ok_or("Cannot strip parent dir")?
             .to_path_buf();
-        path_final.push("thumbnail");
+        // The API and WebUI containers share the plural mount point.
+        path_final.push("thumbnails");
 
         // Makes the dir
         create_dir_all(&path_final)?;
