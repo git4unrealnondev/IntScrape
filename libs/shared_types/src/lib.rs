@@ -406,6 +406,9 @@ pub enum PluginProperties {
     ThreadNum(u64),
     /// Sets the number of jobs that may run concurrently for the plugin
     JobNum(u64),
+    /// Sets the amount of times to check a file's hash before accepting it as correct. Common
+    /// behavior for wwbsites that compress videos
+    HashDownloadRetry(u8),
     /// Changes the text or file downloading
     Modifier(TargetModifier),
     /// Tells the system that we are going to ideally process a login type

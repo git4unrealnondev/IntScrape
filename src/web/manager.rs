@@ -37,10 +37,19 @@ use tokio::{
     task::JoinSet,
 };
 
+// How many files should we download concurrently
 const MAX_CONCURRENT_DOWNLOADS: usize = 5;
-const MAX_CONCURRENT_JOBS: usize = 1000;
+
+// How many jobs can we run simultainously
+const MAX_CONCURRENT_JOBS: usize = 10;
+
+// Dunno what this does
 const MAX_CONCURRENT_PROCESSING: usize = 20;
+
+// How many times should we retry to download a file
 const MAX_DOWNLOAD_RETRIES: u8 = 3;
+
+// How many times before we accept the file as correct
 const HASH_MISMATCH_ACCEPT_THRESHOLD: u8 = 3;
 
 fn retry_delay(attempt: u8) -> Duration {
@@ -687,6 +696,15 @@ impl Scraper {
             }
         };
 
+        // Sets the amount of times to retry a hash before its accepted as the default
+        let mut hash_download_retry_number = None;
+        for property in self.plugin.properties.iter() {
+            if let PluginProperties::HashDownloadRetry(retry_num) = property {
+                hash_download_retry_number = Some(*retry_num);
+                break;
+            }
+        }
+
         'main_loop: loop {
             if self
                 .download_manager
@@ -888,7 +906,7 @@ impl Scraper {
                         repeated_mismatch_count = 1;
                     }
 
-                    if repeated_mismatch_count >= HASH_MISMATCH_ACCEPT_THRESHOLD {
+                    if repeated_mismatch_count >= hash_download_retry_number.unwrap_or(HASH_MISMATCH_ACCEPT_THRESHOLD) {
                         log::warn!(
                             "Scraper: {} JobId: {} Hash mismatch repeated {} times; accepting stable download.",
                             self.plugin.name,
