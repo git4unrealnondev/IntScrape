@@ -906,7 +906,9 @@ impl Scraper {
                         repeated_mismatch_count = 1;
                     }
 
-                    if repeated_mismatch_count >= hash_download_retry_number.unwrap_or(HASH_MISMATCH_ACCEPT_THRESHOLD) {
+                    if repeated_mismatch_count
+                        >= hash_download_retry_number.unwrap_or(HASH_MISMATCH_ACCEPT_THRESHOLD)
+                    {
                         log::warn!(
                             "Scraper: {} JobId: {} Hash mismatch repeated {} times; accepting stable download.",
                             self.plugin.name,
@@ -1656,11 +1658,20 @@ impl DownloadsManager {
                 break;
             }
 
-            // 2. Look for an idle job
+            // 2. Start the highest-priority idle job. Older jobs win priority ties.
             let job_to_run = if let Some(idx) = scraper_internal
                 .job_storage
                 .iter()
-                .position(|j| !j.isrunning)
+                .enumerate()
+                .filter(|(_, job)| !job.isrunning)
+                .max_by(|(_, left), (_, right)| {
+                    left.config
+                        .priority
+                        .cmp(&right.config.priority)
+                        .then_with(|| right.config.time.cmp(&left.config.time))
+                        .then_with(|| right.id.cmp(&left.id))
+                })
+                .map(|(idx, _)| idx)
             {
                 let job = &mut scraper_internal.job_storage[idx];
                 job.isrunning = true;

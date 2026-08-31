@@ -277,6 +277,10 @@ PRAGMA cache_size = -64000;
         Self::internal_table_create_relationship_v1(&conn);
         Self::internal_table_create_tag_search_fts_v6(&conn).unwrap();
         Self::internal_file_download_location_set_default(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_ready_priority
+             ON Jobs (site, is_running, priority DESC, time, id);",
+        )?;
 
         // Resetting is_running to false
         Self::internal_jobs_reset_isrunning(&conn).unwrap();

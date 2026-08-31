@@ -1278,6 +1278,9 @@ CREATE TABLE IF NOT EXISTS Jobs (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedup 
 ON Jobs (time, reptime, site, param);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_ready_priority
+ON Jobs (site, is_running, priority DESC, time, id);
 ",
         )
         .unwrap();
@@ -1690,11 +1693,11 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
 
         Self::internal_audit_context_set(&conn, "relationship added").unwrap();
         let tag_started = std::time::Instant::now();
-        let tag_map = Self::internal_tag_bulk_add(&conn, tag, self.plugin_manager.clone());
+        let tag_map = self.internal_tag_bulk_add(&conn, tag, self.plugin_manager.clone());
         let tag_elapsed = tag_started.elapsed();
         let relationships: HashSet<(u64, u64)> = tag_map.values().map(|f| (*file_id, *f)).collect();
         let relationship_started = std::time::Instant::now();
-        Self::internal_relationship_bulk_add(Arc::new(self.clone()), &conn, &relationships);
+        Self::internal_relationships_bulk_add(Arc::new(self.clone()), &conn, &relationships);
         let relationship_elapsed = relationship_started.elapsed();
 
         conn.commit().unwrap();
@@ -1731,7 +1734,7 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
         };
 
         Self::internal_audit_context_set(&conn, "tag callback processed").unwrap();
-        Self::internal_tag_bulk_add(&conn, tag_actions, self.plugin_manager.clone());
+        self.internal_tag_bulk_add(&conn, tag_actions, self.plugin_manager.clone());
         conn.commit().is_ok()
     }
 
@@ -1757,10 +1760,10 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
 
         for (file_id, tags) in tags_by_file {
             Self::internal_audit_context_set(&conn, "relationship added").unwrap();
-            let tag_map = Self::internal_tag_bulk_add(&conn, tags, self.plugin_manager.clone());
+            let tag_map = self.internal_tag_bulk_add(&conn, tags, self.plugin_manager.clone());
             let relationships: HashSet<(u64, u64)> =
                 tag_map.values().map(|tag_id| (*file_id, *tag_id)).collect();
-            Self::internal_relationship_bulk_add(Arc::new(self.clone()), &conn, &relationships);
+            Self::internal_relationships_bulk_add(Arc::new(self.clone()), &conn, &relationships);
         }
 
         match conn.commit() {
@@ -2423,6 +2426,7 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
         self.namespace_cache
             .write()
             .insert(namespace.name.clone(), namespace_id);
+        Self::internal_relationship_partition_create(conn, namespace_id);
         namespace_id
     }
 
@@ -2441,29 +2445,48 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
         sites: Vec<String>,
         chunk_size: usize,
     ) -> Result<Vec<DbJobsObj>, rusqlite::Error> {
-        if chunk_size == 0 {
+        if chunk_size == 0 || sites.is_empty() {
             return Ok(Vec::new());
         }
-        let chunk_size = i64::try_from(chunk_size).unwrap_or(i64::MAX);
-
         let mut out = Vec::new();
-        for site in sites {
-            let mut stmt = conn.prepare(
+        let limit = i64::try_from(chunk_size).unwrap_or(i64::MAX);
+        let now = get_sys_time_in_secs();
+
+        for sites in sites.chunks(SQL_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", sites.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
                 "SELECT id, time, reptime, priority, recreation, site, param, user_data, is_running
                  FROM Jobs
-                 WHERE site = ?1
+                 WHERE site IN ({placeholders})
                    AND is_running IS false
-                   AND time + reptime <= ?2
+                   AND time + reptime <= ?
                  ORDER BY priority DESC, time, id
-                 LIMIT ?3",
-            )?;
+                 LIMIT ?"
+            );
+            let mut query_params: Vec<&dyn ToSql> =
+                sites.iter().map(|site| site as &dyn ToSql).collect();
+            query_params.push(&now);
+            query_params.push(&limit);
+
+            let mut stmt = conn.prepare(&query)?;
             let jobs = stmt.query_map(
-                params![site, get_sys_time_in_secs(), chunk_size],
+                params_from_iter(query_params),
                 shared_types::DbJobsObj::from_row,
             )?;
             out.extend(jobs.collect::<Result<Vec<_>, _>>()?);
         }
 
+        out.sort_unstable_by(|left, right| {
+            right
+                .config
+                .priority
+                .cmp(&left.config.priority)
+                .then_with(|| left.config.time.cmp(&right.config.time))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        out.truncate(chunk_size);
         Ok(out)
     }
 
@@ -2730,7 +2753,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                 })
             })?
             .collect::<Result<HashSet<_>, _>>()?;
-        Self::internal_namespace_bulk_add(&tx, &namespaces);
+        self.internal_namespace_bulk_add(&tx, &namespaces);
         tx.execute(
             "INSERT INTO slurp_namespaces(source_id, target_id)
              SELECT s.id, n.id
@@ -2778,7 +2801,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                     }],
                 })
                 .collect::<Vec<_>>();
-            Self::internal_tag_bulk_add(&tx, &actions, self.plugin_manager.clone());
+            self.internal_tag_bulk_add(&tx, &actions, self.plugin_manager.clone());
             last_tag_id = *last_id;
         }
         tx.execute(
@@ -2949,7 +2972,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                     .iter()
                     .map(|(file_id, tag_id, _, _)| (*file_id, *tag_id))
                     .collect();
-                Self::internal_relationship_bulk_add(Arc::new(self.clone()), &tx, &relationships);
+                Self::internal_relationships_bulk_add(Arc::new(self.clone()), &tx, &relationships);
                 last_file_id = *source_file_id;
                 last_tag_id = *source_tag_id;
             }
@@ -3001,7 +3024,6 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             [tag_id],
             |row| row.get(0),
         )?;
-        Self::internal_relationship_partition_create(conn, namespace_id);
         let table = Self::relationship_partition_name(namespace_id);
         conn.execute(
             &format!("INSERT OR IGNORE INTO {table} (file_id, tag_id) VALUES (?1, ?2)"),
@@ -3023,6 +3045,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     /// Adds tags into db
     ///
     pub(in crate::db) fn internal_tag_bulk_add(
+        &self,
         conn: &Connection,
         tag_actions: &[FileTagAction],
         plugin_manager: Arc<RwLock<Option<Arc<PluginManager>>>>,
@@ -3050,7 +3073,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             })
             .collect();
 
-        let namespace_ids = Self::internal_namespace_bulk_add(conn, &namespaces);
+        let namespace_ids = self.internal_namespace_bulk_add(conn, &namespaces);
 
         // 2️⃣ DEDUPLICATE AND GROUP PLAIN TAGS TO BULK INSERT
         // Collect unique (name, namespace_id) tuples alongside their original struct keys
@@ -3192,6 +3215,11 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             Self::internal_parents_bulk_add(conn, &parents);
         }
 
+        let mut tag_cache = self.tag_cache.write();
+        for (tag, &tag_id) in &out {
+            tag_cache.insert(tag_id, tag.clone());
+        }
+
         out
     }
 
@@ -3204,6 +3232,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     /// Bulk adds namespaces into DB returning their id
     ///
     pub(in crate::db) fn internal_namespace_bulk_add(
+        &self,
         conn: &Connection,
         namespaces: &HashSet<shared_types::GenericNamespaceObj>,
     ) -> HashMap<shared_types::GenericNamespaceObj, u64> {
@@ -3248,7 +3277,19 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
             }
         }
 
-        for namespace_id in out.values().copied() {
+        let mut new_namespace_ids = Vec::new();
+        {
+            let mut namespace_cache = self.namespace_cache.write();
+            for (namespace, &namespace_id) in &out {
+                if namespace_cache
+                    .insert(namespace.name.clone(), namespace_id)
+                    .is_none()
+                {
+                    new_namespace_ids.push(namespace_id);
+                }
+            }
+        }
+        for namespace_id in new_namespace_ids {
             Self::internal_relationship_partition_create(conn, namespace_id);
         }
         out
@@ -3388,66 +3429,77 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
     }
 
     ///
-    /// Bulk adds relationship into DB with chunking to prevent parameter limit overflow
-    ///
+    /// Groups mixed-namespace relationships before inserting each partition.
+    pub(in crate::db) fn internal_relationships_bulk_add(
+        self: Arc<Self>,
+        conn: &Connection,
+        relationships: &HashSet<(u64, u64)>,
+    ) {
+        let mut by_namespace = HashMap::<u64, HashSet<(u64, u64)>>::new();
+        for &(file_id, tag_id) in relationships {
+            let Ok(namespace_id) = conn.query_row(
+                "SELECT namespace FROM Tags WHERE id = ?1",
+                [tag_id],
+                |row| row.get::<_, u64>(0),
+            ) else {
+                continue;
+            };
+            by_namespace
+                .entry(namespace_id)
+                .or_default()
+                .insert((file_id, tag_id));
+        }
+
+        for (namespace_id, relationships) in by_namespace {
+            Self::internal_relationship_bulk_add(self.clone(), conn, namespace_id, &relationships);
+        }
+    }
+
+    /// Bulk adds relationships to a known namespace partition.
     pub(in crate::db) fn internal_relationship_bulk_add(
         self: Arc<Self>,
         conn: &Connection,
+        namespace_id: u64,
         relationships: &HashSet<(u64, u64)>,
     ) {
         if relationships.is_empty() {
             return;
         }
 
-        let mut by_namespace: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
-        for &(file_id, tag_id) in relationships {
-            if let Ok(namespace_id) = conn.query_row(
-                "SELECT namespace FROM Tags WHERE id = ?1",
-                [tag_id],
-                |row| row.get::<_, u64>(0),
-            ) {
-                Self::internal_relationship_partition_create(conn, namespace_id);
-                by_namespace
-                    .entry(namespace_id)
-                    .or_default()
-                    .push((file_id, tag_id));
-            }
-        }
+        let table = Self::relationship_partition_name(namespace_id);
+        let relationships = relationships.iter().copied().collect::<Vec<_>>();
         let mut inserted_relationships = 0;
 
-        for (namespace_id, relationships) in by_namespace {
-            let table = Self::relationship_partition_name(namespace_id);
-            for chunk in relationships.chunks(SQL_CHUNK_SIZE) {
-                let mut query = format!("INSERT OR IGNORE INTO {table} (file_id, tag_id) VALUES ");
-                let mut params_vector: Vec<&dyn rusqlite::types::ToSql> =
-                    Vec::with_capacity(chunk.len() * 2);
+        for chunk in relationships.chunks(SQL_CHUNK_SIZE) {
+            let mut query = format!("INSERT OR IGNORE INTO {table} (file_id, tag_id) VALUES ");
+            let mut params_vector: Vec<&dyn rusqlite::types::ToSql> =
+                Vec::with_capacity(chunk.len() * 2);
 
-                for (i, relationship) in chunk.iter().enumerate() {
-                    if i > 0 {
-                        query.push_str(", ");
-                    }
-                    query.push_str(&format!("(?{}, ?{})", i * 2 + 1, i * 2 + 2));
-                    params_vector.push(&relationship.0);
-                    params_vector.push(&relationship.1);
+            for (i, relationship) in chunk.iter().enumerate() {
+                if i > 0 {
+                    query.push_str(", ");
                 }
+                query.push_str(&format!("(?{}, ?{})", i * 2 + 1, i * 2 + 2));
+                params_vector.push(&relationship.0);
+                params_vector.push(&relationship.1);
+            }
 
-                match conn.execute(&query, &*params_vector) {
-                    Ok(inserted) => {
-                        inserted_relationships += inserted;
-                        if inserted > 0 {
-                            for (_, tag_id) in chunk {
-                                conn.execute(
-                                    "UPDATE Tags SET count = count + 1 WHERE id = ?1",
-                                    [tag_id],
-                                )
-                                .unwrap();
-                            }
+            match conn.execute(&query, &*params_vector) {
+                Ok(inserted) => {
+                    inserted_relationships += inserted;
+                    if inserted > 0 {
+                        for (_, tag_id) in chunk {
+                            conn.execute(
+                                "UPDATE Tags SET count = count + 1 WHERE id = ?1",
+                                [tag_id],
+                            )
+                            .unwrap();
                         }
                     }
-                    Err(e) => {
-                        log::error!("Failed to bulk insert relationships: {e}");
-                        return;
-                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to bulk insert relationships: {e}");
+                    return;
                 }
             }
         }
@@ -3456,7 +3508,7 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         if inserted_relationships > 0 {
             let mut guard = self.relationship_roaring_storage.write();
             if let Some(roaring) = guard.as_mut() {
-                for (file_id, tag_id) in relationships {
+                for (file_id, tag_id) in &relationships {
                     roaring.relationship_roaring_add(conn, *file_id, *tag_id);
                 }
             }
@@ -3979,7 +4031,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
 
             Self::internal_audit_context_set(&conn, &audit_reason).unwrap();
             let tag_cache =
-                Self::internal_tag_bulk_add(&conn, &all_tag_actions, self.plugin_manager.clone());
+                self.internal_tag_bulk_add(&conn, &all_tag_actions, self.plugin_manager.clone());
 
             let file_ids: Vec<u64> = file_cache.values().copied().collect();
             let current_file_relationships =
@@ -4104,7 +4156,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
 
             if !rels_to_add.is_empty() {
                 Self::internal_audit_context_set(&conn, &audit_reason).unwrap();
-                Self::internal_relationship_bulk_add(self.clone(), &conn, &rels_to_add);
+                Self::internal_relationships_bulk_add(self.clone(), &conn, &rels_to_add);
             }
 
             conn.commit().unwrap();
@@ -4304,7 +4356,6 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             let Some(source_url_namespace_id) = source_url_namespace_id else {
                 return out;
             };
-            Self::internal_relationship_partition_create(&conn, source_url_namespace_id);
             let relationship_table = Self::relationship_partition_name(source_url_namespace_id);
 
             for urls in urls.chunks(SQL_CHUNK_SIZE) {
@@ -4318,12 +4369,13 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 let query = format!(
                     "SELECT t.name, f.id, f.hash, f.extension, f.storage_id, f.size_bytes
                      FROM Tags t
-                     JOIN (
-                         SELECT tag_id, MIN(file_id) AS file_id
-                         FROM {relationship_table}
-                         GROUP BY tag_id
-                     ) r ON r.tag_id = t.id
-                     JOIN File f ON f.id = r.file_id
+                     JOIN File f ON f.id = (
+                         SELECT r.file_id
+                         FROM {relationship_table} r
+                         WHERE r.tag_id = t.id
+                         ORDER BY r.file_id
+                         LIMIT 1
+                     )
                      WHERE t.namespace = ?{namespace_param}
                        AND t.name IN ({placeholders})",
                     namespace_param = urls.len() + 1,
@@ -4442,7 +4494,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             let mut writer_conn = self_clone.writer_conn.lock();
             let conn = writer_conn.transaction().unwrap();
             Self::internal_audit_context_set(&conn, "relationship added").unwrap();
-            Self::internal_relationship_bulk_add(self, &conn, &rel_list);
+            Self::internal_relationships_bulk_add(self, &conn, &rel_list);
             conn.commit().unwrap();
         })
         .await
@@ -5089,6 +5141,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         let tags_owned = tags.to_vec();
         let audit_reason = audit_reason.to_string();
         let writer_conn = self.writer_conn.clone();
+        let database = self.clone();
 
         let plugin_manager = self.plugin_manager.clone();
         tokio::task::spawn_blocking(move || {
@@ -5099,7 +5152,7 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .unwrap();
                 Self::internal_audit_context_set(&tn, &audit_reason).unwrap();
-                out_tags = Self::internal_tag_bulk_add(&tn, &tags_owned, plugin_manager.clone());
+                out_tags = database.internal_tag_bulk_add(&tn, &tags_owned, plugin_manager.clone());
 
                 tn.commit().unwrap();
             }
@@ -5329,7 +5382,7 @@ mod tests {
             vec![plugin_tag("audit", "test")],
         )];
         MainDatabase::internal_audit_context_set(&conn, "tag discovered from input").unwrap();
-        let tags = MainDatabase::internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
+        let tags = db.internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
         let tag_id = *tags.values().next().unwrap();
         MainDatabase::internal_file_bulk_add(&conn, HashSet::from([file("audit-hash", "bin")]));
         let file_id: u64 = conn
@@ -5338,7 +5391,7 @@ mod tests {
             })
             .unwrap();
         MainDatabase::internal_audit_context_set(&conn, "relationship added").unwrap();
-        MainDatabase::internal_relationship_bulk_add(
+        MainDatabase::internal_relationships_bulk_add(
             db.clone(),
             &conn,
             &HashSet::from([(file_id, tag_id)]),
@@ -5390,7 +5443,7 @@ mod tests {
         )];
         let reason = "scraper: test-scraper";
         MainDatabase::internal_audit_context_set(&conn, reason).unwrap();
-        let tags = MainDatabase::internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
+        let tags = db.internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
         let tag_id = *tags.values().next().unwrap();
         MainDatabase::internal_file_bulk_add(&conn, HashSet::from([file("source-hash", "bin")]));
         let file_id: u64 = conn
@@ -5402,7 +5455,7 @@ mod tests {
             .unwrap();
 
         MainDatabase::internal_audit_context_set(&conn, reason).unwrap();
-        MainDatabase::internal_relationship_bulk_add(
+        MainDatabase::internal_relationships_bulk_add(
             db.clone(),
             &conn,
             &HashSet::from([(file_id, tag_id)]),
@@ -5499,7 +5552,7 @@ mod tests {
         let tag2 = tag1.clone();
 
         // Pass duplicate elements in the batch array
-        MainDatabase::internal_tag_bulk_add(&conn, &[tag1, tag2], db.plugin_manager.clone());
+        db.internal_tag_bulk_add(&conn, &[tag1, tag2], db.plugin_manager.clone());
 
         // Due to INSERT OR IGNORE, SQL should gracefully process without panicking on unique constraints
         let tag_count: i32 = conn
@@ -5551,7 +5604,7 @@ mod tests {
         let conn = db.pool.get().unwrap();
 
         let tag_map =
-            MainDatabase::internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
+            db.internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
         let first_id = tag_map.get(&actions[0].tags[0].tag).copied().unwrap();
         let second_id = tag_map.get(&actions[1].tags[0].tag).copied().unwrap();
 
@@ -5613,10 +5666,12 @@ mod tests {
             .expect("Failed to pull connection from test pool");
 
         // 1. Test insertion
-        let ids = MainDatabase::internal_namespace_bulk_add(&conn, &set);
+        let ids = db.internal_namespace_bulk_add(&conn, &set);
         assert_eq!(ids.len(), 2);
         assert!(ids.contains_key(&ns1));
         assert!(ids.contains_key(&ns2));
+        assert_eq!(db.namespace_cache.read().get(&ns1.name), ids.get(&ns1));
+        assert_eq!(db.namespace_cache.read().get(&ns2.name), ids.get(&ns2));
 
         // 2. Test Upsert (ON CONFLICT update description)
         let ns1_updated = GenericNamespaceObj {
@@ -5627,7 +5682,7 @@ mod tests {
         let mut update_set = HashSet::new();
         update_set.insert(ns1_updated.clone());
 
-        let updated_ids = MainDatabase::internal_namespace_bulk_add(&conn, &update_set);
+        let updated_ids = db.internal_namespace_bulk_add(&conn, &update_set);
         assert_eq!(updated_ids.get(&ns1_updated), ids.get(&ns1)); // ID should remain unchanged
 
         // Verify description updated in DB
@@ -5682,7 +5737,7 @@ mod tests {
 
         // 2. Add tags dynamically through your revamped bulk add function
         // This registers all 3 tags and their namespaces simultaneously
-        let tag_ids = MainDatabase::internal_tag_bulk_add(
+        let tag_ids = db.internal_tag_bulk_add(
             &conn,
             &[complex_plugin_tag],
             db.plugin_manager.clone(),
@@ -5774,7 +5829,7 @@ mod tests {
         };
 
         // Execute bulk add
-        MainDatabase::internal_tag_bulk_add(&conn, &[complex_tag], db.plugin_manager.clone());
+        db.internal_tag_bulk_add(&conn, &[complex_tag], db.plugin_manager.clone());
 
         // Assertions 1: Ensure all 3 distinct namespaces were automatically extracted and created
         let ns_count: i32 = conn
@@ -5802,7 +5857,7 @@ mod tests {
         let db = new_test();
         let conn = db.pool.get().unwrap();
 
-        assert!(MainDatabase::internal_namespace_bulk_add(&conn, &HashSet::new()).is_empty());
+        assert!(db.internal_namespace_bulk_add(&conn, &HashSet::new()).is_empty());
         assert_eq!(
             MainDatabase::internal_namespace_get_id(&conn, "missing"),
             None
@@ -5858,7 +5913,7 @@ mod tests {
             TagOperation::Add,
             vec![plugin_tag(url, "source_url")],
         )];
-        let tags = MainDatabase::internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
+        let tags = db.internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
         let tag_id = tags[&tag(url, "source_url")];
         let file_id = MainDatabase::internal_file_bulk_add(
             &conn,
@@ -5868,7 +5923,7 @@ mod tests {
         .next()
         .and_then(|file| file.id)
         .unwrap();
-        MainDatabase::internal_relationship_bulk_add(
+        MainDatabase::internal_relationships_bulk_add(
             db.clone(),
             &conn,
             &HashSet::from([(file_id, tag_id)]),
@@ -5894,7 +5949,7 @@ mod tests {
             TagOperation::Add,
             vec![plugin_tag(url, "source_url")],
         )];
-        MainDatabase::internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
+        db.internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
         drop(conn);
 
         assert_eq!(
@@ -5935,10 +5990,12 @@ mod tests {
             ],
         )];
         let result =
-            MainDatabase::internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
+            db.internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
 
         assert_eq!(result.len(), 1);
         assert!(result.contains_key(&tag("valid", "tags")));
+        let tag_id = result[&tag("valid", "tags")];
+        assert_eq!(db.tag_cache.write().get(tag_id), Some(tag("valid", "tags")));
         assert_eq!(
             conn.query_row("SELECT count(*) FROM Tags", [], |row| row.get::<_, u64>(0))
                 .unwrap(),
@@ -5983,7 +6040,7 @@ mod tests {
                 .unwrap()
                 .id
                 .unwrap();
-        let tag_ids = MainDatabase::internal_tag_bulk_add(
+        let tag_ids = db.internal_tag_bulk_add(
             &conn,
             &[
                 file_action(TagOperation::Add, vec![plugin_tag("one", "a")]),
@@ -5995,7 +6052,7 @@ mod tests {
         let two_id = tag_ids[&tag("two", "b")];
         let relationships =
             HashSet::from([(file_id, one_id), (file_id, one_id), (file_id, two_id)]);
-        MainDatabase::internal_relationship_bulk_add(db.clone(), &conn, &relationships);
+        MainDatabase::internal_relationships_bulk_add(db.clone(), &conn, &relationships);
 
         assert_eq!(
             MainDatabase::internal_file_id_get_tag_ids(&conn, &file_id).unwrap(),
@@ -6058,7 +6115,7 @@ mod tests {
             let inserted = inserted.into_iter().next().unwrap();
             ids.insert(hash.to_string(), inserted.id.unwrap());
         }
-        let tags = MainDatabase::internal_tag_bulk_add(
+        let tags = db.internal_tag_bulk_add(
             &conn,
             &[
                 file_action(
@@ -6080,7 +6137,7 @@ mod tests {
         let blue = tags[&tag("blue", "color")];
         let round = tags[&tag("round", "shape")];
         let square = tags[&tag("square", "shape")];
-        MainDatabase::internal_relationship_bulk_add(
+        MainDatabase::internal_relationships_bulk_add(
             db.clone(),
             &conn,
             &HashSet::from([
@@ -6165,7 +6222,7 @@ mod tests {
                 .unwrap()
                 .id
                 .unwrap();
-        let tags = MainDatabase::internal_tag_bulk_add(
+        let tags = db.internal_tag_bulk_add(
             &conn,
             &[file_action(
                 TagOperation::Add,
@@ -6180,7 +6237,7 @@ mod tests {
         let keep_one = tags[&tag("keep-one", "test")];
         let keep_two = tags[&tag("keep-two", "test")];
         let excluded = tags[&tag("excluded", "test")];
-        MainDatabase::internal_relationship_bulk_add(
+        MainDatabase::internal_relationships_bulk_add(
             db.clone(),
             &conn,
             &HashSet::from([(file_id, keep_one), (file_id, keep_two)]),
@@ -6216,7 +6273,7 @@ mod tests {
             file_ids.insert(hash, file_id);
         }
 
-        let tags = MainDatabase::internal_tag_bulk_add(
+        let tags = db.internal_tag_bulk_add(
             &conn,
             &[file_action(
                 TagOperation::Add,
@@ -6232,7 +6289,7 @@ mod tests {
         let or_tag = tags[&tag("or", "test")];
         let not_tag = tags[&tag("not", "test")];
 
-        MainDatabase::internal_relationship_bulk_add(
+        MainDatabase::internal_relationships_bulk_add(
             db.clone(),
             &conn,
             &HashSet::from([
@@ -6310,7 +6367,7 @@ mod tests {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let tags = MainDatabase::internal_tag_bulk_add(
+        let tags = db.internal_tag_bulk_add(
             &conn,
             &[file_action(
                 TagOperation::Add,
@@ -6327,7 +6384,7 @@ mod tests {
         let female_e6 = tags[&tag("female", "e6")];
         let female_e6ai = tags[&tag("female", "e6ai")];
         let excluded = tags[&tag("excluded", "test")];
-        MainDatabase::internal_relationship_bulk_add(
+        MainDatabase::internal_relationships_bulk_add(
             db.clone(),
             &conn,
             &HashSet::from([
@@ -6366,7 +6423,7 @@ mod tests {
             );
         }
 
-        let tags = MainDatabase::internal_tag_bulk_add(
+        let tags = db.internal_tag_bulk_add(
             &conn,
             &[
                 file_action(
@@ -6382,7 +6439,7 @@ mod tests {
         );
         let popular = tags[&tag("popular", "cache")];
         let uncached = tags[&tag("uncached", "cache")];
-        MainDatabase::internal_relationship_bulk_add(
+        MainDatabase::internal_relationships_bulk_add(
             db.clone(),
             &conn,
             &HashSet::from([
@@ -6421,7 +6478,7 @@ mod tests {
     fn test_tag_search_resolves_typos_from_ram_and_sqlite() {
         let db = new_test();
         let conn = db.pool.get().unwrap();
-        let tags = MainDatabase::internal_tag_bulk_add(
+        let tags = db.internal_tag_bulk_add(
             &conn,
             &[
                 file_action(TagOperation::Add, vec![plugin_tag("red fox", "subject")]),
@@ -6464,7 +6521,7 @@ mod tests {
             (file_ids[3], female),
             (file_ids[4], female),
         ]);
-        MainDatabase::internal_relationship_bulk_add(db.clone(), &conn, &relationships);
+        MainDatabase::internal_relationships_bulk_add(db.clone(), &conn, &relationships);
 
         let popular = db.search_db_tags_fts("red fxo", &Some(1));
         assert_eq!(popular[0].tag_id, red_fox);
@@ -6647,7 +6704,7 @@ mod tests {
     fn test_tag_name_search_groups_same_names_across_namespaces() {
         let db = new_test();
         let conn = db.pool.get().unwrap();
-        let tags = MainDatabase::internal_tag_bulk_add(
+        let tags = db.internal_tag_bulk_add(
             &conn,
             &[
                 file_action(TagOperation::Add, vec![plugin_tag("female", "e6")]),
@@ -6668,7 +6725,7 @@ mod tests {
             );
             file_ids.push(inserted.into_iter().next().unwrap().id.unwrap());
         }
-        MainDatabase::internal_relationship_bulk_add(
+        MainDatabase::internal_relationships_bulk_add(
             db.clone(),
             &conn,
             &HashSet::from([
@@ -6947,6 +7004,34 @@ mod tests {
     }
 
     #[test]
+    fn test_jobs_get_torun_orders_priority_across_sites() {
+        let db = new_test();
+        let conn = db.pool.get().unwrap();
+
+        let mut low = job("low", 0, 0);
+        low.priority = 1;
+        let mut high = job("high", 0, 0);
+        high.priority = 100;
+        let mut middle = job("middle", 0, 0);
+        middle.priority = 50;
+
+        MainDatabase::internal_jobs_add(&conn, &low);
+        MainDatabase::internal_jobs_add(&conn, &high);
+        MainDatabase::internal_jobs_add(&conn, &middle);
+
+        let jobs = MainDatabase::internal_jobs_get_torun_chunk(
+            &conn,
+            vec!["low".into(), "high".into(), "middle".into()],
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].config.priority, 100);
+        assert_eq!(jobs[1].config.priority, 50);
+    }
+
+    #[test]
     fn test_parent_constraints_distinguish_limit_to() {
         let db = new_test();
         let conn = db.pool.get().unwrap();
@@ -6968,7 +7053,7 @@ mod tests {
                 limit.clone(),
             ],
         )];
-        let ids = MainDatabase::internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
+        let ids = db.internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
         let relation = TagParents {
             tag_id: ids[&child.tag],
             relate_tag_id: ids[&parent.tag],
