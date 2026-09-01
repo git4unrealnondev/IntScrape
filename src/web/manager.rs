@@ -477,10 +477,13 @@ impl Scraper {
                                             }
                                             Ok(None) => {
                                                 log::error!(
-                                                    "Worker: {} JobId: {} -- File: {:?} had None?? This shouldn't happen unless an error or bad data got in.",
+                                                    "Worker: {} JobId: {} -- File download did not complete: {}",
                                                     plugin_name,
                                                     job_id,
-                                                    file,
+                                                    file.source.as_ref().map_or("missing source", |source| match source {
+                                                        FileSource::Url(url) => url.as_str(),
+                                                        FileSource::Bytes(_) => "in-memory bytes",
+                                                    }),
                                                 );
                                             }
                                             Err(err) => {
@@ -969,6 +972,10 @@ impl Scraper {
         let should_exit = self.download_manager.should_exit.clone();
 
         if should_exit.load(Ordering::SeqCst) {
+            info!(
+                "Scraper: {} JobId: {} -- Skipping file because shutdown was requested.",
+                self.plugin.name, self.job.id
+            );
             return Ok(None);
         }
 
@@ -982,6 +989,10 @@ impl Scraper {
         // Skips downloading file IF we have tag x associated with file_id
         for skip in &file.skip_if {
             if should_exit.load(Ordering::SeqCst) {
+                info!(
+                    "Scraper: {} JobId: {} -- Skipping file because shutdown was requested.",
+                    self.plugin.name, self.job.id
+                );
                 return Ok(None);
             }
             if let SkipIf::FileTagRelationship(tag) = skip
@@ -1012,6 +1023,10 @@ impl Scraper {
                     );
                     return Ok(None);
                 }
+                info!(
+                    "Scraper: {} JobId: {} -- Skipping URL with no associated file: {}",
+                    self.plugin.name, self.job.id, file_url
+                );
                 let Some(file_internal) = source_status.file.as_ref() else {
                     return Ok(None);
                 };
@@ -1029,6 +1044,10 @@ impl Scraper {
         // Associates file hashes with a file object
         for hash in file.hash.iter() {
             if should_exit.load(Ordering::SeqCst) {
+                info!(
+                    "Scraper: {} JobId: {} -- Skipping file because shutdown was requested.",
+                    self.plugin.name, self.job.id
+                );
                 return Ok(None);
             }
             let db = self.download_manager.db.clone();
@@ -1055,7 +1074,13 @@ impl Scraper {
 
         // Download or fetch file via its disk path reference
         let temp_file = match file.source {
-            None => return Ok(None),
+            None => {
+                log::warn!(
+                    "Scraper: {} JobId: {} -- Skipping file with no source.",
+                    self.plugin.name, self.job.id
+                );
+                return Ok(None);
+            }
             Some(ref url_source) => {
                 match url_source {
                     FileSource::Url(file_url) => {
@@ -1069,6 +1094,10 @@ impl Scraper {
                                 TrackedFile::Temp(path_out)
                             } else {
                                 *download_issue = true;
+                                log::error!(
+                                    "Scraper: {} JobId: {} -- Download failed after retries: {}",
+                                    self.plugin.name, self.job.id, file_url
+                                );
                                 return Ok(None);
                             }
                         } else {
@@ -1085,6 +1114,10 @@ impl Scraper {
                     // to maintain identical architectural tracking shapes.
                     FileSource::Bytes(file_bytes) => {
                         if should_exit.load(Ordering::SeqCst) {
+                            info!(
+                                "Scraper: {} JobId: {} -- Skipping in-memory file because shutdown was requested.",
+                                self.plugin.name, self.job.id
+                            );
                             return Ok(None);
                         }
                         let mut temp_file = tempfile::NamedTempFile::new_in(temp_dir())?;
@@ -1113,7 +1146,13 @@ impl Scraper {
                 while !should_exit.load(Ordering::SeqCst) {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-            } => return Ok(None),
+            } => {
+                info!(
+                    "Scraper: {} JobId: {} -- Skipping file because shutdown was requested while waiting for processing.",
+                    self.plugin.name, self.job.id
+                );
+                return Ok(None);
+            }
         };
         let processing_pool = self.download_manager.heavy_processing_pool.clone();
         let db = self.download_manager.db.clone();
@@ -1239,12 +1278,22 @@ impl Scraper {
         let _ = tokio::fs::remove_file(&temp_file_path).await;
         let processed = match processed {
             Ok(Ok(processed)) => processed,
-            Ok(Err(_error)) if should_exit.load(Ordering::SeqCst) => return Ok(None),
+            Ok(Err(_error)) if should_exit.load(Ordering::SeqCst) => {
+                info!(
+                    "Scraper: {} JobId: {} -- Skipping file because shutdown was requested during processing.",
+                    self.plugin.name, self.job.id
+                );
+                return Ok(None);
+            }
             Ok(Err(error)) => return Err(error.into()),
             Err(error) => return Err(error.into()),
         };
 
         if should_exit.load(Ordering::SeqCst) {
+            info!(
+                "Scraper: {} JobId: {} -- Skipping processed file because shutdown was requested.",
+                self.plugin.name, self.job.id
+            );
             return Ok(None);
         }
 
@@ -1255,7 +1304,13 @@ impl Scraper {
 
         let storage_id = match storage_id_result {
             Some(id) => id,
-            None => return Ok(None),
+            None => {
+                log::error!(
+                    "Scraper: {} JobId: {} -- File processing completed without a storage location.",
+                    self.plugin.name, self.job.id
+                );
+                return Ok(None);
+            }
         };
 
         let file_manager = FileManager {
