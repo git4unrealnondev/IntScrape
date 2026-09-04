@@ -23,7 +23,7 @@ impl MainDatabase {
         let success = match job.config.site.as_str() {
             SYSTEM_DATABASE_BACKUP_SITE => self.run_backup_job(job).await,
             SYSTEM_DATABASE_SLURP_SITE => self.run_slurp_job(job).await,
-            SYSTEM_FILE_SIZE_SITE => match self.update_missing_file_sizes().await {
+            SYSTEM_FILE_SIZE_SITE => match self.clone().update_missing_file_sizes().await {
                 Ok(_) => true,
                 Err(error) => {
                     log::error!("File-size system job {} failed: {error}", job.id);
@@ -202,7 +202,7 @@ impl MainDatabase {
                          .iter()
                          .filter_map(|f| {
                             if let Some(file_path) =
-                                Self::internal_file_get_physical_path(&conn, f)
+                                MainDatabase::internal_file_get_physical_path(&conn, f)
                                     .ok()
                                     .flatten()
                             {

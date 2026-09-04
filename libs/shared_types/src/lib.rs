@@ -76,6 +76,7 @@ pub struct DbSettingsObj {
 pub enum DbSearchTypeEnum {
     And,
     Or,
+    Not,
 }
 #[derive(Deserialize, Debug, Serialize, bitcode::Encode, bitcode::Decode, Clone)]
 pub struct SearchObj {

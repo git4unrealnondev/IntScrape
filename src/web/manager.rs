@@ -407,6 +407,7 @@ impl Scraper {
                                 let existing_source_files = Arc::new(
                                     self.download_manager
                                         .db
+                                        .clone()
                                         .source_url_files_get(
                                             scraper_object
                                                 .files
@@ -996,7 +997,7 @@ impl Scraper {
                 return Ok(None);
             }
             if let SkipIf::FileTagRelationship(tag) = skip
-                && let Some(file_id) = self.download_manager.db.tag_get_file_id(tag).await
+                && let Some(file_id) = self.download_manager.db.clone().tag_get_file_id(tag).await
                 && let Some(file_internal) = self.download_manager.db.file_id_get(file_id).await
             {
                 info!(
@@ -1023,11 +1024,12 @@ impl Scraper {
                     );
                     return Ok(None);
                 }
-                info!(
-                    "Scraper: {} JobId: {} -- Skipping URL with no associated file: {}",
-                    self.plugin.name, self.job.id, file_url
-                );
+
                 let Some(file_internal) = source_status.file.as_ref() else {
+                    info!(
+                        "Scraper: {} JobId: {} -- Skipping URL with no associated file: {}",
+                        self.plugin.name, self.job.id, file_url
+                    );
                     return Ok(None);
                 };
                 info!(
@@ -1077,7 +1079,8 @@ impl Scraper {
             None => {
                 log::warn!(
                     "Scraper: {} JobId: {} -- Skipping file with no source.",
-                    self.plugin.name, self.job.id
+                    self.plugin.name,
+                    self.job.id
                 );
                 return Ok(None);
             }
@@ -1096,7 +1099,9 @@ impl Scraper {
                                 *download_issue = true;
                                 log::error!(
                                     "Scraper: {} JobId: {} -- Download failed after retries: {}",
-                                    self.plugin.name, self.job.id, file_url
+                                    self.plugin.name,
+                                    self.job.id,
+                                    file_url
                                 );
                                 return Ok(None);
                             }
@@ -1307,7 +1312,8 @@ impl Scraper {
             None => {
                 log::error!(
                     "Scraper: {} JobId: {} -- File processing completed without a storage location.",
-                    self.plugin.name, self.job.id
+                    self.plugin.name,
+                    self.job.id
                 );
                 return Ok(None);
             }

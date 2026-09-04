@@ -3,6 +3,7 @@ use log::info;
 use roaring::RoaringTreemap;
 use rusqlite::{Connection, params, params_from_iter};
 use rusqlite::{Error, OptionalExtension};
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -26,6 +27,7 @@ pub struct SearchQuery<'a> {
     limit: Option<u64>,
     and_search: Option<(DbSearchTypeEnum, &'a [u64])>,
     or_search: Option<(DbSearchTypeEnum, &'a [u64])>,
+    not_search: Option<(DbSearchTypeEnum, &'a [u64])>,
     sort: bool,
 }
 
@@ -38,6 +40,7 @@ impl<'a> SearchQuery<'a> {
             limit: None,
             and_search: None,
             or_search: None,
+            not_search: None,
             sort: false,
         }
     }
@@ -67,6 +70,12 @@ impl<'a> SearchQuery<'a> {
     #[must_use]
     pub const fn or_search(mut self, tag_ids: &'a [u64]) -> Self {
         self.or_search = Some((DbSearchTypeEnum::Or, tag_ids));
+
+        self
+    }
+    #[must_use]
+    pub const fn not_search(mut self, tag_ids: &'a [u64]) -> Self {
+        self.not_search = Some((DbSearchTypeEnum::Not, tag_ids));
 
         self
     }
@@ -166,7 +175,7 @@ impl RelationshipStorage {
             .unwrap();
         let mut stmt = tn.prepare(&format!(
             "SELECT CAST(file_id AS INTEGER), CAST(tag_id AS INTEGER) FROM {} ORDER BY file_id",
-            MainDatabase::relationship_union_source(tn, "r")
+            self.db.relationship_union_source(tn, "r")
         ))?;
         let rows = stmt
             .query_map([], |row| {
@@ -218,7 +227,7 @@ impl RelationshipStorage {
 
         let mut stmt = tn.prepare(&format!(
             "SELECT CAST(file_id AS INTEGER), CAST(tag_id AS INTEGER) FROM {} ORDER BY tag_id",
-            MainDatabase::relationship_union_source(tn, "r")
+            self.db.relationship_union_source(tn, "r")
         ))?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)))?;
 
@@ -249,6 +258,8 @@ impl RelationshipStorage {
         if let Some(tagid) = current_tagid {
             self.relationship_cache_add_tagid_sql(tn, tagid, &bitmap);
         }
+        // Rebuild both in-memory maps after regenerating the auxiliary roaring tables.
+        self.load_relationship_cache(tn);
         info!("Finished recaching roaring table");
         Ok(())
     }
@@ -294,12 +305,49 @@ impl RelationshipStorage {
         }
 
         if matches!(self.internal_cache, InternalCacheType::Full) {
-            if let Ok(mut stmt) =
+            let has_relationship_source = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'Namespace')",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap_or(false);
+
+            if has_relationship_source {
+                // The partitioned relationship tables are authoritative. Rebuild the reverse
+                // map from them so a partial or stale auxiliary roaring table cannot hide files.
+                let source = self.db.relationship_union_source(conn, "r");
+                if let Ok(mut stmt) = conn.prepare(&format!(
+                    "SELECT file_id, tag_id FROM {source} ORDER BY file_id"
+                )) && let Ok(rows) =
+                    stmt.query_map([], |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)))
+                {
+                    let mut current_file_id = None;
+                    let mut bitmap = RoaringTreemap::new();
+                    for (file_id, tag_id) in rows.flatten() {
+                        if current_file_id != Some(file_id) {
+                            if let Some(previous_file_id) = current_file_id {
+                                bitmap.optimize();
+                                self.file_id.insert(previous_file_id, bitmap.clone());
+                                bitmap.clear();
+                            }
+                            current_file_id = Some(file_id);
+                        }
+                        bitmap.insert(tag_id);
+                    }
+                    if let Some(file_id) = current_file_id {
+                        bitmap.optimize();
+                        self.file_id.insert(file_id, bitmap);
+                    }
+                }
+            } else if let Ok(mut stmt) =
                 conn.prepare("SELECT fileid, tagid_bitmap FROM RelationshipRoaringFileid")
                 && let Ok(rows) = stmt.query_map([], |row| {
                     Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
                 })
             {
+                // Keep the standalone roaring storage usable for callers that only provide the
+                // auxiliary cache tables and not the main application schema.
                 for (fileid, tagid_bitmap) in rows.flatten() {
                     if let Ok(mut bitmap) =
                         RoaringTreemap::deserialize_unchecked_from(Cursor::new(tagid_bitmap))
@@ -372,6 +420,7 @@ impl RelationshipStorage {
                 match search_type {
                     DbSearchTypeEnum::And => *current &= bitmap.as_ref(),
                     DbSearchTypeEnum::Or => *current |= bitmap.as_ref(),
+                    DbSearchTypeEnum::Not => *current ^= bitmap.as_ref(),
                 }
             } else {
                 result = Some(bitmap.into_owned());
@@ -388,7 +437,7 @@ impl RelationshipStorage {
     pub(in crate::db) fn relationship_search_tagid_roaring_in_memory(
         &self,
         file_id: u64,
-    ) -> Option<Vec<u64>> {
+    ) -> Option<HashSet<u64>> {
         if !matches!(self.internal_cache, InternalCacheType::Full) {
             return None;
         }
@@ -646,6 +695,13 @@ impl RelationshipStorage {
                     }
                 }
                 Some(acc)
+            }
+            DbSearchTypeEnum::Not => {
+                let mut first = bitmaps_iter.next()?.clone();
+                for b in bitmaps_iter {
+                    first ^= b;
+                }
+                Some(Cow::Owned(first))
             }
         }
     }

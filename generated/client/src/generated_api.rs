@@ -525,7 +525,7 @@ pub fn namespace_set_async(
     crate::init_data_request_async(crate::SupportedDBRequests::SetNamespace(namespace))
 }
 ///
-/// Searches the db for all file_ids that are related to the searchobj
+/// Human written tag searching layer
 ///
 pub fn search_db_files(
     search: SearchObj,
@@ -534,7 +534,7 @@ pub fn search_db_files(
     crate::init_data_request(crate::SupportedDBRequests::SearchFiles(search, limit))
 }
 ///
-/// Searches the db for all file_ids that are related to the searchobj
+/// Human written tag searching layer
 ///
 pub fn search_db_files_async(
     search: SearchObj,

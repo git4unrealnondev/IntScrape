@@ -5,31 +5,34 @@ use rusqlite::{Connection, params};
 use crate::db::MainDatabase;
 
 impl MainDatabase {
-    pub(in crate::db) fn internal_update_db_5_to_6(
+    pub fn internal_update_db_5_to_6(
+        &self,
         conn: &Connection,
     ) -> Result<(), r2d2_sqlite::rusqlite::Error> {
-        Self::internal_table_create_tag_search_fts_v6(conn)?;
-        Self::internal_db_version_set(conn, 6)
+        self.internal_table_create_tag_search_fts_v6(conn)?;
+        self.internal_db_version_set(conn, 6)
     }
 
     ///
     /// Updates the db from Version 1 to Version 2
     ///
-    pub(in crate::db) fn internal_update_db_1_to_2(
+    pub fn internal_update_db_1_to_2(
+        &self,
         conn: &Connection,
     ) -> Result<(), r2d2_sqlite::rusqlite::Error> {
-        Self::internal_table_create_dead_urls_v1(conn)?;
+        MainDatabase::internal_table_create_dead_urls_v1(conn)?;
 
-        Self::internal_db_version_set(conn, 2)?;
+        self.internal_db_version_set(conn, 2)?;
         Ok(())
     }
 
     /// Updates the db from Version 2 to Version 3.
-    pub(in crate::db) fn internal_update_db_2_to_3(
+    pub fn internal_update_db_2_to_3(
+        &self,
         conn: &Connection,
     ) -> Result<(), r2d2_sqlite::rusqlite::Error> {
-        Self::internal_table_create_audit_log_v3(conn)?;
-        Self::internal_setting_set(
+        self.internal_table_create_audit_log_v3(conn)?;
+        self.internal_setting_set(
             conn,
             &shared_types::DbSettingsObj {
                 name: "SYSTEM_audit_log_enabled".into(),
@@ -66,11 +69,12 @@ impl MainDatabase {
              FROM Relationship",
             [],
         )?;
-        Self::internal_db_version_set(conn, 3)
+        self.internal_db_version_set(conn, 3)
     }
 
     /// Updates the audited global relationship table to namespace partitions.
-    pub(in crate::db) fn internal_update_db_3_to_4(
+    pub fn internal_update_db_3_to_4(
+        &self,
         conn: &Connection,
     ) -> Result<(), r2d2_sqlite::rusqlite::Error> {
         conn.execute_batch(
@@ -84,15 +88,16 @@ impl MainDatabase {
              DROP TRIGGER IF EXISTS audit_parent_delete;
              DROP TABLE IF EXISTS AuditLog;",
         )?;
-        Self::internal_relationship_migrate_legacy(conn);
-        Self::internal_db_version_set(conn, 4)
+        self.internal_relationship_migrate_legacy(conn);
+        self.internal_db_version_set(conn, 4)
     }
 
     /// Upates from V4 to V5
-    pub(in crate::db) fn internal_update_db_4_to_5(
+    pub fn internal_update_db_4_to_5(
+        &self,
         conn: &Connection,
     ) -> Result<(), r2d2_sqlite::rusqlite::Error> {
-        Self::internal_table_create_file_hashes_v1(conn);
+        MainDatabase::internal_table_create_file_hashes_v1(conn);
 
         conn.execute("ALTER TABLE File ADD COLUMN size_bytes INTEGER;", [])?;
 
@@ -107,8 +112,8 @@ impl MainDatabase {
             ("FileHash-ImageHash", "ImageHash"),
             ("FileHash-IPFSCID", "IPFSCID"),
         ] {
-            if let Some(ns_id) = Self::internal_namespace_get_id(conn, ns_name) {
-                let relationship_table = Self::relationship_partition_name(ns_id);
+            if let Some(ns_id) = MainDatabase::internal_namespace_get_id(conn, ns_name) {
+                let relationship_table = self.relationship_partition_name(ns_id);
                 let query = format!(
                     "INSERT OR IGNORE INTO FileHashes (file_id, algorithm, digest)
                      SELECT MIN(r.file_id), ?1, t.name
@@ -122,9 +127,9 @@ impl MainDatabase {
             }
         }
 
-        Self::internal_namespace_bulk_delete(conn, &ns_ids_to_remove)?;
+        MainDatabase::internal_namespace_bulk_delete(conn, &ns_ids_to_remove)?;
 
-        let file_storage_map = Self::internal_file_storage_get_all(conn)?;
+        let file_storage_map = MainDatabase::internal_file_storage_get_all(conn)?;
         let mut files = conn.prepare(
             "SELECT id, hash, extension, storage_id
              FROM File
@@ -151,12 +156,12 @@ impl MainDatabase {
             };
             let mut path = file_storage_map
                 .get(&storage_id)
-                .and_then(|base_path| Self::get_file_location(&file, base_path));
+                .and_then(|base_path| MainDatabase::get_file_location(&file, base_path));
             if path.is_none() {
                 path = file_storage_map
                     .iter()
                     .filter(|(storage, _)| **storage != storage_id)
-                    .find_map(|(_, base_path)| Self::get_file_location(&file, base_path));
+                    .find_map(|(_, base_path)| MainDatabase::get_file_location(&file, base_path));
             }
             if let Some(path) = path
                 && let Ok(metadata) = fs::metadata(path)
@@ -165,6 +170,6 @@ impl MainDatabase {
             }
         }
 
-        Self::internal_db_version_set(conn, 5)
+        self.internal_db_version_set(conn, 5)
     }
 }

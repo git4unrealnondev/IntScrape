@@ -3,6 +3,7 @@ use parking_lot::{Mutex, RwLock};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::{SqliteConnectionManager, rusqlite::Connection};
 use rayon::ThreadPool;
+use shared_types::{DbSettingsObj, Tag};
 use std::{
     collections::{HashMap, VecDeque},
     path::Path,
@@ -44,6 +45,7 @@ pub struct MainDatabase {
     pool: Pool<SqliteConnectionManager>,
     writer_conn: Arc<Mutex<PooledConnection<SqliteConnectionManager>>>,
     namespace_cache: Arc<RwLock<HashMap<String, u64>>>,
+    setting_cache: Arc<RwLock<HashMap<String, DbSettingsObj>>>,
     tag_cache: Arc<RwLock<TagCache>>,
     tag_search_cache: Arc<RwLock<TagSearchCache>>,
     cache_type: Arc<RwLock<CacheType>>,
@@ -137,7 +139,7 @@ impl MainDatabase {
         should_exit: Arc<AtomicBool>,
     ) -> Arc<Self> {
         let manager = SqliteConnectionManager::file(db_path).with_init(|c| {
-            /*  c.trace(Some(|statement: &str| {
+            /*c.trace(Some(|statement: &str| {
                 log::info!("Executing SQL: {}", statement);
             }));*/
             // Bound genuine lockups without turning ordinary writer contention
@@ -166,6 +168,7 @@ PRAGMA cache_size = -64000;
         let main_db: Arc<Self> = Self {
             pool,
             namespace_cache: Arc::new(RwLock::new(HashMap::new())),
+            setting_cache: Arc::new(RwLock::new(HashMap::new())),
             tag_cache: Arc::new(RwLock::new(TagCache::new())),
             tag_search_cache: Arc::new(RwLock::new(TagSearchCache::default())),
             cache_type: Arc::new(RwLock::new(CacheType::Bare)),
@@ -231,8 +234,54 @@ PRAGMA cache_size = -64000;
             })
             .unwrap();
         let mut cache = self.namespace_cache.write();
+        // Used for tag cache
+        let mut reverse_cache = HashMap::new();
+
         for namespace in namespaces.flatten() {
+            reverse_cache.insert(namespace.0, namespace.1.clone());
             cache.insert(namespace.1, namespace.0);
+        }
+
+        // Loads initial tag cache
+        let mut cache_cache = self.tag_cache.write();
+        let mut stmt = conn
+            .prepare("SELECT id, name, namespace FROM High_Value_Tags LIMIT ?1;")
+            .unwrap();
+
+        let loaded_caches = stmt
+            .query_map([TAG_CACHE_LIMIT], |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
+                ))
+            })
+            .unwrap();
+
+        for (tag_id, name, tag_namespace_id) in loaded_caches.flatten() {
+            if let Some(namespace_name) = reverse_cache.get(&tag_namespace_id) {
+                cache_cache.insert(
+                    tag_id,
+                    Tag {
+                        name,
+                        namespace: shared_types::GenericNamespaceObj {
+                            name: namespace_name.clone(),
+                            description: None,
+                        },
+                    },
+                );
+            }
+        }
+
+        let mut stmt = conn
+            .prepare("SELECT name, description, num, param FROM Settings;")
+            .unwrap();
+
+        let obj = serde_rusqlite::from_rows::<shared_types::DbSettingsObj>(stmt.raw_query());
+
+        let mut setting_cache = self.setting_cache.write();
+        for setting in obj.flatten() {
+            setting_cache.insert(setting.name.clone(), setting);
         }
     }
 
@@ -242,8 +291,7 @@ PRAGMA cache_size = -64000;
         let mut conn = pool.transaction().unwrap();
 
         loop {
-            if let Ok(Some(db_version_setting)) =
-                Self::internal_setting_get(&conn, "SYSTEM_VERSION")
+            if let Ok(Some(db_version_setting)) = self.internal_setting_get(&conn, "SYSTEM_VERSION")
             {
                 if let Some(db_version_local) = db_version_setting.num {
                     if db_version_local != DB_VERSION {
@@ -252,11 +300,11 @@ PRAGMA cache_size = -64000;
                         );
 
                         match db_version_local {
-                            1 => Self::internal_update_db_1_to_2(&conn)?,
-                            2 => Self::internal_update_db_2_to_3(&conn)?,
-                            3 => Self::internal_update_db_3_to_4(&conn)?,
-                            4 => Self::internal_update_db_4_to_5(&conn)?,
-                            5 => Self::internal_update_db_5_to_6(&conn)?,
+                            1 => self.internal_update_db_1_to_2(&conn)?,
+                            2 => self.internal_update_db_2_to_3(&conn)?,
+                            3 => self.internal_update_db_3_to_4(&conn)?,
+                            4 => self.internal_update_db_4_to_5(&conn)?,
+                            5 => self.internal_update_db_5_to_6(&conn)?,
                             _ => break,
                         }
                         conn.commit()?;
@@ -274,18 +322,19 @@ PRAGMA cache_size = -64000;
 
         // Ensure additive schema changes are applied to databases already at the
         // current version as well as databases upgraded through a version step.
-        Self::internal_table_create_relationship_v1(&conn);
-        Self::internal_table_create_tag_search_fts_v6(&conn).unwrap();
-        Self::internal_file_download_location_set_default(&conn).unwrap();
+        self.internal_table_create_relationship_v1(&conn);
+        self.internal_table_create_tag_search_fts_v6(&conn).unwrap();
+        self.internal_file_download_location_set_default(&conn)
+            .unwrap();
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_jobs_ready_priority
              ON Jobs (site, is_running, priority DESC, time, id);",
         )?;
 
         // Resetting is_running to false
-        Self::internal_jobs_reset_isrunning(&conn).unwrap();
+        MainDatabase::internal_jobs_reset_isrunning(&conn).unwrap();
 
-        Self::internal_load_caching(self.clone(), &conn);
+        self.internal_load_caching(&conn);
 
         conn.commit().unwrap();
 
@@ -296,25 +345,25 @@ PRAGMA cache_size = -64000;
     /// Creates the initial version of the DB at the file location
     ///
     fn create_initial_db(&self, conn: &Connection) -> Result<(), r2d2_sqlite::rusqlite::Error> {
-        Self::internal_table_create_namespace_v1(conn);
-        Self::internal_table_create_tags_v1(conn);
+        MainDatabase::internal_table_create_namespace_v1(conn);
+        self.internal_table_create_tags_v1(conn);
 
         // Added in DB Version 2
-        Self::internal_table_create_dead_urls_v1(conn)?;
+        MainDatabase::internal_table_create_dead_urls_v1(conn)?;
 
-        Self::internal_table_create_relationship_v1(conn);
-        Self::internal_table_create_parents_v1(conn);
+        self.internal_table_create_relationship_v1(conn);
+        MainDatabase::internal_table_create_parents_v1(conn);
 
-        Self::internal_table_create_settings_v1(conn);
+        MainDatabase::internal_table_create_settings_v1(conn);
 
-        Self::internal_table_create_file_storage_locations_v1(conn);
-        Self::internal_table_create_file_v2(conn);
-        Self::internal_table_create_file_hashes_v1(conn);
+        MainDatabase::internal_table_create_file_storage_locations_v1(conn);
+        MainDatabase::internal_table_create_file_v2(conn);
+        MainDatabase::internal_table_create_file_hashes_v1(conn);
 
-        Self::internal_table_create_jobs_v1(conn);
+        MainDatabase::internal_table_create_jobs_v1(conn);
         RelationshipStorage::internal_table_relationship_cache_create_v1(conn);
-        Self::internal_db_version_set(conn, DB_VERSION)?;
-        Self::internal_setting_set(
+        self.internal_db_version_set(conn, DB_VERSION)?;
+        self.internal_setting_set(
             conn,
             &shared_types::DbSettingsObj {
                 name: "SYSTEM_API_URL".into(),
@@ -324,7 +373,7 @@ PRAGMA cache_size = -64000;
             },
         )
         .unwrap();
-        Self::internal_setting_set(
+        self.internal_setting_set(
             conn,
             &shared_types::DbSettingsObj {
                 name: "SYSTEM_DEFAULT_USER_AGENT".into(),
@@ -335,7 +384,7 @@ PRAGMA cache_size = -64000;
                 param: Some("IntScrape V1.0".into()),
             },
         )?;
-        Self::internal_setting_set(
+        self.internal_setting_set(
             conn,
             &shared_types::DbSettingsObj {
                 name: "SYSTEM_audit_log_enabled".into(),
@@ -345,7 +394,7 @@ PRAGMA cache_size = -64000;
             },
         )?;
 
-        Self::internal_setting_set(
+        self.internal_setting_set(
             conn,
             &shared_types::DbSettingsObj {
                 name: "SYSTEM_tag_count_popular_division".into(),
@@ -356,7 +405,7 @@ PRAGMA cache_size = -64000;
                 param: None,
             },
         )?;
-        Self::internal_setting_set(
+        self.internal_setting_set(
             conn,
             &shared_types::DbSettingsObj {
                 name: "SYSTEM_tag_count_popular_division_old".into(),
@@ -367,7 +416,7 @@ PRAGMA cache_size = -64000;
                 param: None,
             },
         )?;
-        Self::internal_setup_default_cache(conn);
+        self.internal_setup_default_cache(conn);
         Ok(())
     }
 }
