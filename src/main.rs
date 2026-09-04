@@ -155,7 +155,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 }
                 // Claim the job before spawning it. This prevents the next
                 // polling pass from launching a duplicate maintenance run.
-                db_spawn.job_set_is_running(job).await;
+                if !db_spawn.job_set_is_running(job).await {
+                    log::error!(
+                        "Skipping system job {} because it could not be claimed",
+                        job.id
+                    );
+                    continue;
+                }
                 active_system_jobs_clone.fetch_add(1, Ordering::SeqCst);
                 let db = db_spawn.clone();
                 let active_system_jobs = active_system_jobs_clone.clone();

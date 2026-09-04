@@ -1759,7 +1759,11 @@ impl DownloadsManager {
                 let job_permit = job_limiter.acquire_owned().await;
 
                 info!("DownloadManager: Setting job {} to running status.", job.id);
-                self.db.job_set_is_running(&job).await;
+                if !self.db.job_set_is_running(&job).await {
+                    log::error!("Skipping job {} because it could not be claimed", job.id);
+                    drop(job_permit);
+                    continue;
+                }
 
                 let job_id = job.id;
                 let scraper_name = scraper_name.clone();

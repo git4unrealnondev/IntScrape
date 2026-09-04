@@ -259,7 +259,11 @@ impl MainDatabase {
                             continue;
                         }
 
-                        let mut writer = writer_conn_clone.lock();
+                        let Some(mut writer) = writer_conn_clone
+                            .try_lock_for(std::time::Duration::from_secs(5))
+                        else {
+                            return Err(Box::new(rusqlite::Error::ExecuteReturnedResults));
+                        };
                         let conn = writer.transaction()?;
 
                         let placeholders: String = pending_list
@@ -418,7 +422,12 @@ impl MainDatabase {
         if candidates.is_empty() {
             return Ok(0);
         }
-        let mut writer = self.writer_conn.lock();
+        let Some(mut writer) = self
+            .writer_conn
+            .try_lock_for(std::time::Duration::from_secs(5))
+        else {
+            return Err(rusqlite::Error::ExecuteReturnedResults);
+        };
         let tx = writer.transaction()?;
         for (file_id, algorithm, digest) in candidates {
             Self::internal_file_hash_add(&tx, &algorithm, &digest, &file_id)?;

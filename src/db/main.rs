@@ -718,13 +718,22 @@ impl MainDatabase {
     /// Recaches db internally
     ///
     pub fn recache_roaring_db(&self) {
-        let mut write_guard = self.writer_conn.lock();
+        let Some(mut write_guard) = self
+            .writer_conn
+            .try_lock_for(std::time::Duration::from_secs(5))
+        else {
+            log::error!("Timed out waiting for the database writer while recaching relationships");
+            return;
+        };
         // Mutation paths acquire writer_conn before this cache lock.
         let mut roaring_guard = self.relationship_roaring_storage.write();
         if let Some(roaring) = roaring_guard.as_mut() {
             let conn = write_guard.transaction().unwrap();
             roaring.recache_roaring(&conn).unwrap();
-            conn.commit().unwrap();
+            if let Err(error) = conn.commit() {
+                log::error!("Failed to commit relationship recache transaction: {error}");
+                return;
+            }
         }
     }
 
@@ -1716,7 +1725,13 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
     pub fn file_relationship_tags_add_sync(&self, file_id: &u64, tag: &[FileTagAction]) -> bool {
         let started = std::time::Instant::now();
         let lock_started = std::time::Instant::now();
-        let mut guard = self.writer_conn.lock();
+        let Some(mut guard) = self
+            .writer_conn
+            .try_lock_for(std::time::Duration::from_secs(5))
+        else {
+            log::error!("Timed out waiting for the database writer while adding relationships");
+            return false;
+        };
         let writer_lock_elapsed = lock_started.elapsed();
         let transaction_started = std::time::Instant::now();
         let conn = guard.transaction().unwrap();
@@ -1759,7 +1774,13 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
             return true;
         }
 
-        let mut guard = self.writer_conn.lock();
+        let Some(mut guard) = self
+            .writer_conn
+            .try_lock_for(std::time::Duration::from_secs(5))
+        else {
+            log::error!("Timed out waiting for the database writer while adding tag actions");
+            return false;
+        };
         let Ok(conn) = guard.transaction() else {
             return false;
         };
@@ -1780,7 +1801,15 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
             return true;
         }
 
-        let mut guard = self.writer_conn.lock();
+        let Some(mut guard) = self
+            .writer_conn
+            .try_lock_for(std::time::Duration::from_secs(5))
+        else {
+            log::error!(
+                "Timed out waiting for the database writer while adding bulk relationships"
+            );
+            return false;
+        };
         let conn = match guard.transaction() {
             Ok(conn) => conn,
             Err(error) => {
@@ -2561,8 +2590,7 @@ SELECT DISTINCT file_id FROM {} WHERE tag_id in (
         conn.execute(
             "UPDATE Jobs SET is_running = true WHERE id IS ?1;",
             params![job_id],
-        )
-        .unwrap();
+        )?;
 
         Ok(())
     }
@@ -2771,7 +2799,13 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
                 "source must be a file".into(),
             ));
         }
-        let conn = self.writer_conn.lock();
+        let Some(conn) = self
+            .writer_conn
+            .try_lock_for(std::time::Duration::from_secs(5))
+        else {
+            log::error!("Timed out waiting for the database writer while slurping database");
+            return Err(rusqlite::Error::ExecuteReturnedResults);
+        };
         let source = source.to_string_lossy();
         conn.execute("ATTACH DATABASE ?1 AS slurp_source", [source.as_ref()])?;
         let result = self.internal_db_slurp_attached(&conn);
@@ -3942,7 +3976,13 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     ///
     #[ipc(name = "dead_url_add", request = "AddDeadUrl")]
     pub fn dead_url_add_sync(&self, dead_url: &String) -> bool {
-        let mut writer_conn = self.writer_conn.lock();
+        let Some(mut writer_conn) = self
+            .writer_conn
+            .try_lock_for(std::time::Duration::from_secs(5))
+        else {
+            log::error!("Timed out waiting for the database writer while adding dead URL");
+            return false;
+        };
         let conn = writer_conn.transaction().unwrap();
         let _ = self.internal_dead_url_add(&conn, dead_url);
         let _ = conn.commit();
@@ -4034,11 +4074,22 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         let writer_conn = self.writer_conn.clone();
 
         tokio::task::spawn_blocking(move || {
-            let mut writer_lock_guard = writer_conn.lock();
+            let Some(mut writer_lock_guard) =
+                writer_conn.try_lock_for(std::time::Duration::from_secs(5))
+            else {
+                log::error!(
+                    "Timed out waiting for the database writer while processing scraper results"
+                );
+                return;
+            };
 
-            let conn = writer_lock_guard
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .unwrap();
+            let conn = match writer_lock_guard.transaction() {
+                Ok(conn) => conn,
+                Err(error) => {
+                    log::error!("Failed to begin scraper persistence transaction: {error}");
+                    return;
+                }
+            };
 
             'ScraperLoop: for scraperdatareturn in jobs {
                 for skip_conditions in scraperdatareturn.skip_conditions {
@@ -4235,7 +4286,13 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         let database = Arc::new(self.clone());
         let writer_conn = self.writer_conn.clone();
         tokio::task::spawn_blocking(move || {
-            let mut pool = writer_conn.lock();
+            let Some(mut pool) = writer_conn.try_lock_for(std::time::Duration::from_secs(5)) else {
+                log::error!(
+                    "Timed out waiting for the database writer while updating job {}",
+                    job.id
+                );
+                return;
+            };
             let conn = match pool.transaction() {
                 Ok(c) => c,
                 Err(e) => {
@@ -4353,7 +4410,10 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 drop(files);
                 drop(conn);
 
-                let mut writer = writer_conn.lock();
+            let Some(mut writer) = writer_conn.try_lock_for(std::time::Duration::from_secs(5)) else {
+                log::error!("Timed out waiting for the database writer while updating file sizes");
+                return Err(rusqlite::Error::ExecuteReturnedResults);
+            };
                 let tx = writer.transaction()?;
                 {
                     let mut update = tx.prepare("UPDATE File SET size_bytes = ?1 WHERE id = ?2")?;
@@ -4555,7 +4615,13 @@ SELECT id, name, namespace FROM High_Value_Tags;",
 
         tokio::task::spawn_blocking(move || {
             let self_clone = self.clone();
-            let mut writer_conn = self_clone.writer_conn.lock();
+            let Some(mut writer_conn) = self_clone
+                .writer_conn
+                .try_lock_for(std::time::Duration::from_secs(5))
+            else {
+                log::error!("Timed out waiting for the database writer while adding relationships");
+                return;
+            };
             let conn = writer_conn.transaction().unwrap();
             Self::internal_audit_context_set(&conn, "relationship added").unwrap();
             self.internal_relationships_bulk_add(&conn, &rel_list);
@@ -4574,7 +4640,15 @@ SELECT id, name, namespace FROM High_Value_Tags;",
 
         tokio::task::spawn_blocking(move || {
             let self_clone = self.clone();
-            let mut writer_conn = self_clone.writer_conn.lock();
+            let Some(mut writer_conn) = self_clone
+                .writer_conn
+                .try_lock_for(std::time::Duration::from_secs(5))
+            else {
+                log::error!(
+                    "Timed out waiting for the database writer while deleting relationships"
+                );
+                return;
+            };
             let conn = writer_conn.transaction().unwrap();
             Self::internal_audit_context_set(&conn, "relationship removed").unwrap();
             self.internal_relationship_bulk_delete(&conn, &rel_list);
@@ -4616,7 +4690,13 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     #[must_use]
     #[ipc(name = "namespace_set", request = "SetNamespace")]
     pub fn namespace_add_sync(&self, namespace: &GenericNamespaceObj) -> u64 {
-        let mut guard = self.writer_conn.lock();
+        let Some(mut guard) = self
+            .writer_conn
+            .try_lock_for(std::time::Duration::from_secs(5))
+        else {
+            log::error!("Timed out waiting for the database writer while adding namespace");
+            return 0;
+        };
         let conn = guard.transaction().unwrap();
         let out = self.internal_namespace_get_or_create(&conn, namespace);
         conn.commit().unwrap();
@@ -5251,11 +5331,33 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     #[must_use]
     #[ipc(name = "setting_set", request = "SettingsSet")]
     pub fn setting_set_sync(&self, obj: &DbSettingsObj) -> bool {
-        let mut writer_conn = self.writer_conn.lock();
-        if let Ok(conn) = writer_conn.transaction() {
-            let _ = self.internal_setting_set(&conn, obj);
-
-            conn.commit();
+        let Some(mut writer_conn) = self
+            .writer_conn
+            .try_lock_for(std::time::Duration::from_secs(5))
+        else {
+            log::error!(
+                "Timed out waiting for the database writer while setting {}",
+                obj.name
+            );
+            return false;
+        };
+        let conn = match writer_conn.transaction() {
+            Ok(conn) => conn,
+            Err(error) => {
+                log::error!(
+                    "Failed to begin setting transaction for {}: {error}",
+                    obj.name
+                );
+                return false;
+            }
+        };
+        if let Err(error) = self.internal_setting_set(&conn, obj) {
+            log::error!("Failed to set setting {}: {error}", obj.name);
+            return false;
+        }
+        if let Err(error) = conn.commit() {
+            log::error!("Failed to commit setting {}: {error}", obj.name);
+            return false;
         }
         false
     }
@@ -5274,22 +5376,50 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     ///
     /// Sets a job to be running inside of the db
     ///
-    pub async fn job_set_is_running(&self, job: &DbJobsObj) {
+    pub async fn job_set_is_running(&self, job: &DbJobsObj) -> bool {
         let job_id = job.id;
         let database = self.clone();
         let writer_conn = self.writer_conn.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            let mut writer_lock_guard = writer_conn.lock();
-            let tn = writer_lock_guard
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .unwrap();
-            let status = database.internal_jobs_set_isrunning(&tn, job_id).is_ok();
+        tokio::task::spawn_blocking(move || {
+            let lock_started = std::time::Instant::now();
+            let Some(mut writer_lock_guard) =
+                writer_conn.try_lock_for(std::time::Duration::from_secs(5))
+            else {
+                log::error!(
+                    "Timed out waiting for the database writer while claiming job {job_id}"
+                );
+                return false;
+            };
 
-            tn.commit().unwrap();
+            let lock_elapsed = lock_started.elapsed();
+            let transaction_started = std::time::Instant::now();
+            // A deferred transaction avoids taking SQLite's writer lock until
+            // the small UPDATE below actually needs it.
+            let transaction = match writer_lock_guard.transaction() {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    log::error!("Failed to begin transaction while claiming job {job_id} after waiting {lock_elapsed:?}: {error}");
+                    return false;
+                }
+            };
 
-            status
+            if let Err(error) = database.internal_jobs_set_isrunning(&transaction, job_id) {
+                log::error!("Failed to mark job {job_id} as running: {error}");
+                return false;
+            }
+
+            if let Err(error) = transaction.commit() {
+                log::error!("Failed to commit running status for job {job_id} after transaction setup {transaction_started:?}: {error}");
+                return false;
+            }
+
+            true
         })
-        .await;
+        .await
+        .unwrap_or_else(|error| {
+            log::error!("Job {job_id} status task failed: {error}");
+            false
+        })
     }
 
     ///
@@ -5300,14 +5430,32 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         let database = self.clone();
         let writer_conn = self.writer_conn.clone();
         tokio::task::spawn_blocking(move || {
-            let mut writer_lock_guard = writer_conn.lock();
-            let tn = writer_lock_guard
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .unwrap();
-            let status = database.internal_job_remove(&tn, job_id).is_ok();
-
-            tn.commit().unwrap();
-            status
+            let Some(mut writer_lock_guard) =
+                writer_conn.try_lock_for(std::time::Duration::from_secs(5))
+            else {
+                log::error!(
+                    "Timed out waiting for the database writer while removing job {job_id}"
+                );
+                return false;
+            };
+            let tn = match writer_lock_guard.transaction() {
+                Ok(tn) => tn,
+                Err(error) => {
+                    log::error!("Failed to begin removal transaction for job {job_id}: {error}");
+                    return false;
+                }
+            };
+            if let Err(error) = database.internal_job_remove(&tn, job_id) {
+                log::error!("Failed to remove job {job_id}: {error}");
+                return false;
+            }
+            match tn.commit() {
+                Ok(()) => true,
+                Err(error) => {
+                    log::error!("Failed to commit removal of job {job_id}: {error}");
+                    false
+                }
+            }
         })
         .await
         .unwrap();
@@ -5382,10 +5530,25 @@ SELECT id, name, namespace FROM High_Value_Tags;",
     #[must_use]
     #[ipc(name = "jobs_add_single", request = "JobsAddSingle")]
     pub fn jobs_add_single_sync(&self, job: PluginJob) -> u64 {
-        let mut writer_conn = self.writer_conn.lock();
-        let conn = writer_conn.transaction().unwrap();
+        let Some(mut writer_conn) = self
+            .writer_conn
+            .try_lock_for(std::time::Duration::from_secs(5))
+        else {
+            log::error!("Timed out waiting for the database writer while adding a job");
+            return 0;
+        };
+        let conn = match writer_conn.transaction() {
+            Ok(conn) => conn,
+            Err(error) => {
+                log::error!("Failed to begin job insertion transaction: {error}");
+                return 0;
+            }
+        };
         let out = self.internal_jobs_add(&conn, &job);
-        conn.commit().unwrap();
+        if let Err(error) = conn.commit() {
+            log::error!("Failed to commit job insertion: {error}");
+            return 0;
+        }
         out
     }
     /*
@@ -5430,14 +5593,26 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         tokio::task::spawn_blocking(move || {
             let out_tags;
             {
-                let mut writer_lock_guard = writer_conn.lock();
-                let tn = writer_lock_guard
-                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                    .unwrap();
+                let Some(mut writer_lock_guard) =
+                    writer_conn.try_lock_for(std::time::Duration::from_secs(5))
+                else {
+                    log::error!("Timed out waiting for the database writer while adding tags");
+                    return HashMap::new();
+                };
+                let tn = match writer_lock_guard.transaction() {
+                    Ok(tn) => tn,
+                    Err(error) => {
+                        log::error!("Failed to begin tag insertion transaction: {error}");
+                        return HashMap::new();
+                    }
+                };
                 Self::internal_audit_context_set(&tn, &audit_reason).unwrap();
                 out_tags = database.internal_tag_bulk_add(&tn, &tags_owned, plugin_manager.clone());
 
-                tn.commit().unwrap();
+                if let Err(error) = tn.commit() {
+                    log::error!("Failed to commit tag insertion: {error}");
+                    return HashMap::new();
+                }
             }
             out_tags
         })
@@ -5459,14 +5634,25 @@ SELECT id, name, namespace FROM High_Value_Tags;",
 
         let tags_owned = tags.clone();
         tokio::task::spawn_blocking(move || {
-            let mut writer_lock_guard = writer_conn.lock();
-
-            let tn = writer_lock_guard
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .unwrap();
+            let Some(mut writer_lock_guard) =
+                writer_conn.try_lock_for(std::time::Duration::from_secs(5))
+            else {
+                log::error!("Timed out waiting for the database writer while adding files");
+                return HashSet::new();
+            };
+            let tn = match writer_lock_guard.transaction() {
+                Ok(tn) => tn,
+                Err(error) => {
+                    log::error!("Failed to begin file insertion transaction: {error}");
+                    return HashSet::new();
+                }
+            };
             let out_tags = self.internal_file_bulk_add(&tn, tags_owned);
 
-            tn.commit().unwrap();
+            if let Err(error) = tn.commit() {
+                log::error!("Failed to commit file insertion: {error}");
+                return HashSet::new();
+            }
             out_tags
         })
         .await

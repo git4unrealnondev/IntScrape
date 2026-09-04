@@ -142,15 +142,15 @@ impl MainDatabase {
             /*c.trace(Some(|statement: &str| {
                 log::info!("Executing SQL: {}", statement);
             }));*/
-            // Bound genuine lockups without turning ordinary writer contention
-            // into an immediate database failure.
-            c.busy_timeout(Duration::from_secs(30))?;
+            // Do not let a blocked writer stall the scheduler for minutes when
+            // several requests queue behind the same SQLite file.
+            c.busy_timeout(Duration::from_secs(5))?;
             c.execute_batch(
                 "
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
- PRAGMA busy_timeout = 30000;
+ PRAGMA busy_timeout = 5000;
 PRAGMA cache_size = -64000;
 ",
             )
@@ -191,7 +191,10 @@ PRAGMA cache_size = -64000;
     /// Manages the DB shutdown
     ///
     pub fn shutdown(&self) {
-        let guard = self.writer_conn.lock();
+        let Some(guard) = self.writer_conn.try_lock_for(Duration::from_secs(5)) else {
+            log::error!("Timed out waiting for the database writer during shutdown");
+            return;
+        };
 
         if let Err(e) = guard.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
             log::error!("Failed to checkpoint WAL file during drop: {e:?}");
@@ -209,7 +212,9 @@ PRAGMA cache_size = -64000;
         let temporary = destination.with_extension("backup.tmp");
         let _ = std::fs::remove_file(&temporary);
         let temporary_string = temporary.to_string_lossy().into_owned();
-        let guard = self.writer_conn.lock();
+        let Some(guard) = self.writer_conn.try_lock_for(Duration::from_secs(5)) else {
+            return Err(r2d2_sqlite::rusqlite::Error::ExecuteReturnedResults);
+        };
         guard.execute(
             "VACUUM INTO ?1",
             r2d2_sqlite::rusqlite::params![temporary_string],
