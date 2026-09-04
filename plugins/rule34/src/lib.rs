@@ -114,9 +114,28 @@ pub fn url_dump(
 #[unsafe(no_mangle)]
 pub fn parser_call(
     text_input: &str,
-    _source_url: &str,
+    source_url: &str,
     scraperdata: &shared_types::ScraperDataReturn,
 ) -> Vec<shared_types::ScraperReturn> {
+    if scraperdata
+        .job
+        .user_data
+        .contains_key("INTSCRAPE_REDOWNLOAD")
+    {
+        let Some(hash) = scraperdata.job.user_data.get("INTSCRAPE_REDOWNLOAD_HASH") else {
+            return vec![ScraperReturn::Nothing];
+        };
+        let file = FileObject {
+            source: Some(FileSource::Url(source_url.to_string())),
+            hash: vec![HashesSupported::Sha512(hash.clone())],
+            ..Default::default()
+        };
+        return vec![ScraperReturn::Data(shared_types::ScraperObject {
+            files: HashSet::from([file]),
+            ..Default::default()
+        })];
+    }
+
     let recursion = scraperdata
         .job
         .user_data

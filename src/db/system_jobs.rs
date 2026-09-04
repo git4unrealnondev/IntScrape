@@ -10,7 +10,8 @@ use strum::IntoEnumIterator;
 
 use super::{
     MainDatabase, SYSTEM_DATABASE_BACKUP_SITE, SYSTEM_DATABASE_SLURP_SITE, SYSTEM_FILE_HASH_SITE,
-    SYSTEM_FILE_SIZE_SITE, SYSTEM_STORAGE_CHECK_FILENAME_MODE, SYSTEM_STORAGE_CHECK_SITE,
+    SYSTEM_FILE_SIZE_SITE, SYSTEM_STORAGE_CHECK_FILENAME_MODE,
+    SYSTEM_STORAGE_CHECK_REDOWNLOAD_MODE, SYSTEM_STORAGE_CHECK_SITE,
 };
 
 impl MainDatabase {
@@ -43,6 +44,11 @@ impl MainDatabase {
                         if mode == SYSTEM_STORAGE_CHECK_FILENAME_MODE =>
                     {
                         crate::cli::cli_structs::CheckFilesEnum::StorageCheckFileName
+                    }
+                    Some(ScraperParam::Normal(mode))
+                        if mode == SYSTEM_STORAGE_CHECK_REDOWNLOAD_MODE =>
+                    {
+                        crate::cli::cli_structs::CheckFilesEnum::Redownload
                     }
                     _ => crate::cli::cli_structs::CheckFilesEnum::StorageCheck,
                 };

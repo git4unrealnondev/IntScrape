@@ -33,6 +33,7 @@ pub const SYSTEM_FILE_SIZE_SITE: &str = "SYSTEM_FILE_SIZE";
 pub const SYSTEM_FILE_HASH_SITE: &str = "SYSTEM_FILE_HASH";
 pub const SYSTEM_STORAGE_CHECK_SITE: &str = "SYSTEM_STORAGE_CHECK";
 pub const SYSTEM_STORAGE_CHECK_FILENAME_MODE: &str = "filename";
+pub const SYSTEM_STORAGE_CHECK_REDOWNLOAD_MODE: &str = "redownload";
 
 pub enum CacheType {
     // Will be use to query the DB directly. No caching. DEFAULT OPTION

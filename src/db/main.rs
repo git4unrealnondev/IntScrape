@@ -2657,22 +2657,27 @@ ON CONFLICT(time, reptime, site, param) DO UPDATE SET
         let user_data_json = serde_json::to_string(&config.user_data).unwrap();
         let manager_json = serde_json::to_string(&config.recreation).unwrap(); // Replace with your actual serialized DbJobsManager struct
 
-        let id: u64 = stmt
-            .query_row(
-                params![
-                    config.time,
-                    config.reptime,
-                    config.priority,
-                    manager_json,
-                    config.site,
-                    param_json,
-                    user_data_json
-                ],
-                |row| row.get(0),
-            )
-            .unwrap();
-
-        id
+        match stmt.query_row(
+            params![
+                config.time,
+                config.reptime,
+                config.priority,
+                manager_json,
+                config.site,
+                param_json,
+                user_data_json
+            ],
+            |row| row.get(0),
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                log::error!(
+                    "Failed to insert or update job for site '{}': {error}",
+                    config.site
+                );
+                0
+            }
+        }
     }
 
     ///
@@ -3719,10 +3724,11 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         // FIX: Combined into a single DO UPDATE SET clause separated by a comma
         query.push_str(
             " ON CONFLICT(hash) 
-         DO UPDATE SET 
-            extension = excluded.extension,
-            storage_id = excluded.storage_id
-         RETURNING id",
+          DO UPDATE SET
+             extension = excluded.extension,
+             storage_id = excluded.storage_id,
+             size_bytes = COALESCE(excluded.size_bytes, File.size_bytes)
+          RETURNING id",
         );
 
         let mut stmt = conn.prepare(&query).unwrap();
@@ -3740,6 +3746,20 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         }
 
         out
+    }
+
+    ///
+    /// Gets the file ids where the size_bytes is null
+    ///
+    fn internal_file_id_get_size_bytes_null(
+        &self,
+        conn: &Connection,
+    ) -> Result<HashSet<u64>, rusqlite::Error> {
+        let mut stmt = conn.prepare("SELECT id FROM File WHERE size_bytes IS Null;")?;
+        Ok(stmt
+            .query_map([], |f| f.get::<_, u64>(0))?
+            .flatten()
+            .collect())
     }
 
     pub fn debug_print_parents(conn: &Connection) {
@@ -3812,11 +3832,17 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         info!("Staring to fix internal files");
         let conn = self.pool.get()?;
 
+        // Keep track of records whose size has never been recorded. These are
+        // repaired from existing files below; only physically absent files are
+        // sent through the redownload path.
+        let missing_size_ids = self.internal_file_id_get_size_bytes_null(&conn)?;
+
         let file_storage_map = Self::internal_file_storage_get_all(&conn)?;
 
         let files = self.internal_file_get_all(&conn)?;
 
         let mut file_storage_missing = HashSet::new();
+        let mut missing_size_updates = Vec::new();
 
         let mut valid_paths = HashSet::new();
 
@@ -3826,7 +3852,21 @@ SELECT id, name, namespace FROM High_Value_Tags;",
             if let Some(file_base_path) = file_storage_map.get(&file.storage_id)
                 && let Some(file_path) = Self::get_file_location(file, file_base_path)
             {
+                let file_size = file
+                    .id
+                    .filter(|id| missing_size_ids.contains(id))
+                    .and_then(|_| {
+                        std::fs::metadata(&file_path)
+                            .ok()
+                            .map(|metadata| metadata.len())
+                    });
                 valid_paths.insert(file_path);
+                if let Some(file_id) = file.id
+                    && missing_size_ids.contains(&file_id)
+                    && let Some(size) = file_size
+                {
+                    missing_size_updates.push((file_id, size));
+                }
                 continue;
             }
 
@@ -3834,6 +3874,27 @@ SELECT id, name, namespace FROM High_Value_Tags;",
         }
 
         info!("Missing {} files from db.", file_storage_missing.len());
+
+        if !missing_size_updates.is_empty() {
+            let mut writer = self
+                .writer_conn
+                .try_lock_for(std::time::Duration::from_secs(5))
+                .ok_or_else(|| "timed out waiting for the database writer".to_string())?;
+            let tx = writer.transaction()?;
+            for (file_id, size) in missing_size_updates {
+                tx.execute(
+                    "UPDATE File SET size_bytes = ?1 WHERE id = ?2 AND size_bytes IS NULL",
+                    params![size, file_id],
+                )?;
+            }
+            tx.commit()?;
+        }
+
+        if *action == CheckFilesEnum::Redownload {
+            drop(conn);
+            self.queue_missing_file_jobs(&file_storage_missing)?;
+            return Ok(());
+        }
 
         if !file_storage_missing.is_empty()
             || matches!(
@@ -3925,6 +3986,91 @@ SELECT id, name, namespace FROM High_Value_Tags;",
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Queues missing files as normal plugin jobs. The regular scheduler then
+    /// applies the selected plugin's rate limiter and download handling.
+    fn queue_missing_file_jobs(
+        &self,
+        missing_files: &HashSet<&FileInternal>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let conn = self.pool.get()?;
+        let candidates = missing_files
+            .iter()
+            .map(|file| (*file).clone())
+            .collect::<HashSet<_>>();
+
+        let mut jobs = Vec::new();
+        for file in candidates {
+            let Some(file_id) = file.id else {
+                continue;
+            };
+            let tag_ids = self.internal_file_id_get_tag_ids(&conn, &file_id)?;
+            let source_url = Self::internal_tag_id_get_tag(&conn, &tag_ids)
+                .into_values()
+                .find(|tag| tag.namespace.name == "source_url")
+                .map(|tag| tag.name);
+            if let Some(source_url) = source_url {
+                let Some(plugin_manager) = self.plugin_manager.read().as_ref().cloned() else {
+                    log::warn!("Cannot queue file {file_id}: plugin manager is not initialized");
+                    continue;
+                };
+                let Some(site) = plugin_manager.site_for_url(&source_url) else {
+                    log::warn!("Cannot queue file {file_id}: no plugin handles {source_url}");
+                    continue;
+                };
+                jobs.push(shared_types::PluginJob {
+                    time: crate::helper_functions::get_sys_time_in_secs(),
+                    reptime: 0,
+                    // SQLite INTEGER is signed 64-bit; keep recovery jobs at
+                    // the highest representable priority without overflowing
+                    // rusqlite's u64-to-integer conversion.
+                    priority: shared_types::DEFAULT_PRIORITY,
+                    recreation: None,
+                    site: site.to_string(),
+                    param: vec![shared_types::ScraperParam::Url(shared_types::Url {
+                        url: source_url,
+                        local_modifiers: Vec::new(),
+                    })],
+                    user_data: {
+                        let mut user_data = std::collections::BTreeMap::new();
+                        user_data.insert("INTSCRAPE_REDOWNLOAD".into(), "true".into());
+                        user_data
+                            .insert("INTSCRAPE_REDOWNLOAD_FILE_ID".into(), file_id.to_string());
+                        user_data.insert("INTSCRAPE_REDOWNLOAD_HASH".into(), file.hash);
+                        user_data.insert(
+                            "INTSCRAPE_REDOWNLOAD_STORAGE_ID".into(),
+                            file.storage_id.to_string(),
+                        );
+                        user_data
+                    },
+                });
+            } else {
+                log::warn!("Cannot redownload file {file_id}: no source URL tag");
+            }
+        }
+        drop(conn);
+
+        if jobs.is_empty() {
+            return Ok(());
+        }
+
+        let Some(mut writer) = self
+            .writer_conn
+            .try_lock_for(std::time::Duration::from_secs(5))
+        else {
+            return Err("timed out waiting for the database writer".into());
+        };
+        let tx = writer.transaction()?;
+        for job in &jobs {
+            self.internal_jobs_add(&tx, job);
+        }
+        tx.commit()?;
+        info!(
+            "Queued {} missing files for plugin-managed redownload",
+            jobs.len()
+        );
         Ok(())
     }
 

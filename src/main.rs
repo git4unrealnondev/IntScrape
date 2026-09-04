@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
 use crate::{
     db::{
         MainDatabase, SYSTEM_DATABASE_BACKUP_SITE, SYSTEM_DATABASE_SLURP_SITE,
@@ -202,7 +204,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // Maintenance tasks are independent of the download manager, but still
     // need to finish before the database and process resources are dropped.
+    let shutdown_deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
     while active_system_jobs.load(Ordering::SeqCst) != 0 {
+        if tokio::time::Instant::now() >= shutdown_deadline {
+            log::error!(
+                "Shutdown timeout reached with {} system jobs still active",
+                active_system_jobs.load(Ordering::SeqCst)
+            );
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -211,6 +221,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     while !download_manager.downloads_complete().await
         || !download_manager.all_jobs_complete().await
     {
+        if tokio::time::Instant::now() >= shutdown_deadline {
+            log::error!("Shutdown timeout reached with downloads or workers still active");
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 

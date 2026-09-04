@@ -233,24 +233,30 @@ impl Scraper {
         let plugin = self.plugin.clone();
         let plugin_name = self.plugin.name.clone();
         let job_id = self.job.id.clone();
-
-        let scraper_data_return;
+        let is_redownload = self
+            .job
+            .config
+            .user_data
+            .contains_key("INTSCRAPE_REDOWNLOAD");
 
         let default_scraper_data = ScraperDataReturn {
             job,
             skip_conditions: vec![],
         };
 
-        match tokio::task::spawn_blocking(move || {
-            plugin_manager.url_dump(&default_scraper_data, &plugin)
-        })
-        .await
-        {
-            Ok(scrap_data) => match scrap_data {
-                Ok(good_data) => {
-                    scraper_data_return = Arc::new(good_data);
-                }
-                Err(e) => {
+        let scraper_data_return = if is_redownload {
+            // Recovery jobs already contain the file URL. Let the plugin's
+            // parser decide how to handle it without running url_dump or
+            // downloading the URL as a text page first.
+            Arc::new(vec![default_scraper_data])
+        } else {
+            match tokio::task::spawn_blocking(move || {
+                plugin_manager.url_dump(&default_scraper_data, &plugin)
+            })
+            .await
+            {
+                Ok(Ok(good_data)) => Arc::new(good_data),
+                Ok(Err(e)) => {
                     log::error!(
                         "DownloadManager: While getting a dump of URL's to do {} had an error {:?}",
                         plugin_name,
@@ -261,11 +267,9 @@ impl Scraper {
                         .await;
                     return Err("Scrap data had an error. Check logs".into());
                 }
-            },
-            Err(e) => {
-                return Err(format!("Url Dump had error: {e}").into());
+                Err(e) => return Err(format!("Url Dump had error: {e}").into()),
             }
-        }
+        };
 
         let should_remove_job = Arc::new(AtomicBool::new(true));
 
@@ -329,7 +333,12 @@ impl Scraper {
                     break 'scraperloop;
                 }
 
-                let text_result = if plugin_handles_text {
+                let text_result = if is_redownload {
+                    scrap_data.job.param.iter().find_map(|param| match param {
+                        ScraperParam::Url(url) => Some((String::new(), url.url.clone())),
+                        _ => None,
+                    })
+                } else if plugin_handles_text {
                     match param {
                         ScraperParam::Url(url) => Some((String::new(), url.url.clone())),
                         ScraperParam::UrlPost(url) => Some((String::new(), url.url.clone())),
@@ -719,6 +728,13 @@ impl Scraper {
             }
             // Rate limiting
             while self.ratelimiter.check().is_err() {
+                if self
+                    .download_manager
+                    .should_exit
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return None;
+                }
                 let jitter = rand::random::<u64>() % 50;
                 tokio::time::sleep(Duration::from_millis(100 + jitter)).await;
             }
@@ -971,6 +987,11 @@ impl Scraper {
         let plugin_manager = self.download_manager.plugin_manager.clone();
         let self_clone = self.clone();
         let should_exit = self.download_manager.should_exit.clone();
+        let is_redownload = self
+            .job
+            .config
+            .user_data
+            .contains_key("INTSCRAPE_REDOWNLOAD");
 
         if should_exit.load(Ordering::SeqCst) {
             info!(
@@ -1012,10 +1033,12 @@ impl Scraper {
         }
 
         // Check the source URL before doing hash lookups.
-        if let Some(file_url) = file.source.as_ref().and_then(|source| match source {
-            FileSource::Url(file_url) => Some(file_url),
-            FileSource::Bytes(_) => None,
-        }) {
+        if !is_redownload
+            && let Some(file_url) = file.source.as_ref().and_then(|source| match source {
+                FileSource::Url(file_url) => Some(file_url),
+                FileSource::Bytes(_) => None,
+            })
+        {
             if let Some(source_status) = existing_source_files.get(file_url) {
                 if source_status.dead {
                     info!(
@@ -1044,7 +1067,7 @@ impl Scraper {
         }
 
         // Associates file hashes with a file object
-        for hash in file.hash.iter() {
+        for hash in file.hash.iter().filter(|_| !is_redownload) {
             if should_exit.load(Ordering::SeqCst) {
                 info!(
                     "Scraper: {} JobId: {} -- Skipping file because shutdown was requested.",
@@ -1782,13 +1805,21 @@ impl DownloadsManager {
 
                 tokio::task::spawn(async move {
                     let _job_permit = job_permit;
-                    if let Err(err) = scraper.run_scraper().await {
+                    let error_message = match scraper.clone().run_scraper().await {
+                        Ok(()) => None,
+                        Err(err) => Some(err.to_string()),
+                    };
+                    if let Some(error_message) = error_message {
                         log::error!(
                             "Worker: {} JobId: {} scraper had err: {}",
                             scraper_name,
                             job_id,
-                            err
+                            error_message
                         );
+                        let mut retry_job = scraper.job.clone();
+                        retry_job.isrunning = false;
+                        retry_job.config.time = get_sys_time_in_secs();
+                        scraper.download_manager.db.jobs_update(&retry_job).await;
                     }
                 });
             } else {

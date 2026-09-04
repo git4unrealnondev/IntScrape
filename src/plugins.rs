@@ -39,9 +39,14 @@ impl Drop for PluginManager {
         let threads_to_join = std::mem::take(&mut *guard);
 
         for thread in threads_to_join {
-            // Now we own the handle and can safely call .join()
-            if let Err(err) = thread.join() {
-                log::error!("PluginManager thread had error {err:?}");
+            if thread.is_finished() {
+                if let Err(err) = thread.join() {
+                    log::error!("PluginManager thread had error {err:?}");
+                }
+            } else {
+                // A plugin callback is external code and cannot be forced to
+                // return. Do not make Ctrl-C wait indefinitely for it.
+                log::error!("PluginManager thread did not stop during shutdown; detaching it");
             }
         }
     }
@@ -75,6 +80,25 @@ impl PluginManager {
     pub fn get_storage_sites(&self) -> Vec<String> {
         let guard = self.storage_site.read();
         guard.keys().cloned().collect()
+    }
+
+    /// Resolves a source URL to a registered plugin site alias.
+    pub fn site_for_url(&self, source_url: &str) -> Option<String> {
+        let host = url::Url::parse(source_url)
+            .ok()?
+            .host_str()?
+            .to_ascii_lowercase();
+        let sites = self.storage_site.read();
+        sites
+            .keys()
+            .filter(|site| {
+                let alias = site.to_ascii_lowercase();
+                host == alias
+                    || host.ends_with(&format!(".{alias}"))
+                    || host.split('.').any(|label| label == alias)
+            })
+            .max_by_key(|site| site.len())
+            .cloned()
     }
 
     /// Adds tags to cache will let system process later.
