@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 shared_types = { workspace = true }
 client = { workspace = true }
 anyhow = "1.0.75"
-arti-client = { version = "0.45", features = [
+arti-client = { version = "0.46", features = [
     "onion-service-service",
 ] }
 axum = { version = "0.8.1", features = ["json", "macros", "tracing"] }
