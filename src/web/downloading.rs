@@ -139,6 +139,7 @@ impl Scraper {
         &self,
         input_url: ScraperParam,
         should_remove_job: Arc<AtomicBool>,
+        priority: u64,
     ) -> Option<(String, String)> {
         let url;
         let post_data;
@@ -174,7 +175,7 @@ impl Scraper {
 
         loop {
             // Waits to respect ratelimiter
-            self.ratelimiter.until_ready().await;
+            self.ratelimiter.wait(priority).await;
             info!(
                 "Worker: {} JobId: {} -- Spawned web reach to: {}",
                 self.plugin.name, self.job.id, url_parsed

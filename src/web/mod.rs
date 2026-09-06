@@ -2,6 +2,7 @@ use shared_types::{FileInternal, FileManager};
 
 pub mod downloading;
 pub mod manager;
+pub mod ratelimit;
 pub mod scraping;
 
 enum FileReturn {

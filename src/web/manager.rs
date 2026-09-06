@@ -70,13 +70,13 @@ fn is_retryable_status(status: StatusCode) -> bool {
     )
 }
 
-use crate::db::main::SourceUrlFileStatus;
 use crate::{
     db::MainDatabase,
     helper_functions::{self, get_sys_time_in_secs, memory_manage},
     plugins::PluginManager,
     web::FileReturn,
 };
+use crate::{db::main::SourceUrlFileStatus, web::ratelimit::RatelimitManager};
 
 enum TrackedFile {
     Temp(tempfile::NamedTempFile),
@@ -154,7 +154,7 @@ impl TrackedFile {
 
 pub(in crate::web) struct Scraper {
     pub(in crate::web) job: DbJobsObj,
-    pub(in crate::web) ratelimiter: Arc<DefaultDirectRateLimiter>,
+    pub(in crate::web) ratelimiter: Arc<RatelimitManager>,
     pub(in crate::web) plugin_manager: Arc<PluginManager>,
     pub(in crate::web) plugin: Plugin,
     pub(in crate::web) download_manager: Arc<DownloadsManager>,
@@ -167,7 +167,7 @@ struct InternalStorage {
     plugin: Plugin,
     job_storage: Vec<DbJobsObj>,
     completed_job_storage: Vec<DbJobsObj>,
-    ratelimiter: Arc<DefaultDirectRateLimiter>,
+    ratelimiter: Arc<RatelimitManager>,
     job_limiter: Arc<Semaphore>,
     //Stores file urls that we're downloading
     file_urls: HashSet<String>,
@@ -198,7 +198,7 @@ impl Drop for FileProcessingGuard {
 impl Scraper {
     pub fn new(
         job: DbJobsObj,
-        ratelimiter: Arc<DefaultDirectRateLimiter>,
+        ratelimiter: Arc<RatelimitManager>,
         plugin_manager: Arc<PluginManager>,
         plugin: Plugin,
         download_manager: Arc<DownloadsManager>,
@@ -348,9 +348,10 @@ impl Scraper {
                     let scraper = self.clone();
                     let param_clone = param.clone();
                     let should_remove_job_clone = should_remove_job.clone();
+                    let priority = self.job.config.priority;
                     tokio::spawn(async move {
                         scraper
-                            .dltext(param_clone, should_remove_job_clone.clone())
+                            .dltext(param_clone, should_remove_job_clone.clone(), priority)
                             .await
                     })
                     .await
@@ -727,17 +728,7 @@ impl Scraper {
                 break;
             }
             // Rate limiting
-            while self.ratelimiter.check().is_err() {
-                if self
-                    .download_manager
-                    .should_exit
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    return None;
-                }
-                let jitter = rand::random::<u64>() % 50;
-                tokio::time::sleep(Duration::from_millis(100 + jitter)).await;
-            }
+            self.ratelimiter.wait(self.job.config.priority).await;
 
             info!(
                 "Scraper: {} JobId: {} -- Downloading url: {}",
@@ -1519,25 +1510,11 @@ impl DownloadsManager {
                 let mut ratelimit = None;
                 for properties in &plugin.properties {
                     if let PluginProperties::Ratelimit(num, duration) = properties {
-                        let hits = *num;
-                        let total_duration = *duration;
-
                         info!(
-                            "DownloadManager: Creating Ratelimiter with properties: {hits} tries per: {total_duration:?}"
+                            "DownloadManager: Creating Ratelimiter with properties: {num} tries per: {duration:?}"
                         );
 
-                        // Guard against division by zero just in case
-                        let hits_nonzero = std::num::NonZeroU32::new(hits)
-                            .unwrap_or(std::num::NonZeroU32::new(1).unwrap());
-
-                        // Calculate how long it takes to regenerate ONE single cell
-                        let cell_replenish_interval = total_duration / hits_nonzero.get();
-
-                        ratelimit = Some(
-                            Quota::with_period(cell_replenish_interval)
-                                .unwrap()
-                                .allow_burst(hits_nonzero),
-                        );
+                        ratelimit = Some(RatelimitManager::new(*num, *duration));
                     }
                 }
                 if ratelimit.is_none() {
@@ -1546,11 +1523,7 @@ impl DownloadsManager {
                         1,
                         Duration::from_secs(1)
                     );
-                    ratelimit = Some(
-                        Quota::with_period(Duration::from_secs(1))
-                            .unwrap()
-                            .allow_burst(std::num::NonZeroU32::new(1).unwrap()),
-                    );
+                    ratelimit = Some(RatelimitManager::default());
                 }
 
                 // Check if we need to load login data
@@ -1578,7 +1551,7 @@ impl DownloadsManager {
                     InternalStorage {
                         plugin: plugin.clone(),
                         job_storage: job_storage.clone(),
-                        ratelimiter: Arc::new(governor::RateLimiter::direct(ratelimit.unwrap())),
+                        ratelimiter: Arc::new(ratelimit.unwrap()),
                         job_limiter: Arc::new(Semaphore::new(max_concurrent_jobs)),
                         completed_job_storage: vec![],
                         file_urls: HashSet::new(),

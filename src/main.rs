@@ -122,6 +122,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         //.expect("Error setting Ctrl-C handler");
     }
 
+    // Container runtimes use SIGTERM for a normal stop. Ctrl-C handlers do not
+    // receive it, so handle it explicitly to allow SQLite to close cleanly.
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
     plugin_manager.callback_on_start();
 
     // Does the CLI input processing
@@ -133,9 +138,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let db_spawn = db.clone();
     let active_system_jobs = Arc::new(AtomicUsize::new(0));
     let active_system_jobs_clone = active_system_jobs.clone();
-    let spawner = tokio::task::spawn(async move {
+    let should_exit_for_spawner = should_exit.clone();
+    let mut spawner = tokio::task::spawn(async move {
         loop {
-            if should_exit.load(std::sync::atomic::Ordering::SeqCst) {
+            if should_exit_for_spawner.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }
             let mut sites = plugin_manager_clone.get_storage_sites();
@@ -152,7 +158,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .iter()
                 .filter(|job| crate::db::system_jobs::is_system_job(job))
             {
-                if should_exit.load(std::sync::atomic::Ordering::SeqCst) {
+                if should_exit_for_spawner.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
                 // Claim the job before spawning it. This prevents the next
@@ -174,7 +180,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 });
             }
 
-            if should_exit.load(std::sync::atomic::Ordering::SeqCst) {
+            if should_exit_for_spawner.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }
 
@@ -200,6 +206,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     });
 
+    #[cfg(unix)]
+    tokio::select! {
+        result = &mut spawner => result?,
+        _ = terminate.recv() => {
+            log::info!("received SIGTERM");
+            should_exit.store(true, Ordering::SeqCst);
+            spawner.await?;
+        }
+    }
+
+    #[cfg(not(unix))]
     spawner.await?;
 
     // Maintenance tasks are independent of the download manager, but still
@@ -237,10 +254,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Call shutdown before db exit
     db.shutdown();
     drop(db);
-
-    // Cleans up temp db files
-    let _ = std::fs::remove_file("./main.db-wal");
-    let _ = std::fs::remove_file("./main.db-shm");
 
     Ok(())
 }
