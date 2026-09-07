@@ -112,7 +112,7 @@ impl MainDatabase {
             ("FileHash-ImageHash", "ImageHash"),
             ("FileHash-IPFSCID", "IPFSCID"),
         ] {
-            if let Some(ns_id) = MainDatabase::internal_namespace_get_id(conn, ns_name) {
+            if let Some(ns_id) = self.internal_namespace_get_id(conn, ns_name) {
                 let relationship_table = self.relationship_partition_name(ns_id);
                 let query = format!(
                     "INSERT OR IGNORE INTO FileHashes (file_id, algorithm, digest)

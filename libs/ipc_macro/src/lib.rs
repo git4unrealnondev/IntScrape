@@ -38,6 +38,7 @@ fn parse_client_path(attr: TokenStream) -> syn::Result<String> {
         syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
         attr,
     )?;
+    #[allow(clippy::never_loop)]
     for argument in args {
         let Meta::NameValue(value) = argument else {
             return Err(syn::Error::new_spanned(

@@ -4,6 +4,7 @@ use std::{
     fs::create_dir_all,
     io::{BufReader, Cursor},
     path::{Path, PathBuf},
+    sync::{LazyLock, Mutex},
 };
 
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -17,6 +18,20 @@ use thumbnailer::{ThumbnailSize, create_thumbnails_dynamic};
 static PLUGIN_NAME: &str = "File-Thumbnailer";
 static SIZE_THUMBNAIL_X: u32 = 250;
 static SIZE_THUMBNAIL_Y: u32 = 250;
+
+/// Logs a thumbnail error over IPC only the first time the exact message
+/// appears in this process run. Unsupported formats can be a large fraction
+/// of scanned files; logging every one over the single IPC channel floods
+/// the host log and adds a round trip per file.
+static LOGGED_THUMBNAIL_ERRORS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn log_once_thumbnail(message: String) {
+    let mut logged = LOGGED_THUMBNAIL_ERRORS.lock().unwrap();
+    if logged.insert(message.clone()) {
+        let _ = client::log_silent(message);
+    }
+}
 
 ///
 /// Will determine how long the video will be before attempting to take another frame.
@@ -82,12 +97,20 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
                 }
 
                 // Note: file_id is &&FileId because batch contains references from .iter()
-                if let Ok(Some(file_path)) = client::get_file_path(**file_id)
-                    && let Ok(file_data) = std::fs::read(&file_path)
-                {
-                    let callback = on_download(&file_data);
-                    let tags: Vec<_> = callback.tags.into_iter().collect();
-                    pending.push((**file_id, tags));
+                if let Ok(Some(file_path)) = client::get_file_path(**file_id) {
+                    let reader = std::fs::File::open(&file_path)
+                        .map(BufReader::new)
+                        .map_err(|error| format!("{error}"))
+                        .and_then(generate_thumbnails);
+                    match reader {
+                        Ok(tags) => {
+                            let tags = tags.into_iter().collect();
+                            pending.push((**file_id, tags));
+                        }
+                        Err(error) => {
+                            log_once_thumbnail(format!("{PLUGIN_NAME}: Recieved Error {error}"));
+                        }
+                    }
                 }
 
                 Ok(pending)
@@ -185,10 +208,17 @@ fn file_thumbnail_generate_thumbnail_fid(
         let Some(Ok(file_path)) = client::get_file_path(*file_id).transpose() else {
             return out;
         };
-        let Ok(bytes) = std::fs::read(&file_path) else {
-            return out;
+        let tags = match std::fs::File::open(&file_path)
+            .map(BufReader::new)
+            .map_err(|error| format!("{error}"))
+            .and_then(generate_thumbnails)
+        {
+            Ok(tags) => tags,
+            Err(error) => {
+                log_once_thumbnail(format!("{PLUGIN_NAME}: Recieved Error {error}"));
+                HashSet::new()
+            }
         };
-        let tags = on_download(&bytes).tags;
         let tags: Vec<FileTagAction> = tags.iter().cloned().collect();
 
         if let Ok(thumbpath) = process_thumb_location() {
@@ -289,51 +319,52 @@ fn process_thumb_location() -> Result<PathBuf, Box<dyn Error>> {
 
 #[unsafe(no_mangle)]
 fn on_download(bytes: &[u8]) -> CallbackReturn {
+    match generate_thumbnails(BufReader::new(Cursor::new(bytes))) {
+        Ok(tags) => CallbackReturn {
+            tags,
+            ..Default::default()
+        },
+        Err(error) => {
+            log_once_thumbnail(format!("{PLUGIN_NAME}: Recieved Error {error}"));
+            CallbackReturn::default()
+        }
+    }
+}
+
+/// Generates a thumbnail from any readable source, streaming the media
+/// straight through instead of buffering the whole file in memory.
+fn generate_thumbnails(
+    reader: impl std::io::BufRead + std::io::Seek,
+) -> Result<HashSet<FileTagAction>, String> {
     let mut tags = HashSet::new();
-
-    match create_thumbnails_dynamic(
-        BufReader::new(Cursor::new(bytes)),
+    let thumb = create_thumbnails_dynamic(
+        reader,
         &ThumbnailSize::Custom((SIZE_THUMBNAIL_X, SIZE_THUMBNAIL_Y)),
-    ) {
-        Ok(thumb) => {
-            if let Ok(thumbpath) = process_thumb_location() {
-                let (thumb_path, thumb_hash) = make_thumbnail_path(&thumbpath, &thumb);
-                let thpath = thumb_path
-                    .join(thumb_hash.clone())
-                    .with_added_extension("webp");
-                let pa = thpath.to_string_lossy().to_string();
+    )
+    .map_err(|error| format!("{error:?}"))?;
+    let thumbpath = process_thumb_location().map_err(|error| error.to_string())?;
+    let (thumb_path, thumb_hash) = make_thumbnail_path(&thumbpath, &thumb);
+    let thpath = thumb_path
+        .join(thumb_hash.clone())
+        .with_added_extension("webp");
+    let pa = thpath.to_string_lossy().to_string();
 
-                match std::fs::write(&pa, thumb) {
-                    Ok(_) => {
-                        let _ = tags.insert(FileTagAction {
-                            operation: shared_types::TagOperation::Set,
-                            tags: vec![PluginTag {
-                                tag: Tag {
-                                    name: thumb_hash.to_string(),
-                                    namespace: GenericNamespaceObj {
-                                        name: "file_thumbnail".to_string(),
-                                        description: Some("A thumbnail hash.".into()),
-                                    },
-                                },
-                                ..Default::default()
-                            }],
-                        });
-                    }
-                    Err(e) => {
-                        let _ = client::log_silent(format!("{PLUGIN_NAME}: Got error {:?}", e));
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            let _ = client::log_silent(format!("{PLUGIN_NAME}: Recieved Error {:?}", e));
-        }
-    }
+    std::fs::write(&pa, &thumb).map_err(|error| format!("{error}"))?;
+    tags.insert(FileTagAction {
+        operation: shared_types::TagOperation::Set,
+        tags: vec![PluginTag {
+            tag: Tag {
+                name: thumb_hash.to_string(),
+                namespace: GenericNamespaceObj {
+                    name: "file_thumbnail".to_string(),
+                    description: Some("A thumbnail hash.".into()),
+                },
+            },
+            ..Default::default()
+        }],
+    });
 
-    CallbackReturn {
-        tags,
-        ..Default::default()
-    }
+    Ok(tags)
 }
 
 fn make_thumbnail_path(dbloc: &PathBuf, imgdata: &Vec<u8>) -> (PathBuf, String) {

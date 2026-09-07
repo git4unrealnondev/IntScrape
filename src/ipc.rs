@@ -236,4 +236,59 @@ mod tests {
         drop(server);
         let _ = std::fs::remove_file(SOCKET_PATH);
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_search_over_ipc_returns_populated_results() {
+        let _socket_lock = SOCKET_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _ = std::fs::remove_file(SOCKET_PATH);
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let processing_pool = Arc::new(ThreadPoolBuilder::new().build().unwrap());
+        let should_exit = Arc::new(AtomicBool::new(false));
+        let db = MainDatabase::new(&db_path, processing_pool, should_exit.clone());
+        let plugins_path = temp_dir.path().join("plugins");
+        std::fs::create_dir(&plugins_path).unwrap();
+        let plugin_manager = PluginManager::new(&plugins_path, db.clone(), should_exit.clone());
+        let server = IpcServer::new(db, should_exit, plugin_manager);
+
+        for _ in 0..20 {
+            if Path::new(SOCKET_PATH).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            Path::new(SOCKET_PATH).exists(),
+            "IPC socket was not created"
+        );
+
+        // Add a tag over the IPC channel, mirroring how production populates tags.
+        let added = client::tag_actions_add(vec![shared_types::FileTagAction {
+            operation: shared_types::TagOperation::Add,
+            tags: vec![shared_types::PluginTag {
+                tag: shared_types::Tag {
+                    name: "red fox".into(),
+                    namespace: shared_types::GenericNamespaceObj {
+                        name: "subject".into(),
+                        description: None,
+                    },
+                },
+                ..Default::default()
+            }],
+        }])
+        .unwrap();
+        assert!(added, "tag action add over IPC failed");
+
+        // Typo + prefix queries must resolve over the same channel.
+        let typo = client::search_tag_fts("red fxo".into(), Some(10)).unwrap();
+        let prefix = client::search_tag_fts("red f".into(), Some(10)).unwrap();
+        assert!(!typo.is_empty(), "typo search over IPC returned no results");
+        assert!(
+            !prefix.is_empty(),
+            "prefix search over IPC returned no results"
+        );
+
+        drop(server);
+        let _ = std::fs::remove_file(SOCKET_PATH);
+    }
 }

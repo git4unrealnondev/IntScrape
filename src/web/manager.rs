@@ -76,10 +76,109 @@ use crate::{
     plugins::PluginManager,
     web::FileReturn,
 };
-use crate::{db::main::SourceUrlFileStatus, web::ratelimit::RatelimitManager};
+use crate::{
+    db::{SourceUrlFileStatus, hashessupportedtokey},
+    web::ratelimit::RatelimitManager,
+};
 
 enum TrackedFile {
     Temp(tempfile::NamedTempFile),
+}
+
+#[derive(Clone)]
+struct ComputedCoreHashes {
+    md5: String,
+    sha1: String,
+    sha256: String,
+    sha512: String,
+}
+
+struct DownloadedFile {
+    temp_file: NamedTempFile,
+    core_hashes: ComputedCoreHashes,
+}
+
+fn finalize_core_hashes(hashers: Vec<DownloadHasher>) -> ComputedCoreHashes {
+    let mut iter = hashers.into_iter();
+    let next = |iter: &mut std::vec::IntoIter<DownloadHasher>| {
+        iter.next()
+            .map(|hasher| hasher.finish().unwrap_or_default())
+            .unwrap_or_default()
+    };
+    ComputedCoreHashes {
+        md5: next(&mut iter),
+        sha1: next(&mut iter),
+        sha256: next(&mut iter),
+        sha512: next(&mut iter),
+    }
+}
+
+fn core_hasher_set() -> Vec<DownloadHasher> {
+    [
+        HashesSupported::Md5(String::new()),
+        HashesSupported::Sha1(String::new()),
+        HashesSupported::Sha256(String::new()),
+        HashesSupported::Sha512(String::new()),
+    ]
+    .iter()
+    .map(DownloadHasher::new)
+    .collect()
+}
+
+/// Streams a file once computing the core hash set (MD5, SHA1, SHA256, SHA512).
+/// Used for in-memory byte sources that never passed through
+/// [`download_file`](`Scraper::download_file`).
+fn hash_file_core(path: &std::path::Path) -> std::io::Result<ComputedCoreHashes> {
+    use std::io::Read;
+    const STREAM_BUFFER_SIZE: usize = 256 * 1024;
+    let mut hashers = core_hasher_set();
+    let mut reader =
+        std::io::BufReader::with_capacity(STREAM_BUFFER_SIZE, std::fs::File::open(path)?);
+    let mut buffer = vec![0u8; STREAM_BUFFER_SIZE];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        for hasher in hashers.iter_mut() {
+            hasher.update(&buffer[..read]);
+        }
+    }
+    Ok(finalize_core_hashes(hashers))
+}
+
+/// Streams a file once computing only its SHA-512. Used by the storage check
+/// so misplaced files are never buffered whole into RAM.
+pub fn hash_file_sha512(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read;
+    const STREAM_BUFFER_SIZE: usize = 256 * 1024;
+    let mut hasher = sha2::Sha512::new();
+    let mut reader =
+        std::io::BufReader::with_capacity(STREAM_BUFFER_SIZE, std::fs::File::open(path)?);
+    let mut buffer = vec![0u8; STREAM_BUFFER_SIZE];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(encode_upper(hasher.finalize()))
+}
+
+/// Computes an image perceptual hash from the file on disk, decoding from a
+/// buffered reader rather than loading the whole file into memory.
+fn image_hash_from_path(path: &std::path::Path) -> Option<String> {
+    let hasher = HasherConfig::new()
+        .hash_alg(image_hasher::HashAlg::Median)
+        .bit_order(BitOrder::MsbFirst)
+        .preproc_dct()
+        .to_hasher();
+    let mut image_reader =
+        image::ImageReader::new(std::io::BufReader::new(std::fs::File::open(path).ok()?));
+    image_reader = image_reader.with_guessed_format().ok()?;
+    let decode = image_reader.decode().ok()?;
+    Some(hasher.hash_image(&decode).to_base64())
 }
 
 #[derive(Clone)]
@@ -232,7 +331,7 @@ impl Scraper {
         let job = self.job.config.clone();
         let plugin = self.plugin.clone();
         let plugin_name = self.plugin.name.clone();
-        let job_id = self.job.id.clone();
+        let job_id = self.job.id;
         let is_redownload = self
             .job
             .config
@@ -431,10 +530,31 @@ impl Scraper {
                                         .await,
                                 );
 
+                                // Resolve hash dedup once per chunk instead of one
+                                // DB round trip per hash per file.
+                                let db = self.download_manager.db.clone();
+                                let chunk_hashes = scraper_object
+                                    .files
+                                    .iter()
+                                    .flat_map(|file| file.hash.iter())
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                let (result_sender, result_receiver) =
+                                    tokio::sync::oneshot::channel();
+                                self.download_manager.heavy_processing_pool.spawn(move || {
+                                    let _ =
+                                        result_sender.send(db.hashes_files_get_sync(&chunk_hashes));
+                                });
+                                let existing_hash_files =
+                                    Arc::new(result_receiver.await.map_err(|_| {
+                                        std::io::Error::other("hash lookup task failed")
+                                    })?);
+
                                 let mut set = JoinSet::new();
                                 for mut file in scraper_object.files {
                                     let scraper = self.clone();
                                     let existing_source_files = existing_source_files.clone();
+                                    let existing_hash_files = existing_hash_files.clone();
                                     let file_id_tag_map_clone = file_id_tag_map.clone();
                                     let should_remove_job_clone = should_remove_job.clone();
                                     let job_list_clone = job_list.clone();
@@ -464,6 +584,7 @@ impl Scraper {
                                                  &mut jobs,
                                                  &mut download_issue,
                                                  &existing_source_files,
+                                                 &existing_hash_files,
                                              )
                                             .await.map_err(|err| err.to_string());
                                         match file_result
@@ -512,7 +633,6 @@ impl Scraper {
                                             should_remove_job_clone
                                                 .store(false, std::sync::atomic::Ordering::Relaxed);
                                         }
-                                        memory_manage();
                                     });
 
                                     while matches!(set.try_join_next(), Some(Ok(()))) {
@@ -697,7 +817,7 @@ impl Scraper {
         file_url: &str,
         hash: &Vec<HashesSupported>,
         temp_dir: &std::path::Path,
-    ) -> Option<NamedTempFile> {
+    ) -> Option<DownloadedFile> {
         let mut cnt = 0;
         let mut last_mismatch_hashes: Option<Vec<String>> = None;
         let mut repeated_mismatch_count = 0;
@@ -808,6 +928,13 @@ impl Scraper {
 
             let mut downloaded_bytes_count = 0;
             let mut stream_failed = false;
+            // Incrementally hash while streaming so the file never has to be
+            // re-read for verification after the download completes. Declared
+            // variants are used for verification; the core set is reused by the
+            // processing stage so files are hashed exactly once.
+            let mut verify_hashers: Vec<DownloadHasher> =
+                hash.iter().map(DownloadHasher::new).collect();
+            let mut core_hashers: Vec<DownloadHasher> = core_hasher_set();
             // Stream network chunks straight to disk (Constantly uses ~8KB to 64KB max per active task)
             loop {
                 if self
@@ -841,6 +968,12 @@ impl Scraper {
                             log::error!("Failed to write chunk to disk: {err:?}");
                             stream_failed = true;
                             break;
+                        }
+                        for hasher in verify_hashers.iter_mut() {
+                            hasher.update(&chunk);
+                        }
+                        for hasher in core_hashers.iter_mut() {
+                            hasher.update(&chunk);
                         }
                     }
                     Ok(None) => break, // Finished downloading successfully
@@ -883,67 +1016,67 @@ impl Scraper {
                 None => true,
             };
 
-            if size_matches {
-                let hash_inputs = hash.clone();
-                let hash_path = temp_file.path().to_path_buf();
-                let processing_pool = self.download_manager.heavy_processing_pool.clone();
-                let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
-                processing_pool.spawn(move || {
-                    let hash_result = std::fs::read(&hash_path)
-                        .map(|bytes| {
-                            let bytes = Bytes::from(bytes);
-                            let actual_hashes = hash_inputs
-                                .iter()
-                                .map(|hash| hash_bytes(&bytes, hash).0)
-                                .collect::<Vec<_>>();
-                            let hash_matches = hash_inputs
-                                .iter()
-                                .zip(&actual_hashes)
-                                .all(|(hash, actual)| actual == expected_hash(hash));
-                            (actual_hashes, hash_matches)
-                        })
-                        .unwrap_or_default();
-                    let _ = result_sender.send(hash_result);
-                });
-                let (actual_hashes, hash_matches) = result_receiver.await.unwrap_or_default();
+            let core_hashes = finalize_core_hashes(core_hashers);
 
-                if hash_matches {
-                    return Some(temp_file);
-                } else {
-                    if last_mismatch_hashes.as_ref() == Some(&actual_hashes) {
-                        repeated_mismatch_count += 1;
-                    } else {
-                        last_mismatch_hashes = Some(actual_hashes);
-                        repeated_mismatch_count = 1;
-                    }
-
-                    if repeated_mismatch_count
-                        >= hash_download_retry_number.unwrap_or(HASH_MISMATCH_ACCEPT_THRESHOLD)
-                    {
-                        log::warn!(
-                            "Scraper: {} JobId: {} Hash mismatch repeated {} times; accepting stable download.",
-                            self.plugin.name,
-                            self.job.id,
-                            repeated_mismatch_count
-                        );
-                        return Some(temp_file);
-                    }
-
-                    log::warn!(
-                        "Scraper: {} JobId: {} Hash mismatch detected. Retrying. Attempt: {}",
-                        self.plugin.name,
-                        self.job.id,
-                        cnt + 1
-                    );
-                    let _ = tokio::fs::remove_file(&temp_file).await;
-                }
-            } else {
+            if !size_matches {
                 log::error!(
                     "Scraper: {} JobId: {} Mismatched length. Downloaded {} Expected {:?}",
                     self.plugin.name,
                     self.job.id,
                     downloaded_bytes_count,
                     content_length_header
+                );
+                let _ = tokio::fs::remove_file(&temp_file).await;
+            } else if verify_hashers.is_empty() {
+                // No declared hashes to verify against.
+                return Some(DownloadedFile {
+                    temp_file,
+                    core_hashes,
+                });
+            } else {
+                let actual_hashes = verify_hashers
+                    .into_iter()
+                    .map(|hasher| hasher.finish().unwrap_or_default())
+                    .collect::<Vec<_>>();
+                let hash_matches = hash
+                    .iter()
+                    .zip(&actual_hashes)
+                    .all(|(expected, actual)| actual == expected_hash(expected));
+
+                if hash_matches {
+                    return Some(DownloadedFile {
+                        temp_file,
+                        core_hashes,
+                    });
+                }
+
+                if last_mismatch_hashes.as_ref() == Some(&actual_hashes) {
+                    repeated_mismatch_count += 1;
+                } else {
+                    last_mismatch_hashes = Some(actual_hashes);
+                    repeated_mismatch_count = 1;
+                }
+
+                if repeated_mismatch_count
+                    >= hash_download_retry_number.unwrap_or(HASH_MISMATCH_ACCEPT_THRESHOLD)
+                {
+                    log::warn!(
+                        "Scraper: {} JobId: {} Hash mismatch repeated {} times; accepting stable download.",
+                        self.plugin.name,
+                        self.job.id,
+                        repeated_mismatch_count
+                    );
+                    return Some(DownloadedFile {
+                        temp_file,
+                        core_hashes,
+                    });
+                }
+
+                log::warn!(
+                    "Scraper: {} JobId: {} Hash mismatch detected. Retrying. Attempt: {}",
+                    self.plugin.name,
+                    self.job.id,
+                    cnt + 1
                 );
                 let _ = tokio::fs::remove_file(&temp_file).await;
             }
@@ -974,6 +1107,7 @@ impl Scraper {
         jobs: &mut Vec<ScraperDataReturn>,
         download_issue: &mut bool,
         existing_source_files: &HashMap<String, SourceUrlFileStatus>,
+        existing_hash_files: &HashMap<(String, String), FileInternal>,
     ) -> Result<Option<FileReturn>, Box<dyn Error>> {
         let plugin_manager = self.download_manager.plugin_manager.clone();
         let self_clone = self.clone();
@@ -1066,17 +1200,8 @@ impl Scraper {
                 );
                 return Ok(None);
             }
-            let db = self.download_manager.db.clone();
-            let lookup_hash = hash.clone();
-            let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
-            self.download_manager.heavy_processing_pool.spawn(move || {
-                let _ = result_sender.send(db.contains_hash_sync(&lookup_hash));
-            });
-            let file_internal = result_receiver
-                .await
-                .map_err(|_| std::io::Error::other("hash lookup task failed"))?;
-
-            if let Some(file_internal) = file_internal {
+            let hash_key = hashessupportedtokey(hash);
+            if let Some(file_internal) = existing_hash_files.get(&hash_key) {
                 info!(
                     "Scraper: {} JobId: {} Skipping file_id {} because hash: {:?} already in db.",
                     self.plugin.name,
@@ -1084,12 +1209,12 @@ impl Scraper {
                     file_internal.id.unwrap_or(0),
                     hash
                 );
-                return Ok(Some(FileReturn::File(file_internal.into())));
+                return Ok(Some(FileReturn::File(file_internal.clone().into())));
             }
         }
 
         // Download or fetch file via its disk path reference
-        let temp_file = match file.source {
+        let (temp_file, computed_core_hashes) = match file.source {
             None => {
                 log::warn!(
                     "Scraper: {} JobId: {} -- Skipping file with no source.",
@@ -1107,8 +1232,9 @@ impl Scraper {
                                 .download_file(file_url, &file.hash, temp_dir().as_path())
                                 .await;
                             self.release_download_file(file_url).await;
-                            if let Some(path_out) = downloaded {
-                                TrackedFile::Temp(path_out)
+                            if let Some(downloaded) = downloaded {
+                                let computed = downloaded.core_hashes;
+                                (TrackedFile::Temp(downloaded.temp_file), Some(computed))
                             } else {
                                 *download_issue = true;
                                 log::error!(
@@ -1141,7 +1267,7 @@ impl Scraper {
                         }
                         let mut temp_file = tempfile::NamedTempFile::new_in(temp_dir())?;
                         temp_file.write_all(&file_bytes)?;
-                        TrackedFile::Temp(temp_file)
+                        (TrackedFile::Temp(temp_file), None)
                     }
                 }
             }
@@ -1186,32 +1312,66 @@ impl Scraper {
                     return Err("shutdown requested".to_string());
                 }
 
-                // Read the temporary file once for hashing, format detection, and callbacks.
-                let bytes = Bytes::from(
-                    std::fs::read(&processing_file_path)
-                        .map_err(|error| format!("failed to read temporary file: {error}"))?,
-                );
+                // Detect the format from a bounded header read instead of loading
+                // the entire file into memory.
+                let format = {
+                    let format_file = std::fs::File::open(&processing_file_path)
+                        .map_err(|error| format!("failed to open temporary file: {error}"))?;
+                    FileFormat::from_reader(format_file).unwrap_or_default()
+                };
+                let extension = format.extension().to_string();
+                let is_image = format.media_type().starts_with("image/");
+                let file_len = std::fs::metadata(&processing_file_path)
+                    .map(|meta| meta.len())
+                    .unwrap_or(0);
 
                 if should_exit_for_processing.load(Ordering::SeqCst) {
                     return Err("shutdown requested".to_string());
                 }
 
-                // 2. Compute format and layout
-                let hash = hash_bytes(&bytes, &HashesSupported::Sha512(String::new())).0;
-                let extension = FileFormat::from_bytes(&bytes).extension().to_string();
+                // Files downloaded from a URL arrive with core hashes already
+                // computed while streaming. Only in-memory byte sources need a
+                // (buffered) hashing pass here, so files are never read twice.
+                let (md5_hash, sha1_hash, sha256_hash, sha512_hash) = match computed_core_hashes {
+                    Some(computed) => (
+                        computed.md5,
+                        computed.sha1,
+                        computed.sha256,
+                        computed.sha512,
+                    ),
+                    None => {
+                        let computed = hash_file_core(&processing_file_path)
+                            .map_err(|error| format!("failed to hash temporary file: {error}"))?;
+                        (
+                            computed.md5,
+                            computed.sha1,
+                            computed.sha256,
+                            computed.sha512,
+                        )
+                    }
+                };
+
                 {
                     let mut hash_guard = file_hash_local.lock().unwrap();
-                    hash_guard.push(HashesSupported::Sha512(hash.clone()));
+                    hash_guard.push(HashesSupported::Sha512(sha512_hash.clone()));
                 }
 
-                let file_download_location = db.file_download_location_get_sync(&hash, &extension);
+                let file_download_location =
+                    db.file_download_location_get_sync(&sha512_hash, &extension);
 
                 if should_exit_for_processing.load(Ordering::SeqCst) {
                     return Err("shutdown requested".to_string());
                 }
 
-                // Callback plugins
-                plugin_manager.callback_on_download(&bytes, &mut tags_owned, &mut jobs_owned);
+                // Callback plugins require the whole file in memory, so only buffer
+                // it for them when at least one callback is actually registered.
+                if plugin_manager.has_download_callbacks() {
+                    let bytes = Bytes::from(
+                        std::fs::read(&processing_file_path)
+                            .map_err(|error| format!("failed to read temporary file: {error}"))?,
+                    );
+                    plugin_manager.callback_on_download(&bytes, &mut tags_owned, &mut jobs_owned);
+                }
 
                 // Adds hash for other types onto hash if they dont exist
                 for hash_type in HashesSupported::iter() {
@@ -1234,25 +1394,40 @@ impl Scraper {
                         .iter()
                         .any(|f_h| discriminant(f_h) == discriminant(&hash_type));
 
-                    if !exists {
-                        let hash_string = hash_bytes(&bytes, &hash_type).0;
+                    if exists {
+                        continue;
+                    }
 
-                        let new_hash = match hash_type {
-                            HashesSupported::Md5(_) => HashesSupported::Md5(hash_string),
-                            HashesSupported::Sha1(_) => HashesSupported::Sha1(hash_string),
-                            HashesSupported::Sha256(_) => HashesSupported::Sha256(hash_string),
-                            HashesSupported::Sha512(_) => HashesSupported::Sha512(hash_string),
-                            HashesSupported::IPFSCID(_) => HashesSupported::IPFSCID(hash_string),
-                            HashesSupported::IPFSCID1(_) => HashesSupported::IPFSCID1(hash_string),
-                            HashesSupported::ImageHash(_) => {
-                                HashesSupported::ImageHash(hash_string)
-                            }
-                        };
-
-                        {
-                            let mut hash_guard = file_hash_local.lock().unwrap();
-                            hash_guard.push(new_hash);
+                    // Missing variants are filled from the precomputed core hashes so
+                    // the file is only read once. Image hashes are only computed for
+                    // actual images; non-image files could never decode anyway.
+                    let Some(hash_string) = (match &hash_type {
+                        HashesSupported::Md5(_) => Some(md5_hash.clone()),
+                        HashesSupported::Sha1(_) => Some(sha1_hash.clone()),
+                        HashesSupported::Sha256(_) => Some(sha256_hash.clone()),
+                        HashesSupported::Sha512(_) => Some(sha512_hash.clone()),
+                        HashesSupported::ImageHash(_) if is_image => {
+                            image_hash_from_path(&processing_file_path)
                         }
+                        HashesSupported::ImageHash(_) => None,
+                        HashesSupported::IPFSCID(_) | HashesSupported::IPFSCID1(_) => None,
+                    }) else {
+                        continue;
+                    };
+
+                    let new_hash = match &hash_type {
+                        HashesSupported::Md5(_) => HashesSupported::Md5(hash_string),
+                        HashesSupported::Sha1(_) => HashesSupported::Sha1(hash_string),
+                        HashesSupported::Sha256(_) => HashesSupported::Sha256(hash_string),
+                        HashesSupported::Sha512(_) => HashesSupported::Sha512(hash_string),
+                        HashesSupported::IPFSCID(_) => HashesSupported::IPFSCID(hash_string),
+                        HashesSupported::IPFSCID1(_) => HashesSupported::IPFSCID1(hash_string),
+                        HashesSupported::ImageHash(_) => HashesSupported::ImageHash(hash_string),
+                    };
+
+                    {
+                        let mut hash_guard = file_hash_local.lock().unwrap();
+                        hash_guard.push(new_hash);
                     }
                 }
 
@@ -1275,12 +1450,12 @@ impl Scraper {
                         .map_err(|error| format!("failed to finalize file: {error}"))?;
                     let storage_id = storage_id_db;
                     Ok::<_, String>((
-                        hash,
+                        sha512_hash,
                         extension,
                         Some(storage_id),
                         tags_owned,
                         jobs_owned,
-                        Some(bytes.len() as u64),
+                        Some(file_len),
                     ))
                 } else {
                     Err("no file storage location configured".to_string())

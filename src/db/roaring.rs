@@ -608,6 +608,70 @@ impl RelationshipStorage {
         .unwrap();
     }
 
+    /// Adds a relationship to the auxiliary roaring SQL tables only, reading the
+    /// current bitmaps from those tables instead of the in-memory maps.
+    ///
+    /// Used when a relationship write cannot take the roaring write lock because
+    /// a search reader is active. Keeps the SQL side authoritative so a later
+    /// `load_relationship_cache` (see `roaring_memory_dirty`) can repair the RAM
+    /// copy. Must only be called while holding any roaring lock.
+    pub(in crate::db) fn relationship_cache_add_sql_standalone(
+        &self,
+        tn: &Connection,
+        file_id: u64,
+        tag_id: u64,
+    ) {
+        let mut tag_bitmap = Self::read_fileid_bitmap(tn, file_id).unwrap_or_default();
+        tag_bitmap.insert(tag_id);
+        self.relationship_cache_add_fileid_sql(tn, file_id, &tag_bitmap);
+
+        let mut file_bitmap = Self::read_tagid_bitmap(tn, tag_id).unwrap_or_default();
+        file_bitmap.insert(file_id);
+        self.relationship_cache_add_tagid_sql(tn, tag_id, &file_bitmap);
+    }
+
+    /// Removes a relationship from the auxiliary roaring SQL tables only, mirroring
+    /// the SQL half of `remove_roaring` without touching the in-memory maps.
+    pub(in crate::db) fn relationship_cache_remove_sql_standalone(
+        &self,
+        tn: &Connection,
+        file_id: u64,
+        tag_id: u64,
+    ) {
+        if let Some(mut tag_bitmap) = Self::read_fileid_bitmap(tn, file_id) {
+            tag_bitmap.remove(tag_id);
+            self.relationship_cache_add_fileid_sql(tn, file_id, &tag_bitmap);
+        }
+        if let Some(mut file_bitmap) = Self::read_tagid_bitmap(tn, tag_id) {
+            file_bitmap.remove(file_id);
+            self.relationship_cache_add_tagid_sql(tn, tag_id, &file_bitmap);
+        }
+    }
+
+    fn read_fileid_bitmap(tn: &Connection, file_id: u64) -> Option<RoaringTreemap> {
+        tn.query_row(
+            "SELECT tagid_bitmap FROM RelationshipRoaringFileid WHERE fileid = ?",
+            params![file_id],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .and_then(|raw| RoaringTreemap::deserialize_unchecked_from(&raw[..]).ok())
+    }
+
+    fn read_tagid_bitmap(tn: &Connection, tag_id: u64) -> Option<RoaringTreemap> {
+        tn.query_row(
+            "SELECT fileid_bitmap FROM RelationshipRoaringTagid WHERE tagid = ?",
+            params![tag_id],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .and_then(|raw| RoaringTreemap::deserialize_unchecked_from(&raw[..]).ok())
+    }
+
     ///
     /// Loads the relationships into the internal memory
     ///
@@ -661,7 +725,7 @@ impl RelationshipStorage {
         self.relationship_cache_add_sql(tn, file_id, tag_id);
     }
 
-    fn internal_search_item<'a>(
+    pub(crate) fn internal_search_item<'a>(
         &'a self,
         tag_id_list: &[u64],
         searchtype: DbSearchTypeEnum,

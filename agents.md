@@ -37,7 +37,7 @@ Treat "millions of items" as a hard operating requirement, not as a large test c
 - A `limit` parameter is not sufficient if the query first materializes all matching rows. Apply limits and ordering in SQL and verify the query plan.
 - Do not return `HashSet<u64>`, `Vec<u64>`, or maps containing millions of values through the current IPC API. Add page-oriented APIs with a stable cursor/keyset before exposing large results.
 - Keep item payloads small. Avoid cloning `DbJobsObj`, URLs, tags, response text, or plugin output across task boundaries unless ownership requires it.
-- `memory_manage()`/`malloc_trim()` is not a memory strategy. Fix retention and allocation behavior first; use heap profiling for evidence.
+- `memory_manage()`/`malloc_trim()` is not a memory strategy. Fix retention and allocation behavior first; use heap profiling for evidence. When trimming is still used, call it at true job boundaries (start/end of a job), never once per file.
 
 ### Backpressure and task limits
 
@@ -59,16 +59,23 @@ Treat "millions of items" as a hard operating requirement, not as a large test c
 
 - Use prepared statements and transactions for bulk writes. Chunk parameter lists below SQLite's variable limit; keep `SQL_CHUNK_SIZE` centralized and measure transaction duration.
 - Do not perform one SQL query per item for million-item operations. Use joins, temporary staging tables, `INSERT ... SELECT`, upserts, or bulk statements.
+- Batch per-job dedup lookups the same way the source-URL status cache is loaded: resolve the chunk's whole hash set (`hashes_files_get_sync`) or URL set (`source_url_files_get`) in a handful of chunked queries before spawning per-file tasks, then dedupe against the in-memory map. Nothing per-URL/per-hash may take a fresh DB round trip in the hot loop.
+- Resolve existence queries with indexed batched `IN`/row-value lookups instead of correlated subqueries per row. Fetch the matched objects in a second batched pass. Keep historical behavior (e.g. `ORDER BY file_id LIMIT 1` becomes `MIN(file_id)` grouped) that downstream code relies on.
 - Do not hold a write transaction while downloading, hashing, invoking a plugin, or doing filesystem work.
 - Use keyset pagination (`WHERE id > ? ORDER BY id LIMIT ?`) instead of large `OFFSET` scans for deep traversal. Make ordering deterministic and use indexed columns.
 - Add or verify indexes for every high-volume lookup and relationship direction. Use `EXPLAIN QUERY PLAN` in tests or profiling notes for new queries.
 - Keep migrations set-based and restart-safe. Never load an entire table into a Rust collection during migration when SQL can transform it in place or rows can be streamed in bounded batches.
 - Avoid dynamically generating a huge `UNION ALL` query as the number of namespaces grows. If namespace partitioning remains, measure SQLite statement size and consider a stable view/table or an indexed common relationship table.
 - Keep cache policy explicit. Do not silently switch to `Full` for large databases, and do not duplicate the same relationship data in SQLite, Roaring, and Rust collections without a measured reason.
+- Every `SearchHolder` is an independent predicate: AND/OR holders intersect into the running result, NOT holders subtract the union of their tags' files. Prefer the Roaring fast path when the relationship cache holds all searched tags. In the SQL fallback, place set operators *between* operands (never a dangling trailing operator), wrap the whole compound in a `SELECT file_id FROM (...)` so the statement is valid SQLite, wrap UNION groups in parentheses so OR groups bind before INTERSECT/EXCEPT, and prepend `SELECT id AS file_id FROM File` as the driver for not-only searches.
+- Tag search: `search_db_tags_fts` skips the FTS round trip only when `TagSearchCache::is_complete()` AND the `tag_search_dirty` flag is clear. `complete` is just the count snapshot at cache load; never treat it as freshness. Any tag/relationship mutation must set `tag_search_dirty` (the FTS table is trigger-maintained, so the dirty→FTS path is the fresh source of truth), and `refresh_tag_search_cache` must clear it.
 
 ### Downloads and files
 
 - Preserve streaming downloads to temporary files and incremental hashing. Never buffer media in memory.
+- Hash each downloaded file exactly once, as part of the download read. Update the `core_hasher_set()` hashers (MD5/SHA1/SHA256/SHA512) and any plugin-declared verify hashers per chunk while streaming to the temp file; never re-read the whole file just to hash it later.
+- Processing must not cause a second full read. Detect format with `FileFormat::from_reader(std::fs::File)` (a bounded header read) for extension/media type, buffer the same hash on one pass, and compute `Image` hashes only for files whose detected media type is an image. Whole-file-buffer code paths (plugin `on_download` callbacks) must be gated behind a check for registered callbacks so default runs stay streaming.
+- The storage check may hash every misplaced file, but never `std::fs::read` one whole: stream each file (`hash_file_sha512`) over a bounded buffered reader. SHA-512 digests are stored uppercase (`encode_upper`) — any re-derivation must match the stored casing to hit the lookup map.
 - Enforce response-size limits where the source or plugin does not provide a trusted bound. Clean up partial files on cancellation, retry, hash mismatch, and failure.
 - Deduplicate in-flight URLs with bounded or database-backed state. A process-wide `HashSet<String>` can grow without limit and must have a lifecycle/eviction policy if it is used for more than transient work.
 - Keep logging out of per-item hot loops at `info` level for million-item runs. Use counters, sampled logs, structured progress, and aggregate error reporting.

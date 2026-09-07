@@ -144,7 +144,7 @@ mod tests {
     async fn test_high_and_low_priority_tasks() {
         // Create a ratelimiter with a 50ms replenishment rate
         let manager = Arc::new(RatelimitManager::new(1, Duration::from_millis(50)));
-        
+
         // Consume the initial available token so the bucket is empty
         manager.wait(1).await;
 

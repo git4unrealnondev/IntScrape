@@ -136,7 +136,7 @@ impl MainDatabase {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let pool = self.pool.clone();
         let should_exit_clone = self.should_exit.clone();
-        let writer_conn_clone = self.writer_conn.clone();
+        let database = self.clone();
 
         let result = tokio::task::spawn_blocking(
             move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -265,11 +265,7 @@ impl MainDatabase {
                             continue;
                         }
 
-                        let Some(mut writer) = writer_conn_clone
-                            .try_lock_for(std::time::Duration::from_secs(5))
-                        else {
-                            return Err(Box::new(rusqlite::Error::ExecuteReturnedResults));
-                        };
+                        let mut writer = database.writer_lock();
                         let conn = writer.transaction()?;
 
                         let placeholders: String = pending_list

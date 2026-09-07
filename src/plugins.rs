@@ -317,6 +317,17 @@ impl PluginManager {
         }
     }
 
+    /// Returns true if any `on_download` storage callbacks are currently registered
+    /// and loaded. Used to skip buffering whole files in memory when no plugin
+    /// needs the full bytes.
+    pub fn has_download_callbacks(&self) -> bool {
+        let callback_names = self.storage_callbacks.read();
+        let libraries = self.storage_libs.read();
+        callback_names
+            .get(&GlobalCallbacks::Download)
+            .is_some_and(|names| names.iter().any(|name| libraries.contains_key(name)))
+    }
+
     ///
     /// Runs all `on_download` callbacks concurrently and merges their results.
     pub fn callback_on_download(

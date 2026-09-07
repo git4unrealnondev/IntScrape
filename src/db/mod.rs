@@ -27,6 +27,22 @@ pub(crate) mod system_jobs;
 mod tag_search;
 mod update_handler;
 
+mod audit;
+mod cache;
+mod dead_url;
+mod file;
+mod jobs;
+mod namespace;
+mod processing;
+mod relationship;
+mod schema;
+mod search;
+mod settings;
+mod slurp;
+mod tag;
+#[cfg(test)]
+mod tests;
+
 pub const SYSTEM_DATABASE_BACKUP_SITE: &str = "SYSTEM_BACKUP";
 pub const SYSTEM_DATABASE_SLURP_SITE: &str = "SYSTEM_DB_SLURP";
 pub const SYSTEM_FILE_SIZE_SITE: &str = "SYSTEM_FILE_SIZE";
@@ -34,6 +50,13 @@ pub const SYSTEM_FILE_HASH_SITE: &str = "SYSTEM_FILE_HASH";
 pub const SYSTEM_STORAGE_CHECK_SITE: &str = "SYSTEM_STORAGE_CHECK";
 pub const SYSTEM_STORAGE_CHECK_FILENAME_MODE: &str = "filename";
 pub const SYSTEM_STORAGE_CHECK_REDOWNLOAD_MODE: &str = "redownload";
+
+/// Maximum rows per write batch for the write path. Kept separate from
+/// `shared_types::SQL_CHUNK_SIZE`, which drives the plugin-facing chunking.
+pub(crate) const SQL_CHUNK_SIZE: usize = 800;
+
+pub use self::file::SourceUrlFileStatus;
+pub(crate) use self::file::hashessupportedtokey;
 
 pub enum CacheType {
     // Will be use to query the DB directly. No caching. DEFAULT OPTION
@@ -49,8 +72,13 @@ pub struct MainDatabase {
     setting_cache: Arc<RwLock<HashMap<String, DbSettingsObj>>>,
     tag_cache: Arc<RwLock<TagCache>>,
     tag_search_cache: Arc<RwLock<TagSearchCache>>,
+    tag_search_dirty: Arc<AtomicBool>,
     cache_type: Arc<RwLock<CacheType>>,
     relationship_roaring_storage: Arc<RwLock<Option<RelationshipStorage>>>,
+    // Set when a relationship mutation could not take the roaring write lock
+    // because a reader was active. The in-memory bitmaps may be stale until the
+    // next search refreshes them from the (always-current) auxiliary SQL tables.
+    roaring_memory_dirty: Arc<AtomicBool>,
     plugin_manager: Arc<RwLock<Option<Arc<PluginManager>>>>,
     heavy_processing_pool: Arc<ThreadPool>,
     should_exit: Arc<AtomicBool>,
@@ -172,8 +200,10 @@ PRAGMA cache_size = -64000;
             setting_cache: Arc::new(RwLock::new(HashMap::new())),
             tag_cache: Arc::new(RwLock::new(TagCache::new())),
             tag_search_cache: Arc::new(RwLock::new(TagSearchCache::default())),
+            tag_search_dirty: Arc::new(AtomicBool::new(true)),
             cache_type: Arc::new(RwLock::new(CacheType::Bare)),
             relationship_roaring_storage: Arc::new(RwLock::new(None)),
+            roaring_memory_dirty: Arc::new(AtomicBool::new(false)),
             writer_conn,
             plugin_manager: Arc::new(RwLock::new(None)),
             heavy_processing_pool,
@@ -188,14 +218,44 @@ PRAGMA cache_size = -64000;
         main_db
     }
 
+    /// Locks the single writer connection, waiting as long as needed instead of
+    /// dropping a write after a short deadline.
+    ///
+    /// Every writer transaction is bounded (no re-entrant acquisition and no
+    /// external code runs under the lock), so a busy writer always means
+    /// ordinary contention, not a deadlock. The old `try_lock_for(5s)` + "drop
+    /// the write" pattern turned that contention into lost jobs, dropped dead
+    /// URLs and re-download loops. This waits instead, preserving the write,
+    /// and logs once when the wait becomes noticeable.
+    pub(crate) fn writer_lock(
+        &self,
+    ) -> parking_lot::MutexGuard<'_, PooledConnection<SqliteConnectionManager>> {
+        let started = std::time::Instant::now();
+        let mut warned = false;
+        loop {
+            if let Some(guard) = self.writer_conn.try_lock_for(Duration::from_secs(1)) {
+                if warned {
+                    log::warn!(
+                        "Database writer was busy for {:?} before this write could start",
+                        started.elapsed()
+                    );
+                }
+                return guard;
+            }
+            if !warned && started.elapsed() >= Duration::from_secs(5) {
+                warned = true;
+                log::warn!(
+                    "Database writer is busy; this write will wait instead of being dropped"
+                );
+            }
+        }
+    }
+
     ///
     /// Manages the DB shutdown
     ///
     pub fn shutdown(&self) {
-        let Some(guard) = self.writer_conn.try_lock_for(Duration::from_secs(5)) else {
-            log::error!("Timed out waiting for the database writer during shutdown");
-            return;
-        };
+        let guard = self.writer_lock();
 
         if let Err(e) = guard.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
             log::error!("Failed to checkpoint WAL file during drop: {e:?}");
@@ -213,9 +273,7 @@ PRAGMA cache_size = -64000;
         let temporary = destination.with_extension("backup.tmp");
         let _ = std::fs::remove_file(&temporary);
         let temporary_string = temporary.to_string_lossy().into_owned();
-        let Some(guard) = self.writer_conn.try_lock_for(Duration::from_secs(5)) else {
-            return Err(r2d2_sqlite::rusqlite::Error::ExecuteReturnedResults);
-        };
+        let guard = self.writer_lock();
         guard.execute(
             "VACUUM INTO ?1",
             r2d2_sqlite::rusqlite::params![temporary_string],
