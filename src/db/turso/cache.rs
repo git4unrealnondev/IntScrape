@@ -1,8 +1,54 @@
 use shared_types::DbSettingsObj;
+use turso::{Connection, Result};
 
 use crate::db::turso::TursoDatabase;
 
 impl TursoDatabase {
+    /// Gets a storage location id by path from the internal cache.
+    pub(in crate::db::turso) async fn file_storage_location_get_cache(
+        &self,
+        location: &str,
+    ) -> Option<u64> {
+        let cache = self.file_storage_location_cache.read().await;
+        cache.get(location).copied()
+    }
+
+    /// Caches a storage location id by path.
+    pub(in crate::db::turso) async fn file_storage_location_set_cache(
+        &self,
+        location: &str,
+        id: u64,
+    ) {
+        let mut cache = self.file_storage_location_cache.write().await;
+        cache.insert(location.to_string(), id);
+    }
+
+    /// Loads every `FileStorageLocations` row into the cache.
+    pub(in crate::db::turso) async fn file_storage_location_load(
+        &self,
+        conn: &Connection,
+    ) -> Result<()> {
+        let mut rows = conn
+            .query("SELECT id, location FROM FileStorageLocations;", ())
+            .await?;
+        let mut cache = self.file_storage_location_cache.write().await;
+        cache.clear();
+        while let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            let location: String = row.get(1)?;
+            cache.insert(location, id as u64);
+        }
+        Ok(())
+    }
+
+    /// Re-seeds the storage location cache from committed rows, discarding any
+    /// entries added by a transaction that has since rolled back.
+    pub(in crate::db::turso) async fn file_storage_location_cache_reload(
+        &self,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        self.file_storage_location_load(&conn).await
+    }
     /// Gets a setting from the internal cache
     pub(in crate::db::turso) async fn setting_get_cache(
         &self,

@@ -157,7 +157,7 @@ impl TursoDatabase {
         name: &str,
     ) -> Result<()> {
         conn.execute(
-            "INSERT INTO FileStorageLocations (location) VALUES (?1);",
+            "INSERT OR IGNORE INTO FileStorageLocations (location) VALUES (?1);",
             (name,),
         )
         .await?;
@@ -171,13 +171,27 @@ impl TursoDatabase {
         conn: &Connection,
         location_path: &str,
     ) -> Result<u64> {
+        if let Some(path_id) = self.file_storage_location_get_cache(location_path).await {
+            return Ok(path_id);
+        }
+
         if let Some(path_id) = self.file_storage_location_get(conn, location_path).await? {
+            self.file_storage_location_set_cache(location_path, path_id).await;
             return Ok(path_id);
         }
 
         self.file_storage_location_set(conn, location_path).await?;
 
-        Ok(conn.last_insert_rowid() as u64)
+        // Another writer may have created the row between our SELECT and our
+        // INSERT, in which case `last_insert_rowid` would be stale. Re-select
+        // the authoritative id instead (and cache it).
+        let path_id = self
+            .file_storage_location_get(conn, location_path)
+            .await?
+            .expect("row exists after INSERT OR IGNORE");
+        self.file_storage_location_set_cache(location_path, path_id).await;
+
+        Ok(path_id)
     }
 
     /// Gets the location where files should be stored, creating the default
@@ -362,4 +376,48 @@ pub(in crate::db::turso) fn file_on_disk(file_internal: &FileInternal, base_path
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    async fn new_test_db() -> Arc<TursoDatabase> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let should_exit = Arc::new(AtomicBool::new(false));
+        TursoDatabase::new_with_exit(&db_path, should_exit).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_storage_location_get_or_create_is_cached() {
+        let db = new_test_db().await;
+        let conn = db.connect().unwrap();
+
+        let first = db
+            .file_storage_location_get_or_create(&conn, "cache_me")
+            .await
+            .unwrap();
+        let second = db
+            .file_storage_location_get_or_create(&conn, "cache_me")
+            .await
+            .unwrap();
+        assert_eq!(first, second, "repeated lookups must reuse the cached id");
+        assert_eq!(
+            db.file_storage_location_get_cache("cache_me").await,
+            Some(first)
+        );
+
+        // Inserting a second row and reloading repopulates the cache from the
+        // committed state without dropping the existing entry.
+        db.file_storage_location_set(&conn, "cache_me_other").await.unwrap();
+        db.file_storage_location_cache_reload().await.unwrap();
+        assert_eq!(
+            db.file_storage_location_get_cache("cache_me").await,
+            Some(first)
+        );
+        assert!(db.file_storage_location_get_cache("cache_me_other").await.is_some());
+    }
 }

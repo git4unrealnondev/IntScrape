@@ -529,6 +529,20 @@ pub fn setting_get_async(
     crate::init_data_request_async(crate::SupportedDBRequests::SettingsGetName(name))
 }
 ///
+/// Returns every setting in the database.
+///
+pub fn settings_list() -> Result<Vec<DbSettingsObj>, Box<dyn std::error::Error>> {
+    crate::init_data_request(crate::SupportedDBRequests::SettingsList())
+}
+///
+/// Returns every setting in the database.
+///
+pub fn settings_list_async() -> impl std::future::Future<
+    Output = Result<Vec<DbSettingsObj>, Box<dyn std::error::Error + Send + Sync>>,
+> {
+    crate::init_data_request_async(crate::SupportedDBRequests::SettingsList())
+}
+///
 /// Sets the setting in the db. Updates it if the setting already exists
 ///
 pub fn setting_set(obj: DbSettingsObj) -> Result<bool, Box<dyn std::error::Error>> {

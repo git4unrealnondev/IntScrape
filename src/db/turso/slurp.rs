@@ -32,6 +32,12 @@ impl TursoDatabase {
                 Ok(result) => return Ok(result),
                 Err(error) if matches!(error, turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => {
                     log::warn!("Turso slurp transaction conflicted; retrying in 50ms: {error}");
+                    // The failed attempt's inserts rolled back wholesale, so any
+                    // storage-location ids it cached are stale. Re-seed from the
+                    // committed rows so the retry cannot reference missing rows.
+                    if let Err(reload_error) = self.file_storage_location_cache_reload().await {
+                        log::warn!("Failed to reload storage-location cache after conflict: {reload_error}");
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
                 Err(error) => return Err(error),
@@ -513,6 +519,7 @@ impl TursoDatabase {
             .map_err(db_error)?;
 
         let mut copied = 0_u64;
+        let mut batch: Vec<PluginJob> = Vec::with_capacity(SQL_CHUNK_SIZE);
         for row in rows {
             let (time, reptime, priority, recreation_json, site, param, user_data_json) =
                 row.map_err(db_error)?;
@@ -550,8 +557,16 @@ impl TursoDatabase {
                 param: params,
                 user_data,
             };
-            self.job_add_sql(&conn, &job).await?;
-            copied += 1;
+            batch.push(job);
+            if batch.len() >= SQL_CHUNK_SIZE {
+                self.jobs_bulk_add_sql(&conn, &batch).await?;
+                copied += batch.len() as u64;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            self.jobs_bulk_add_sql(&conn, &batch).await?;
+            copied += batch.len() as u64;
         }
         log::info!("Slurping {copied} jobs into the db.");
 

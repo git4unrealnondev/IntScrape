@@ -176,6 +176,17 @@ impl TursoDatabase {
     }
 
     ///
+    /// Lists every setting currently held in the settings cache.
+    ///
+    pub async fn settings_get_all_sync(&self) -> Vec<DbSettingsObj> {
+        let setting_guard = self.setting_cache.read().await;
+        let mut settings: Vec<DbSettingsObj> =
+            setting_guard.values().cloned().collect();
+        settings.sort_by(|a, b| a.name.cmp(&b.name));
+        settings
+    }
+
+    ///
     /// Gets a setting by name.
     ///
     pub async fn setting_get_sync(&self, name: &str) -> Option<DbSettingsObj> {

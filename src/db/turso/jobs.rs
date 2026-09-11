@@ -209,6 +209,45 @@ impl TursoDatabase {
         Ok(id)
     }
 
+    /// Bulk inserts jobs with the same deduplication semantics as
+    /// [`Self::job_add_sql`], batching one multi-row statement per chunk.
+    /// The slurp uses this because per-row inserts dominate its runtime on
+    /// job-heavy source databases.
+    pub(in crate::db::turso) async fn jobs_bulk_add_sql(
+        &self,
+        conn: &Connection,
+        jobs: &[PluginJob],
+    ) -> Result<()> {
+        for chunk in jobs.chunks(SQL_CHUNK_SIZE) {
+            let mut holders = Vec::with_capacity(chunk.len());
+            let mut params = Vec::with_capacity(chunk.len() * 7);
+            for config in chunk {
+                holders.push("(?, ?, ?, ?, ?, ?, ?)");
+                params.push(Value::from(config.time as i64));
+                params.push(Value::from(config.reptime as i64));
+                params.push(Value::from(config.priority as i64));
+                params.push(Value::from(
+                    serde_json::to_string(&config.recreation).unwrap(),
+                ));
+                params.push(Value::from(config.site.clone()));
+                params.push(Value::from(serde_json::to_string(&config.param).unwrap()));
+                params.push(Value::from(serde_json::to_string(&config.user_data).unwrap()));
+            }
+            let sql = format!(
+                "INSERT INTO Jobs (time, reptime, priority, recreation, site, param, user_data)
+                 VALUES {}
+                 ON CONFLICT(time, reptime, site, param) DO UPDATE SET
+                     reptime = excluded.reptime,
+                     priority = excluded.priority,
+                     user_data = excluded.user_data;",
+                holders.join(", ")
+            );
+            conn.execute(sql, params_from_iter(params)).await?;
+        }
+
+        Ok(())
+    }
+
     /// Gets all sites currently in db from Jobs.
     pub(in crate::db::turso) async fn jobs_get_all_sites_sql(
         &self,

@@ -563,6 +563,14 @@ impl TursoDatabase {
     }
 
     ///
+    /// Returns every setting in the database.
+    ///
+    #[ipc(name = "settings_list", request = "SettingsList")]
+    pub async fn ipc_settings_list(&self) -> Vec<DbSettingsObj> {
+        self.settings_get_all_sync().await
+    }
+
+    ///
     /// Sets the setting in the db. Updates it if the setting already exists
     ///
     #[ipc(name = "setting_set", request = "SettingsSet")]

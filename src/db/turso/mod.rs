@@ -46,6 +46,7 @@ pub struct TursoDatabase {
     db_path: String,
     namespace_cache: Arc<RwLock<HashMap<String, u64>>>,
     namespace_cache_reverse: Arc<RwLock<HashMap<u64, String>>>,
+    file_storage_location_cache: Arc<RwLock<HashMap<String, u64>>>,
     setting_cache: Arc<RwLock<HashMap<String, DbSettingsObj>>>,
     plugin_manager: Arc<parking_lot::RwLock<Option<Arc<PluginManager>>>>,
     should_exit: Arc<std::sync::atomic::AtomicBool>,
@@ -120,6 +121,7 @@ impl TursoDatabase {
             db_path: db_path.to_string_lossy().to_string(),
             namespace_cache: Arc::new(RwLock::new(HashMap::new())),
             namespace_cache_reverse: Arc::new(RwLock::new(HashMap::new())),
+            file_storage_location_cache: Arc::new(RwLock::new(HashMap::new())),
             setting_cache: Arc::new(RwLock::new(HashMap::new())),
             plugin_manager: Arc::new(parking_lot::RwLock::new(None)),
             should_exit,
@@ -163,6 +165,29 @@ impl TursoDatabase {
                 "DROP INDEX IF EXISTS idx_tags_fts;\nCREATE INDEX IF NOT EXISTS idx_tags_fts ON Tags USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);\nOPTIMIZE INDEX idx_tags_fts;",
             )
             .await;
+
+        // The legacy backend attached triggers to Tags that maintained its own
+        // FTS5 shadow tables (Tags_Popular_fts / Tags_Search_fts) and fired on
+        // every tag insert/update/delete. Turso keeps the tag counts in Rust
+        // and maintains its own `USING fts` index, so any surviving triggers
+        // are either broken (their FTS5 tables no longer exist) or would
+        // double-maintain counts. Drop every trigger at boot so a migrated
+        // database never trips on stale legacy rules.
+        {
+            let mut rows = conn
+                .query("SELECT name FROM sqlite_schema WHERE type = 'trigger';", ())
+                .await?;
+            let mut triggers = Vec::new();
+            while let Some(row) = rows.next().await? {
+                triggers.push(row.get::<String>(0)?);
+            }
+            drop(rows);
+            for name in triggers {
+                log::info!("Dropping legacy trigger '{name}'.");
+                conn.execute(&format!("DROP TRIGGER IF EXISTS \"{name}\";"), ())
+                    .await?;
+            }
+        }
 
         conn.pragma_update("journal_mode", "'mvcc'").await?;
 
@@ -287,6 +312,7 @@ impl TursoDatabase {
 
         self.namespace_load(&conn).await?;
         self.settings_load(&conn).await?;
+        self.file_storage_location_load(&conn).await?;
 
         Ok(())
     }

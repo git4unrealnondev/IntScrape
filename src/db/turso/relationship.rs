@@ -307,7 +307,6 @@ impl TursoDatabase {
 
         for (namespace_id, namespace_relationships) in by_namespace {
             let rels: Vec<(u64, u64)> = namespace_relationships.into_iter().collect();
-            let mut inserted_total = 0;
             for chunk in rels.chunks(SQL_CHUNK_SIZE) {
                 let mut holders = Vec::with_capacity(chunk.len());
                 let mut params = Vec::with_capacity(chunk.len() * 2);
@@ -321,18 +320,15 @@ impl TursoDatabase {
                     holders.join(", ")
                 );
                 let inserted = conn.execute(sql, params_from_iter(params)).await?;
-                inserted_total += inserted;
                 if inserted > 0 {
+                    let mut count_deltas: HashMap<u64, u64> = HashMap::new();
                     for (_, tag_id) in chunk {
-                        conn.execute(
-                            "UPDATE Tags SET count = count + 1 WHERE id = ?1;",
-                            (*tag_id as i64,),
-                        )
-                        .await?;
+                        *count_deltas.entry(*tag_id).or_default() += 1;
                     }
+                    let (count_sql, count_params) = tag_count_update_sql(&count_deltas, false);
+                    conn.execute(count_sql, params_from_iter(count_params)).await?;
                 }
             }
-            let _ = inserted_total;
         }
 
         Ok(())
@@ -391,13 +387,12 @@ impl TursoDatabase {
                 );
                 let deleted = conn.execute(sql, params_from_iter(params)).await?;
                 if deleted > 0 {
+                    let mut count_deltas: HashMap<u64, u64> = HashMap::new();
                     for (_, tag_id) in chunk {
-                        conn.execute(
-                            "UPDATE Tags SET count = MAX(count - 1, 0) WHERE id = ?1;",
-                            (*tag_id as i64,),
-                        )
-                        .await?;
+                        *count_deltas.entry(*tag_id).or_default() += 1;
                     }
+                    let (count_sql, count_params) = tag_count_update_sql(&count_deltas, true);
+                    conn.execute(count_sql, params_from_iter(count_params)).await?;
                 }
             }
         }
@@ -555,5 +550,121 @@ impl TursoDatabase {
         } else {
             Ok(None)
         }
+    }
+}
+
+/// Builds a single `UPDATE Tags SET count = ... CASE id WHEN ? THEN ? ... END
+/// WHERE id IN (...)`, bumping every tag's count by its aggregated delta in
+/// one round trip instead of one UPDATE per tag. `decrement` clamps the count
+/// at zero via `MAX(count - delta, 0)`.
+fn tag_count_update_sql(deltas: &HashMap<u64, u64>, decrement: bool) -> (String, Vec<Value>) {
+    let mut clauses = Vec::with_capacity(deltas.len());
+    let mut params = Vec::with_capacity(deltas.len() * 3);
+    for (tag_id, delta) in deltas {
+        clauses.push("WHEN ? THEN ?".to_string());
+        params.push(Value::from(*tag_id as i64));
+        params.push(Value::from(*delta as i64));
+    }
+    let placeholders = std::iter::repeat_n("?", deltas.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    for tag_id in deltas.keys() {
+        params.push(Value::from(*tag_id as i64));
+    }
+    let expression = if decrement {
+        format!("MAX(count - CASE id {} ELSE 0 END, 0)", clauses.join(" "))
+    } else {
+        format!("count + CASE id {} ELSE 0 END", clauses.join(" "))
+    };
+    (
+        format!("UPDATE Tags SET count = {expression} WHERE id IN ({placeholders});"),
+        params,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared_types::{FileInternal, GenericNamespaceObj, Tag};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use crate::db::turso::TagDb;
+
+    async fn new_test_db() -> Arc<TursoDatabase> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let should_exit = Arc::new(AtomicBool::new(false));
+        TursoDatabase::new_with_exit(&db_path, should_exit).await
+    }
+
+    async fn tag_count(db: &TursoDatabase, conn: &Connection, tag_id: u64) -> i64 {
+        let mut rows = conn
+            .query("SELECT count FROM Tags WHERE id = ?1;", (tag_id as i64,))
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        row.get(0).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bulk_relationship_add_and_delete_aggregate_tag_counts() {
+        let db = new_test_db().await;
+        let conn = db.connect().unwrap();
+
+        // Fresh namespace + tag (also creates the Relationship_{ns} partition).
+        let tags: HashSet<Tag> = HashSet::from([Tag {
+            name: "mammal".into(),
+            namespace: GenericNamespaceObj {
+                name: "species".into(),
+                description: None,
+            },
+        }]);
+        let tag_db_set = db.tag_add_bulk(&conn, &tags).await.unwrap();
+        let tag_db: &TagDb = tag_db_set.iter().next().unwrap();
+        let tag_id = tag_db.id as u64;
+        assert_eq!(tag_count(&db, &conn, tag_id).await, 0);
+
+        // Two files, both related to the same tag.
+        let storage_id = db
+            .file_storage_location_get_or_create(&conn, "test_storage")
+            .await
+            .unwrap();
+        let files = db
+            .file_add_bulk(
+                &conn,
+                &[
+                    FileInternal {
+                        id: None,
+                        hash: "aaahash1".into(),
+                        extension: "jpg".into(),
+                        storage_id,
+                        size_bytes: Some(1),
+                    },
+                    FileInternal {
+                        id: None,
+                        hash: "aaahash2".into(),
+                        extension: "jpg".into(),
+                        storage_id,
+                        size_bytes: Some(2),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        let file_ids: Vec<u64> = files.iter().map(|file| file.id.unwrap()).collect();
+        assert_eq!(file_ids.len(), 2);
+
+        let relationships: HashSet<(u64, u64)> =
+            file_ids.iter().map(|file_id| (*file_id, tag_id)).collect();
+        db.relationships_bulk_add(&conn, &relationships).await.unwrap();
+        assert_eq!(
+            tag_count(&db, &conn, tag_id).await,
+            2,
+            "two relationships must increment the count twice"
+        );
+
+        db.relationship_bulk_delete(&conn, &relationships).await.unwrap();
+        assert_eq!(tag_count(&db, &conn, tag_id).await, 0);
     }
 }
