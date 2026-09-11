@@ -19,14 +19,14 @@ use shared_types::{
     ScraperDataReturn, StartupThreadType, Tag,
 };
 
-use crate::db::MainDatabase;
+use crate::db::turso::TursoDatabase;
 
 pub struct PluginManager {
     storage: RwLock<HashMap<String, shared_types::Plugin>>,
     storage_site: RwLock<HashMap<String, String>>,
     storage_callbacks: RwLock<HashMap<GlobalCallbacks, HashSet<String>>>,
     storage_libs: RwLock<HashMap<String, Arc<Library>>>,
-    db: Arc<MainDatabase>,
+db: Arc<TursoDatabase>,
     threads: RwLock<Vec<JoinHandle<()>>>,
     should_exit: Arc<AtomicBool>,
     regex_tags_cache: RwLock<HashMap<Tag, u64>>,
@@ -53,7 +53,7 @@ impl Drop for PluginManager {
 }
 
 impl PluginManager {
-    pub fn new(path: &Path, db: Arc<MainDatabase>, should_exit: Arc<AtomicBool>) -> Arc<Self> {
+    pub fn new(path: &Path, db: Arc<TursoDatabase>, should_exit: Arc<AtomicBool>) -> Arc<Self> {
         let plugin_manager = Self {
             storage: HashMap::new().into(),
             storage_libs: HashMap::new().into(),
@@ -138,7 +138,22 @@ impl PluginManager {
             info!("Ignoring plugins: {:?}", ignored_plugins);
         }
 
-        for entry in fs::read_dir(path).unwrap().flatten() {
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                info!("No plugins directory at {:?}, creating it.", path);
+                if let Err(error) = fs::create_dir_all(path) {
+                    log::error!("Failed to create plugins directory {path:?}: {error}");
+                }
+                return;
+            }
+            Err(error) => {
+                log::error!("Failed to read plugins directory {path:?}: {error}");
+                return;
+            }
+        };
+
+        for entry in entries.flatten() {
             let path = entry.path();
 
             let extension = path.extension().and_then(|s| s.to_str());

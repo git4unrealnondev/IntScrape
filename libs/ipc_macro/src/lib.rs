@@ -149,47 +149,92 @@ fn expand(mut input: ItemImpl, client_path: String) -> syn::Result<TokenStream2>
                 "IPC methods must be public",
             ));
         }
-        if method.sig.asyncness.is_some() {
-            return Err(syn::Error::new_spanned(
-                &method.sig.ident,
-                "async IPC methods are not supported",
-            ));
-        }
+        let is_async = method.sig.asyncness.is_some();
         validate_arguments(method)?;
-        methods.push((method.clone(), options));
+        methods.push((method.clone(), options, is_async));
     }
     write_client_file(&client_path, &methods)?;
+
+    // Sync callers keep the blocking `dispatch_ipc_request`; it only serves
+    // handlers that are themselves synchronous. Async handlers are always
+    // dispatched through `dispatch_ipc_request_async`.
+    if methods.iter().all(|(_, _, is_async)| !is_async) {
+        input
+            .items
+            .push(ImplItem::Fn(sync_dispatch_method(&methods)));
+    }
     input
         .items
-        .push(ImplItem::Fn(server_dispatch_method(&methods)));
+        .push(ImplItem::Fn(async_dispatch_method(&methods)));
     Ok(quote! { #input })
 }
 
-fn server_dispatch_method(methods: &[(ImplItemFn, IpcOptions)]) -> ImplItemFn {
-    let arms = methods.iter().map(|(method, options)| {
-        let default_variant = pascal_case(&method.sig.ident);
-        let variant = options.request_variant.as_ref().unwrap_or(&default_variant);
-        let method_name = &method.sig.ident;
-        let args = method_arguments(method).expect("validated IPC method");
-        let names = args.iter().map(|(name, _)| name).collect::<Vec<_>>();
-        let pattern = quote! { client::SupportedDBRequests::#variant(#(#names),*) };
-        let call_args = args.iter().map(|(name, ty)| {
-            if matches!(ty, Type::Reference(_)) {
-                quote! { &#name }
-            } else {
-                quote! { #name }
-            }
-        });
-
-        quote! {
-            #pattern => Some(
-                client::data_size_to_b(&self.#method_name(#(#call_args),*))
-            ),
+/// One match arm for a single dispatched IPC request.
+///
+/// When `include_if_async` is false, async handlers are excluded from the arm
+/// list (used by the blocking dispatcher, which cannot await).
+fn dispatch_arm(
+    method: &ImplItemFn,
+    options: &IpcOptions,
+    include_if_async: bool,
+) -> Option<TokenStream2> {
+    let is_async = method.sig.asyncness.is_some();
+    if is_async && !include_if_async {
+        return None;
+    }
+    let default_variant = pascal_case(&method.sig.ident);
+    let variant = options.request_variant.as_ref().unwrap_or(&default_variant);
+    let method_name = &method.sig.ident;
+    let args = method_arguments(method).expect("validated IPC method");
+    let names = args.iter().map(|(name, _)| name).collect::<Vec<_>>();
+    let pattern = quote! { client::SupportedDBRequests::#variant(#(#names),*) };
+    let call_args = args.iter().map(|(name, ty)| {
+        if matches!(ty, Type::Reference(_)) {
+            quote! { &#name }
+        } else {
+            quote! { #name }
         }
     });
+    let call = if is_async {
+        quote! { self.#method_name(#(#call_args),*).await }
+    } else {
+        quote! { self.#method_name(#(#call_args),*) }
+    };
 
+    Some(quote! {
+        #pattern => Some(client::data_size_to_b(&#call)),
+    })
+}
+
+/// Builds the blocking `dispatch_ipc_request` used by sync dispatch paths.
+fn sync_dispatch_method(methods: &[(ImplItemFn, IpcOptions, bool)]) -> ImplItemFn {
+    let arms = methods
+        .iter()
+        .filter_map(|(method, options, _)| dispatch_arm(method, options, false));
     syn::parse_quote! {
         pub fn dispatch_ipc_request(
+            &self,
+            request: client::SupportedDBRequests,
+        ) -> Option<Vec<u8>> {
+            match request {
+                #(#arms)*
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Builds the async `dispatch_ipc_request_async` used by async dispatch paths.
+///
+/// Async handlers are awaited; sync handlers are called directly. Keeping every
+/// handler behind the async dispatcher lets a fully-async database (such as the
+/// libSQL/turso backend) serve requests without a blocking wrapper thread.
+fn async_dispatch_method(methods: &[(ImplItemFn, IpcOptions, bool)]) -> ImplItemFn {
+    let arms = methods
+        .iter()
+        .filter_map(|(method, options, _)| dispatch_arm(method, options, true));
+    syn::parse_quote! {
+        pub async fn dispatch_ipc_request_async(
             &self,
             request: client::SupportedDBRequests,
         ) -> Option<Vec<u8>> {
@@ -281,7 +326,7 @@ fn pascal_case(name: &syn::Ident) -> syn::Ident {
     format_ident!("{output}")
 }
 
-fn write_client_file(path: &str, methods: &[(ImplItemFn, IpcOptions)]) -> syn::Result<()> {
+fn write_client_file(path: &str, methods: &[(ImplItemFn, IpcOptions, bool)]) -> syn::Result<()> {
     let manifest = std::env::var_os("CARGO_MANIFEST_DIR").ok_or_else(|| {
         syn::Error::new(
             proc_macro2::Span::call_site(),
@@ -293,7 +338,7 @@ fn write_client_file(path: &str, methods: &[(ImplItemFn, IpcOptions)]) -> syn::R
         fs::create_dir_all(parent).map_err(io_error)?;
     }
 
-    let functions = methods.iter().map(|(method, options)| {
+    let functions = methods.iter().map(|(method, options, _)| {
         let docs = documentation(&method.attrs);
         let default_name = method.sig.ident.clone();
         let name = options.client_name.as_ref().unwrap_or(&default_name);

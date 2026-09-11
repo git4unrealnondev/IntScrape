@@ -2,7 +2,7 @@ use std::{collections::HashSet, fs};
 
 use rusqlite::{Connection, params};
 
-use crate::db::MainDatabase;
+use super::MainDatabase;
 
 impl MainDatabase {
     pub fn internal_update_db_5_to_6(
@@ -31,44 +31,6 @@ impl MainDatabase {
         &self,
         conn: &Connection,
     ) -> Result<(), r2d2_sqlite::rusqlite::Error> {
-        self.internal_table_create_audit_log_v3(conn)?;
-        self.internal_setting_set(
-            conn,
-            &shared_types::DbSettingsObj {
-                name: "SYSTEM_audit_log_enabled".into(),
-                description: Some("Whether database changes are recorded in AuditLog.".into()),
-                num: Some(1),
-                param: None,
-            },
-        )?;
-
-        // Existing rows predate auditing, so record their current state. The
-        // relationship row keeps its indexed IDs in columns instead of
-        // duplicating them in JSON.
-        conn.execute(
-            "INSERT INTO AuditLog
-                (changed_at, entity_type, action, file_id, reason)
-             SELECT unixepoch(), 'file', 'create', id,
-                    'existing file imported during V3 migration'
-             FROM File",
-            [],
-        )?;
-        conn.execute(
-            "INSERT INTO AuditLog
-                (changed_at, entity_type, action, tag_id, reason)
-             SELECT unixepoch(), 'tag', 'create', t.id,
-                    'existing tag imported during V3 migration'
-             FROM Tags t",
-            [],
-        )?;
-        conn.execute(
-            "INSERT INTO AuditLog
-                (changed_at, entity_type, action, file_id, tag_id, reason)
-             SELECT unixepoch(), 'relationship', 'create', file_id, tag_id,
-                    'existing relationship imported during V3 migration'
-             FROM Relationship",
-            [],
-        )?;
         self.internal_db_version_set(conn, 3)
     }
 
@@ -77,17 +39,6 @@ impl MainDatabase {
         &self,
         conn: &Connection,
     ) -> Result<(), r2d2_sqlite::rusqlite::Error> {
-        conn.execute_batch(
-            "DROP TRIGGER IF EXISTS audit_file_insert;
-             DROP TRIGGER IF EXISTS audit_file_delete;
-             DROP TRIGGER IF EXISTS audit_file_update;
-             DROP TRIGGER IF EXISTS audit_tag_insert;
-             DROP TRIGGER IF EXISTS audit_tag_delete;
-             DROP TRIGGER IF EXISTS audit_tag_update;
-             DROP TRIGGER IF EXISTS audit_parent_insert;
-             DROP TRIGGER IF EXISTS audit_parent_delete;
-             DROP TABLE IF EXISTS AuditLog;",
-        )?;
         self.internal_relationship_migrate_legacy(conn);
         self.internal_db_version_set(conn, 4)
     }

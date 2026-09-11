@@ -2,22 +2,6 @@
 #![allow(dead_code)]
 use shared_types::*;
 use std::collections::{HashMap, HashSet};
-/// Returns audit entries filtered by either entity identifier.
-pub fn audit_get(
-    file_id: Option<u64>,
-    tag_id: Option<u64>,
-) -> Result<Vec<AuditLogEntry>, Box<dyn std::error::Error>> {
-    crate::init_data_request(crate::SupportedDBRequests::AuditGet(file_id, tag_id))
-}
-/// Returns audit entries filtered by either entity identifier.
-pub fn audit_get_async(
-    file_id: Option<u64>,
-    tag_id: Option<u64>,
-) -> impl std::future::Future<
-    Output = Result<Vec<AuditLogEntry>, Box<dyn std::error::Error + Send + Sync>>,
-> {
-    crate::init_data_request_async(crate::SupportedDBRequests::AuditGet(file_id, tag_id))
-}
 ///
 /// Gets namespace id if it exists
 ///
@@ -250,7 +234,7 @@ pub fn tag_actions_add_async(
 ) -> impl std::future::Future<Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>> {
     crate::init_data_request_async(crate::SupportedDBRequests::TagActionsAdd(tag_actions))
 }
-/// Adds tags to multiple files in one SQLite transaction.
+/// Adds tags to multiple files in one connection.
 pub fn put_tags_to_files(
     tags_by_file: HashMap<u64, Vec<FileTagAction>>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
@@ -258,7 +242,7 @@ pub fn put_tags_to_files(
         tags_by_file,
     ))
 }
-/// Adds tags to multiple files in one SQLite transaction.
+/// Adds tags to multiple files in one connection.
 pub fn put_tags_to_files_async(
     tags_by_file: HashMap<u64, Vec<FileTagAction>>,
 ) -> impl std::future::Future<Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>> {
@@ -268,14 +252,12 @@ pub fn put_tags_to_files_async(
 }
 ///
 /// Gets all file ids inside of the db.
-/// #Safety Returns None if an error occurs
 ///
 pub fn get_file_ids_all() -> Result<HashSet<u64>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::GetFileListId())
 }
 ///
 /// Gets all file ids inside of the db.
-/// #Safety Returns None if an error occurs
 ///
 pub fn get_file_ids_all_async()
 -> impl std::future::Future<Output = Result<HashSet<u64>, Box<dyn std::error::Error + Send + Sync>>>
@@ -368,21 +350,20 @@ pub fn relationship_get_parent_fileid_async(
 /// Gets every parent relation declared by a child tag.
 pub fn parent_relationships_get(
     tag_id: u64,
-) -> Result<Vec<shared_types::TagParents>, Box<dyn std::error::Error>> {
+) -> Result<Vec<TagParents>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::ParentRelationshipsGet(tag_id))
 }
 /// Gets every parent relation declared by a child tag.
 pub fn parent_relationships_get_async(
     tag_id: u64,
-) -> impl std::future::Future<
-    Output = Result<Vec<shared_types::TagParents>, Box<dyn std::error::Error + Send + Sync>>,
-> {
+) -> impl std::future::Future<Output = Result<Vec<TagParents>, Box<dyn std::error::Error + Send + Sync>>>
+{
     crate::init_data_request_async(crate::SupportedDBRequests::ParentRelationshipsGet(tag_id))
 }
 /// Gets parent relations for multiple child tags in one IPC request.
 pub fn parent_relationships_get_many(
     tag_ids: HashSet<u64>,
-) -> Result<HashMap<u64, Vec<shared_types::TagParents>>, Box<dyn std::error::Error>> {
+) -> Result<HashMap<u64, Vec<TagParents>>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::ParentRelationshipsGetMany(
         tag_ids,
     ))
@@ -391,10 +372,7 @@ pub fn parent_relationships_get_many(
 pub fn parent_relationships_get_many_async(
     tag_ids: HashSet<u64>,
 ) -> impl std::future::Future<
-    Output = Result<
-        HashMap<u64, Vec<shared_types::TagParents>>,
-        Box<dyn std::error::Error + Send + Sync>,
-    >,
+    Output = Result<HashMap<u64, Vec<TagParents>>, Box<dyn std::error::Error + Send + Sync>>,
 > {
     crate::init_data_request_async(crate::SupportedDBRequests::ParentRelationshipsGetMany(
         tag_ids,
@@ -403,7 +381,7 @@ pub fn parent_relationships_get_many_async(
 /// Gets every child relation that points at a parent tag.
 pub fn child_relationships_get(
     relate_tag_id: u64,
-) -> Result<Vec<shared_types::TagParents>, Box<dyn std::error::Error>> {
+) -> Result<Vec<TagParents>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::ChildRelationshipsGet(
         relate_tag_id,
     ))
@@ -411,9 +389,8 @@ pub fn child_relationships_get(
 /// Gets every child relation that points at a parent tag.
 pub fn child_relationships_get_async(
     relate_tag_id: u64,
-) -> impl std::future::Future<
-    Output = Result<Vec<shared_types::TagParents>, Box<dyn std::error::Error + Send + Sync>>,
-> {
+) -> impl std::future::Future<Output = Result<Vec<TagParents>, Box<dyn std::error::Error + Send + Sync>>>
+{
     crate::init_data_request_async(crate::SupportedDBRequests::ChildRelationshipsGet(
         relate_tag_id,
     ))
@@ -421,7 +398,7 @@ pub fn child_relationships_get_async(
 /// Gets child relations for multiple parent tags in one IPC request.
 pub fn child_relationships_get_many(
     tag_ids: HashSet<u64>,
-) -> Result<HashMap<u64, Vec<shared_types::TagParents>>, Box<dyn std::error::Error>> {
+) -> Result<HashMap<u64, Vec<TagParents>>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::ChildRelationshipsGetMany(
         tag_ids,
     ))
@@ -430,10 +407,7 @@ pub fn child_relationships_get_many(
 pub fn child_relationships_get_many_async(
     tag_ids: HashSet<u64>,
 ) -> impl std::future::Future<
-    Output = Result<
-        HashMap<u64, Vec<shared_types::TagParents>>,
-        Box<dyn std::error::Error + Send + Sync>,
-    >,
+    Output = Result<HashMap<u64, Vec<TagParents>>, Box<dyn std::error::Error + Send + Sync>>,
 > {
     crate::init_data_request_async(crate::SupportedDBRequests::ChildRelationshipsGetMany(
         tag_ids,
@@ -443,7 +417,7 @@ pub fn child_relationships_get_many_async(
 pub fn parent_relationship_get(
     tag_id: u64,
     relate_tag_id: u64,
-) -> Result<Option<shared_types::TagParents>, Box<dyn std::error::Error>> {
+) -> Result<Option<TagParents>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::ParentRelationshipGet(
         tag_id,
         relate_tag_id,
@@ -454,7 +428,7 @@ pub fn parent_relationship_get_async(
     tag_id: u64,
     relate_tag_id: u64,
 ) -> impl std::future::Future<
-    Output = Result<Option<shared_types::TagParents>, Box<dyn std::error::Error + Send + Sync>>,
+    Output = Result<Option<TagParents>, Box<dyn std::error::Error + Send + Sync>>,
 > {
     crate::init_data_request_async(crate::SupportedDBRequests::ParentRelationshipGet(
         tag_id,
@@ -493,7 +467,7 @@ pub fn dead_url_add_async(
     crate::init_data_request_async(crate::SupportedDBRequests::AddDeadUrl(dead_url))
 }
 ///
-/// Checks if a lsit of urls are dead
+/// Checks if a list of urls are dead
 ///
 pub fn dead_url_get(
     dead_urls: Vec<String>,
@@ -501,7 +475,7 @@ pub fn dead_url_get(
     crate::init_data_request(crate::SupportedDBRequests::GetDeadUrl(dead_urls))
 }
 ///
-/// Checks if a lsit of urls are dead
+/// Checks if a list of urls are dead
 ///
 pub fn dead_url_get_async(
     dead_urls: Vec<String>,

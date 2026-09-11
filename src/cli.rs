@@ -3,7 +3,7 @@ extern crate clap;
 use crate::cli::cli_structs::Database;
 use crate::helper_functions;
 use crate::{
-    db::{MainDatabase, SYSTEM_DATABASE_SLURP_SITE},
+    db::{SYSTEM_DATABASE_SLURP_SITE, turso::TursoDatabase},
     web::manager::hash_bytes,
 };
 use bytes::Bytes;
@@ -90,7 +90,7 @@ pub fn time_conv(inp: &str) -> u64 {
 }
 
 /// Returns the main argument and parses data.
-pub async fn main(db: Arc<MainDatabase>) {
+pub async fn main(db: Arc<TursoDatabase>) {
     let args = cli_structs::MainWrapper::parse();
     if args.a.is_none() {
         return;
@@ -129,7 +129,7 @@ pub async fn main(db: Arc<MainDatabase>) {
                         recreation,
                     };
 
-                    db.jobs_add_single_sync(job);
+                    db.jobs_add_single(job).await;
 
                     /*  let mut system_data = BTreeMap::new();
                     for each in addstruct.system_data.chunks(2) {
@@ -515,7 +515,7 @@ pub async fn main(db: Arc<MainDatabase>) {
             cli_structs::TasksStruct::Database(db_action) => {
                 match db_action {
                     Database::DbSlurp(slurp) => {
-                        let counts = db.db_slurp(Path::new(&slurp.source)).unwrap();
+                        let counts = db.db_slurp(Path::new(&slurp.source)).await.unwrap();
                         println!(
                             "Imported {} namespaces, {} tags, and {} files",
                             counts.0, counts.1, counts.2
@@ -528,7 +528,7 @@ pub async fn main(db: Arc<MainDatabase>) {
                         db.recache_roaring_db();
                     }
                     Database::ScheduleBackup(backup) => {
-                        db.jobs_add_single_sync(shared_types::PluginJob {
+                        db.jobs_add_single(shared_types::PluginJob {
                             time: helper_functions::get_sys_time_in_secs(),
                             reptime: time_conv(&backup.time),
                             priority: i64::MAX as u64,
@@ -541,10 +541,11 @@ pub async fn main(db: Arc<MainDatabase>) {
                                 backup.every,
                                 backup.count,
                             )),
-                        });
+                        })
+                        .await;
                     }
                     Database::ScheduleHashMissing(hash_job) => {
-                        db.jobs_add_single_sync(shared_types::PluginJob {
+                        db.jobs_add_single(shared_types::PluginJob {
                             time: helper_functions::get_sys_time_in_secs(),
                             reptime: time_conv(&hash_job.time),
                             priority: i64::MAX as u64,
@@ -555,7 +556,8 @@ pub async fn main(db: Arc<MainDatabase>) {
                                 hash_job.every,
                                 hash_job.count,
                             )),
-                        });
+                        })
+                        .await;
                     }
                     _ => {}
                 }

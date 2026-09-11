@@ -6,17 +6,6 @@ use std::time::Duration;
 pub const DEFAULT_PRIORITY: u64 = 10;
 pub const SQL_CHUNK_SIZE: u64 = 1000;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
-pub struct AuditLogEntry {
-    pub id: u64,
-    pub changed_at: u64,
-    pub entity_type: String,
-    pub action: String,
-    pub file_id: Option<u64>,
-    pub tag_id: Option<u64>,
-    pub reason: String,
-}
-
 /// FFI-safe alternative to String
 #[repr(C)]
 pub struct CVec<T> {
@@ -65,7 +54,7 @@ pub enum DbResponse {
     UserData { user_id: u64, balance: f64 },
 }
 
-#[derive(Deserialize, Debug, Serialize, bitcode::Encode, bitcode::Decode, Clone)]
+#[derive(PartialEq, Deserialize, Debug, Serialize, bitcode::Encode, bitcode::Decode, Clone)]
 pub struct DbSettingsObj {
     pub name: String,
     pub description: Option<String>,
@@ -699,10 +688,10 @@ pub struct Tag {
     Eq,
     Hash,
     Debug,
-    Serialize,
-    Deserialize,
     bitcode::Encode,
     bitcode::Decode,
+    Deserialize,
+    Serialize,
 )]
 pub struct PluginTag {
     /// Use composition: A TagObject *has* a fundamental Tag definition

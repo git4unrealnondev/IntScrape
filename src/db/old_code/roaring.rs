@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::io::Cursor;
 use std::sync::Arc;
 
-use crate::db::MainDatabase;
+use super::MainDatabase;
 use shared_types::DbSearchTypeEnum;
 
 /// Gets the cache type

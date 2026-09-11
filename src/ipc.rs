@@ -1,4 +1,4 @@
-use crate::db::MainDatabase;
+use crate::db::turso::TursoDatabase;
 use crate::plugins::PluginManager;
 use interprocess::local_socket::ToFsName;
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, tokio::prelude::*};
@@ -16,7 +16,7 @@ static IPC_TEST_SETTING_STARTED: AtomicBool = AtomicBool::new(false);
 pub struct IpcServer {
     local_server: Mutex<Option<JoinHandle<()>>>,
     should_exit: Arc<AtomicBool>,
-    db: Arc<MainDatabase>,
+    db: Arc<TursoDatabase>,
     plugin_manager: Arc<PluginManager>,
 }
 
@@ -33,7 +33,7 @@ impl Drop for IpcServer {
 
 impl IpcServer {
     pub fn new(
-        db: Arc<MainDatabase>,
+        db: Arc<TursoDatabase>,
         should_exit: Arc<AtomicBool>,
         plugin_manager: Arc<PluginManager>,
     ) -> Arc<Self> {
@@ -86,17 +86,10 @@ impl IpcServer {
                                 Err(_) => return,
                             };
 
-                            // Database and plugin dispatch are synchronous and may wait on
-                            // SQLite or plugin code. Keep that work off Tokio's IO workers so
-                            // other IPC connections remain responsive while it runs.
-                            let response = match run_blocking(move || {
-                                self_for_conn.conn_to_function(received_data)
-                            })
-                            .await
-                            {
-                                Ok(response) => response,
-                                Err(_) => return,
-                            };
+                            // Turso handlers are asynchronous. Poll the request
+                            // directly so one connection never consumes a
+                            // blocking-pool worker while it waits on the database.
+                            let response = self_for_conn.conn_to_function(received_data).await;
                             let _ = client::send_preserialize(&response, &mut reader).await;
                         });
                     }
@@ -117,7 +110,7 @@ impl IpcServer {
     ///
     /// Converts the functions to the u8 outputs
     ///
-    fn conn_to_function(&self, action: client::SupportedDBRequests) -> Vec<u8> {
+    async fn conn_to_function(self: Arc<Self>, action: client::SupportedDBRequests) -> Vec<u8> {
         match action {
             client::SupportedDBRequests::LoggingNoPrint(data) => {
                 info!("IPC LOG: {data}");
@@ -127,9 +120,14 @@ impl IpcServer {
                 client::data_size_to_b(&self.should_exit.load(Ordering::SeqCst))
             }
             client::SupportedDBRequests::ExternalPluginCall(key, callback_info) => {
-                let out = self
-                    .plugin_manager
-                    .external_plugin_call(&key, &callback_info);
+                // Plugin callbacks are synchronous and may perform arbitrary
+                // work, so keep them off Tokio's executor threads.
+                let plugin_manager = self.plugin_manager.clone();
+                let out = tokio::task::spawn_blocking(move || {
+                    plugin_manager.external_plugin_call(&key, &callback_info)
+                })
+                .await
+                .unwrap_or_default();
 
                 client::data_size_to_b(&out)
             }
@@ -139,29 +137,22 @@ impl IpcServer {
                     IPC_TEST_SETTING_STARTED.store(true, Ordering::Release);
                 }
                 self.db
-                    .dispatch_ipc_request(action)
+                    .dispatch_ipc_request_async(action)
+                    .await
                     .unwrap_or_else(|| client::data_size_to_b(&false))
             }
         }
     }
 }
 
-async fn run_blocking<F>(operation: F) -> Result<Vec<u8>, tokio::task::JoinError>
-where
-    F: FnOnce() -> Vec<u8> + Send + 'static,
-{
-    tokio::task::spawn_blocking(operation).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::{IPC_TEST_SETTING_STARTED, IpcServer};
-    use crate::db::MainDatabase;
+    use crate::db::turso::TursoDatabase;
     use crate::plugins::PluginManager;
-    use rayon::ThreadPoolBuilder;
     use std::path::Path;
     use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, Mutex, OnceLock, mpsc};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
     use tempfile::tempdir;
 
@@ -169,15 +160,14 @@ mod tests {
     static SOCKET_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn long_ipc_task_does_not_block_another_task() {
+    async fn ipc_requests_on_separate_connections_are_handled_concurrently() {
         let _socket_lock = SOCKET_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         let _ = std::fs::remove_file(SOCKET_PATH);
         IPC_TEST_SETTING_STARTED.store(false, std::sync::atomic::Ordering::Release);
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let processing_pool = Arc::new(ThreadPoolBuilder::new().build().unwrap());
         let should_exit = Arc::new(AtomicBool::new(false));
-        let db = MainDatabase::new(&db_path, processing_pool, should_exit.clone());
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
         let plugins_path = temp_dir.path().join("plugins");
         std::fs::create_dir(&plugins_path).unwrap();
         let plugin_manager = PluginManager::new(&plugins_path, db.clone(), should_exit.clone());
@@ -194,45 +184,31 @@ mod tests {
             "IPC socket was not created"
         );
 
-        // Hold SQLite's writer lock so the real setting write remains blocked
-        // inside the IPC worker until after the concurrent request is checked.
-        let (lock_ready_sender, lock_ready_receiver) = mpsc::sync_channel(0);
-        let (release_sender, release_receiver) = mpsc::sync_channel(0);
-        let lock_path = db_path.clone();
-        let lock_thread = std::thread::spawn(move || {
-            let connection = r2d2_sqlite::rusqlite::Connection::open(lock_path).unwrap();
-            connection.execute_batch("BEGIN IMMEDIATE").unwrap();
-            lock_ready_sender.send(()).unwrap();
-            release_receiver.recv().unwrap();
-            connection.execute_batch("ROLLBACK").unwrap();
-        });
-        lock_ready_receiver.recv().unwrap();
+        // Fire a database write and a lifecycle read concurrently. They travel
+        // over separate connections and must each complete without blocking
+        // the other, matching how independent plugin/UI requests are served.
+        let (write_result, exit_result) = tokio::join!(
+            client::setting_set_async(shared_types::DbSettingsObj {
+                name: "ipc_concurrency_test".to_string(),
+                description: None,
+                num: None,
+                param: Some("concurrent write".to_string()),
+            }),
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                client::should_exit_async(),
+            )
+        );
 
-        let long_task = tokio::spawn(client::setting_set_async(shared_types::DbSettingsObj {
-            name: "ipc_concurrency_test".to_string(),
-            description: None,
-            num: None,
-            param: Some("blocked write".to_string()),
-        }));
-        for _ in 0..100 {
-            if IPC_TEST_SETTING_STARTED.load(std::sync::atomic::Ordering::Acquire) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(IPC_TEST_SETTING_STARTED.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            write_result.unwrap(),
+            "concurrent setting set over IPC failed"
+        );
+        let exit_result = exit_result
+            .expect("short IPC request was blocked by the long IPC request")
+            .unwrap();
+        assert!(!exit_result);
 
-        let short_result =
-            tokio::time::timeout(Duration::from_millis(200), client::should_exit_async())
-                .await
-                .expect("short IPC request was blocked by the long IPC request")
-                .unwrap();
-
-        assert!(!short_result);
-        assert!(!long_task.is_finished());
-        release_sender.send(()).unwrap();
-        assert!(!long_task.await.unwrap().unwrap());
-        lock_thread.join().unwrap();
         drop(server);
         let _ = std::fs::remove_file(SOCKET_PATH);
     }
@@ -243,9 +219,8 @@ mod tests {
         let _ = std::fs::remove_file(SOCKET_PATH);
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let processing_pool = Arc::new(ThreadPoolBuilder::new().build().unwrap());
         let should_exit = Arc::new(AtomicBool::new(false));
-        let db = MainDatabase::new(&db_path, processing_pool, should_exit.clone());
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
         let plugins_path = temp_dir.path().join("plugins");
         std::fs::create_dir(&plugins_path).unwrap();
         let plugin_manager = PluginManager::new(&plugins_path, db.clone(), should_exit.clone());
@@ -286,6 +261,28 @@ mod tests {
         assert!(
             !prefix.is_empty(),
             "prefix search over IPC returned no results"
+        );
+
+        let female_added = client::tag_actions_add(vec![shared_types::FileTagAction {
+            operation: shared_types::TagOperation::Add,
+            tags: vec![shared_types::PluginTag {
+                tag: shared_types::Tag {
+                    name: "female".into(),
+                    namespace: shared_types::GenericNamespaceObj {
+                        name: "subject".into(),
+                        description: None,
+                    },
+                },
+                ..Default::default()
+            }],
+        }])
+        .unwrap();
+        assert!(female_added, "female tag add over IPC failed");
+        assert!(
+            !client::search_tag_fts("fem".into(), Some(10))
+                .unwrap()
+                .is_empty(),
+            "partial fem search over IPC returned no results"
         );
 
         drop(server);

@@ -71,7 +71,7 @@ fn is_retryable_status(status: StatusCode) -> bool {
 }
 
 use crate::{
-    db::MainDatabase,
+    db::turso::TursoDatabase,
     helper_functions::{self, get_sys_time_in_secs, memory_manage},
     plugins::PluginManager,
     web::FileReturn,
@@ -273,7 +273,7 @@ struct InternalStorage {
 }
 
 pub struct DownloadsManager {
-    pub db: Arc<MainDatabase>,
+    pub db: Arc<TursoDatabase>,
     plugin_manager: Arc<PluginManager>,
     jobs: RwLock<HashMap<String, InternalStorage>>,
     downloading_urls: RwLock<HashSet<String>>,
@@ -402,6 +402,9 @@ impl Scraper {
                 .should_exit
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
+                // Never remove a still-queued job on shutdown; it retries
+                // on the next boot.
+                should_remove_job.store(false, std::sync::atomic::Ordering::Relaxed);
                 break;
             }
 
@@ -542,8 +545,9 @@ impl Scraper {
                                 let (result_sender, result_receiver) =
                                     tokio::sync::oneshot::channel();
                                 self.download_manager.heavy_processing_pool.spawn(move || {
-                                    let _ =
-                                        result_sender.send(db.hashes_files_get_sync(&chunk_hashes));
+                                    let _ = result_sender.send(
+                                        db.hashes_files_get_sync_blocking(&chunk_hashes),
+                                    );
                                 });
                                 let existing_hash_files =
                                     Arc::new(result_receiver.await.map_err(|_| {
@@ -702,22 +706,32 @@ impl Scraper {
 
             let audit_reason = format!("scraper: {plugin_name}");
 
-            self.download_manager
+            let db_process_ok = self
+                .download_manager
                 .db
-                .tags_add_bulk(
-                    &[FileTagAction {
-                        operation: TagOperation::Add,
-                        tags,
-                    }],
-                    &audit_reason,
-                )
-                .await;
+                .tag_actions_add(&[FileTagAction {
+                    operation: TagOperation::Add,
+                    tags,
+                }])
+                .await
+                && self
+                    .download_manager
+                    .db
+                    .clone()
+                    .process_scraper(file_id_tag_map, job_list, audit_reason)
+                    .await;
 
-            self.download_manager
-                .db
-                .clone()
-                .process_scraper(file_id_tag_map, job_list, audit_reason)
-                .await;
+            if !db_process_ok {
+                // Do not remove the job when the database could not persist
+                // the scrape result; it will be retried on the next boot.
+                log::error!(
+                    "Worker: {} JobId: {} -- Database issue while saving scrape results; keeping job to retry on next boot.",
+                    plugin_name,
+                    job_id,
+                );
+                should_remove_job
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         if self.manage_recreation().await {
             should_remove_job.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -730,6 +744,16 @@ impl Scraper {
             {
                 internal_storage.job_storage.retain(|f| *f != self.job);
             }
+        }
+
+        // The job may have finished, but if a shutdown was requested while it
+        // was running, never drop it from the queue -- retry on the next boot.
+        if self
+            .download_manager
+            .should_exit
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            should_remove_job.store(false, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Removes job if we need to
@@ -1357,7 +1381,7 @@ impl Scraper {
                 }
 
                 let file_download_location =
-                    db.file_download_location_get_sync(&sha512_hash, &extension);
+                    db.file_download_location_get_sync_blocking(&sha512_hash, &extension);
 
                 if should_exit_for_processing.load(Ordering::SeqCst) {
                     return Err("shutdown requested".to_string());
@@ -1550,7 +1574,7 @@ impl Scraper {
 
 impl DownloadsManager {
     pub fn new(
-        db: Arc<MainDatabase>,
+        db: Arc<TursoDatabase>,
         plugin_manager: Arc<PluginManager>,
         heavy_processing_pool: Arc<ThreadPool>,
         should_exit: Arc<AtomicBool>,
@@ -1580,7 +1604,7 @@ impl DownloadsManager {
                 if let LoginType::Cookie(name, _) = logintype {
                     if let Some(api_key) = self
                         .db
-                        .setting_get_sync(&format!("PLUGIN_{}_{}_COOKIE", plugin.name, name))
+                        .setting_get_sync_blocking(&format!("PLUGIN_{}_{}_COOKIE", plugin.name, name))
                     {
                         out.push(ScraperParam::Login(LoginType::Cookie(
                             name.clone(),
@@ -1593,10 +1617,10 @@ impl DownloadsManager {
 
         if let Some(api_key) = self
             .db
-            .setting_get_sync(&format!("PLUGIN_{}_API_KEY", plugin.name))
+            .setting_get_sync_blocking(&format!("PLUGIN_{}_API_KEY", plugin.name))
             && let Some(api_pass) = self
                 .db
-                .setting_get_sync(&format!("PLUGIN_{}_API_PASS", plugin.name))
+                .setting_get_sync_blocking(&format!("PLUGIN_{}_API_PASS", plugin.name))
         {
             out.push(ScraperParam::Login(LoginType::Api(
                 api_key.param.unwrap(),
@@ -1754,7 +1778,7 @@ impl DownloadsManager {
                     LoginType::Api(key, api) => {
                         if self
                             .db
-                            .setting_get_sync(&format!("PLUGIN_{}_{}", plugin.name, "API_KEY"))
+                            .setting_get_sync_blocking(&format!("PLUGIN_{}_{}", plugin.name, "API_KEY"))
                             .is_none()
                         {
                             dbg!(&plugin.name, &key, &api);
@@ -1778,13 +1802,13 @@ impl DownloadsManager {
                             if user_pass.ends_with('\r') {
                                 user_pass.pop();
                             }
-                            self.db.setting_set_sync(&DbSettingsObj {
+                            self.db.setting_set_sync_blocking(&DbSettingsObj {
                                 name: format!("PLUGIN_{}_API_KEY", plugin.name),
                                 description: Some("API Login for site.".into()),
                                 num: None,
                                 param: Some(user_name),
                             });
-                            self.db.setting_set_sync(&DbSettingsObj {
+                            self.db.setting_set_sync_blocking(&DbSettingsObj {
                                 name: format!("PLUGIN_{}_API_PASS", plugin.name),
                                 description: Some("API Login for site.".into()),
                                 num: None,
@@ -1795,7 +1819,7 @@ impl DownloadsManager {
                     LoginType::ApiNamespaced(ns, key, api)
                         if self
                             .db
-                            .setting_get_sync(&format!(
+                            .setting_get_sync_blocking(&format!(
                                 "PLUGIN_{}_{}_{}",
                                 plugin.name, ns, "API_NS"
                             ))
@@ -1822,7 +1846,7 @@ impl DownloadsManager {
                         if user_pass.ends_with('\r') {
                             user_pass.pop();
                         }
-                        self.db.setting_set_sync(&DbSettingsObj {
+                        self.db.setting_set_sync_blocking(&DbSettingsObj {
                             name: format!("PLUGIN_{}_{}_{}", plugin.name, ns, "API_NS"),
                             description: Some("API Login for site.".into()),
                             num: None,
@@ -1832,7 +1856,7 @@ impl DownloadsManager {
                     LoginType::Cookie(cookie_name, help_text)
                         if self
                             .db
-                            .setting_get_sync(&format!(
+                            .setting_get_sync_blocking(&format!(
                                 "PLUGIN_{}_{}_{}",
                                 plugin.name, cookie_name, "COOKIE"
                             ))
@@ -1852,7 +1876,7 @@ impl DownloadsManager {
                             user_name.pop();
                         }
 
-                        self.db.setting_set_sync(&DbSettingsObj {
+                        self.db.setting_set_sync_blocking(&DbSettingsObj {
                             name: format!("PLUGIN_{}_{}_{}", plugin.name, cookie_name, "COOKIE"),
                             description: Some("Cookie for site..".into()),
                             num: None,

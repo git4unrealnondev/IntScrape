@@ -5,7 +5,7 @@ use syn::{Attribute, FnArg, ImplItem, Item, Meta, Pat, Type};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
-    let source_path = manifest.join("../../src/db/main.rs");
+    let source_path = manifest.join("../../src/db/turso/ipc.rs");
     println!("cargo:rerun-if-changed={}", source_path.display());
     println!("cargo:rerun-if-changed=../../libs/shared_types/src");
 

@@ -11,6 +11,11 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+// The file-status and hash-key helpers now live on the active `turso` backend;
+// the legacy layer re-exports them so its processing code and tests share one
+// implementation.
+pub use crate::db::{SourceUrlFileStatus, hashessupportedtoinner, hashessupportedtokey};
+
 fn process_storage_check_chunk(
     paths: &[PathBuf],
     file_hash: &HashMap<String, FileInternal>,
@@ -125,29 +130,6 @@ fn move_to_storage_dumpster(path: &Path, default_file_location: &(PathBuf, u64))
             .with_file_name("dumpster")
             .join(file_name),
     );
-}
-
-#[derive(Debug, Default, PartialEq)]
-pub struct SourceUrlFileStatus {
-    pub file: Option<FileInternal>,
-    pub dead: bool,
-}
-
-pub fn hashessupportedtoinner(hash: &HashesSupported) -> (&str, &String) {
-    match hash {
-        HashesSupported::Md5(md5) => ("MD5", md5),
-        HashesSupported::Sha1(hash) => ("SHA1", hash),
-        HashesSupported::Sha256(hash) => ("SHA256", hash),
-        HashesSupported::Sha512(hash) => ("SHA512", hash),
-        HashesSupported::IPFSCID(hash) => ("IPFSCID", hash),
-        HashesSupported::IPFSCID1(hash) => ("IPFSCID1", hash),
-        HashesSupported::ImageHash(hash) => ("ImageHash", hash),
-    }
-}
-
-pub fn hashessupportedtokey(hash: &HashesSupported) -> (String, String) {
-    let (algorithm, digest) = hashessupportedtoinner(hash);
-    (algorithm.to_string(), digest.clone())
 }
 
 impl MainDatabase {

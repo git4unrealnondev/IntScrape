@@ -12,9 +12,10 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::{
     db::{
-        MainDatabase, SYSTEM_DATABASE_BACKUP_SITE, SYSTEM_DATABASE_SLURP_SITE,
-        SYSTEM_FILE_HASH_SITE, SYSTEM_FILE_SIZE_SITE, SYSTEM_STORAGE_CHECK_SITE,
+        SYSTEM_DATABASE_BACKUP_SITE, SYSTEM_DATABASE_SLURP_SITE, SYSTEM_FILE_HASH_SITE,
+        SYSTEM_FILE_SIZE_SITE, SYSTEM_STORAGE_CHECK_SITE,
     },
+    db::turso::TursoDatabase,
     ipc::IpcServer,
     plugins::PluginManager,
     web::manager::DownloadsManager,
@@ -40,7 +41,7 @@ pub mod web;
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-const DB_PATH: &str = "main.db";
+const TURSO_DB_PATH: &str = "turso.db";
 const LOG_PATH: &str = "log.txt";
 pub const PLUGINS_PATH: &str = "compiled_plugins";
 const DB_VERSION: u64 = 6;
@@ -90,11 +91,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .build()?,
     );
 
-    let db = MainDatabase::new(
-        Path::new(DB_PATH),
-        heavy_processing_pool.clone(),
-        should_exit.clone(),
-    );
+    let db = TursoDatabase::new_with_exit(Path::new(TURSO_DB_PATH), should_exit.clone()).await;
+    log::info!("Turso database ready at {TURSO_DB_PATH}");
 
     let plugins_path =
         std::env::var("INTSCRAPE_PLUGINS_PATH").unwrap_or_else(|_| PLUGINS_PATH.to_owned());
@@ -252,7 +250,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     drop(download_manager);
 
     // Call shutdown before db exit
-    db.shutdown();
+    db.shutdown().await;
     drop(db);
 
     Ok(())

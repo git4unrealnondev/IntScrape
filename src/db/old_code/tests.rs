@@ -116,18 +116,10 @@ fn test_database_initialization_and_settings() {
 
     assert_eq!(user_agent.param, Some("IntScrape V1.0".to_string()));
 
-    let audit_table: i32 = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'AuditLog'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(audit_table, 0);
 }
 
 #[test]
-fn test_v2_database_upgrades_to_v3_audit_log() {
+fn test_v2_database_upgrade_runs_migrations() {
     let path = std::env::temp_dir().join(format!(
         "intscrape-db-v2-upgrade-{}.sqlite",
         std::process::id()
@@ -177,159 +169,6 @@ fn test_v2_database_upgrades_to_v3_audit_log() {
         .unwrap()
         .unwrap();
     assert_eq!(version.num, Some(DB_VERSION));
-    assert_eq!(
-        conn.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'AuditLog'",
-            [],
-            |row| row.get::<_, i32>(0),
-        )
-        .unwrap(),
-        0
-    );
-}
-
-#[test]
-fn test_relationship_and_tag_changes_are_audited() {
-    return;
-    let db = new_test();
-    let conn = db.pool.get().unwrap();
-    let actions = [file_action(
-        TagOperation::Add,
-        vec![plugin_tag("audit", "test")],
-    )];
-    MainDatabase::internal_audit_context_set(&conn, "tag discovered from input").unwrap();
-    let tags = db.internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
-    let tag_id = *tags.values().next().unwrap();
-    db.internal_file_bulk_add(&conn, HashSet::from([file("audit-hash", "bin")]));
-    let file_id: u64 = conn
-        .query_row("SELECT id FROM File WHERE hash = 'audit-hash'", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    MainDatabase::internal_audit_context_set(&conn, "relationship added").unwrap();
-    db.internal_relationships_bulk_add(&conn, &HashSet::from([(file_id, tag_id)]));
-
-    let count: i32 = conn
-        .query_row(
-            "SELECT count(*) FROM AuditLog WHERE entity_type IN ('tag', 'relationship')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(count, 2);
-    let reason: String = conn
-        .query_row(
-            "SELECT reason FROM AuditLog WHERE entity_type = 'relationship'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(!reason.is_empty());
-
-    let file_entries = db.audit_get_sync(&Some(file_id), &None);
-    assert_eq!(file_entries.len(), 2);
-    assert!(
-        file_entries
-            .iter()
-            .all(|entry| entry.file_id == Some(file_id))
-    );
-    assert!(
-        file_entries
-            .iter()
-            .any(|entry| entry.tag_id == Some(tag_id))
-    );
-
-    let tag_entries = db.audit_get_sync(&None, &Some(tag_id));
-    assert_eq!(tag_entries.len(), 2);
-    assert!(tag_entries.iter().all(|entry| entry.tag_id == Some(tag_id)));
-}
-
-#[test]
-fn test_audit_reason_can_identify_scraper_source() {
-    return;
-    let db = new_test();
-    let conn = db.pool.get().unwrap();
-    let actions = [file_action(
-        TagOperation::Add,
-        vec![plugin_tag("source-tag", "source")],
-    )];
-    let reason = "scraper: test-scraper";
-    MainDatabase::internal_audit_context_set(&conn, reason).unwrap();
-    let tags = db.internal_tag_bulk_add(&conn, &actions, db.plugin_manager.clone());
-    let tag_id = *tags.values().next().unwrap();
-    db.internal_file_bulk_add(&conn, HashSet::from([file("source-hash", "bin")]));
-    let file_id: u64 = conn
-        .query_row(
-            "SELECT id FROM File WHERE hash = 'source-hash'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-
-    MainDatabase::internal_audit_context_set(&conn, reason).unwrap();
-    db.internal_relationships_bulk_add(&conn, &HashSet::from([(file_id, tag_id)]));
-
-    let reasons: Vec<String> = conn
-        .prepare(
-            "SELECT reason FROM AuditLog
-                 WHERE (entity_type = 'tag' AND tag_id = ?1)
-                    OR (entity_type = 'relationship' AND file_id = ?2 AND tag_id = ?1)",
-        )
-        .unwrap()
-        .query_map(params![tag_id, file_id], |row| row.get(0))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-
-    assert_eq!(reasons.len(), 2);
-    assert!(reasons.iter().all(|audit_reason| audit_reason == reason));
-}
-
-#[test]
-fn test_relationship_cascade_delete_is_audited() {
-    return;
-    let db = new_test();
-    let conn = db.pool.get().unwrap();
-    MainDatabase::internal_audit_context_set(&conn, "cascade test").unwrap();
-    conn.execute(
-        "INSERT INTO Namespace (name, description) VALUES ('cascade', NULL)",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO File (hash, extension, storage_id) VALUES ('cascade-hash', 'bin', 1)",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO Tags (name, namespace) VALUES (
-                'cascade-tag', (SELECT id FROM Namespace WHERE name = 'cascade')
-            )",
-        [],
-    )
-    .unwrap();
-    db.internal_relationship_partition_create(&conn, 1);
-    conn.execute(
-        "INSERT INTO Relationship_1 (file_id, tag_id) VALUES (
-                (SELECT id FROM File WHERE hash = 'cascade-hash'),
-                (SELECT id FROM Tags WHERE name = 'cascade-tag')
-            )",
-        [],
-    )
-    .unwrap();
-
-    conn.execute("DELETE FROM File WHERE hash = 'cascade-hash'", [])
-        .unwrap();
-
-    let relationship_delete_count: i32 = conn
-        .query_row(
-            "SELECT count(*) FROM AuditLog
-                 WHERE entity_type = 'relationship' AND action = 'delete'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(relationship_delete_count, 1);
 }
 
 #[test]
