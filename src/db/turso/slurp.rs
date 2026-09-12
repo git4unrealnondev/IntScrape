@@ -30,13 +30,16 @@ impl TursoDatabase {
         loop {
             match self.internal_db_slurp(&source_conn).await {
                 Ok(result) => return Ok(result),
-                Err(error) if matches!(error, turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => {
+                Err(error)
+                    if matches!(error, turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) =>
+                {
                     log::warn!("Turso slurp transaction conflicted; retrying in 50ms: {error}");
-                    // The failed attempt's inserts rolled back wholesale, so any
-                    // storage-location ids it cached are stale. Re-seed from the
-                    // committed rows so the retry cannot reference missing rows.
+                    // A failed batch is rolled back when its connection drops.
+                    // Re-seed caches before restarting the import attempt.
                     if let Err(reload_error) = self.file_storage_location_cache_reload().await {
-                        log::warn!("Failed to reload storage-location cache after conflict: {reload_error}");
+                        log::warn!(
+                            "Failed to reload storage-location cache after conflict: {reload_error}"
+                        );
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
@@ -96,22 +99,20 @@ impl TursoDatabase {
         let namespace_bulk = self.namespace_ensure_set(&namespace_set).await?;
         let namespace_count = namespace_bulk.len() as u64;
 
-        // A slurp can run for a long time. BEGIN CONCURRENT lets unrelated
-        // Turso writers, such as the job scheduler, proceed while this import
-        // builds its snapshot. Conflicts are reported at COMMIT instead of
-        // blocking every writer for the duration of the import.
-        conn.execute("BEGIN CONCURRENT", ()).await?;
-
         // Storage locations: re-use whatever rows exist, creating the rest.
+        // Keep each batch short so scraper writes can commit between batches.
+        conn.execute("BEGIN CONCURRENT", ()).await?;
         let mut locations = source
             .prepare("SELECT location FROM FileStorageLocations")
             .map_err(db_error)?;
         let mut location_rows = locations.query([]).map_err(db_error)?;
         while let Some(row) = location_rows.next().map_err(db_error)? {
             let location: String = row.get(0).map_err(db_error)?;
-            self.file_storage_location_get_or_create(&conn, &location).await?;
+            self.file_storage_location_get_or_create(&conn, &location)
+                .await?;
         }
         drop(location_rows);
+        conn.execute("COMMIT", ()).await?;
 
         // Tags, chunked by id, building the source -> target tag map.
         let mut slurp_tags: HashMap<u64, u64> = HashMap::new();
@@ -163,7 +164,9 @@ impl TursoDatabase {
                     })
                     .collect::<Vec<_>>();
                 log::info!("Slurping {} tags into the db.", batch.len());
+                conn.execute("BEGIN CONCURRENT", ()).await?;
                 let mapping = self.tag_action_bulk_add(&conn, &actions).await?;
+                conn.execute("COMMIT", ()).await?;
                 tag_count += batch.len() as u64;
                 for (source_id, name, namespace, description) in &batch {
                     let key = Tag {
@@ -233,7 +236,8 @@ impl TursoDatabase {
                 for (_, hash, extension, size_bytes, location) in &batch {
                     let storage_id = match location.as_deref() {
                         Some(location) => {
-                            self.file_storage_location_get_or_create(&conn, location).await?
+                            self.file_storage_location_get_or_create(&conn, location)
+                                .await?
                         }
                         None => 0,
                     };
@@ -247,9 +251,11 @@ impl TursoDatabase {
                 }
                 file_count += files.len() as u64;
                 log::info!("Slurping {} files into the db.", files.len());
+                conn.execute("BEGIN CONCURRENT", ()).await?;
                 let resolved = self
                     .file_add_bulk(&conn, &files.iter().cloned().collect::<Vec<_>>())
                     .await?;
+                conn.execute("COMMIT", ()).await?;
                 let target_by_hash: HashMap<&str, u64> = resolved
                     .iter()
                     .filter_map(|file| file.id.map(|id| (file.hash.as_str(), id)))
@@ -275,7 +281,8 @@ impl TursoDatabase {
                     [],
                     |row| row.get::<_, i64>(0),
                 )
-                .map_err(db_error)? == 1;
+                .map_err(db_error)?
+                == 1;
             if has_file_hashes {
                 let mut last_file_id = 0_u64;
                 loop {
@@ -310,9 +317,11 @@ impl TursoDatabase {
                                 .map(|target_id| (*target_id, algorithm.as_str(), digest.as_str()))
                         })
                         .collect();
-                log::info!("Slurping {} hashes into the db.", tuples.len());
+                    log::info!("Slurping {} hashes into the db.", tuples.len());
                     if !tuples.is_empty() {
+                        conn.execute("BEGIN CONCURRENT", ()).await?;
                         self.file_hashes_add_bulk(&conn, &tuples).await?;
+                        conn.execute("COMMIT", ()).await?;
                     }
                     last_file_id = *last_id;
                 }
@@ -322,14 +331,13 @@ impl TursoDatabase {
         // Relationships, one source namespace partition (or the legacy single
         // `Relationship` table) at a time.
         {
-            let source_table_exists =
-                |name: &str| -> Result<bool> {
-                    let mut stmt = source
-                        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")
-                        .map_err(db_error)?;
-                    let mut rows = stmt.query([name]).map_err(db_error)?;
-                    Ok(rows.next().map_err(db_error)?.is_some())
-                };
+            let source_table_exists = |name: &str| -> Result<bool> {
+                let mut stmt = source
+                    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")
+                    .map_err(db_error)?;
+                let mut rows = stmt.query([name]).map_err(db_error)?;
+                Ok(rows.next().map_err(db_error)?.is_some())
+            };
             let has_legacy_relationship = source_table_exists("Relationship")?;
 
             for source_namespace in ns_by_source_id.keys() {
@@ -355,9 +363,14 @@ impl TursoDatabase {
                         ))
                         .map_err(db_error)?;
                     let rows = stmt
-                        .query_map([last_file_id as i64, last_tag_id as i64, SQL_CHUNK_SIZE as i64], |row| {
-                            Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?))
-                        })
+                        .query_map(
+                            [
+                                last_file_id as i64,
+                                last_tag_id as i64,
+                                SQL_CHUNK_SIZE as i64,
+                            ],
+                            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+                        )
                         .map_err(db_error)?;
                     let batch: Vec<_> = rows.filter_map(|r| r.ok()).collect();
                     drop(stmt);
@@ -373,8 +386,13 @@ impl TursoDatabase {
                             Some((*target_file, *target_tag))
                         })
                         .collect::<HashSet<_>>();
-                log::info!("Slurping {} relationships into the db.", relationships.len());
+                    log::info!(
+                        "Slurping {} relationships into the db.",
+                        relationships.len()
+                    );
+                    conn.execute("BEGIN CONCURRENT", ()).await?;
                     self.relationships_bulk_add(&conn, &relationships).await?;
+                    conn.execute("COMMIT", ()).await?;
 
                     last_file_id = *source_file_id;
                     last_tag_id = *source_tag_id;
@@ -409,8 +427,10 @@ impl TursoDatabase {
                     });
                 }
             }
-                log::info!("Slurping {} parents into the db.", parent_set.len());
+            log::info!("Slurping {} parents into the db.", parent_set.len());
+            conn.execute("BEGIN CONCURRENT", ()).await?;
             self.parents_bulk_add(&conn, &parent_set).await?;
+            conn.execute("COMMIT", ()).await?;
         }
 
         // Jobs. Source ids are intentionally not preserved: the target Jobs
@@ -431,8 +451,6 @@ impl TursoDatabase {
         if has_jobs {
             self.slurp_jobs(&conn, source).await?;
         }
-
-        conn.execute("COMMIT", ()).await?;
 
         Ok((namespace_count, tag_count, file_count))
     }
@@ -468,9 +486,7 @@ impl TursoDatabase {
             .iter()
             .all(|column| columns.contains(*column))
         {
-            log::warn!(
-                "Slurp: source Jobs table is missing required columns; skipping jobs."
-            );
+            log::warn!("Slurp: source Jobs table is missing required columns; skipping jobs.");
             return Ok(());
         }
 
@@ -502,20 +518,17 @@ impl TursoDatabase {
         );
         let mut stmt = source.prepare(&select).map_err(db_error)?;
         let rows = stmt
-            .query_map(
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, u64>(0)?,
-                        row.get::<_, u64>(1)?,
-                        row.get::<_, Option<u64>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                    ))
-                },
-            )
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, Option<u64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
             .map_err(db_error)?;
 
         let mut copied = 0_u64;
@@ -559,13 +572,17 @@ impl TursoDatabase {
             };
             batch.push(job);
             if batch.len() >= SQL_CHUNK_SIZE {
+                conn.execute("BEGIN CONCURRENT", ()).await?;
                 self.jobs_bulk_add_sql(&conn, &batch).await?;
+                conn.execute("COMMIT", ()).await?;
                 copied += batch.len() as u64;
                 batch.clear();
             }
         }
         if !batch.is_empty() {
+            conn.execute("BEGIN CONCURRENT", ()).await?;
             self.jobs_bulk_add_sql(&conn, &batch).await?;
+            conn.execute("COMMIT", ()).await?;
             copied += batch.len() as u64;
         }
         log::info!("Slurping {copied} jobs into the db.");
@@ -584,7 +601,9 @@ fn parse_slurp_job_recreation(json: &str) -> Option<DbJobRecreation> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
     value
         .get("recreation")
-        .and_then(|recreation| serde_json::from_value::<Option<DbJobRecreation>>(recreation.clone()).ok())
+        .and_then(|recreation| {
+            serde_json::from_value::<Option<DbJobRecreation>>(recreation.clone()).ok()
+        })
         .flatten()
 }
 
@@ -607,20 +626,15 @@ mod tests {
 
     /// Point a source sqlite file at `script` and return a connection to it.
     /// The tempdir must outlive the connection, so both are returned.
-    fn new_source(
-        script: &str,
-    ) -> (r2d2_sqlite::rusqlite::Connection, tempfile::TempDir) {
+    fn new_source(script: &str) -> (r2d2_sqlite::rusqlite::Connection, tempfile::TempDir) {
         let temp_dir = tempfile::tempdir().unwrap();
         let source_path = temp_dir.path().join("source.db");
-        let conn =
-            r2d2_sqlite::rusqlite::Connection::open(&source_path).unwrap();
+        let conn = r2d2_sqlite::rusqlite::Connection::open(&source_path).unwrap();
         conn.execute_batch(script).unwrap();
         (conn, temp_dir)
     }
 
-    async fn target_jobs(
-        db: &TursoDatabase,
-    ) -> Vec<(String, u64, Option<String>, Option<String>)> {
+    async fn target_jobs(db: &TursoDatabase) -> Vec<(String, u64, Option<String>, Option<String>)> {
         let conn = db.connect().unwrap();
         let mut rows = conn
             .query(
@@ -663,10 +677,17 @@ mod tests {
         let (site, priority, recreation, user_data) = &jobs[0];
         assert_eq!(site, "e621");
         assert_eq!(*priority, 5);
-        assert!(recreation.as_deref().unwrap().contains("OnTagId"), "recreation from recreation column");
+        assert!(
+            recreation.as_deref().unwrap().contains("OnTagId"),
+            "recreation from recreation column"
+        );
         assert_eq!(user_data.as_deref().unwrap(), "{\"k\":\"v\"}");
         assert_eq!(jobs[1].1, 10);
-        assert_eq!(jobs[1].2, Some("null".into()), "empty recreation stays null");
+        assert_eq!(
+            jobs[1].2,
+            Some("null".into()),
+            "empty recreation stays null"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -698,7 +719,11 @@ mod tests {
             recreation.as_deref().unwrap().contains("OnTag"),
             "recreation must be read out of the Manager JSON"
         );
-        assert_eq!(user_data.as_deref().unwrap(), "{\"user\":\"y\"}", "user data from UserData");
+        assert_eq!(
+            user_data.as_deref().unwrap(),
+            "{\"user\":\"y\"}",
+            "user data from UserData"
+        );
         assert_eq!(jobs[1].0, "saucenao");
         assert_eq!(jobs[1].1, 10, "NULL priority defaults to 10");
         assert_eq!(jobs[1].2, Some("null".into()));
