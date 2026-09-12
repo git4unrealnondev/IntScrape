@@ -159,36 +159,6 @@ impl TursoDatabase {
         // database so a crash never leaves a job stuck as "running".
         self.jobs_reset_isrunning_sql(&conn).await?;
 
-        // Keep existing databases on the ngram tokenizer as well.
-        let _ = conn
-            .execute_batch(
-                "DROP INDEX IF EXISTS idx_tags_fts;\nCREATE INDEX IF NOT EXISTS idx_tags_fts ON Tags USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);\nOPTIMIZE INDEX idx_tags_fts;",
-            )
-            .await;
-
-        // The legacy backend attached triggers to Tags that maintained its own
-        // FTS5 shadow tables (Tags_Popular_fts / Tags_Search_fts) and fired on
-        // every tag insert/update/delete. Turso keeps the tag counts in Rust
-        // and maintains its own `USING fts` index, so any surviving triggers
-        // are either broken (their FTS5 tables no longer exist) or would
-        // double-maintain counts. Drop every trigger at boot so a migrated
-        // database never trips on stale legacy rules.
-        {
-            let mut rows = conn
-                .query("SELECT name FROM sqlite_schema WHERE type = 'trigger';", ())
-                .await?;
-            let mut triggers = Vec::new();
-            while let Some(row) = rows.next().await? {
-                triggers.push(row.get::<String>(0)?);
-            }
-            drop(rows);
-            for name in triggers {
-                log::info!("Dropping legacy trigger '{name}'.");
-                conn.execute(&format!("DROP TRIGGER IF EXISTS \"{name}\";"), ())
-                    .await?;
-            }
-        }
-
         conn.pragma_update("journal_mode", "'mvcc'").await?;
 
         conn.commit().await?;

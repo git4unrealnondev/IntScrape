@@ -74,6 +74,7 @@ impl MainDatabase {
              FROM Tags_Search_fts f
              JOIN Tags t ON t.id = f.rowid
              WHERE Tags_Search_fts MATCH ?1
+             ORDER BY t.count DESC, t.id ASC
              LIMIT ?2",
         );
         // A stale or missing FTS index (for example a database that predates
@@ -800,7 +801,10 @@ impl MainDatabase {
         // Wrap the whole compound in a FROM subquery: a bare parenthesized
         // compound is rejected by the SQLite parser as a top-level statement,
         // and the outer SELECT lets a trailing LIMIT apply to the final set.
-        let mut sql_string = format!("SELECT file_id FROM ({})", sql_list.join(" "));
+        let mut sql_string = format!(
+            "SELECT file_id FROM ({}) ORDER BY file_id DESC",
+            sql_list.join(" ")
+        );
         if let Some(limit) = limit {
             sql_string.push_str(&format!(" LIMIT {limit}"));
         }

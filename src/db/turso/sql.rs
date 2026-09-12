@@ -147,14 +147,15 @@ impl TursoDatabase {
             .and_then(|s| s.num)
             .unwrap_or(5) as i64;
 
-        // Tier 1: popular tags (count >= threshold) ranked by BM25 score.
+        // Tier 1: popular tags (count >= threshold), with the most-used tags
+        // first and BM25 relevance breaking ties.
         {
             let mut rows = conn
                 .query(
                     "SELECT id, count, fts_score(name, ?1) AS score \
                      FROM Tags \
                      WHERE fts_match(name, ?1) AND count >= ?2 \
-                     ORDER BY score ASC \
+                     ORDER BY count DESC, score ASC, id ASC \
                      LIMIT ?3;",
                     (fts_query.clone(), popular_threshold, limit as i64),
                 )
@@ -176,7 +177,7 @@ impl TursoDatabase {
                     "SELECT id, count, fts_score(name, ?1) AS score \
                      FROM Tags \
                      WHERE fts_match(name, ?1) \
-                     ORDER BY score ASC \
+                     ORDER BY count DESC, score ASC, id ASC \
                      LIMIT ?2;",
                     (fts_query, limit as i64),
                 )

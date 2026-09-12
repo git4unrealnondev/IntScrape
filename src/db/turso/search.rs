@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use shared_types::{SearchHolder, SearchObj};
-use turso::{Connection, Result};
+use turso::{params_from_iter, Connection, Result, Value};
 
 use crate::db::turso::TursoDatabase;
+use crate::db::SQL_CHUNK_SIZE;
 
 /// How many tag ids are pulled from FTS when resolving a human name.
 const FTS_NAME_LIMIT: usize = 10;
@@ -64,7 +65,12 @@ impl TursoDatabase {
         }
 
         let mut resolved_not = not_ids.to_vec();
-        for matching_ids in self.resolve_tag_names(not_tags).await?.into_iter().flatten() {
+        for matching_ids in self
+            .resolve_tag_names(not_tags)
+            .await?
+            .into_iter()
+            .flatten()
+        {
             resolved_not.extend(matching_ids);
         }
         if !resolved_not.is_empty() {
@@ -89,17 +95,30 @@ impl TursoDatabase {
         search: &SearchObj,
         limit: &Option<u64>,
     ) -> Result<Vec<u64>> {
-        // Builds mapping for id -> namespace id
+        // Resolve all tag namespaces in batched queries instead of one query
+        // per tag. Search requests commonly contain many tag IDs.
         let mut id_ns_map = HashMap::new();
+        let mut tag_ids = HashSet::new();
         for search_holder in search.searches.iter() {
             let ids = holder_ids(search_holder);
             for tag_id in ids {
-                if id_ns_map.contains_key(tag_id) {
-                    continue;
-                }
-                if let Some(namespace_id) = self.tag_namespace_id(conn, *tag_id).await? {
-                    id_ns_map.insert(*tag_id, namespace_id);
-                }
+                tag_ids.insert(*tag_id);
+            }
+        }
+        let tag_ids: Vec<u64> = tag_ids.into_iter().collect();
+        for chunk in tag_ids.chunks(SQL_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let params: Vec<Value> = chunk.iter().map(|id| Value::from(*id as i64)).collect();
+            let mut rows = conn
+                .query(
+                    format!("SELECT id, namespace FROM Tags WHERE id IN ({placeholders});"),
+                    params_from_iter(params),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                id_ns_map.insert(row.get::<u64>(0)?, row.get::<u64>(1)?);
             }
         }
 
@@ -164,7 +183,10 @@ impl TursoDatabase {
             sql_list.insert(1, "EXCEPT".into());
         }
 
-        let mut sql_string = format!("SELECT file_id FROM ({})", sql_list.join(" "));
+        let mut sql_string = format!(
+            "SELECT file_id FROM ({}) ORDER BY file_id DESC",
+            sql_list.join(" ")
+        );
         if let Some(limit) = limit {
             sql_string.push_str(&format!(" LIMIT {limit}"));
         }

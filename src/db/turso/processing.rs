@@ -173,14 +173,17 @@ impl TursoDatabase {
         };
         let resolved_files: Vec<FileInternal> = resolved_files.into_iter().collect();
 
+        let resolved_files_by_hash: HashMap<&str, &FileInternal> = resolved_files
+            .iter()
+            .map(|file| (file.hash.as_str(), file))
+            .collect();
         let mapped_files: Vec<_> = map
             .keys()
             .filter_map(|file_manager| {
-                let matching_res = resolved_files
-                    .iter()
-                    .find(|res| res.hash == file_manager.internal.hash)?;
+                let matching_res = resolved_files_by_hash
+                    .get(file_manager.internal.hash.as_str())?;
                 let mut temp = file_manager.clone();
-                temp.internal = matching_res.clone();
+                temp.internal = (*matching_res).clone();
                 Some(temp)
             })
             .collect();
