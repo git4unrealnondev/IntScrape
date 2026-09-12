@@ -121,7 +121,6 @@ CREATE TABLE IF NOT EXISTS Tags (
     FOREIGN KEY (namespace) REFERENCES Namespace(id) ON DELETE CASCADE ON UPDATE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_tags_count_covering ON Tags(count DESC, name, namespace);
-DROP INDEX IF EXISTS idx_tags_fts;
 CREATE INDEX IF NOT EXISTS idx_tags_fts ON Tags USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);
 OPTIMIZE INDEX idx_tags_fts;
 ",

@@ -259,14 +259,6 @@ impl TursoDatabase {
             }
         };
 
-        // FTS index rows are replayed by turso's schema reload on the next
-        // open. A clean shutdown drops the index first (check_db recreates it
-        // on the next boot), so a previously-crashed session can never be
-        // bricked by a stale/duplicated idx_tags_fts schema row.
-        if let Err(error) = conn.execute("DROP INDEX IF EXISTS idx_tags_fts;", ()).await {
-            log::error!("Failed to drop FTS index while shutting down: {error}");
-        }
-
         // `PRAGMA wal_checkpoint(TRUNCATE)` returns a result row, so it has to
         // be drained through `query` instead of `execute`.
         if let Err(error) = conn.query("PRAGMA wal_checkpoint(TRUNCATE);", ()).await {
