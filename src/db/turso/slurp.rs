@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::Instant;
 
 use shared_types::{
     DbJobRecreation, FileInternal, GenericNamespaceObj, PluginJob, ScraperParam, Tag, TagParents,
@@ -64,6 +65,7 @@ impl TursoDatabase {
         let conn = self.connect()?;
 
         // Namespaces, remembering id -> object and name -> target id.
+        let slurp_started = Instant::now();
         let mut ns_by_source_id: HashMap<u64, GenericNamespaceObj> = HashMap::new();
         let mut namespace_set: HashSet<GenericNamespaceObj> = HashSet::new();
         {
@@ -97,6 +99,11 @@ impl TursoDatabase {
         // cached (the common warm-db case).
         let namespace_bulk = self.namespace_ensure_set(&namespace_set).await?;
         let namespace_count = namespace_bulk.len() as u64;
+        log::info!(
+            "Slurp stage namespaces complete: {} namespaces in {:?}",
+            namespace_count,
+            slurp_started.elapsed()
+        );
 
         // Storage locations: re-use whatever rows exist, creating the rest.
         // Keep each batch short so scraper writes can commit between batches.
@@ -116,6 +123,10 @@ impl TursoDatabase {
         }
         drop(location_rows);
         conn.execute("COMMIT", ()).await?;
+        log::info!(
+            "Slurp stage storage locations complete in {:?}",
+            slurp_started.elapsed()
+        );
 
         // Tags, chunked by id, building the source -> target tag map.
         let mut slurp_tags: HashMap<u64, u64> = HashMap::new();
@@ -127,6 +138,7 @@ impl TursoDatabase {
                 .await?;
             let mut last_tag_id = 0_u64;
             loop {
+                let batch_started = Instant::now();
                 let mut stmt = source
                     .prepare(
                         "SELECT s.id, s.name, n.name, n.description
@@ -154,6 +166,7 @@ impl TursoDatabase {
                 };
 
                 log::info!("Slurping {} tags into the db.", batch.len());
+                let target_started = Instant::now();
                 conn.execute("BEGIN CONCURRENT", ()).await?;
                 let mapping = self.slurp_tags_bulk_add(&conn, &batch).await?;
                 conn.execute("COMMIT", ()).await?;
@@ -171,8 +184,19 @@ impl TursoDatabase {
                     }
                 }
                 last_tag_id = *last_id;
+                log::info!(
+                    "Slurp tags batch complete: {} rows, target {:?}, total {:?}",
+                    batch.len(),
+                    target_started.elapsed(),
+                    batch_started.elapsed()
+                );
             }
         }
+        log::info!(
+            "Slurp stage tags complete: {} tags in {:?}",
+            tag_count,
+            slurp_started.elapsed()
+        );
 
         // Files, chunked by id.
         let mut slurp_files: HashMap<u64, u64> = HashMap::new();
@@ -196,6 +220,7 @@ impl TursoDatabase {
 
             let mut last_file_id = 0_u64;
             loop {
+                let batch_started = Instant::now();
                 let file_query = format!(
                     "SELECT f.id, f.hash, f.extension, {size_column}, f.storage_id
                      FROM File f
@@ -236,6 +261,7 @@ impl TursoDatabase {
                 }
                 file_count += files.len() as u64;
                 log::info!("Slurping {} files into the db.", files.len());
+                let target_started = Instant::now();
                 conn.execute("BEGIN CONCURRENT", ()).await?;
                 let resolved = self
                     .file_add_bulk(&conn, &files.iter().cloned().collect::<Vec<_>>())
@@ -252,8 +278,19 @@ impl TursoDatabase {
                 }
 
                 last_file_id = *last_id;
+                log::info!(
+                    "Slurp files batch complete: {} rows, target {:?}, total {:?}",
+                    files.len(),
+                    target_started.elapsed(),
+                    batch_started.elapsed()
+                );
             }
         }
+        log::info!(
+            "Slurp stage files complete: {} files in {:?}",
+            file_count,
+            slurp_started.elapsed()
+        );
 
         // Secondary hashes, keyed through the source file id.
         {
@@ -271,6 +308,7 @@ impl TursoDatabase {
             if has_file_hashes {
                 let mut last_file_id = 0_u64;
                 loop {
+                    let batch_started = Instant::now();
                     let mut stmt = source
                         .prepare(
                             "SELECT h.file_id, h.algorithm, h.digest
@@ -304,14 +342,25 @@ impl TursoDatabase {
                         .collect();
                     log::info!("Slurping {} hashes into the db.", tuples.len());
                     if !tuples.is_empty() {
+                        let target_started = Instant::now();
                         conn.execute("BEGIN CONCURRENT", ()).await?;
                         self.file_hashes_add_bulk(&conn, &tuples).await?;
                         conn.execute("COMMIT", ()).await?;
+                        log::info!(
+                            "Slurp hashes batch target complete: {} rows in {:?} (total {:?})",
+                            tuples.len(),
+                            target_started.elapsed(),
+                            batch_started.elapsed()
+                        );
                     }
                     last_file_id = *last_id;
                 }
             }
         }
+        log::info!(
+            "Slurp stage hashes complete in {:?}",
+            slurp_started.elapsed()
+        );
 
         // Relationships, one source namespace partition (or the legacy single
         // `Relationship` table) at a time.
@@ -348,6 +397,7 @@ impl TursoDatabase {
                 let mut last_file_id = 0_u64;
                 let mut last_tag_id = 0_u64;
                 loop {
+                    let batch_started = Instant::now();
                     let query = if source_table.1 {
                         format!(
                             "SELECT r.file_id, r.tag_id
@@ -413,6 +463,7 @@ impl TursoDatabase {
                         "Slurping {} relationships into the db.",
                         relationships.len()
                     );
+                    let target_started = Instant::now();
                     conn.execute("BEGIN CONCURRENT", ()).await?;
                     self.slurp_relationships_bulk_add(&conn, target_namespace, &relationships)
                         .await?;
@@ -420,18 +471,29 @@ impl TursoDatabase {
 
                     last_file_id = *source_file_id;
                     last_tag_id = *source_tag_id;
+                    log::info!(
+                        "Slurp relationships batch complete: {} rows, target {:?}, total {:?}",
+                        relationships.len(),
+                        target_started.elapsed(),
+                        batch_started.elapsed()
+                    );
                 }
 
                 conn.execute(
                     format!(
-                        "UPDATE Tags SET count = (
+                        "UPDATE Tags AS target_tag SET count = (
                              SELECT COUNT(*) FROM Relationship_{target_namespace} r
-                             WHERE r.tag_id = Tags.id
-                         ) WHERE namespace = ?1"
+                             WHERE r.tag_id = target_tag.id
+                         ) WHERE target_tag.namespace = ?1"
                     ),
                     (target_namespace as i64,),
                 )
                 .await?;
+                log::info!(
+                    "Slurp count recalculation for namespace {} complete in {:?}",
+                    target_namespace,
+                    slurp_started.elapsed()
+                );
             }
         }
 

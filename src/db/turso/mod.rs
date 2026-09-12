@@ -105,10 +105,13 @@ impl TursoDatabase {
         // MVCC allows BEGIN CONCURRENT transactions to overlap. The pragma is
         // required for the database itself; the passive-checkpoint builder
         // option alone does not enable MVCC.
-        if let Ok(conn) = db.connect()
-            && let Err(error) = conn.execute("PRAGMA journal_mode = 'mvcc';", ()).await
-        {
-            log::error!("Failed to enable Turso MVCC mode: {error}");
+        if let Ok(conn) = db.connect() {
+            match conn.pragma_update("journal_mode", "'mvcc'").await {
+                Ok(_) => {}
+                Err(error) => {
+                    log::error!("Failed to enable Turso MVCC mode: {error}");
+                }
+            }
         }
 
         let out = TursoDatabase {
