@@ -6,10 +6,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use shared_types::{
-    DbJobRecreation, FileInternal, FileTagAction, GenericNamespaceObj, PluginJob, PluginTag,
-    ScraperParam, Tag, TagOperation, TagParents, TagType,
+    DbJobRecreation, FileInternal, GenericNamespaceObj, PluginJob, ScraperParam, Tag, TagParents,
 };
-use turso::{Connection, Result};
+use turso::{Connection, Result, Value, params_from_iter};
 
 use crate::db::SQL_CHUNK_SIZE;
 use crate::db::turso::TursoDatabase;
@@ -118,6 +117,10 @@ impl TursoDatabase {
         let mut slurp_tags: HashMap<u64, u64> = HashMap::new();
         let mut tag_count = 0_u64;
         {
+            // Maintaining the n-gram index for every imported row is vastly
+            // more expensive than rebuilding it once after the import.
+            conn.execute("DROP INDEX IF EXISTS idx_tags_fts", ())
+                .await?;
             let mut last_tag_id = 0_u64;
             loop {
                 let mut stmt = source
@@ -146,26 +149,9 @@ impl TursoDatabase {
                     break;
                 };
 
-                let actions = batch
-                    .iter()
-                    .map(|(_, name, namespace, description)| FileTagAction {
-                        operation: TagOperation::Add,
-                        tags: vec![PluginTag {
-                            tag: Tag {
-                                name: name.clone(),
-                                namespace: GenericNamespaceObj {
-                                    name: namespace.clone(),
-                                    description: description.clone(),
-                                },
-                            },
-                            tag_type: TagType::NormalNoRegex,
-                            relates_to: None,
-                        }],
-                    })
-                    .collect::<Vec<_>>();
                 log::info!("Slurping {} tags into the db.", batch.len());
                 conn.execute("BEGIN CONCURRENT", ()).await?;
-                let mapping = self.tag_action_bulk_add(&conn, &actions).await?;
+                let mapping = self.slurp_tags_bulk_add(&conn, &batch).await?;
                 conn.execute("COMMIT", ()).await?;
                 tag_count += batch.len() as u64;
                 for (source_id, name, namespace, description) in &batch {
@@ -340,39 +326,77 @@ impl TursoDatabase {
             };
             let has_legacy_relationship = source_table_exists("Relationship")?;
 
-            for source_namespace in ns_by_source_id.keys() {
+            for (source_namespace, namespace) in &ns_by_source_id {
                 let partition = format!("Relationship_{source_namespace}");
                 let source_table = if source_table_exists(&partition)? {
-                    partition
+                    (partition, false)
                 } else if has_legacy_relationship {
-                    "Relationship".to_string()
+                    // The legacy table contains all namespaces. It must be
+                    // filtered below or it will be copied once per namespace.
+                    ("Relationship".to_string(), true)
                 } else {
                     continue;
                 };
+                let target_namespace = self
+                    .namespace_get_name_cache(&namespace.name)
+                    .await
+                    .ok_or_else(|| {
+                        turso::Error::ConversionFailure(
+                            format!("slurp namespace not cached: {}", namespace.name).into(),
+                        )
+                    })?;
 
                 let mut last_file_id = 0_u64;
                 let mut last_tag_id = 0_u64;
                 loop {
-                    let mut stmt = source
-                        .prepare(&format!(
+                    let query = if source_table.1 {
+                        format!(
                             "SELECT r.file_id, r.tag_id
-                             FROM {source_table} r
+                             FROM {} r
+                             JOIN Tags t ON t.id = r.tag_id
+                             WHERE t.namespace = ?3
+                               AND (r.file_id > ?1 OR (r.file_id = ?1 AND r.tag_id > ?2))
+                             ORDER BY r.file_id, r.tag_id
+                             LIMIT ?4",
+                            source_table.0
+                        )
+                    } else {
+                        format!(
+                            "SELECT r.file_id, r.tag_id
+                             FROM {} r
                              WHERE r.file_id > ?1 OR (r.file_id = ?1 AND r.tag_id > ?2)
                              ORDER BY r.file_id, r.tag_id
-                             LIMIT ?3"
-                        ))
-                        .map_err(db_error)?;
-                    let rows = stmt
-                        .query_map(
-                            [
-                                last_file_id as i64,
-                                last_tag_id as i64,
-                                SQL_CHUNK_SIZE as i64,
-                            ],
-                            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+                             LIMIT ?3",
+                            source_table.0
                         )
-                        .map_err(db_error)?;
-                    let batch: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+                    };
+                    let mut stmt = source.prepare(&query).map_err(db_error)?;
+                    let batch: Vec<(u64, u64)> = if source_table.1 {
+                        let rows = stmt
+                            .query_map(
+                                [
+                                    last_file_id as i64,
+                                    last_tag_id as i64,
+                                    *source_namespace as i64,
+                                    SQL_CHUNK_SIZE as i64,
+                                ],
+                                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+                            )
+                            .map_err(db_error)?;
+                        rows.filter_map(|r| r.ok()).collect()
+                    } else {
+                        let rows = stmt
+                            .query_map(
+                                [
+                                    last_file_id as i64,
+                                    last_tag_id as i64,
+                                    SQL_CHUNK_SIZE as i64,
+                                ],
+                                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+                            )
+                            .map_err(db_error)?;
+                        rows.filter_map(|r| r.ok()).collect()
+                    };
                     drop(stmt);
                     let Some((source_file_id, source_tag_id)) = batch.last() else {
                         break;
@@ -385,18 +409,30 @@ impl TursoDatabase {
                             let target_tag = slurp_tags.get(tag_id)?;
                             Some((*target_file, *target_tag))
                         })
-                        .collect::<HashSet<_>>();
+                        .collect::<Vec<_>>();
                     log::info!(
                         "Slurping {} relationships into the db.",
                         relationships.len()
                     );
                     conn.execute("BEGIN CONCURRENT", ()).await?;
-                    self.relationships_bulk_add(&conn, &relationships).await?;
+                    self.slurp_relationships_bulk_add(&conn, target_namespace, &relationships)
+                        .await?;
                     conn.execute("COMMIT", ()).await?;
 
                     last_file_id = *source_file_id;
                     last_tag_id = *source_tag_id;
                 }
+
+                conn.execute(
+                    format!(
+                        "UPDATE Tags SET count = (
+                             SELECT COUNT(*) FROM Relationship_{target_namespace} r
+                             WHERE r.tag_id = Tags.id
+                         ) WHERE namespace = ?1"
+                    ),
+                    (target_namespace as i64,),
+                )
+                .await?;
             }
         }
 
@@ -452,7 +488,114 @@ impl TursoDatabase {
             self.slurp_jobs(&conn, source).await?;
         }
 
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_tags_fts ON Tags USING fts
+                 (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);
+             OPTIMIZE INDEX idx_tags_fts;",
+        )
+        .await?;
+
         Ok((namespace_count, tag_count, file_count))
+    }
+
+    /// Imports tags without the plugin-facing action path. Slurp tags are
+    /// always normal tags, so regex registration and parent processing are
+    /// unnecessary here; the source-to-target mapping is all the caller needs.
+    async fn slurp_tags_bulk_add(
+        &self,
+        conn: &Connection,
+        batch: &[(u64, String, String, Option<String>)],
+    ) -> Result<HashMap<Tag, i64>> {
+        let mut holders = Vec::with_capacity(batch.len());
+        let mut params = Vec::with_capacity(batch.len() * 2);
+        let mut namespace_ids = HashMap::new();
+        for (_, name, namespace, _) in batch {
+            let namespace_id = if let Some(&id) = namespace_ids.get(namespace) {
+                id
+            } else {
+                let id = self
+                    .namespace_get_name_cache(namespace)
+                    .await
+                    .ok_or_else(|| {
+                        turso::Error::ConversionFailure(
+                            format!("slurp namespace not cached: {namespace}").into(),
+                        )
+                    })?;
+                namespace_ids.insert(namespace.clone(), id);
+                id
+            };
+            holders.push("(?, ?)");
+            params.push(Value::from(name.as_str()));
+            params.push(Value::from(namespace_id as i64));
+        }
+
+        let mut rows = conn
+            .query(
+                format!(
+                    "INSERT INTO Tags (name, namespace) VALUES {} \
+                     ON CONFLICT(name, namespace) DO UPDATE SET name = excluded.name \
+                     RETURNING id, name, namespace",
+                    holders.join(", ")
+                ),
+                params_from_iter(params),
+            )
+            .await?;
+        let mut ids = HashMap::with_capacity(batch.len());
+        while let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            let name: String = row.get(1)?;
+            let namespace_id: u64 = row.get(2)?;
+            ids.insert((name, namespace_id), id);
+        }
+
+        let mut mapping = HashMap::with_capacity(batch.len());
+        for (_, name, namespace, description) in batch {
+            let namespace_id = namespace_ids[namespace];
+            if let Some(&id) = ids.get(&(name.clone(), namespace_id)) {
+                mapping.insert(
+                    Tag {
+                        name: name.clone(),
+                        namespace: GenericNamespaceObj {
+                            name: namespace.clone(),
+                            description: description.clone(),
+                        },
+                    },
+                    id,
+                );
+            }
+        }
+        Ok(mapping)
+    }
+
+    /// Inserts relationships into a known namespace partition. The normal
+    /// relationship helper has to resolve namespaces and maintain live tag
+    /// counts for interactive writes; slurp recalculates counts once per
+    /// partition after all rows have been copied.
+    async fn slurp_relationships_bulk_add(
+        &self,
+        conn: &Connection,
+        namespace_id: u64,
+        relationships: &[(u64, u64)],
+    ) -> Result<()> {
+        for chunk in relationships.chunks(SQL_CHUNK_SIZE) {
+            let mut holders = Vec::with_capacity(chunk.len());
+            let mut params = Vec::with_capacity(chunk.len() * 2);
+            for &(file_id, tag_id) in chunk {
+                holders.push("(?, ?)");
+                params.push(Value::from(file_id as i64));
+                params.push(Value::from(tag_id as i64));
+            }
+            conn.execute(
+                format!(
+                    "INSERT OR IGNORE INTO Relationship_{namespace_id} (file_id, tag_id)
+                     VALUES {}",
+                    holders.join(", ")
+                ),
+                params_from_iter(params),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Copies `Jobs` rows into turso, mapping whichever schema the source

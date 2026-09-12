@@ -12,9 +12,10 @@ pub const SYSTEM_STORAGE_CHECK_SITE: &str = "SYSTEM_STORAGE_CHECK";
 pub const SYSTEM_STORAGE_CHECK_FILENAME_MODE: &str = "filename";
 pub const SYSTEM_STORAGE_CHECK_REDOWNLOAD_MODE: &str = "redownload";
 
-/// Maximum rows per write batch for the write path. Kept separate from
-/// `shared_types::SQL_CHUNK_SIZE`, which drives the plugin-facing chunking.
-pub(crate) const SQL_CHUNK_SIZE: usize = 800;
+/// Maximum rows per generated SQL batch. Turso supports up to 32766 bound
+/// variables per statement; the widest batch currently uses seven variables
+/// per row (Jobs), so 4600 leaves a small safety margin below that ceiling.
+pub(crate) const SQL_CHUNK_SIZE: usize = 4600;
 
 #[derive(Debug, Default, PartialEq)]
 pub struct SourceUrlFileStatus {
