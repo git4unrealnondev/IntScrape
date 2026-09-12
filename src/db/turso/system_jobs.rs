@@ -7,7 +7,10 @@ use shared_types::{DbJobRecreation, DbJobsObj, HashesSupported, ScraperParam};
 use strum::IntoEnumIterator;
 
 use crate::backup_path::dated_backup_destination;
-use crate::db::{SYSTEM_DATABASE_BACKUP_SITE, SYSTEM_DATABASE_SLURP_SITE, SYSTEM_FILE_HASH_SITE, SYSTEM_FILE_SIZE_SITE, SYSTEM_STORAGE_CHECK_SITE, SQL_CHUNK_SIZE};
+use crate::db::{
+    SQL_CHUNK_SIZE, SYSTEM_DATABASE_BACKUP_SITE, SYSTEM_DATABASE_SLURP_SITE, SYSTEM_FILE_HASH_SITE,
+    SYSTEM_FILE_SIZE_SITE, SYSTEM_STORAGE_CHECK_SITE,
+};
 use crate::web::manager::hash_bytes;
 
 use super::TursoDatabase;
@@ -100,7 +103,10 @@ impl TursoDatabase {
         }
     }
 
-    async fn backup_db_to(&self, destination: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn backup_db_to(
+        &self,
+        destination: &Path,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.connect()?;
         let _ = conn.query("PRAGMA wal_checkpoint(TRUNCATE);", ()).await;
         if let Some(parent) = destination.parent() {
@@ -110,7 +116,9 @@ impl TursoDatabase {
         Ok(())
     }
 
-    pub async fn update_missing_file_sizes(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn update_missing_file_sizes(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let connection = self.connect()?;
         let storage = self.file_storage_get_all(&connection).await?;
 
@@ -172,9 +180,7 @@ impl TursoDatabase {
                                 .find(|(sid, _)| **sid != *storage_id)
                                 .and_then(|(_, base)| super::file::file_on_disk(&file, base))
                         })?;
-                    std::fs::metadata(path)
-                        .ok()
-                        .map(|m| (*id, m.len()))
+                    std::fs::metadata(path).ok().map(|m| (*id, m.len()))
                 })
                 .collect();
 
@@ -199,7 +205,9 @@ impl TursoDatabase {
         Ok(())
     }
 
-    pub async fn hash_missing_file_hashes(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn hash_missing_file_hashes(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let connection = self.connect()?;
 
         let algorithms: Vec<(&'static str, HashesSupported)> = HashesSupported::iter()
@@ -209,8 +217,12 @@ impl TursoDatabase {
                 HashesSupported::Sha256(_) => ("SHA256", HashesSupported::Sha256(String::new())),
                 HashesSupported::Sha512(_) => ("SHA512", HashesSupported::Sha512(String::new())),
                 HashesSupported::IPFSCID(_) => ("IPFSCID", HashesSupported::IPFSCID(String::new())),
-                HashesSupported::IPFSCID1(_) => ("IPFSCID1", HashesSupported::IPFSCID1(String::new())),
-                HashesSupported::ImageHash(_) => ("ImageHash", HashesSupported::ImageHash(String::new())),
+                HashesSupported::IPFSCID1(_) => {
+                    ("IPFSCID1", HashesSupported::IPFSCID1(String::new()))
+                }
+                HashesSupported::ImageHash(_) => {
+                    ("ImageHash", HashesSupported::ImageHash(String::new()))
+                }
             })
             .collect();
 
@@ -261,7 +273,8 @@ impl TursoDatabase {
             let file_paths: Vec<(u64, String)> = {
                 let mut out = Vec::new();
                 for &file_id in &file_ids {
-                    if let Ok(Some(path)) = self.file_get_physical_path(&connection, file_id).await {
+                    if let Ok(Some(path)) = self.file_get_physical_path(&connection, file_id).await
+                    {
                         out.push((file_id, path));
                     }
                 }
@@ -314,10 +327,7 @@ impl TursoDatabase {
                         }
                     }
                 }
-                log::info!(
-                    "File-hash system updated {} files",
-                    pending.len(),
-                );
+                log::info!("File-hash system updated {} files", pending.len(),);
             }
         }
 

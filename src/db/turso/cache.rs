@@ -43,9 +43,7 @@ impl TursoDatabase {
 
     /// Re-seeds the storage location cache from committed rows, discarding any
     /// entries added by a transaction that has since rolled back.
-    pub(in crate::db::turso) async fn file_storage_location_cache_reload(
-        &self,
-    ) -> Result<()> {
+    pub(in crate::db::turso) async fn file_storage_location_cache_reload(&self) -> Result<()> {
         let conn = self.connect()?;
         self.file_storage_location_load(&conn).await
     }

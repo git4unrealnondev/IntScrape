@@ -72,7 +72,10 @@ impl TursoDatabase {
         tag_id: u64,
     ) -> Result<Option<u64>> {
         let mut rows = conn
-            .query("SELECT namespace FROM Tags WHERE id = ?1;", (tag_id as i64,))
+            .query(
+                "SELECT namespace FROM Tags WHERE id = ?1;",
+                (tag_id as i64,),
+            )
             .await?;
 
         if let Some(row) = rows.next().await? {
@@ -135,8 +138,7 @@ impl TursoDatabase {
                  JOIN Namespace n ON t.namespace = n.id
                  WHERE t.id IN ({placeholders})"
             );
-            let params: Vec<Value> =
-                chunk.iter().map(|id| Value::from(*id as i64)).collect();
+            let params: Vec<Value> = chunk.iter().map(|id| Value::from(*id as i64)).collect();
 
             let mut rows = conn.query(&sql, params_from_iter(params)).await?;
             while let Some(row) = rows.next().await? {
@@ -182,7 +184,10 @@ impl TursoDatabase {
                 .map(|id| Value::from(*id as i64))
                 .collect::<Vec<Value>>();
             let deleted = conn
-                .execute(format!("DELETE FROM Tags WHERE id IN ({placeholders});"), params)
+                .execute(
+                    format!("DELETE FROM Tags WHERE id IN ({placeholders});"),
+                    params,
+                )
                 .await?;
             total_deleted += deleted;
         }
@@ -201,7 +206,10 @@ impl TursoDatabase {
         };
         let table = format!("Relationship_{namespace_id}");
         let mut rows = conn
-            .query(format!("SELECT 1 FROM {table} WHERE tag_id = ?1 LIMIT 1;"), (tag_id as i64,))
+            .query(
+                format!("SELECT 1 FROM {table} WHERE tag_id = ?1 LIMIT 1;"),
+                (tag_id as i64,),
+            )
             .await?;
 
         Ok(rows.next().await?.is_some())

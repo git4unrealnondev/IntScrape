@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use shared_types::{SearchHolder, SearchObj};
-use turso::{params_from_iter, Connection, Result, Value};
+use turso::{Connection, Result, Value, params_from_iter};
 
-use crate::db::turso::TursoDatabase;
 use crate::db::SQL_CHUNK_SIZE;
+use crate::db::turso::TursoDatabase;
 
 /// How many tag ids are pulled from FTS when resolving a human name.
 const FTS_NAME_LIMIT: usize = 10;

@@ -68,9 +68,14 @@ impl TursoDatabase {
                 match conn.execute("COMMIT", ()).await {
                     Ok(_) => break,
                     Err(error)
-                        if matches!(error, turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) =>
+                        if matches!(
+                            error,
+                            turso::Error::Busy(_) | turso::Error::BusySnapshot(_)
+                        ) =>
                     {
-                        log::warn!("Concurrent scrape-job commit conflicted; retrying in 50ms: {error}");
+                        log::warn!(
+                            "Concurrent scrape-job commit conflicted; retrying in 50ms: {error}"
+                        );
                         let _ = conn.execute("ROLLBACK", ()).await;
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
@@ -114,7 +119,10 @@ impl TursoDatabase {
         for chunk in map_entries.chunks(PROCESS_CHUNK_SIZE) {
             let chunk_map: HashMap<FileManager, Vec<FileTagAction>> =
                 chunk.iter().cloned().collect();
-            if !database.process_scraper_chunk(chunk_map, &audit_reason).await {
+            if !database
+                .process_scraper_chunk(chunk_map, &audit_reason)
+                .await
+            {
                 return false;
             }
         }
@@ -180,8 +188,8 @@ impl TursoDatabase {
         let mapped_files: Vec<_> = map
             .keys()
             .filter_map(|file_manager| {
-                let matching_res = resolved_files_by_hash
-                    .get(file_manager.internal.hash.as_str())?;
+                let matching_res =
+                    resolved_files_by_hash.get(file_manager.internal.hash.as_str())?;
                 let mut temp = file_manager.clone();
                 temp.internal = (*matching_res).clone();
                 Some(temp)
@@ -368,12 +376,9 @@ impl TursoDatabase {
             return false;
         }
 
-
         match conn.execute("COMMIT", ()).await {
             Ok(_) => true,
-            Err(error)
-                if Self::is_concurrency_conflict(&error) =>
-            {
+            Err(error) if Self::is_concurrency_conflict(&error) => {
                 // The caller owns the input map, so the whole chunk can be
                 // safely reconstructed from the same snapshot on retry.
                 log::warn!("Concurrent scraper commit conflicted; retrying in 50ms: {error}");
@@ -415,8 +420,7 @@ impl TursoDatabase {
             }
         }
 
-        let Ok(Some(source_url_namespace_id)) =
-            self.namespace_get(&conn, "source_url").await
+        let Ok(Some(source_url_namespace_id)) = self.namespace_get(&conn, "source_url").await
         else {
             return out;
         };
@@ -666,5 +670,4 @@ mod tests {
         assert!(db.setting_get_sync_blocking("SYSTEM_VERSION").is_some());
         db.shutdown().await;
     }
-
 }

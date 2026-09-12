@@ -79,7 +79,9 @@ impl TursoDatabase {
                 return HashMap::new();
             }
         };
-        self.dead_url_get(&conn, &dead_url).await.unwrap_or_default()
+        self.dead_url_get(&conn, &dead_url)
+            .await
+            .unwrap_or_default()
     }
 
     /// Checks if a file with this source URL should be downloaded.
@@ -133,8 +135,9 @@ impl TursoDatabase {
     ) -> bool {
         match skip_conditions {
             SkipIf::ParentsRelateLimitto((relate_to, limit_to)) => {
-                if let Ok(status) =
-                    self.parent_relate_limit_exists(conn, &relate_to, &limit_to).await
+                if let Ok(status) = self
+                    .parent_relate_limit_exists(conn, &relate_to, &limit_to)
+                    .await
                     && status
                 {
                     info!(

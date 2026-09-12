@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use shared_types::{
-    DbSettingsObj, FileInternal, FileTagAction, GenericNamespaceObj, HashesSupported, PluginJob, Tag,
+    DbSettingsObj, FileInternal, FileTagAction, GenericNamespaceObj, HashesSupported, PluginJob,
+    Tag,
 };
 use turso::Result;
 
@@ -180,8 +181,7 @@ impl TursoDatabase {
     ///
     pub async fn settings_get_all_sync(&self) -> Vec<DbSettingsObj> {
         let setting_guard = self.setting_cache.read().await;
-        let mut settings: Vec<DbSettingsObj> =
-            setting_guard.values().cloned().collect();
+        let mut settings: Vec<DbSettingsObj> = setting_guard.values().cloned().collect();
         settings.sort_by(|a, b| a.name.cmp(&b.name));
         settings
     }

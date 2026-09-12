@@ -15,7 +15,9 @@ impl TursoDatabase {
         alias: &str,
     ) -> Result<String> {
         let mut tables = Vec::new();
-        let mut rows = conn.query("SELECT id FROM Namespace ORDER BY id;", ()).await?;
+        let mut rows = conn
+            .query("SELECT id FROM Namespace ORDER BY id;", ())
+            .await?;
         while let Some(row) = rows.next().await? {
             let namespace_id: i64 = row.get(0)?;
             tables.push(format!("Relationship_{namespace_id}"));
@@ -66,7 +68,9 @@ impl TursoDatabase {
         conn: &Connection,
         file_id: u64,
     ) -> Result<HashSet<u64>> {
-        let relationship_source = self.relationship_union_source(conn, "relationships").await?;
+        let relationship_source = self
+            .relationship_union_source(conn, "relationships")
+            .await?;
         let sql = format!("SELECT tag_id FROM {relationship_source} WHERE file_id = ?1;");
 
         let mut out = HashSet::new();
@@ -84,7 +88,9 @@ impl TursoDatabase {
         conn: &Connection,
         tag_id: u64,
     ) -> Result<HashSet<u64>> {
-        let relationship_source = self.relationship_union_source(conn, "relationships").await?;
+        let relationship_source = self
+            .relationship_union_source(conn, "relationships")
+            .await?;
         let sql = format!("SELECT file_id FROM {relationship_source} WHERE tag_id = ?1;");
 
         let mut out = HashSet::new();
@@ -120,7 +126,9 @@ impl TursoDatabase {
         conn: &Connection,
         tag_id: u64,
     ) -> Result<HashSet<u64>> {
-        let relationship_source = self.relationship_union_source(conn, "relationships").await?;
+        let relationship_source = self
+            .relationship_union_source(conn, "relationships")
+            .await?;
         let sql = format!(
             "SELECT DISTINCT relationships.file_id
              FROM {relationship_source}
@@ -222,9 +230,8 @@ impl TursoDatabase {
         column: &str,
         value: u64,
     ) -> Result<Vec<TagParents>> {
-        let sql = format!(
-            "SELECT tag_id, relate_tag_id, limit_to FROM Parents WHERE {column} = ?1;"
-        );
+        let sql =
+            format!("SELECT tag_id, relate_tag_id, limit_to FROM Parents WHERE {column} = ?1;");
 
         let mut out = Vec::new();
         let mut rows = conn.query(&sql, (value as i64,)).await?;
@@ -252,9 +259,7 @@ impl TursoDatabase {
         let sql = format!(
             "INSERT OR IGNORE INTO Relationship_{namespace_id} (file_id, tag_id) VALUES (?1, ?2);"
         );
-        let inserted = conn
-            .execute(sql, (file_id as i64, tag_id as i64))
-            .await?;
+        let inserted = conn.execute(sql, (file_id as i64, tag_id as i64)).await?;
         if inserted > 0 {
             conn.execute(
                 "UPDATE Tags SET count = count + 1 WHERE id = ?1;",
@@ -278,10 +283,7 @@ impl TursoDatabase {
         // Resolve every tag's namespace with chunked lookups instead of one
         // point query per relationship.
         let mut tag_namespaces = HashMap::new();
-        let tag_ids: Vec<u64> = relationships
-            .iter()
-            .map(|(_, tag_id)| *tag_id)
-            .collect();
+        let tag_ids: Vec<u64> = relationships.iter().map(|(_, tag_id)| *tag_id).collect();
         for chunk in tag_ids.chunks(SQL_CHUNK_SIZE) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
@@ -315,18 +317,25 @@ impl TursoDatabase {
                     params.push(Value::from(*file_id as i64));
                     params.push(Value::from(*tag_id as i64));
                 }
-                let sql = format!(
-                    "INSERT OR IGNORE INTO Relationship_{namespace_id} (file_id, tag_id) VALUES {};",
-                    holders.join(", ")
-                );
-                let inserted = conn.execute(sql, params_from_iter(params)).await?;
-                if inserted > 0 {
-                    let mut count_deltas: HashMap<u64, u64> = HashMap::new();
-                    for (_, tag_id) in chunk {
-                        *count_deltas.entry(*tag_id).or_default() += 1;
-                    }
+                let mut inserted_rows = conn
+                    .query(
+                        format!(
+                            "INSERT OR IGNORE INTO Relationship_{namespace_id} (file_id, tag_id) \
+                             VALUES {} RETURNING tag_id",
+                            holders.join(", ")
+                        ),
+                        params_from_iter(params),
+                    )
+                    .await?;
+                let mut count_deltas: HashMap<u64, u64> = HashMap::new();
+                while let Some(row) = inserted_rows.next().await? {
+                    let tag_id: u64 = row.get(0)?;
+                    *count_deltas.entry(tag_id).or_default() += 1;
+                }
+                if !count_deltas.is_empty() {
                     let (count_sql, count_params) = tag_count_update_sql(&count_deltas, false);
-                    conn.execute(count_sql, params_from_iter(count_params)).await?;
+                    conn.execute(count_sql, params_from_iter(count_params))
+                        .await?;
                 }
             }
         }
@@ -345,10 +354,7 @@ impl TursoDatabase {
         }
 
         let mut tag_namespaces = HashMap::new();
-        let tag_ids: Vec<u64> = relationships
-            .iter()
-            .map(|(_, tag_id)| *tag_id)
-            .collect();
+        let tag_ids: Vec<u64> = relationships.iter().map(|(_, tag_id)| *tag_id).collect();
         for chunk in tag_ids.chunks(SQL_CHUNK_SIZE) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
@@ -381,18 +387,24 @@ impl TursoDatabase {
                     params.push(Value::from(*file_id as i64));
                     params.push(Value::from(*tag_id as i64));
                 }
-                let sql = format!(
-                    "DELETE FROM Relationship_{namespace_id} WHERE {};",
-                    clauses.join(" OR ")
-                );
-                let deleted = conn.execute(sql, params_from_iter(params)).await?;
-                if deleted > 0 {
-                    let mut count_deltas: HashMap<u64, u64> = HashMap::new();
-                    for (_, tag_id) in chunk {
-                        *count_deltas.entry(*tag_id).or_default() += 1;
-                    }
+                let mut deleted_rows = conn
+                    .query(
+                        format!(
+                            "DELETE FROM Relationship_{namespace_id} WHERE {} RETURNING tag_id",
+                            clauses.join(" OR ")
+                        ),
+                        params_from_iter(params),
+                    )
+                    .await?;
+                let mut count_deltas: HashMap<u64, u64> = HashMap::new();
+                while let Some(row) = deleted_rows.next().await? {
+                    let tag_id: u64 = row.get(0)?;
+                    *count_deltas.entry(tag_id).or_default() += 1;
+                }
+                if !count_deltas.is_empty() {
                     let (count_sql, count_params) = tag_count_update_sql(&count_deltas, true);
-                    conn.execute(count_sql, params_from_iter(count_params)).await?;
+                    conn.execute(count_sql, params_from_iter(count_params))
+                        .await?;
                 }
             }
         }
@@ -410,12 +422,9 @@ impl TursoDatabase {
         let Some(namespace_id) = self.tag_namespace_id(conn, tag_id).await? else {
             return Ok(());
         };
-        let sql = format!(
-            "DELETE FROM Relationship_{namespace_id} WHERE file_id = ?1 AND tag_id = ?2;"
-        );
-        let deleted = conn
-            .execute(sql, (file_id as i64, tag_id as i64))
-            .await?;
+        let sql =
+            format!("DELETE FROM Relationship_{namespace_id} WHERE file_id = ?1 AND tag_id = ?2;");
+        let deleted = conn.execute(sql, (file_id as i64, tag_id as i64)).await?;
         if deleted > 0 {
             conn.execute(
                 "UPDATE Tags SET count = MAX(count - 1, 0) WHERE id = ?1;",
@@ -529,11 +538,7 @@ impl TursoDatabase {
     }
 
     /// Resolves a tag's id by name + namespace name.
-    async fn tag_id_by_name_ns(
-        &self,
-        conn: &Connection,
-        tag: &Tag,
-    ) -> Result<Option<u64>> {
+    async fn tag_id_by_name_ns(&self, conn: &Connection, tag: &Tag) -> Result<Option<u64>> {
         let mut rows = conn
             .query(
                 "SELECT t.id
@@ -657,14 +662,18 @@ mod tests {
 
         let relationships: HashSet<(u64, u64)> =
             file_ids.iter().map(|file_id| (*file_id, tag_id)).collect();
-        db.relationships_bulk_add(&conn, &relationships).await.unwrap();
+        db.relationships_bulk_add(&conn, &relationships)
+            .await
+            .unwrap();
         assert_eq!(
             tag_count(&db, &conn, tag_id).await,
             2,
             "two relationships must increment the count twice"
         );
 
-        db.relationship_bulk_delete(&conn, &relationships).await.unwrap();
+        db.relationship_bulk_delete(&conn, &relationships)
+            .await
+            .unwrap();
         assert_eq!(tag_count(&db, &conn, tag_id).await, 0);
     }
 }

@@ -35,7 +35,9 @@ impl TursoDatabase {
     #[ipc(name = "search_tag_fts", request = "SearchTags")]
     pub async fn ipc_search_tag_fts(&self, tag: &str, limit: &Option<u64>) -> Vec<TagSearch> {
         let max_rows = limit.unwrap_or(10) as usize;
-        self.tags_search_fts(tag, max_rows).await.unwrap_or_default()
+        self.tags_search_fts(tag, max_rows)
+            .await
+            .unwrap_or_default()
     }
 
     /// Resolves tag names across namespaces and searches for files matching
@@ -55,7 +57,10 @@ impl TursoDatabase {
     }
 
     /// Resolves tag names across namespaces while preserving boolean groups.
-    #[ipc(name = "search_db_files_by_tag_groups", request = "SearchFilesByTagGroups")]
+    #[ipc(
+        name = "search_db_files_by_tag_groups",
+        request = "SearchFilesByTagGroups"
+    )]
     pub async fn ipc_search_db_files_by_tag_groups(
         &self,
         and_ids: &[u64],
@@ -84,7 +89,9 @@ impl TursoDatabase {
         let Ok(conn) = self.db.connect() else {
             return None;
         };
-        self.file_get_physical_path(&conn, *file_id).await.unwrap_or(None)
+        self.file_get_physical_path(&conn, *file_id)
+            .await
+            .unwrap_or(None)
     }
 
     #[ipc(name = "get_file_hashes", request = "GetFileHashes")]
@@ -92,7 +99,9 @@ impl TursoDatabase {
         let Ok(conn) = self.db.connect() else {
             return HashMap::new();
         };
-        self.file_hashes_get(&conn, *file_id).await.unwrap_or_default()
+        self.file_hashes_get(&conn, *file_id)
+            .await
+            .unwrap_or_default()
     }
 
     ///
@@ -205,7 +214,9 @@ impl TursoDatabase {
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                     Err(error) => {
-                        log::error!("Failed to begin concurrent tag transaction for file {file_id}: {error}");
+                        log::error!(
+                            "Failed to begin concurrent tag transaction for file {file_id}: {error}"
+                        );
                         return false;
                     }
                 }
@@ -246,7 +257,9 @@ impl TursoDatabase {
             match conn.execute("COMMIT", ()).await {
                 Ok(_) => return true,
                 Err(error) if TursoDatabase::is_concurrency_conflict(&error) => {
-                    log::warn!("Tag transaction for file {file_id} conflicted; retrying in 50ms: {error}");
+                    log::warn!(
+                        "Tag transaction for file {file_id} conflicted; retrying in 50ms: {error}"
+                    );
                     let _ = conn.execute("ROLLBACK", ()).await;
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
@@ -323,11 +336,8 @@ impl TursoDatabase {
                     continue;
                 }
                 match self.tag_action_bulk_add(&conn, tag_actions).await {
-                    Ok(tag_map) => relationships.extend(
-                        tag_map
-                            .values()
-                            .map(|tag_id| (*file_id, *tag_id as u64)),
-                    ),
+                    Ok(tag_map) => relationships
+                        .extend(tag_map.values().map(|tag_id| (*file_id, *tag_id as u64))),
                     Err(error) if TursoDatabase::is_concurrency_conflict(&error) => {
                         log::warn!("Bulk tag transaction conflicted; retrying in 50ms: {error}");
                         let _ = conn.execute("ROLLBACK", ()).await;
@@ -351,7 +361,9 @@ impl TursoDatabase {
             {
                 let _ = conn.execute("ROLLBACK", ()).await;
                 if TursoDatabase::is_concurrency_conflict(&error) {
-                    log::warn!("Bulk relationship transaction conflicted; retrying in 50ms: {error}");
+                    log::warn!(
+                        "Bulk relationship transaction conflicted; retrying in 50ms: {error}"
+                    );
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     continue;
                 }
@@ -362,7 +374,9 @@ impl TursoDatabase {
             match conn.execute("COMMIT", ()).await {
                 Ok(_) => return true,
                 Err(error) if TursoDatabase::is_concurrency_conflict(&error) => {
-                    log::warn!("Bulk tag transaction conflicted at commit; retrying in 50ms: {error}");
+                    log::warn!(
+                        "Bulk tag transaction conflicted at commit; retrying in 50ms: {error}"
+                    );
                     let _ = conn.execute("ROLLBACK", ()).await;
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
@@ -394,11 +408,16 @@ impl TursoDatabase {
         let Ok(conn) = self.db.connect() else {
             return HashSet::new();
         };
-        self.relationship_get_tag_id(&conn, *file_id).await.unwrap_or_default()
+        self.relationship_get_tag_id(&conn, *file_id)
+            .await
+            .unwrap_or_default()
     }
 
     /// Gets tag relationships for multiple files in one IPC request.
-    #[ipc(name = "relationship_get_tagid_many", request = "RelationshipGetTagidMany")]
+    #[ipc(
+        name = "relationship_get_tagid_many",
+        request = "RelationshipGetTagidMany"
+    )]
     pub async fn ipc_relationship_get_tag_id_many(
         &self,
         file_ids: &HashSet<u64>,
@@ -418,11 +437,16 @@ impl TursoDatabase {
         let Ok(conn) = self.db.connect() else {
             return HashSet::new();
         };
-        self.relationship_get_file_id(&conn, *tag_id).await.unwrap_or_default()
+        self.relationship_get_file_id(&conn, *tag_id)
+            .await
+            .unwrap_or_default()
     }
 
     /// Gets file relationships for multiple tags in one IPC request.
-    #[ipc(name = "relationship_get_fileid_many", request = "RelationshipGetFileidMany")]
+    #[ipc(
+        name = "relationship_get_fileid_many",
+        request = "RelationshipGetFileidMany"
+    )]
     pub async fn ipc_relationship_get_file_id_many(
         &self,
         tag_ids: &HashSet<u64>,
@@ -435,7 +459,10 @@ impl TursoDatabase {
     }
 
     /// Gets files whose tag is the related parent of the supplied structural tag.
-    #[ipc(name = "relationship_get_parent_fileid", request = "RelationshipGetParentFileid")]
+    #[ipc(
+        name = "relationship_get_parent_fileid",
+        request = "RelationshipGetParentFileid"
+    )]
     pub async fn ipc_relationship_get_parent_file_id(&self, tag_id: &u64) -> HashSet<u64> {
         let Ok(conn) = self.db.connect() else {
             return HashSet::new();
@@ -451,11 +478,16 @@ impl TursoDatabase {
         let Ok(conn) = self.db.connect() else {
             return Vec::new();
         };
-        self.parent_relationships_get(&conn, *tag_id).await.unwrap_or_default()
+        self.parent_relationships_get(&conn, *tag_id)
+            .await
+            .unwrap_or_default()
     }
 
     /// Gets parent relations for multiple child tags in one IPC request.
-    #[ipc(name = "parent_relationships_get_many", request = "ParentRelationshipsGetMany")]
+    #[ipc(
+        name = "parent_relationships_get_many",
+        request = "ParentRelationshipsGetMany"
+    )]
     pub async fn ipc_parent_relationships_get_many(
         &self,
         tag_ids: &HashSet<u64>,
@@ -463,7 +495,9 @@ impl TursoDatabase {
         let Ok(conn) = self.db.connect() else {
             return HashMap::new();
         };
-        self.parent_relationships_get_many(&conn, tag_ids).await.unwrap_or_default()
+        self.parent_relationships_get_many(&conn, tag_ids)
+            .await
+            .unwrap_or_default()
     }
 
     /// Gets every child relation that points at a parent tag.
@@ -472,11 +506,16 @@ impl TursoDatabase {
         let Ok(conn) = self.db.connect() else {
             return Vec::new();
         };
-        self.child_relationships_get(&conn, *relate_tag_id).await.unwrap_or_default()
+        self.child_relationships_get(&conn, *relate_tag_id)
+            .await
+            .unwrap_or_default()
     }
 
     /// Gets child relations for multiple parent tags in one IPC request.
-    #[ipc(name = "child_relationships_get_many", request = "ChildRelationshipsGetMany")]
+    #[ipc(
+        name = "child_relationships_get_many",
+        request = "ChildRelationshipsGetMany"
+    )]
     pub async fn ipc_child_relationships_get_many(
         &self,
         tag_ids: &HashSet<u64>,
@@ -484,7 +523,9 @@ impl TursoDatabase {
         let Ok(conn) = self.db.connect() else {
             return HashMap::new();
         };
-        self.child_relationships_get_many(&conn, tag_ids).await.unwrap_or_default()
+        self.child_relationships_get_many(&conn, tag_ids)
+            .await
+            .unwrap_or_default()
     }
 
     /// Gets one exact child-parent relation, including its optional limit tag.
@@ -549,11 +590,17 @@ impl TursoDatabase {
     /// Human written tag searching layer
     ///
     #[ipc(name = "search_db_files", request = "SearchFiles")]
-    pub async fn ipc_search_db_files_human(&self, search: &SearchObj, limit: &Option<u64>) -> Vec<u64> {
+    pub async fn ipc_search_db_files_human(
+        &self,
+        search: &SearchObj,
+        limit: &Option<u64>,
+    ) -> Vec<u64> {
         let Ok(conn) = self.db.connect() else {
             return Vec::new();
         };
-        self.search_db_files(&conn, search, limit).await.unwrap_or_default()
+        self.search_db_files(&conn, search, limit)
+            .await
+            .unwrap_or_default()
     }
 
     /// A sync function to get a function
@@ -640,16 +687,14 @@ mod tests {
             }],
         };
 
-        assert!(db
-            .ipc_file_relationship_tags_add(&file_id, &[tag_action])
-            .await);
+        assert!(
+            db.ipc_file_relationship_tags_add(&file_id, &[tag_action])
+                .await
+        );
 
         let conn = db.connect().unwrap();
         let mut rows = conn
-            .query(
-                "SELECT id FROM Namespace WHERE name = 'ipc_fresh_ns';",
-                (),
-            )
+            .query("SELECT id FROM Namespace WHERE name = 'ipc_fresh_ns';", ())
             .await
             .unwrap();
         let Some(row) = rows.next().await.unwrap() else {
@@ -666,14 +711,15 @@ mod tests {
             .await
             .unwrap();
         let partition = rows.next().await.unwrap();
-        assert!(partition.is_some(), "namespace partition table was never created");
+        assert!(
+            partition.is_some(),
+            "namespace partition table was never created"
+        );
         drop(rows);
 
         let mut rows = conn
             .query(
-                &format!(
-                    "SELECT COUNT(*) FROM relationship_{ns_id} WHERE file_id = ?1;",
-                ),
+                &format!("SELECT COUNT(*) FROM relationship_{ns_id} WHERE file_id = ?1;",),
                 (file_id as i64,),
             )
             .await

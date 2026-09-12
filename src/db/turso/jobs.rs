@@ -231,7 +231,9 @@ impl TursoDatabase {
                 ));
                 params.push(Value::from(config.site.clone()));
                 params.push(Value::from(serde_json::to_string(&config.param).unwrap()));
-                params.push(Value::from(serde_json::to_string(&config.user_data).unwrap()));
+                params.push(Value::from(
+                    serde_json::to_string(&config.user_data).unwrap(),
+                ));
             }
             let sql = format!(
                 "INSERT INTO Jobs (time, reptime, priority, recreation, site, param, user_data)
@@ -278,7 +280,10 @@ impl TursoDatabase {
         match result {
             Ok(id) => id,
             Err(error) => {
-                log::error!("Failed to insert or update job for site '{}': {error}", job.site);
+                log::error!(
+                    "Failed to insert or update job for site '{}': {error}",
+                    job.site
+                );
                 0
             }
         }
@@ -299,10 +304,7 @@ impl TursoDatabase {
             let conn = match self.connect() {
                 Ok(conn) => conn,
                 Err(error) => {
-                    log::error!(
-                        "Failed to connect while claiming job {}: {error}",
-                        job.id
-                    );
+                    log::error!("Failed to connect while claiming job {}: {error}", job.id);
                     return false;
                 }
             };
@@ -312,7 +314,10 @@ impl TursoDatabase {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     continue;
                 }
-                log::error!("Failed to begin claim transaction for job {}: {error}", job.id);
+                log::error!(
+                    "Failed to begin claim transaction for job {}: {error}",
+                    job.id
+                );
                 return false;
             }
 
@@ -391,7 +396,11 @@ impl TursoDatabase {
     }
 
     /// Gets jobs that can run now, up to `chunk_size` of them.
-    pub async fn jobs_get_torun_chunk(&self, sites: Vec<String>, chunk_size: usize) -> Vec<DbJobsObj> {
+    pub async fn jobs_get_torun_chunk(
+        &self,
+        sites: Vec<String>,
+        chunk_size: usize,
+    ) -> Vec<DbJobsObj> {
         if chunk_size == 0 || sites.is_empty() {
             return Vec::new();
         }
@@ -402,7 +411,10 @@ impl TursoDatabase {
                 return Vec::new();
             }
         };
-        match self.jobs_get_torun_chunk_sql(&conn, sites, chunk_size).await {
+        match self
+            .jobs_get_torun_chunk_sql(&conn, sites, chunk_size)
+            .await
+        {
             Ok(jobs) => jobs,
             Err(error) => {
                 log::error!("Database error fetching runnable jobs: {error}");

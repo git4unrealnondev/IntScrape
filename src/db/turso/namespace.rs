@@ -212,11 +212,8 @@ impl TursoDatabase {
             .await?;
 
             for ns_id in chunk {
-                conn.execute(
-                    format!("DROP TABLE IF EXISTS Relationship_{ns_id};"),
-                    (),
-                )
-                .await?;
+                conn.execute(format!("DROP TABLE IF EXISTS Relationship_{ns_id};"), ())
+                    .await?;
             }
         }
 

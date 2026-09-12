@@ -72,8 +72,7 @@ impl IpcServer {
                 if self_clone.should_exit.load(Ordering::Relaxed) {
                     break;
                 }
-                tokio::select! {
-                    result = listener.accept() => match result {
+                match listener.accept().await {
                     Ok(conn) => {
                         // Each connection gets its own task so clients can make
                         // independent requests concurrently.
@@ -96,8 +95,6 @@ impl IpcServer {
                     Err(e) => {
                         log::error!("Incoming connection failed: {e}");
                     }
-                    },
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
                 }
             }
         });
@@ -194,10 +191,7 @@ mod tests {
                 num: None,
                 param: Some("concurrent write".to_string()),
             }),
-            tokio::time::timeout(
-                Duration::from_millis(200),
-                client::should_exit_async(),
-            )
+            tokio::time::timeout(Duration::from_millis(200), client::should_exit_async(),)
         );
 
         assert!(

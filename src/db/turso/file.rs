@@ -176,7 +176,8 @@ impl TursoDatabase {
         }
 
         if let Some(path_id) = self.file_storage_location_get(conn, location_path).await? {
-            self.file_storage_location_set_cache(location_path, path_id).await;
+            self.file_storage_location_set_cache(location_path, path_id)
+                .await;
             return Ok(path_id);
         }
 
@@ -189,7 +190,8 @@ impl TursoDatabase {
             .file_storage_location_get(conn, location_path)
             .await?
             .expect("row exists after INSERT OR IGNORE");
-        self.file_storage_location_set_cache(location_path, path_id).await;
+        self.file_storage_location_set_cache(location_path, path_id)
+            .await;
 
         Ok(path_id)
     }
@@ -356,7 +358,10 @@ impl TursoDatabase {
 /// Mirrors `MainDatabase::get_file_location`: resolves the hash-partitioned
 /// path under a storage base, repairing a missing extension on disk when the
 /// file is found without one.
-pub(in crate::db::turso) fn file_on_disk(file_internal: &FileInternal, base_path: &String) -> Option<PathBuf> {
+pub(in crate::db::turso) fn file_on_disk(
+    file_internal: &FileInternal,
+    base_path: &String,
+) -> Option<PathBuf> {
     if file_internal.hash.len() <= 6 {
         return None;
     }
@@ -412,12 +417,18 @@ mod tests {
 
         // Inserting a second row and reloading repopulates the cache from the
         // committed state without dropping the existing entry.
-        db.file_storage_location_set(&conn, "cache_me_other").await.unwrap();
+        db.file_storage_location_set(&conn, "cache_me_other")
+            .await
+            .unwrap();
         db.file_storage_location_cache_reload().await.unwrap();
         assert_eq!(
             db.file_storage_location_get_cache("cache_me").await,
             Some(first)
         );
-        assert!(db.file_storage_location_get_cache("cache_me_other").await.is_some());
+        assert!(
+            db.file_storage_location_get_cache("cache_me_other")
+                .await
+                .is_some()
+        );
     }
 }

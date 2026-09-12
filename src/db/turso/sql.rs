@@ -124,9 +124,7 @@ impl TursoDatabase {
 
     /// Searches tags through the Tantivy-backed FTS index.
     ///
-    /// Uses a two-tier strategy: first queries popular tags (count >= threshold)
-    /// with BM25 relevance scoring. If that doesn't fill the requested limit,
-    /// falls back to the full ngram index for broader partial matches.
+    /// Returns the most-used matching tags, with BM25 relevance breaking ties.
     pub async fn tags_search_fts(
         &self,
         search_string: &str,
@@ -138,63 +136,24 @@ impl TursoDatabase {
         }
         let conn = self.db.connect()?;
         let fts_query = search_string.trim().to_owned();
+        let mut rows = conn
+            .query(
+                "SELECT id, count, fts_score(name, ?1) AS score \
+                 FROM Tags \
+                 WHERE fts_match(name, ?1) \
+                 ORDER BY count DESC, score ASC, id ASC \
+                 LIMIT ?2;",
+                (fts_query, limit as i64),
+            )
+            .await?;
 
-        let popular_threshold: i64 = self
-            .setting_get_sql(&conn, "SYSTEM_tag_count_popular_division")
-            .await
-            .ok()
-            .flatten()
-            .and_then(|s| s.num)
-            .unwrap_or(5) as i64;
-
-        // Tier 1: popular tags (count >= threshold), with the most-used tags
-        // first and BM25 relevance breaking ties.
-        {
-            let mut rows = conn
-                .query(
-                    "SELECT id, count, fts_score(name, ?1) AS score \
-                     FROM Tags \
-                     WHERE fts_match(name, ?1) AND count >= ?2 \
-                     ORDER BY count DESC, score ASC, id ASC \
-                     LIMIT ?3;",
-                    (fts_query.clone(), popular_threshold, limit as i64),
-                )
-                .await?;
-
-            while let Some(row) = rows.next().await? {
-                out.push(TagSearch {
-                    tag_id: row.get(0)?,
-                    count: row.get(1)?,
-                });
-            }
+        while let Some(row) = rows.next().await? {
+            out.push(TagSearch {
+                tag_id: row.get(0)?,
+                count: row.get(1)?,
+            });
         }
 
-        // Tier 2: if popular tags didn't fill the limit, fall back to the full
-        // ngram index for broader partial matches.
-        if out.len() < limit {
-            let mut rows = conn
-                .query(
-                    "SELECT id, count, fts_score(name, ?1) AS score \
-                     FROM Tags \
-                     WHERE fts_match(name, ?1) \
-                     ORDER BY count DESC, score ASC, id ASC \
-                     LIMIT ?2;",
-                    (fts_query, limit as i64),
-                )
-                .await?;
-
-            while let Some(row) = rows.next().await? {
-                let tag_id: u64 = row.get(0)?;
-                if !out.iter().any(|r| r.tag_id == tag_id) {
-                    out.push(TagSearch {
-                        tag_id,
-                        count: row.get(1)?,
-                    });
-                }
-            }
-        }
-
-        out.truncate(limit);
         Ok(out)
     }
 
@@ -468,7 +427,6 @@ impl TursoDatabase {
                 plugin_manager.add_regex_tags(tags_to_add);
             }
         }
-        
 
         Ok(out)
     }

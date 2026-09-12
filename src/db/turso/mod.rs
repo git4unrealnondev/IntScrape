@@ -1,17 +1,12 @@
-use std::{
-    collections::HashMap,
-    future::Future,
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::HashMap, future::Future, path::Path, sync::Arc};
 
 use shared_types::DbSettingsObj;
 use smol_str::SmolStr;
 use tokio::sync::RwLock;
 use turso::{Builder, Database, Result, transaction::Transaction};
 
-use crate::plugins::PluginManager;
 use crate::DB_VERSION;
+use crate::plugins::PluginManager;
 
 mod cache;
 mod dead_url;
@@ -131,7 +126,6 @@ impl TursoDatabase {
             let _ = out.create_db().await;
         }
 
-
         let _ = out.check_db().await;
 
         Arc::new(out)
@@ -151,7 +145,6 @@ impl TursoDatabase {
     async fn check_db(&self) -> Result<()> {
         let mut connection = self.connect()?;
         let conn = connection.transaction().await?;
-
 
         self.table_create_tags(&conn).await;
 
@@ -218,7 +211,9 @@ impl TursoDatabase {
             conn,
             DbSettingsObj {
                 name: "SYSTEM_DEFAULT_USER_AGENT".into(),
-                description: Some("The default user agent to use when connecting to a site.".into()),
+                description: Some(
+                    "The default user agent to use when connecting to a site.".into(),
+                ),
                 num: None,
                 param: Some("IntScrape V1.0".into()),
             },

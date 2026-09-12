@@ -76,25 +76,10 @@ pub(crate) async fn init_data_request_async<
     let conn = LocalSocketStream::connect(name)
         .await
         .map_err(|error| error.to_string())?;
-    //loop {
-    // Wait indefinitely for this to get a connection. shit way of doing it will
-    // likely add a wait or something this will likely block the CPU or something.
-
-    //if let Ok(conn_out) = LocalSocketStream::connect(name.clone()) {
-    //    conn = conn_out;
-    //    break;
-    //}
-    //}
-    // Wrap it into a buffered reader right away so that we could read a single line
-    // out of it.
     let mut conn = BufReader::new(conn);
-
-    // Requesting data from server.
     send(&requesttype, &mut conn)
         .await
         .map_err(|error| error.to_string())?;
-
-    // Recieving size Data from server
     recieve(&mut conn)
         .await
         .map_err(|error| error.to_string().into())
@@ -117,10 +102,10 @@ async fn send<T: Sized + bitcode::Encode>(
     conn: &mut BufReader<LocalSocketStream>,
 ) -> std::io::Result<()> {
     let byte_buf = bitcode::encode(inp);
-    let size = &byte_buf.len();
-
-    conn.get_mut().write_all(&size.to_ne_bytes()).await?;
-    conn.get_mut().write_all(&byte_buf).await
+    let mut frame = Vec::with_capacity(std::mem::size_of::<usize>() + byte_buf.len());
+    frame.extend_from_slice(&byte_buf.len().to_ne_bytes());
+    frame.extend_from_slice(&byte_buf);
+    conn.get_mut().write_all(&frame).await
 }
 
 /// Writes all data into buffer. Assumes data is preserialzied from data generic

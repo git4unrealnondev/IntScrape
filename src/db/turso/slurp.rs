@@ -100,15 +100,19 @@ impl TursoDatabase {
 
         // Storage locations: re-use whatever rows exist, creating the rest.
         // Keep each batch short so scraper writes can commit between batches.
+        let mut source_storage_ids = HashMap::new();
         conn.execute("BEGIN CONCURRENT", ()).await?;
         let mut locations = source
-            .prepare("SELECT location FROM FileStorageLocations")
+            .prepare("SELECT id, location FROM FileStorageLocations")
             .map_err(db_error)?;
         let mut location_rows = locations.query([]).map_err(db_error)?;
         while let Some(row) = location_rows.next().map_err(db_error)? {
-            let location: String = row.get(0).map_err(db_error)?;
-            self.file_storage_location_get_or_create(&conn, &location)
+            let source_id: u64 = row.get(0).map_err(db_error)?;
+            let location: String = row.get(1).map_err(db_error)?;
+            let target_id = self
+                .file_storage_location_get_or_create(&conn, &location)
                 .await?;
+            source_storage_ids.insert(source_id, target_id);
         }
         drop(location_rows);
         conn.execute("COMMIT", ()).await?;
@@ -193,9 +197,8 @@ impl TursoDatabase {
             let mut last_file_id = 0_u64;
             loop {
                 let file_query = format!(
-                    "SELECT f.id, f.hash, f.extension, {size_column}, s.location
+                    "SELECT f.id, f.hash, f.extension, {size_column}, f.storage_id
                      FROM File f
-                     LEFT JOIN FileStorageLocations s ON s.id = f.storage_id
                      WHERE f.id > ?1 AND f.hash IS NOT NULL
                      ORDER BY f.id
                      LIMIT ?2"
@@ -208,7 +211,7 @@ impl TursoDatabase {
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, Option<u64>>(3)?,
-                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<u64>>(4)?,
                         ))
                     })
                     .map_err(db_error)?;
@@ -219,14 +222,10 @@ impl TursoDatabase {
                 };
 
                 let mut files = HashSet::new();
-                for (_, hash, extension, size_bytes, location) in &batch {
-                    let storage_id = match location.as_deref() {
-                        Some(location) => {
-                            self.file_storage_location_get_or_create(&conn, location)
-                                .await?
-                        }
-                        None => 0,
-                    };
+                for (_, hash, extension, size_bytes, source_storage_id) in &batch {
+                    let storage_id = source_storage_id
+                        .and_then(|id| source_storage_ids.get(&id).copied())
+                        .unwrap_or(0);
                     files.insert(FileInternal {
                         id: None,
                         hash: hash.clone(),
