@@ -14,6 +14,24 @@ use turso::{Connection, Result, Value, params_from_iter};
 use crate::db::SQL_CHUNK_SIZE;
 use crate::db::turso::TursoDatabase;
 
+/// Destination batch size for the tags stage. Imported tags arrive in source
+/// id order, which is random relative to the (name, namespace) unique key, so
+/// small per-chunk transactions spend most of their time re-searching that
+/// index; 25k-row batches measured best on the slurp target hardware.
+const SLURP_TAG_BATCH: i64 = 25_000;
+
+/// Destination batch size for the relationship copy, per read and per target
+/// namespace partition.
+const SLURP_RELATIONSHIP_BATCH: usize = 25_000;
+
+/// Keyset scans build `{column} > last` from a seed of 0, which silently drops
+/// a source row whose id is 0 (some hydrus databases genuinely assign a File
+/// the id 0, main.db's 6.8M-row File table has one). Seed the first read at
+/// -1 so `> -1` also covers id 0, then advance with real ids.
+fn keyset_bound(first_pass: bool, last: u64) -> i64 {
+    if first_pass { -1 } else { last as i64 }
+}
+
 impl TursoDatabase {
     /// Copies the supported data from another SQLite database into turso.
     pub async fn db_slurp(&self, source: &Path) -> Result<(u64, u64, u64)> {
@@ -27,9 +45,36 @@ impl TursoDatabase {
         let source_conn = r2d2_sqlite::rusqlite::Connection::open_with_flags(source, read_flags)
             .map_err(db_error)?;
 
-        loop {
+        // Background pollers (system-job spawner) must stop reading the
+        // destination while the import runs: an open reader snapshot keeps the
+        // WAL from truncating, which slows every checkpoint as the import
+        // grows. The IPC server is paused and drained so the import's
+        // BEGIN IMMEDIATE transactions never wait on a UI request. The flags
+        // are cleared even when the loop bails on a non-MVCC error so a failed
+        // slurp never leaves the app paused behind it.
+        self.set_slurping(true);
+        self.ipc_pause().await;
+        // Run the whole import under the classic WAL journal, then flip back to
+        // MVCC when it finishes. A large autocommit (the post-copy index
+        // rebuild, the Tags_slurp swap) under MVCC materializes the entire
+        // delta in the in-memory commit log -- measured pinned RAM with zero
+        // WAL progress for a ~15M-tag import. WAL streams b-tree builds to
+        // temp files and checkpointed pages instead (~7x faster index builds,
+        // ~2x faster inserts on the slurp builder). check_db re-applies
+        // journal_mode=mvcc on the next boot, so a crash mid-import self-heals
+        // even if the restore below is skipped.
+        let wal_fast_lane = self.try_set_journal_mode("wal").await;
+        if wal_fast_lane {
+            log::info!("Turso slurp using WAL journal mode (MVCC commit-log fast lane).");
+        } else {
+            log::warn!(
+                "Turso slurp could not switch off MVCC; falling back to the in-memory \
+                 commit-log path (slower index builds)."
+            );
+        }
+        let result = loop {
             match self.internal_db_slurp(&source_conn).await {
-                Ok(result) => return Ok(result),
+                Ok(result) => break Ok(result),
                 Err(error)
                     if matches!(error, turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) =>
                 {
@@ -43,8 +88,67 @@ impl TursoDatabase {
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
-                Err(error) => return Err(error),
+                Err(error) => break Err(error),
             }
+        };
+        if wal_fast_lane {
+            self.checkpoint_wal().await;
+            if self.try_set_journal_mode("mvcc").await {
+                log::info!("Turso slurp restored MVCC journal mode.");
+            } else {
+                log::warn!(
+                    "Turso slurp could not restore MVCC; check_db re-applies it on the next boot."
+                );
+            }
+        }
+        self.ipc_resume().await;
+        self.set_slurping(false);
+        result
+    }
+
+    /// Sets the destination's journal mode and confirms the resulting mode.
+    /// The pragma is database-wide, so a busy pool connection can reject the
+    /// change; returning false lets the caller keep running (under mvcc) rather
+    /// than abort the import.
+    async fn try_set_journal_mode(&self, mode: &str) -> bool {
+        let Ok(conn) = self.connect() else {
+            return false;
+        };
+        match conn
+            .pragma_update("journal_mode", &format!("'{mode}'"))
+            .await
+        {
+            Ok(_) => {}
+            Err(error) => {
+                log::warn!("Turso journal_mode={mode} rejected: {error}");
+                return false;
+            }
+        }
+        let mut actual = String::new();
+        if conn
+            .pragma_query("journal_mode", |row| {
+                actual = row.get::<String>(0).unwrap_or_default();
+                Ok(())
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        actual.eq_ignore_ascii_case(mode)
+    }
+
+    /// Best-effort fold of the WAL back into the main file before restoring
+    /// MVCC, so the mvcc layer does not have to ingest a growing WAL.
+    async fn checkpoint_wal(&self) {
+        let Ok(conn) = self.connect() else {
+            return;
+        };
+        if let Err(error) = conn
+            .pragma_query("wal_checkpoint(TRUNCATE)", |_row| Ok(()))
+            .await
+        {
+            log::warn!("Turso WAL checkpoint before MVCC restore failed: {error}");
         }
     }
 
@@ -62,7 +166,7 @@ impl TursoDatabase {
         &self,
         source: &r2d2_sqlite::rusqlite::Connection,
     ) -> Result<(u64, u64, u64)> {
-        let conn = self.connect()?;
+        let mut conn = self.connect()?;
 
         // Namespaces, remembering id -> object and name -> target id.
         let slurp_started = Instant::now();
@@ -93,7 +197,7 @@ impl TursoDatabase {
         // Ensuring namespaces runs CREATE TABLE for their Relationship_N
         // partitions — DDL, which turso forbids inside BEGIN CONCURRENT.
         // `namespace_ensure_set` does it in a short exclusive transaction up
-        // front (also seeding the in-memory namespace cache) so the concurrent
+        // front (also seeding the in-memory namespace cache) so the immediate
         // copy below only ever executes DML, and so its snapshot sees the
         // committed namespace rows. Now largely a no-op once namespaces are
         // cached (the common warm-db case).
@@ -108,7 +212,7 @@ impl TursoDatabase {
         // Storage locations: re-use whatever rows exist, creating the rest.
         // Keep each batch short so scraper writes can commit between batches.
         let mut source_storage_ids = HashMap::new();
-        conn.execute("BEGIN CONCURRENT", ()).await?;
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
         let mut locations = source
             .prepare("SELECT id, location FROM FileStorageLocations")
             .map_err(db_error)?;
@@ -131,12 +235,117 @@ impl TursoDatabase {
         // Tags, chunked by id, building the source -> target tag map.
         let mut slurp_tags: HashMap<u64, u64> = HashMap::new();
         let mut tag_count = 0_u64;
+        // New rows the destination actually absorbed. The relationship stage
+        // below reads it (together with its own inserted-relationship count)
+        // to skip recounting when nothing changed: recounting rewrites every
+        // Tags.count row, which maintains the ngram index per row and is
+        // pathological on destinations that already carry idx_tags_fts.
+        let mut tags_added = 0_usize;
         {
-            // Maintaining the n-gram index for every imported row is vastly
-            // more expensive than rebuilding it once after the import.
-            conn.execute("DROP INDEX IF EXISTS idx_tags_fts", ())
+            // Tags arrive in source id order, random relative to the
+            // UNIQUE(name, namespace) key. Warm imports stage new rows in a
+            // constraint-free Tags_slurp copy so inserts never maintain the
+            // unique key per row, then swap the canonical table aside and back
+            // afterwards (and rebuild the n-gram FTS index once at the very
+            // end), resolving existing ids through the indexed Tags table.
+            // Cold imports on an empty destination have nothing to resolve and
+            // no index to re-create: they insert straight into the indexed
+            // Tags table and rebuild only the dropped covering/FTS indexes at
+            // the end (see below).
+
+            // Recover from a crash between the swap steps of a previous run:
+            // the canonical table is moved aside before the new one takes its
+            // name, so a leftover Tags_old is the last good copy of Tags.
+            {
+                let mut check = conn
+                    .prepare(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM sqlite_master
+                             WHERE type = 'table' AND name = ?1
+                         )",
+                    )
+                    .await?;
+                let has_tags: i64 = check.query_row(("Tags",)).await?.get(0)?;
+                let has_old: i64 = check.query_row(("Tags_old",)).await?.get(0)?;
+                if has_tags == 0 && has_old != 0 {
+                    conn.execute("ALTER TABLE Tags_old RENAME TO Tags", ())
+                        .await?;
+                }
+            }
+            conn.execute("DROP TABLE IF EXISTS Tags_slurp", ()).await?;
+
+            // Only a destination that already owns tags needs the per-batch
+            // "exists?" lookup; an empty Tags table has nothing to resolve.
+            let has_existing_tags: bool = {
+                let mut stmt = conn.prepare("SELECT EXISTS(SELECT 1 FROM Tags)").await?;
+                let exists: i64 = stmt.query_row(()).await?.get(0)?;
+                exists != 0
+            };
+
+            // Cold import: on an empty destination there is nothing to resolve and no
+            // data to preserve, so the Tags_slurp swap below is skipped
+            // entirely. The canonical table (empty, so no dependent rows yet)
+            // is recreated without the inline UNIQUE constraint and carries
+            // the named idx_tags_name_namespace index created up front on the
+            // empty table, exactly the layout the warm path produces. Every
+            // 25k-row insert maintains that index incrementally in a small
+            // MVCC commit that keeps the WAL flowing; there are no giant
+            // post-copy CREATE INDEX autocommits. Inserting into an indexed
+            // table costs ~3x per row (measured), but the WAL fast lane more
+            // than makes up for the batch writes. The covering and FTS indexes
+            // are rebuilt once at the end instead of being maintained per row.
+            let cold_import = !has_existing_tags;
+            if cold_import {
+                conn.execute("DROP TABLE IF EXISTS Tags", ()).await?;
+                conn.execute_batch(
+                    "CREATE TABLE Tags (
+                         id INTEGER PRIMARY KEY ,
+                         name TEXT NOT NULL,
+                         namespace INTEGER NOT NULL,
+                         count INTEGER NOT NULL DEFAULT 0 ,
+                         FOREIGN KEY (namespace) REFERENCES Namespace(id)
+                             ON DELETE CASCADE ON UPDATE CASCADE
+                     );
+                     CREATE UNIQUE INDEX idx_tags_name_namespace
+                         ON Tags (name, namespace);",
+                )
                 .await?;
+                conn.execute("DROP INDEX IF EXISTS idx_tags_count_covering", ())
+                    .await?;
+                conn.execute("DROP INDEX IF EXISTS idx_tags_fts", ()).await?;
+                log::info!("Slurp tags: cold import, inserting directly into indexed Tags");
+            } else {
+                conn.execute_batch(
+                    "CREATE TABLE Tags_slurp (
+                         id INTEGER PRIMARY KEY ,
+                         name TEXT NOT NULL,
+                         namespace INTEGER NOT NULL,
+                         count INTEGER NOT NULL DEFAULT 0 ,
+                         FOREIGN KEY (namespace) REFERENCES Namespace(id)
+                             ON DELETE CASCADE ON UPDATE CASCADE
+                     );",
+                )
+                .await?;
+            }
+
+            // The row-value IN (VALUES ...) syntax triggers a full table scan
+            // in the SQLite/turso planner even when a matching unique index
+            // exists. Warm destinations instead populate this temporary table
+            // once per batch and let the planner use an index-nested-loop JOIN
+            // on the unique (name, namespace) constraint. Created up front
+            // because CREATE TABLE is DDL and must stay outside the batches'
+            // BEGIN IMMEDIATE transactions.
+            if has_existing_tags {
+                conn.execute(
+                    "CREATE TEMP TABLE IF NOT EXISTS _slurp_tags_tmp (
+                         name TEXT NOT NULL, namespace INTEGER NOT NULL)",
+                    (),
+                )
+                .await?;
+            }
+
             let mut last_tag_id = 0_u64;
+            let mut first_tag_pass = true;
             loop {
                 let batch_started = Instant::now();
                 let mut stmt = source
@@ -150,7 +359,9 @@ impl TursoDatabase {
                     )
                     .map_err(db_error)?;
                 let rows = stmt
-                    .query_map([last_tag_id as i64, SQL_CHUNK_SIZE as i64], |row| {
+                    .query_map(
+                        [keyset_bound(first_tag_pass, last_tag_id), SLURP_TAG_BATCH],
+                        |row| {
                         Ok((
                             row.get::<_, u64>(0)?,
                             row.get::<_, String>(1)?,
@@ -164,13 +375,22 @@ impl TursoDatabase {
                 let Some((last_id, _, _, _)) = batch.last() else {
                     break;
                 };
+                first_tag_pass = false;
 
                 log::info!("Slurping {} tags into the db.", batch.len());
                 let target_started = Instant::now();
-                conn.execute("BEGIN CONCURRENT", ()).await?;
-                let mapping = self.slurp_tags_bulk_add(&conn, &batch).await?;
+                conn.execute("BEGIN IMMEDIATE", ()).await?;
+                let (mapping, batch_new) = self
+                    .slurp_tags_bulk_add(
+                        &conn,
+                        &batch,
+                        has_existing_tags,
+                        if cold_import { "Tags" } else { "Tags_slurp" },
+                    )
+                    .await?;
                 conn.execute("COMMIT", ()).await?;
                 tag_count += batch.len() as u64;
+                tags_added += batch_new;
                 for (source_id, name, namespace, description) in &batch {
                     let key = Tag {
                         name: name.clone(),
@@ -190,6 +410,90 @@ impl TursoDatabase {
                     target_started.elapsed(),
                     batch_started.elapsed()
                 );
+            }
+
+            // A warm re-slurp that added nothing leaves Tags exactly as it
+            // was: every source tag already resolved to an existing id, so
+            // Tags_slurp is empty. Re-running the swap would copy all rows
+            // across and rebuild both indexes for zero benefit — a
+            // multi-gigabyte single-threaded sort in the MVCC layer that takes
+            // tens of minutes. Skip it, drop the empty import table, and keep
+            // the indexed canonical table in place.
+            if cold_import {
+                // idx_tags_name_namespace carried every insert up front; the
+                // covering index is rebuilt once here (counts were all 0
+                // through the copy), and the final stage rebuilds the dropped
+                // ngram-FTS index over the whole table.
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tags_count_covering
+                     ON Tags(count DESC, name, namespace)",
+                    (),
+                )
+                .await?;
+                log::info!(
+                    "Slurp tags: cold import inserted {} tags into indexed Tags, rebuilt covering",
+                    tag_count
+                );
+            } else if tags_added == 0 {
+                conn.execute("DROP TABLE IF EXISTS Tags_slurp", ()).await?;
+                log::info!("Slurp tags: nothing new, kept existing table");
+            } else {
+                // Swap the import table back under the canonical name and
+                // restore uniqueness and the covering index now that the bulk
+                // insert (which would re-bloat them per row) is done. Ids
+                // keep their values through the rename, so relationship
+                // mapping stays valid.
+                //
+                // The FTS index is dropped first because SQLite rewrites
+                // dependent indexes on table renames; it is rebuilt once at
+                // the very end. The row copy is done in chunks of
+                // SLURP_TAG_BATCH under their own short transactions: a single
+                // `INSERT ... SELECT` over all rows is one multi-GB MVCC
+                // commit that serializes the whole delta into an in-memory
+                // log (measured ~14.5 min and ~11 GB RAM for 15M rows),
+                // whereas chunking (~25k per commit) runs ~2x faster and uses
+                // ~100x less memory (measured ~6.8 min, ~90 MB).
+                conn.execute("DROP INDEX IF EXISTS idx_tags_fts", ())
+                    .await?;
+                let copy_started = Instant::now();
+                let max_copy_id: i64 = {
+                    let mut stmt = conn
+                        .prepare("SELECT COALESCE(MAX(rowid), 0) FROM Tags")
+                        .await?;
+                    let mut rows = stmt.query(()).await?;
+                    rows.next()
+                        .await?
+                        .ok_or_else(|| turso::Error::ConversionFailure("no max rowid row".into()))?
+                        .get::<i64>(0)?
+                };
+                let mut last_copy_id: i64 = 0;
+                while last_copy_id < max_copy_id {
+                    let next = (last_copy_id + SLURP_TAG_BATCH).min(max_copy_id);
+                    conn.execute("BEGIN IMMEDIATE", ()).await?;
+                    conn.execute(
+                        "INSERT INTO Tags_slurp (id, name, namespace, count)
+                             SELECT id, name, namespace, count FROM Tags
+                             WHERE rowid > ?1 AND rowid <= ?2",
+                        (last_copy_id, next),
+                    )
+                    .await?;
+                    conn.execute("COMMIT", ()).await?;
+                    last_copy_id = next;
+                }
+                log::info!("Slurp tags copy complete in {:?}", copy_started.elapsed());
+                conn.execute_batch(
+                    "ALTER TABLE Tags RENAME TO Tags_old;
+                     ALTER TABLE Tags_slurp RENAME TO Tags;
+                     DROP TABLE Tags_old;
+                     CREATE UNIQUE INDEX idx_tags_name_namespace ON Tags (name, namespace);
+                     CREATE INDEX idx_tags_count_covering ON Tags(count DESC, name, namespace);",
+                )
+                .await?;
+            }
+
+            if has_existing_tags {
+                conn.execute("DROP TABLE IF EXISTS _slurp_tags_tmp", ())
+                    .await?;
             }
         }
         log::info!(
@@ -219,6 +523,7 @@ impl TursoDatabase {
             };
 
             let mut last_file_id = 0_u64;
+            let mut first_file_pass = true;
             loop {
                 let batch_started = Instant::now();
                 let file_query = format!(
@@ -230,7 +535,9 @@ impl TursoDatabase {
                 );
                 let mut stmt = source.prepare(&file_query).map_err(db_error)?;
                 let rows = stmt
-                    .query_map([last_file_id as i64, SQL_CHUNK_SIZE as i64], |row| {
+                    .query_map(
+                        [keyset_bound(first_file_pass, last_file_id), (SQL_CHUNK_SIZE * 8) as i64],
+                        |row| {
                         Ok((
                             row.get::<_, u64>(0)?,
                             row.get::<_, String>(1)?,
@@ -245,6 +552,7 @@ impl TursoDatabase {
                 let Some((last_id, _, _, _, _)) = batch.last() else {
                     break;
                 };
+                first_file_pass = false;
 
                 let mut files = HashSet::new();
                 for (_, hash, extension, size_bytes, source_storage_id) in &batch {
@@ -262,7 +570,7 @@ impl TursoDatabase {
                 file_count += files.len() as u64;
                 log::info!("Slurping {} files into the db.", files.len());
                 let target_started = Instant::now();
-                conn.execute("BEGIN CONCURRENT", ()).await?;
+                conn.execute("BEGIN IMMEDIATE", ()).await?;
                 let resolved = self
                     .file_add_bulk(&conn, &files.iter().cloned().collect::<Vec<_>>())
                     .await?;
@@ -307,6 +615,7 @@ impl TursoDatabase {
                 == 1;
             if has_file_hashes {
                 let mut last_file_id = 0_u64;
+                let mut first_hash_pass = true;
                 loop {
                     let batch_started = Instant::now();
                     let mut stmt = source
@@ -319,7 +628,9 @@ impl TursoDatabase {
                         )
                         .map_err(db_error)?;
                     let rows = stmt
-                        .query_map([last_file_id as i64, SQL_CHUNK_SIZE as i64], |row| {
+                        .query_map(
+                            [keyset_bound(first_hash_pass, last_file_id), SQL_CHUNK_SIZE as i64],
+                            |row| {
                             Ok((
                                 row.get::<_, u64>(0)?,
                                 row.get::<_, String>(1)?,
@@ -332,6 +643,7 @@ impl TursoDatabase {
                     let Some((last_id, _, _)) = batch.last() else {
                         break;
                     };
+                    first_hash_pass = false;
                     let tuples: Vec<_> = batch
                         .iter()
                         .filter_map(|(file_id, algorithm, digest)| {
@@ -343,7 +655,7 @@ impl TursoDatabase {
                     log::info!("Slurping {} hashes into the db.", tuples.len());
                     if !tuples.is_empty() {
                         let target_started = Instant::now();
-                        conn.execute("BEGIN CONCURRENT", ()).await?;
+                        conn.execute("BEGIN IMMEDIATE", ()).await?;
                         self.file_hashes_add_bulk(&conn, &tuples).await?;
                         conn.execute("COMMIT", ()).await?;
                         log::info!(
@@ -362,8 +674,16 @@ impl TursoDatabase {
             slurp_started.elapsed()
         );
 
-        // Relationships, one source namespace partition (or the legacy single
-        // `Relationship` table) at a time.
+        // Relationships. The source ships them either as per-namespace
+        // `Relationship_<id>` partitions or as a single legacy `Relationship`
+        // table holding every namespace. The legacy table is huge and shared,
+        // so filtering it per namespace forces nearly a full table scan for
+        // every sparse namespace; the production run measured ~9.5 h of source
+        // reads across the stage. It is therefore streamed once in PRIMARY KEY
+        // order and routed to the correct target partitions in-process. Both
+        // shapes drop the per-partition file_id index while rows land, recount
+        // tag counts with one aggregate pass per namespace, then rebuild the
+        // index once at the end.
         {
             let source_table_exists = |name: &str| -> Result<bool> {
                 let mut stmt = source
@@ -374,84 +694,147 @@ impl TursoDatabase {
             };
             let has_legacy_relationship = source_table_exists("Relationship")?;
 
+            // The Tags count column drives idx_tags_count_covering (ordered by
+            // count DESC). Recount UPDATEs churn this index so aggressively that
+            // turso's commit-log materialization pins memory with no wal
+            // progress at prod scale. Drop the index around every recount and
+            // restore it once after all recalcs complete.
+            let mut covering_dropped = false;
+
+            // Recount markers, persisted across runs. The recount for a
+            // namespace is skipped when its stream inserted nothing, but an
+            // interrupted run can leave freshly inserted relationship rows
+            // without their recount. Mark namespaces whose rows actually
+            // changed so the next run still recounts them even when the
+            // destination is already warm (added == 0); the table is dropped
+            // once an entire slurp completes with every marked namespace
+            // recounted.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS _slurp_pending_recount (
+                     namespace INTEGER PRIMARY KEY);",
+                (),
+            )
+            .await?;
+            let mut pending_recount: HashSet<u64> = HashSet::new();
+            {
+                let mut stmt = conn
+                    .prepare("SELECT namespace FROM _slurp_pending_recount")
+                    .await?;
+                let mut rows = stmt.query(()).await?;
+                while let Some(row) = rows.next().await? {
+                    pending_recount.insert(row.get(0)?);
+                }
+            }
+
+            // Source ids that keep their own partition table; the remaining
+            // namespaces are covered by the legacy table when it exists.
+            let mut partition_source_ids = HashSet::new();
+            {
+                let mut stmt = source
+                    .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+                    .map_err(db_error)?;
+                let mut rows = stmt.query([]).map_err(db_error)?;
+                while let Some(row) = rows.next().map_err(db_error)? {
+                    let name: String = row.get(0).map_err(db_error)?;
+                    if let Some(id) = name
+                        .strip_prefix("Relationship_")
+                        .and_then(|suffix| suffix.parse::<u64>().ok())
+                    {
+                        partition_source_ids.insert(id);
+                    }
+                }
+            }
+            let mut legacy_namespaces: Vec<(u64, u64)> = Vec::new();
             for (source_namespace, namespace) in &ns_by_source_id {
-                let partition = format!("Relationship_{source_namespace}");
-                let source_table = if source_table_exists(&partition)? {
-                    (partition, false)
-                } else if has_legacy_relationship {
-                    // The legacy table contains all namespaces. It must be
-                    // filtered below or it will be copied once per namespace.
-                    ("Relationship".to_string(), true)
-                } else {
+                if partition_source_ids.contains(source_namespace) || !has_legacy_relationship {
                     continue;
-                };
+                }
                 let target_namespace = self
                     .namespace_get_name_cache(&namespace.name)
                     .await
                     .ok_or_else(|| {
-                        turso::Error::ConversionFailure(
-                            format!("slurp namespace not cached: {}", namespace.name).into(),
-                        )
+                        turso::Error::ConversionFailure(format!(
+                            "slurp namespace not cached: {}",
+                            namespace.name
+                        ))
+                    })?;
+                legacy_namespaces.push((*source_namespace, target_namespace));
+            }
+
+            // Per-partition sources: keyset-scan each `Relationship_<id>` table
+            // independently and copy straight into the matching target.
+            // The partition's file_id index is dropped only when the
+            // destination is cold (tags_added reflects that); a warm re-slurp
+            // that manages to insert nothing must not tear down and rebuild
+            // an index for zero benefit (multi-minute CREATE on big
+            // partitions, and it vanishes from the planner meanwhile).
+            let cold_import = tags_added > 0;
+            // Set once if any recount fires these: Tags.count churns
+            // idx_tags_count_covering (ordered by count) so it must be
+            // down while recounts run and restored once all are done.
+            for (source_namespace, namespace) in &ns_by_source_id {
+                if !partition_source_ids.contains(source_namespace) {
+                    continue;
+                }
+                let target_namespace = self
+                    .namespace_get_name_cache(&namespace.name)
+                    .await
+                    .ok_or_else(|| {
+                        turso::Error::ConversionFailure(format!(
+                            "slurp namespace not cached: {}",
+                            namespace.name
+                        ))
                     })?;
 
+                // The partition keeps an extra index on file_id alongside its
+                // PRIMARY KEY (tag_id, file_id). Rebuilding it once after every
+                // row has landed is far cheaper than maintaining it on each of
+                // the thousands of INSERT chunks inside the copy loop.
+                if cold_import {
+                    conn.execute(
+                        format!(
+                            "DROP INDEX IF EXISTS idx_Relationship_{target_namespace}_tag_file"
+                        ),
+                        (),
+                    )
+                    .await?;
+                }
+
+                let partition = format!("Relationship_{source_namespace}");
                 let mut last_file_id = 0_u64;
                 let mut last_tag_id = 0_u64;
+                let mut first_rel_pass = true;
+                let mut added_here = 0_usize;
                 loop {
                     let batch_started = Instant::now();
-                    let query = if source_table.1 {
-                        format!(
-                            "SELECT r.file_id, r.tag_id
-                             FROM {} r
-                             JOIN Tags t ON t.id = r.tag_id
-                             WHERE t.namespace = ?3
-                               AND (r.file_id > ?1 OR (r.file_id = ?1 AND r.tag_id > ?2))
-                             ORDER BY r.file_id, r.tag_id
-                             LIMIT ?4",
-                            source_table.0
-                        )
-                    } else {
-                        format!(
+                    let mut stmt = source
+                        .prepare(&format!(
                             "SELECT r.file_id, r.tag_id
                              FROM {} r
                              WHERE r.file_id > ?1 OR (r.file_id = ?1 AND r.tag_id > ?2)
                              ORDER BY r.file_id, r.tag_id
                              LIMIT ?3",
-                            source_table.0
+                            partition
+                        ))
+                        .map_err(db_error)?;
+                    let rows = stmt
+                        .query_map(
+                            [
+                                keyset_bound(first_rel_pass, last_file_id),
+                                keyset_bound(first_rel_pass, last_tag_id),
+                                SLURP_RELATIONSHIP_BATCH as i64,
+                            ],
+                            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
                         )
-                    };
-                    let mut stmt = source.prepare(&query).map_err(db_error)?;
-                    let batch: Vec<(u64, u64)> = if source_table.1 {
-                        let rows = stmt
-                            .query_map(
-                                [
-                                    last_file_id as i64,
-                                    last_tag_id as i64,
-                                    *source_namespace as i64,
-                                    SQL_CHUNK_SIZE as i64,
-                                ],
-                                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
-                            )
-                            .map_err(db_error)?;
-                        rows.filter_map(|r| r.ok()).collect()
-                    } else {
-                        let rows = stmt
-                            .query_map(
-                                [
-                                    last_file_id as i64,
-                                    last_tag_id as i64,
-                                    SQL_CHUNK_SIZE as i64,
-                                ],
-                                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
-                            )
-                            .map_err(db_error)?;
-                        rows.filter_map(|r| r.ok()).collect()
-                    };
+                        .map_err(db_error)?;
+                    let batch: Vec<(u64, u64)> = rows.filter_map(|r| r.ok()).collect();
                     drop(stmt);
                     let Some((source_file_id, source_tag_id)) = batch.last() else {
                         break;
                     };
+                    first_rel_pass = false;
 
-                    let relationships = batch
+                    let mut relationships = batch
                         .iter()
                         .filter_map(|(file_id, tag_id)| {
                             let target_file = slurp_files.get(file_id)?;
@@ -459,14 +842,27 @@ impl TursoDatabase {
                             Some((*target_file, *target_tag))
                         })
                         .collect::<Vec<_>>();
+                    // The partition's PRIMARY KEY is (tag_id, file_id); the
+                    // keyset scan returns rows in file order, so insert them
+                    // sorted by the key to keep the destination pages hot.
+                    relationships.sort_unstable_by_key(|&(file_id, tag_id)| (tag_id, file_id));
                     log::info!(
                         "Slurping {} relationships into the db.",
                         relationships.len()
                     );
                     let target_started = Instant::now();
-                    conn.execute("BEGIN CONCURRENT", ()).await?;
-                    self.slurp_relationships_bulk_add(&conn, target_namespace, &relationships)
+                    conn.execute("BEGIN IMMEDIATE", ()).await?;
+                    let added = self
+                        .slurp_relationships_bulk_add(&conn, target_namespace, &relationships)
                         .await?;
+                    added_here += added;
+                    if added > 0 {
+                        conn.execute(
+                            "INSERT OR IGNORE INTO _slurp_pending_recount (namespace) VALUES (?1)",
+                            (target_namespace as i64,),
+                        )
+                        .await?;
+                    }
                     conn.execute("COMMIT", ()).await?;
 
                     last_file_id = *source_file_id;
@@ -479,22 +875,216 @@ impl TursoDatabase {
                     );
                 }
 
+                if cold_import || added_here > 0 || pending_recount.contains(&target_namespace) {
+                    // Tags.count churns idx_tags_count_covering (ordered by
+                    // count) on every recount UPDATE: each reordering mutates
+                    // the count b-tree and turso's commit-log materialization
+                    // pins memory with no wal progress until it is rebuilt.
+                    // Drop it once around every recount and restore after all
+                    // recalcs land, mirroring the cold path.
+                    if !covering_dropped {
+                        conn.execute("DROP INDEX IF EXISTS idx_tags_count_covering", ())
+                            .await?;
+                        covering_dropped = true;
+                    }
+                    slurp_recount_namespace(&conn, target_namespace).await?;
+                    log::info!(
+                        "Slurp count recalculation for namespace {} complete in {:?}",
+                        target_namespace,
+                        slurp_started.elapsed()
+                    );
+                }
+
+                // A cold import dropped the index before the copy; warm deltas insert
+                // right through it. `CREATE ... IF NOT EXISTS` is a no-op when
+                // the index is already present, so it is safe to run on every
+                // path: it rebuilds the index exactly when it does not exist
+                // (cold import, or a crashed previous run left it dropped).
                 conn.execute(
                     format!(
-                        "UPDATE Tags AS target_tag SET count = (
-                             SELECT COUNT(*) FROM Relationship_{target_namespace} r
-                             WHERE r.tag_id = target_tag.id
-                         ) WHERE target_tag.namespace = ?1"
+                        "CREATE INDEX IF NOT EXISTS idx_Relationship_{target_namespace}_tag_file
+                         ON Relationship_{target_namespace} (file_id)"
                     ),
-                    (target_namespace as i64,),
+                    (),
                 )
                 .await?;
-                log::info!(
-                    "Slurp count recalculation for namespace {} complete in {:?}",
-                    target_namespace,
-                    slurp_started.elapsed()
-                );
             }
+
+            // Legacy sources: one ordered scan over the whole shared table,
+            // routing each row to its target partition by namespace as it is
+            // read. The scan returns the namespace along with the row, so the
+            // single pass replaces the repeating per-namespace rescans.
+            if !legacy_namespaces.is_empty() {
+                let target_by_source_namespace: HashMap<u64, u64> =
+                    legacy_namespaces.iter().copied().collect();
+                // Only cold imports tear the file_id indexes down; see the
+                // partition path for the rationale.
+                if cold_import {
+                    for &(_, target_namespace) in &legacy_namespaces {
+                        conn.execute(
+                            format!(
+                                "DROP INDEX IF EXISTS idx_Relationship_{target_namespace}_tag_file"
+                            ),
+                            (),
+                        )
+                        .await?;
+                    }
+                }
+
+                let mut last_file_id = 0_u64;
+                let mut last_tag_id = 0_u64;
+                let mut first_legacy_rel_pass = true;
+                let mut added_by_namespace: HashMap<u64, usize> = HashMap::new();
+                loop {
+                    let batch_started = Instant::now();
+                    let mut stmt = source
+                        .prepare(
+                            "SELECT r.file_id, r.tag_id, t.namespace
+                             FROM Relationship r
+                             JOIN Tags t ON t.id = r.tag_id
+                             WHERE (r.file_id > ?1 OR (r.file_id = ?1 AND r.tag_id > ?2))
+                             ORDER BY r.file_id, r.tag_id
+                             LIMIT ?3",
+                        )
+                        .map_err(db_error)?;
+                    let rows = stmt
+                        .query_map(
+                            [
+                                keyset_bound(first_legacy_rel_pass, last_file_id),
+                                keyset_bound(first_legacy_rel_pass, last_tag_id),
+                                SLURP_RELATIONSHIP_BATCH as i64,
+                            ],
+                            |row| {
+                                Ok((
+                                    row.get::<_, u64>(0)?,
+                                    row.get::<_, u64>(1)?,
+                                    row.get::<_, u64>(2)?,
+                                ))
+                            },
+                        )
+                        .map_err(db_error)?;
+                    let batch: Vec<(u64, u64, u64)> = rows.filter_map(|r| r.ok()).collect();
+                    drop(stmt);
+                    let Some(&(next_file_id, next_tag_id, _)) = batch.last() else {
+                        break;
+                    };
+                    first_legacy_rel_pass = false;
+
+                    let mut namespace_groups: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+                    for &(file_id, tag_id, source_namespace) in &batch {
+                        let Some(&target_namespace) =
+                            target_by_source_namespace.get(&source_namespace)
+                        else {
+                            continue;
+                        };
+                        let (Some(&target_file), Some(&target_tag)) =
+                            (slurp_files.get(&file_id), slurp_tags.get(&tag_id))
+                        else {
+                            continue;
+                        };
+                        namespace_groups
+                            .entry(target_namespace)
+                            .or_default()
+                            .push((target_file, target_tag));
+                    }
+                    for (target_namespace, relationships) in namespace_groups.iter_mut() {
+                        // Align with the partition PRIMARY KEY (tag_id, file_id)
+                        // so the destination pages stay hot despite the source
+                        // scan arriving in file order.
+                        relationships.sort_unstable_by_key(|&(file_id, tag_id)| (tag_id, file_id));
+                        log::info!(
+                            "Slurping {} relationships into the db.",
+                            relationships.len()
+                        );
+                        let target_started = Instant::now();
+                        let tn = conn.transaction().await?;
+                        let added = self
+                            .slurp_relationships_bulk_add(
+                                &tn,
+                                *target_namespace,
+                                relationships.as_slice(),
+                            )
+                            .await?;
+                        *added_by_namespace.entry(*target_namespace).or_default() += added;
+                        if added > 0 {
+                            tn.execute(
+                                "INSERT OR IGNORE INTO _slurp_pending_recount (namespace) VALUES (?1)",
+                                (*target_namespace as i64,),
+                            )
+                            .await?;
+                        }
+                        tn.commit().await?;
+                        log::info!(
+                            "Slurp relationships batch complete: {} rows, target {:?}",
+                            relationships.len(),
+                            target_started.elapsed()
+                        );
+                    }
+
+                    last_file_id = next_file_id;
+                    last_tag_id = next_tag_id;
+                    log::info!(
+                        "Slurp relationships source read: {} rows, total {:?}",
+                        batch.len(),
+                        batch_started.elapsed()
+                    );
+                }
+
+                for &(_, target_namespace) in &legacy_namespaces {
+                    if cold_import
+                        || added_by_namespace
+                            .get(&target_namespace)
+                            .copied()
+                            .unwrap_or(0)
+                            > 0
+                        || pending_recount.contains(&target_namespace)
+                    {
+                        if !covering_dropped {
+                            conn.execute("DROP INDEX IF EXISTS idx_tags_count_covering", ())
+                                .await?;
+                            covering_dropped = true;
+                        }
+                        slurp_recount_namespace(&conn, target_namespace).await?;
+                        log::info!(
+                            "Slurp count recalculation for namespace {} complete in {:?}",
+                            target_namespace,
+                            slurp_started.elapsed()
+                        );
+                    }
+                    // Only cold imports rebuilt the dropped partition indexes; on warm
+                    // runs the index either exists (`IF NOT EXISTS` no-ops or
+                    // stays) or is missing from a crashed earlier run and is
+                    // rebuilt right here.
+                    conn.execute(
+                        format!(
+                            "CREATE INDEX IF NOT EXISTS idx_Relationship_{target_namespace}_tag_file
+                             ON Relationship_{target_namespace} (file_id)"
+                        ),
+                        (),
+                    )
+                    .await?;
+                }
+            }
+
+            // Every namespace that gained rows (or carries an interrupted-run
+            // marker) was recounted or explicitly skipped only for a
+            // fully-warm run; either way the marker table is spent now. The
+            // covering index must be restored whether the source used
+            // per-namespace partitions or the legacy shared Relationship table:
+            // recounts drop it (count DESC churns the b-tree) and a
+            // partition-only source never reaches the legacy branch to restore
+            // it.
+            if covering_dropped {
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tags_count_covering
+                     ON Tags(count DESC, name, namespace)",
+                    (),
+                )
+                .await?;
+                log::info!("Slurp restored idx_tags_count_covering after recount");
+            }
+            conn.execute("DROP TABLE IF EXISTS _slurp_pending_recount", ())
+                .await?;
         }
 
         // Parents.
@@ -511,6 +1101,7 @@ impl TursoDatabase {
                     ))
                 })
                 .map_err(db_error)?;
+
             let mut parent_set = HashSet::new();
             for row in rows {
                 let (tag_id, relate_tag_id, limit_to) = row.map_err(db_error)?;
@@ -525,9 +1116,87 @@ impl TursoDatabase {
                 }
             }
             log::info!("Slurping {} parents into the db.", parent_set.len());
-            conn.execute("BEGIN CONCURRENT", ()).await?;
-            self.parents_bulk_add(&conn, &parent_set).await?;
-            conn.execute("COMMIT", ()).await?;
+
+            // --- CRASH RECOVERY CHECK ---
+            // If a previous run crashed between the rename and the drop,
+            // Parents will be missing/incomplete, but Parents_old will hold the good data.
+            {
+                let mut check = conn
+            .prepare(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            )
+            .await?;
+                let has_parents: i64 = check.query_row(("Parents",)).await?.get(0)?;
+                let has_old: i64 = check.query_row(("Parents_old",)).await?.get(0)?;
+
+                if has_parents == 0 && has_old != 0 {
+                    log::warn!(
+                        "Recovery detected: restoring Parents_old to Parents after a previous crash."
+                    );
+                    conn.execute("ALTER TABLE Parents_old RENAME TO Parents", ())
+                        .await?;
+                } else {
+                    // Safe cleanup of any truly dead leftovers from old successful runs
+                    conn.execute("DROP TABLE IF EXISTS Parents_old", ()).await?;
+                }
+            }
+
+            // 1. Drop foreign keys and shift the current table aside safely
+            conn.execute_batch("PRAGMA foreign_keys = OFF;").await?;
+            conn.execute_batch(
+                "ALTER TABLE Parents RENAME TO Parents_old;",
+            )
+            .await?;
+
+            self.table_create_parents(&conn).await;
+
+            // 2. Copy existing data from Parents_old into the new unconstrained Parents table
+            let max_copy_id: i64 = {
+                let mut stmt = conn
+                    .prepare("SELECT COALESCE(MAX(rowid), 0) FROM Parents_old")
+                    .await?;
+                let mut rows = stmt.query(()).await?;
+                rows.next().await?.unwrap().get::<i64>(0)?
+            };
+log::info!("Copying and deduplicating existing parents data");
+            conn.execute(
+    "INSERT INTO Parents (tag_id, relate_tag_id, limit_to)
+     SELECT tag_id, relate_tag_id, limit_to 
+     FROM Parents_old
+     GROUP BY tag_id, relate_tag_id, IFNULL(limit_to, -1)",
+    (),
+).await?;
+
+            // 3. Insert new parents in chunks
+            let parent_vec: Vec<_> = parent_set.into_iter().collect();
+            for parent in parent_vec.chunks(SQL_CHUNK_SIZE * 8) {
+                let tx = conn.transaction().await?;
+                self.parents_bulk_add(&tx, parent).await?;
+                tx.commit().await?;
+            }
+
+            // 4. Deduplicate to ensure unique index creation won't fail
+         /*   conn.execute(
+                "DELETE FROM Parents
+         WHERE rowid NOT IN (
+             SELECT MIN(rowid) FROM Parents
+             GROUP BY tag_id, relate_tag_id, IFNULL(limit_to, -1)
+         )",
+                (),
+            )
+            .await?;
+*/
+            // 5. Cleanup old table, rebuild all indexes once, and restore foreign keys
+            log::info!("Recreating parents indexes");
+            conn.execute_batch(
+                "DROP TABLE Parents_old;
+         CREATE INDEX idx_parents_lim ON Parents (limit_to);
+         CREATE INDEX idx_parents_rel ON Parents (relate_tag_id);
+         CREATE UNIQUE INDEX idx_unique_parents_null_safe
+             ON Parents (tag_id, relate_tag_id, IFNULL(limit_to, -1));
+         PRAGMA foreign_keys = ON;",
+            )
+            .await?;
         }
 
         // Jobs. Source ids are intentionally not preserved: the target Jobs
@@ -562,57 +1231,122 @@ impl TursoDatabase {
     /// Imports tags without the plugin-facing action path. Slurp tags are
     /// always normal tags, so regex registration and parent processing are
     /// unnecessary here; the source-to-target mapping is all the caller needs.
+    ///
+    /// Returns the mapping and how many rows were actually new (i.e. inserted
+    /// into `insert_target`). The caller uses the count to decide whether the
+    /// swap-back is needed at all: a warm re-slurp that added nothing must
+    /// not re-copy the whole table and rebuild its indexes.
+    ///
+    /// `insert_target` is either the canonical `Tags` table (cold import:
+    /// indexed, so new rows maintain the unique key inline) or the
+    /// constraint-free `Tags_slurp` staging table (warm import; the caller
+    /// swaps it under the canonical name afterwards). The value is an internal
+    /// constant, never user input.
     async fn slurp_tags_bulk_add(
         &self,
         conn: &Connection,
         batch: &[(u64, String, String, Option<String>)],
-    ) -> Result<HashMap<Tag, i64>> {
-        let mut holders = Vec::with_capacity(batch.len());
-        let mut params = Vec::with_capacity(batch.len() * 2);
+        lookup_existing: bool,
+        insert_target: &str,
+    ) -> Result<(HashMap<Tag, i64>, usize)> {
         let mut namespace_ids = HashMap::new();
-        for (_, name, namespace, _) in batch {
-            let namespace_id = if let Some(&id) = namespace_ids.get(namespace) {
-                id
-            } else {
+        for (_, _, namespace, _) in batch {
+            if !namespace_ids.contains_key(namespace) {
                 let id = self
                     .namespace_get_name_cache(namespace)
                     .await
                     .ok_or_else(|| {
-                        turso::Error::ConversionFailure(
-                            format!("slurp namespace not cached: {namespace}").into(),
-                        )
+                        turso::Error::ConversionFailure(format!(
+                            "slurp namespace not cached: {namespace}"
+                        ))
                     })?;
                 namespace_ids.insert(namespace.clone(), id);
-                id
-            };
-            holders.push("(?, ?)");
-            params.push(Value::from(name.as_str()));
-            params.push(Value::from(namespace_id as i64));
+            }
         }
 
-        let mut rows = conn
-            .query(
-                format!(
-                    "INSERT INTO Tags (name, namespace) VALUES {} \
-                     ON CONFLICT(name, namespace) DO UPDATE SET name = excluded.name \
-                     RETURNING id, name, namespace",
-                    holders.join(", ")
-                ),
-                params_from_iter(params),
-            )
-            .await?;
-        let mut ids = HashMap::with_capacity(batch.len());
-        while let Some(row) = rows.next().await? {
-            let id: i64 = row.get(0)?;
-            let name: String = row.get(1)?;
-            let namespace_id: u64 = row.get(2)?;
-            ids.insert((name, namespace_id), id);
+        // Rows the destination already owns resolve to their existing target
+        // id through the Tags table (which keeps its unique index and is only
+        // read here). Everything else is genuinely new and lands in
+        // `insert_target` at bulk speed. Source tags are unique by
+        // (name, namespace), so a tag is either existing or new, never both.
+        let mut existing_ids: HashMap<(String, u64), i64> = HashMap::new();
+        if lookup_existing {
+            // Populate the pre-created temp table for this batch and let the
+            // planner use an index-nested-loop JOIN on the unique
+            // (name, namespace) constraint (created/cleaned up by the caller
+            // outside any transaction).
+            conn.execute("DELETE FROM _slurp_tags_tmp", ()).await?;
+            for chunk in batch.chunks(SLURP_TAG_BATCH as usize / 6) {
+                let mut holders = Vec::with_capacity(chunk.len());
+                let mut params = Vec::with_capacity(chunk.len() * 2);
+                for (_, name, namespace, _) in chunk {
+                    holders.push("(?, ?)");
+                    params.push(Value::from(name.as_str()));
+                    params.push(Value::from(namespace_ids[namespace] as i64));
+                }
+                conn.execute(
+                    &format!(
+                        "INSERT INTO _slurp_tags_tmp (name, namespace) VALUES {}",
+                        holders.join(", ")
+                    ),
+                    params_from_iter(params),
+                )
+                .await?;
+            }
+            let mut rows = conn
+                .query(
+                    "SELECT Tags.id, Tags.name, Tags.namespace \
+                     FROM Tags \
+                     JOIN _slurp_tags_tmp \
+                       ON Tags.name = _slurp_tags_tmp.name \
+                       AND Tags.namespace = _slurp_tags_tmp.namespace",
+                    (),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                existing_ids.insert((row.get(1)?, row.get::<i64>(2)? as u64), row.get(0)?);
+            }
         }
+
+        let new_rows: Vec<_> = batch
+            .iter()
+            .filter(|(_, name, namespace, _)| {
+                !existing_ids.contains_key(&(name.clone(), namespace_ids[namespace]))
+            })
+            .collect();
+        let mut holders = Vec::with_capacity(new_rows.len());
+        let mut params = Vec::with_capacity(new_rows.len() * 2);
+        for (_, name, namespace, _) in &new_rows {
+            holders.push("(?, ?)");
+            params.push(Value::from(name.as_str()));
+            params.push(Value::from(namespace_ids[namespace] as i64));
+        }
+        let mut inserted_ids: HashMap<(String, u64), i64> = HashMap::new();
+        if !new_rows.is_empty() {
+            let mut rows = conn
+                .query(
+                    format!(
+                        "INSERT INTO {insert_target} (name, namespace) VALUES {} \
+                         RETURNING id, name, namespace",
+                        holders.join(", ")
+                    ),
+                    params_from_iter(params),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                inserted_ids.insert((row.get(1)?, row.get::<i64>(2)? as u64), row.get(0)?);
+            }
+        }
+        let new_count = new_rows.len();
 
         let mut mapping = HashMap::with_capacity(batch.len());
         for (_, name, namespace, description) in batch {
             let namespace_id = namespace_ids[namespace];
-            if let Some(&id) = ids.get(&(name.clone(), namespace_id)) {
+            let id = existing_ids
+                .get(&(name.clone(), namespace_id))
+                .copied()
+                .or_else(|| inserted_ids.get(&(name.clone(), namespace_id)).copied());
+            if let Some(id) = id {
                 mapping.insert(
                     Tag {
                         name: name.clone(),
@@ -625,20 +1359,25 @@ impl TursoDatabase {
                 );
             }
         }
-        Ok(mapping)
+        Ok((mapping, new_count))
     }
 
     /// Inserts relationships into a known namespace partition. The normal
     /// relationship helper has to resolve namespaces and maintain live tag
     /// counts for interactive writes; slurp recalculates counts once per
     /// partition after all rows have been copied.
+    ///
+    /// Returns how many rows were actually inserted (OR IGNORE skips rows the
+    /// destination already has). The caller sums these to know whether any
+    /// relationship data changed, which decides whether recounts are needed.
     async fn slurp_relationships_bulk_add(
         &self,
         conn: &Connection,
         namespace_id: u64,
         relationships: &[(u64, u64)],
-    ) -> Result<()> {
-        for chunk in relationships.chunks(SQL_CHUNK_SIZE) {
+    ) -> Result<usize> {
+        let mut added = 0_u64;
+        for chunk in relationships.chunks(SLURP_RELATIONSHIP_BATCH) {
             let mut holders = Vec::with_capacity(chunk.len());
             let mut params = Vec::with_capacity(chunk.len() * 2);
             for &(file_id, tag_id) in chunk {
@@ -646,17 +1385,18 @@ impl TursoDatabase {
                 params.push(Value::from(file_id as i64));
                 params.push(Value::from(tag_id as i64));
             }
-            conn.execute(
-                format!(
-                    "INSERT OR IGNORE INTO Relationship_{namespace_id} (file_id, tag_id)
-                     VALUES {}",
-                    holders.join(", ")
-                ),
-                params_from_iter(params),
-            )
-            .await?;
+            added += conn
+                .execute(
+                    format!(
+                        "INSERT OR IGNORE INTO Relationship_{namespace_id} (file_id, tag_id)
+                         VALUES {}",
+                        holders.join(", ")
+                    ),
+                    params_from_iter(params),
+                )
+                .await?;
         }
-        Ok(())
+        Ok(added as usize)
     }
 
     /// Copies `Jobs` rows into turso, mapping whichever schema the source
@@ -776,16 +1516,16 @@ impl TursoDatabase {
             };
             batch.push(job);
             if batch.len() >= SQL_CHUNK_SIZE {
-                conn.execute("BEGIN CONCURRENT", ()).await?;
-                self.jobs_bulk_add_sql(&conn, &batch).await?;
+                conn.execute("BEGIN IMMEDIATE", ()).await?;
+                self.jobs_bulk_add_sql(conn, &batch).await?;
                 conn.execute("COMMIT", ()).await?;
                 copied += batch.len() as u64;
                 batch.clear();
             }
         }
         if !batch.is_empty() {
-            conn.execute("BEGIN CONCURRENT", ()).await?;
-            self.jobs_bulk_add_sql(&conn, &batch).await?;
+            conn.execute("BEGIN IMMEDIATE", ()).await?;
+            self.jobs_bulk_add_sql(conn, &batch).await?;
             conn.execute("COMMIT", ()).await?;
             copied += batch.len() as u64;
         }
@@ -813,6 +1553,82 @@ fn parse_slurp_job_recreation(json: &str) -> Option<DbJobRecreation> {
 
 fn db_error(error: r2d2_sqlite::rusqlite::Error) -> turso::Error {
     turso::Error::ConversionFailure(error.to_string())
+}
+
+/// Builds a single `UPDATE Tags SET count = CASE id WHEN ? THEN ? ... END
+/// WHERE id IN (...)` that *sets* each tag's count to an absolute value in one
+/// round trip. Slurp recomputes counts from an aggregate over a relationship
+/// partition (after zeroing the namespace), so unlike `tag_count_update_sql`
+/// in relationship.rs it replaces the count instead of incrementing it.
+fn tag_count_set_sql(counts: &[(u64, u64)]) -> (String, Vec<Value>) {
+    let mut clauses = Vec::with_capacity(counts.len());
+    let mut params = Vec::with_capacity(counts.len() * 3);
+    for &(tag_id, count) in counts {
+        clauses.push("WHEN ? THEN ?".to_string());
+        params.push(Value::from(tag_id as i64));
+        params.push(Value::from(count as i64));
+    }
+    let placeholders = std::iter::repeat_n("?", counts.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    for &(tag_id, _) in counts {
+        params.push(Value::from(tag_id as i64));
+    }
+    (
+        format!(
+            "UPDATE Tags SET count = CASE id {} END WHERE id IN ({placeholders});",
+            clauses.join(" ")
+        ),
+        params,
+    )
+}
+
+/// Recomputes a namespace's `Tags.count` from its freshly loaded partition.
+/// Zeroing first, then one `GROUP BY` aggregate over tags (instead of a
+/// correlated `COUNT(*)` per tag) prevents stale counts from drifting and runs
+/// in a single concurrent transaction. The partition's PRIMARY KEY
+/// (tag_id, file_id) covers the GROUP BY, so it costs one index scan rather
+/// than one probe per Tags row. See `tag_count_set_sql`.
+async fn slurp_recount_namespace(conn: &Connection, namespace_id: u64) -> Result<()> {
+    // Build the authoritative per-tag counts with one GROUP BY over the freshly
+    // landed partition, then emit every tag in the namespace (zeros included)
+    // as bounded per-chunk updates. A single `UPDATE Tags SET count = 0
+    // WHERE namespace = ?` would sweep the whole 15M-row Tags tree into a new
+    // MVCC image even when only one namespace changes - some fragment shapes
+    // never finish that rematerialization (RSS pins at ~10GB with zero wal).
+    let mut counts: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut rows = conn
+        .query(
+            format!(
+                "SELECT tag_id, COUNT(*) AS count FROM Relationship_{namespace_id}
+                 GROUP BY tag_id"
+            ),
+            (),
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        counts.insert(row.get(0)?, row.get(1)?);
+    }
+    let mut tag_rows = conn
+        .query(
+            "SELECT id FROM Tags WHERE namespace = ?1",
+            (namespace_id as i64,),
+        )
+        .await?;
+    let mut pairs: Vec<(u64, u64)> = Vec::new();
+    while let Some(row) = tag_rows.next().await? {
+        let id: u64 = row.get(0)?;
+        pairs.push((id, counts.get(&id).copied().unwrap_or(0)));
+    }
+
+    conn.execute("BEGIN IMMEDIATE", ()).await?;
+    for chunk in pairs.chunks(SQL_CHUNK_SIZE) {
+        let (count_sql, count_params) = tag_count_set_sql(chunk);
+        conn.execute(count_sql, params_from_iter(count_params))
+            .await?;
+    }
+    conn.execute("COMMIT", ()).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -934,6 +1750,556 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slurp_recomputes_counts_and_rebuilds_bulk_import_indexes() {
+        let db = new_target().await;
+
+        // Warm destination: the namespace, tags and a NULL-limit parent all
+        // already exist here. The source duplicates that parent, so after the
+        // slurp it must be deduplicated rather than doubled while the null-safe
+        // unique index is dropped.
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "INSERT INTO Namespace (id, name, description) VALUES (1, 'species', 'pre');",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO Tags (id, name, namespace) VALUES (1, 'mammal', 1), (2, 'canine', 1);",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO Parents (tag_id, relate_tag_id, limit_to) VALUES (1, 2, NULL);",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source_path = temp_dir.path().join("source.db");
+        {
+            let source = r2d2_sqlite::rusqlite::Connection::open(&source_path).unwrap();
+            source
+                .execute_batch(
+                    "CREATE TABLE Namespace (
+                         id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
+                     INSERT INTO Namespace (name, description) VALUES ('species', 'test');
+
+                     CREATE TABLE Tags (
+                         id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
+                         count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
+                     INSERT INTO Tags (name, namespace) VALUES ('mammal', 1), ('canine', 1);
+
+                     CREATE TABLE FileStorageLocations (
+                         id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
+                     INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
+
+                     CREATE TABLE File (
+                         id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
+                         storage_id INTEGER, size_bytes INTEGER);
+                     INSERT INTO File (hash, extension, storage_id, size_bytes)
+                         VALUES ('slurp-hash', 'jpg', 1, 42);
+
+                     CREATE TABLE Relationship_1 (
+                         file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                         PRIMARY KEY (tag_id, file_id));
+                     INSERT INTO Relationship_1 (file_id, tag_id) VALUES (1, 1), (1, 2);
+
+                     CREATE TABLE Parents (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
+                         relate_tag_id INTEGER NOT NULL, limit_to INTEGER);
+                     INSERT INTO Parents (tag_id, relate_tag_id, limit_to) VALUES (1, 2, NULL);",
+                )
+                .unwrap();
+        }
+
+        let counts = db.db_slurp(&source_path).await.unwrap();
+        assert_eq!(counts, (1, 2, 1));
+
+        let conn = db.connect().unwrap();
+
+        // Counts come from the aggregate upsert over the partition, not a
+        // correlated per-tag probe.
+        let mut rows = conn
+            .query("SELECT id, count FROM Tags ORDER BY id;", ())
+            .await
+            .unwrap();
+        let mut tag_counts = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            tag_counts.push((row.get::<u64>(0).unwrap(), row.get::<u64>(1).unwrap()));
+        }
+        assert!(
+            tag_counts.contains(&(1, 1)),
+            "mammal count must be recomputed from the partition: {tag_counts:?}"
+        );
+        assert!(
+            tag_counts.contains(&(2, 1)),
+            "canine count must be recomputed from the partition: {tag_counts:?}"
+        );
+
+        // The pre-existing NULL-limit parent and the slurped one dedupe back to
+        // a single row, leaving the null-safe unique index rebuildable.
+        let mut rows = conn
+            .query("SELECT tag_id, relate_tag_id, limit_to FROM Parents;", ())
+            .await
+            .unwrap();
+        let mut parents = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            parents.push((
+                row.get::<u64>(0).unwrap(),
+                row.get::<u64>(1).unwrap(),
+                row.get::<Option<u64>>(2).unwrap(),
+            ));
+        }
+        assert_eq!(parents, vec![(1, 2, None)]);
+
+        // Every index dropped for the bulk load must be back in place. Turso
+        // canonicalizes identifiers to lowercase on disk, so the partition
+        // index is queried in its lowercase form.
+        let mut rows = conn
+            .query(
+                "SELECT LOWER(name) FROM sqlite_schema
+                 WHERE type = 'index' AND LOWER(name) IN (?1, ?2, ?3, ?4);",
+                (
+                    "idx_relationship_1_tag_file",
+                    "idx_parents_lim",
+                    "idx_parents_rel",
+                    "idx_unique_parents_null_safe",
+                ),
+            )
+            .await
+            .unwrap();
+        let mut present = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            present.push(row.get::<String>(0).unwrap());
+        }
+        assert_eq!(
+            present.len(),
+            4,
+            "all bulk-import indexes recreated: {present:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slurp_streams_legacy_relationship_table_once() {
+        let db = new_target().await;
+
+        // A single shared `Relationship` table holding every namespace, like
+        // the production source. Rows must be read once and routed by
+        // namespace; references to tags/files missing from the source must be
+        // dropped rather than copied, and each target partition still gets its
+        // count recompute and file_id index rebuild afterwards.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source_path = temp_dir.path().join("source.db");
+        {
+            let source = r2d2_sqlite::rusqlite::Connection::open(&source_path).unwrap();
+            source
+                .execute_batch(
+                    "CREATE TABLE Namespace (
+                         id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
+                     INSERT INTO Namespace (name, description) VALUES
+                         ('species', 'test'), ('artist', 'test');
+
+                     CREATE TABLE Tags (
+                         id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
+                         count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
+                     INSERT INTO Tags (name, namespace) VALUES
+                         ('mammal', 1), ('canine', 1), ('painter', 2);
+
+                     CREATE TABLE FileStorageLocations (
+                         id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
+                     INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
+
+                     CREATE TABLE File (
+                         id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
+                         storage_id INTEGER, size_bytes INTEGER);
+                     INSERT INTO File (hash, extension, storage_id, size_bytes) VALUES
+                         ('slurp-hash', 'jpg', 1, 42), ('legacy-hash', 'png', 1, 43);
+
+                     CREATE TABLE Relationship (
+                         file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                         PRIMARY KEY (file_id, tag_id)) WITHOUT ROWID;
+                     INSERT INTO Relationship (file_id, tag_id) VALUES
+                         (1, 1), (1, 2), (2, 3),
+                         (2, 99),  -- tag id missing from Tags -> dropped
+                         (99, 1);  -- file id missing from File -> dropped
+
+                     CREATE TABLE Parents (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
+                         relate_tag_id INTEGER NOT NULL, limit_to INTEGER);
+                     INSERT INTO Parents (tag_id, relate_tag_id, limit_to) VALUES (1, 2, NULL);",
+                )
+                .unwrap();
+        }
+
+        let counts = db.db_slurp(&source_path).await.unwrap();
+        assert_eq!(counts, (2, 3, 2));
+
+        let conn = db.connect().unwrap();
+        let species_id = db.namespace_get_name_cache("species").await.unwrap();
+        let artist_id = db.namespace_get_name_cache("artist").await.unwrap();
+
+        // Counts recomputed per namespace from the aggregate pass.
+        let mut rows = conn
+            .query("SELECT name, count FROM Tags ORDER BY name;", ())
+            .await
+            .unwrap();
+        let mut tag_counts = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            tag_counts.push((row.get::<String>(0).unwrap(), row.get::<u64>(1).unwrap()));
+        }
+        assert_eq!(
+            tag_counts,
+            vec![
+                ("canine".to_string(), 1),
+                ("mammal".to_string(), 1),
+                ("painter".to_string(), 1),
+            ]
+        );
+
+        // The scanned rows landed in the partition matching their namespace,
+        // with the dangling references dropped before the bulk add.
+        let mut rows = conn
+            .query(
+                format!(
+                    "SELECT f.hash, t.name
+                     FROM Relationship_{species_id} r
+                     JOIN File f ON f.id = r.file_id
+                     JOIN Tags t ON t.id = r.tag_id
+                     ORDER BY t.name;"
+                ),
+                (),
+            )
+            .await
+            .unwrap();
+        let mut species_rows = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            species_rows.push((row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap()));
+        }
+        assert_eq!(
+            species_rows,
+            vec![
+                ("slurp-hash".to_string(), "canine".to_string()),
+                ("slurp-hash".to_string(), "mammal".to_string()),
+            ]
+        );
+
+        let mut rows = conn
+            .query(
+                format!(
+                    "SELECT f.hash, t.name
+                     FROM Relationship_{artist_id} r
+                     JOIN File f ON f.id = r.file_id
+                     JOIN Tags t ON t.id = r.tag_id;"
+                ),
+                (),
+            )
+            .await
+            .unwrap();
+        let mut artist_rows = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            artist_rows.push((row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap()));
+        }
+        assert_eq!(
+            artist_rows,
+            vec![("legacy-hash".to_string(), "painter".to_string())]
+        );
+
+        // Every partition that received routed rows gets its index rebuilt.
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'index' AND LOWER(name) IN (?1, ?2);",
+                (
+                    format!("idx_relationship_{species_id}_tag_file"),
+                    format!("idx_relationship_{artist_id}_tag_file"),
+                ),
+            )
+            .await
+            .unwrap();
+        let rebuilt = rows.next().await.unwrap().unwrap();
+        assert_eq!(rebuilt.get::<u64>(0).unwrap(), 2);
+
+        // The parent survived its mapped copy.
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM Parents;", ())
+            .await
+            .unwrap();
+        let parent_rows = rows.next().await.unwrap().unwrap();
+        assert_eq!(parent_rows.get::<u64>(0).unwrap(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slurp_tags_fresh_fast_path_then_upsert_on_rerun() {
+        let db = new_target().await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source_path = temp_dir.path().join("source.db");
+        {
+            let source = r2d2_sqlite::rusqlite::Connection::open(&source_path).unwrap();
+            source
+                .execute_batch(
+                    "CREATE TABLE Namespace (
+                         id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
+                     INSERT INTO Namespace (name, description) VALUES
+                         ('species', 'test'), ('artist', 'test');
+
+                     CREATE TABLE Tags (
+                         id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
+                         count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
+                     INSERT INTO Tags (name, namespace) VALUES
+                         ('mammal', 1), ('canine', 1), ('painter', 2);
+
+                     CREATE TABLE FileStorageLocations (
+                         id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
+                     INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
+
+                     CREATE TABLE File (
+                         id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
+                         storage_id INTEGER, size_bytes INTEGER);
+                     INSERT INTO File (hash, extension, storage_id, size_bytes) VALUES
+                         ('slurp-hash', 'jpg', 1, 42), ('legacy-hash', 'png', 1, 43);
+
+                     CREATE TABLE Relationship (
+                         file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                         PRIMARY KEY (file_id, tag_id)) WITHOUT ROWID;
+                     INSERT INTO Relationship (file_id, tag_id) VALUES (1, 1), (1, 2), (2, 3);
+
+                     CREATE TABLE Parents (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
+                         relate_tag_id INTEGER NOT NULL, limit_to INTEGER);",
+                )
+                .unwrap();
+        }
+
+        // Fresh destination: the tags stage swaps Tags for the
+        // constraint-free copy (fast path) and restores the named unique
+        // index afterwards.
+        let counts = db.db_slurp(&source_path).await.unwrap();
+        assert_eq!(counts, (2, 3, 2));
+
+        let conn = db.connect().unwrap();
+        let mut tag_rows = conn.query("SELECT COUNT(*) FROM Tags;", ()).await.unwrap();
+        assert_eq!(
+            tag_rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<u64>(0)
+                .unwrap(),
+            3
+        );
+        let mut index_rows = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'index' AND name IN
+                     ('idx_tags_name_namespace', 'idx_tags_count_covering');",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            index_rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<u64>(0)
+                .unwrap(),
+            2
+        );
+
+        // Re-running against the (now warm) destination must keep tag ids
+        // stable: rows the destination already owns resolve to their existing
+        // ids instead of being inserted again, so no duplicate tags and no
+        // duplicate relationships at the (already imported) mapping.
+        let counts = db.db_slurp(&source_path).await.unwrap();
+        assert_eq!(counts, (2, 3, 2));
+        let conn = db.connect().unwrap();
+        let mut tag_rows = conn.query("SELECT COUNT(*) FROM Tags;", ()).await.unwrap();
+        assert_eq!(
+            tag_rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<u64>(0)
+                .unwrap(),
+            3
+        );
+
+        // The swap left the canonical table and no temporary leftovers, and
+        // the previous run's relationship rows deduplicate against this run's.
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name IN ('Tags_slurp', 'Tags_old');",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+            0
+        );
+        let species_id = db.namespace_get_name_cache("species").await.unwrap();
+        let artist_id = db.namespace_get_name_cache("artist").await.unwrap();
+        let mut species_rows = conn
+            .query(
+                format!("SELECT COUNT(*) FROM Relationship_{species_id};",),
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            species_rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<u64>(0)
+                .unwrap(),
+            2
+        );
+        let mut artist_rows = conn
+            .query(
+                format!("SELECT COUNT(*) FROM Relationship_{artist_id};"),
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            artist_rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<u64>(0)
+                .unwrap(),
+            1
+        );
+    }
+
+    /// Cold import from a per-namespace-partition source (no legacy
+    /// `Relationship` table): the tags stage must insert straight into the
+    /// indexed `Tags` table, the covering index must be restored by the common
+    /// post-recount path (the legacy-only branch would miss a partition-only
+    /// source), and the router must reconstruct relation rows and recount.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slurp_cold_partition_only_recounts_and_restores_covering() {
+        let db = new_target().await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source_path = temp_dir.path().join("source.db");
+        {
+            let source = r2d2_sqlite::rusqlite::Connection::open(&source_path).unwrap();
+            source
+                .execute_batch(
+                    "CREATE TABLE Namespace (
+                         id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
+                     INSERT INTO Namespace (name, description) VALUES ('species', 'test');
+
+                     CREATE TABLE Tags (
+                         id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
+                         count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
+                     INSERT INTO Tags (name, namespace) VALUES ('mammal', 1), ('canine', 1);
+
+                     CREATE TABLE FileStorageLocations (
+                         id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
+                     INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
+
+                     CREATE TABLE File (
+                         id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
+                         storage_id INTEGER, size_bytes INTEGER);
+                     INSERT INTO File (hash, extension, storage_id, size_bytes)
+                         VALUES ('slurp-hash', 'jpg', 1, 42);
+
+                     CREATE TABLE Relationship_1 (
+                         file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                         PRIMARY KEY (tag_id, file_id));
+                     INSERT INTO Relationship_1 (file_id, tag_id) VALUES (1, 1), (1, 2);
+
+                     CREATE TABLE Parents (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
+                         relate_tag_id INTEGER NOT NULL, limit_to INTEGER);
+                     INSERT INTO Parents (tag_id, relate_tag_id, limit_to) VALUES (1, 2, NULL);",
+                )
+                .unwrap();
+        }
+
+        let counts = db.db_slurp(&source_path).await.unwrap();
+        assert_eq!(counts, (1, 2, 1));
+
+        let conn = db.connect().unwrap();
+
+        // The cold path keeps the named unique index and restores the covering
+        // index after recounts even though no legacy Relationship existed.
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'index' AND name IN
+                     ('idx_tags_name_namespace', 'idx_tags_count_covering');",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+            2
+        );
+
+        // Counts recomputed per namespace from the partition aggregate pass.
+        let mut rows = conn.query("SELECT name, count FROM Tags ORDER BY name;", ()).await.unwrap();
+        let mut tag_counts = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            tag_counts.push((row.get::<String>(0).unwrap(), row.get::<u64>(1).unwrap()));
+        }
+        assert_eq!(
+            tag_counts,
+            vec![("canine".to_string(), 1), ("mammal".to_string(), 1)]
+        );
+
+        // The partition got its rows and its file_id index.
+        let species_id = db.namespace_get_name_cache("species").await.unwrap();
+        let mut rows = conn
+            .query(
+                format!("SELECT COUNT(*) FROM Relationship_{species_id};",),
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(), 2);
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'index' AND LOWER(name) IN (?1);",
+                (format!("idx_relationship_{species_id}_tag_file"),),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(), 1);
+
+        // The parent landed once.
+        let mut rows = conn.query("SELECT COUNT(*) FROM Parents;", ()).await.unwrap();
+        assert_eq!(rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(), 1);
+
+        // Journal mode was restored to MVCC by the import.
+        let mut mode = String::new();
+        conn.pragma_query("journal_mode", |row| {
+            mode = row.get::<String>(0).unwrap_or_default();
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(mode, "mvcc");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn slurp_jobs_skips_incomplete_jobs_table() {
         let db = new_target().await;
         let (source, _keep) = new_source(
@@ -947,5 +2313,131 @@ mod tests {
 
         let jobs = target_jobs(&db).await;
         assert!(jobs.is_empty(), "missing columns must not abort the slurp");
+    }
+
+    /// Offline throughput smoke for the tag swap + swap-back: imports a few
+    /// hundred thousand rows into `/tmp`, re-imports over the (now warm)
+    /// destination, and checks the merged set stayed canonical. Ignored by
+    /// default; run with `--ignored --nocapture` to see stage timings.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn slurp_swap_throughput_smoke() {
+        let _ = fast_log::init(
+            fast_log::Config::new()
+                .level(log::LevelFilter::Info)
+                .console(),
+        );
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source_path = temp_dir.path().join("source.db");
+        let db = new_target().await;
+        {
+            let mut source = r2d2_sqlite::rusqlite::Connection::open(&source_path).unwrap();
+            source
+                .execute_batch(
+                    "PRAGMA synchronous = OFF;
+                     CREATE TABLE Namespace (
+                         id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
+                     INSERT INTO Namespace (name, description) VALUES ('species', 'test');
+                     CREATE TABLE Tags (
+                         id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
+                         count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
+                     CREATE TABLE FileStorageLocations (
+                         id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
+                     INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
+                     CREATE TABLE File (
+                         id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
+                         storage_id INTEGER, size_bytes INTEGER);
+                     CREATE TABLE Relationship (
+                         file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                         PRIMARY KEY (file_id, tag_id)) WITHOUT ROWID;
+                     CREATE TABLE Parents (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
+                         relate_tag_id INTEGER NOT NULL, limit_to INTEGER);",
+                )
+                .unwrap();
+            let tags = 20_000_u32;
+            let files = 6_000_u32;
+            let rels = 20_000_u32;
+            {
+                let tx = source.transaction().unwrap();
+                for chunk in (1..=tags).collect::<Vec<_>>().chunks(10_000) {
+                    let values = chunk
+                        .iter()
+                        .map(|i| format!("({i}, 'tag_{i}', 1)"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let _ = tx
+                        .execute(
+                            &format!("INSERT INTO Tags (id, name, namespace) VALUES {values};"),
+                            (),
+                        )
+                        .unwrap();
+                }
+                for chunk in (1..=files).collect::<Vec<_>>().chunks(10_000) {
+                    let values = chunk
+                        .iter()
+                        .map(|i| format!("({i}, 'f{i:09x}', 'jpg', 1, 10)"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let _ = tx
+                        .execute(
+                            &format!(
+                                "INSERT INTO File (id, hash, extension, storage_id, size_bytes)
+                                 VALUES {values};"
+                            ),
+                            (),
+                        )
+                        .unwrap();
+                }
+                for chunk in (1..=rels).collect::<Vec<_>>().chunks(10_000) {
+                    let values = chunk
+                        .iter()
+                        .map(|i| format!("({}, {})", (i % files) + 1, (i % tags) + 1))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let _ = tx
+                        .execute(
+                            &format!("INSERT INTO Relationship (file_id, tag_id) VALUES {values};"),
+                            (),
+                        )
+                        .unwrap();
+                }
+                tx.commit().unwrap();
+            }
+        }
+
+        eprintln!("source built: 20k tags, 6k files, 20k rels");
+        let t0 = std::time::Instant::now();
+        let counts = db.db_slurp(&source_path).await.unwrap();
+        let first = t0.elapsed();
+        assert_eq!(counts, (1, 20_000, 6_000));
+        eprintln!("first import done: {first:?}");
+
+        let t0 = std::time::Instant::now();
+        let counts = db.db_slurp(&source_path).await.unwrap();
+        let second = t0.elapsed();
+        assert_eq!(counts, (1, 20_000, 6_000));
+        eprintln!("re-import done: {second:?}");
+
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query("SELECT COUNT(*) FROM Tags;", ()).await.unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+            20_000
+        );
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name IN ('Tags_slurp', 'Tags_old');",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+            0
+        );
+
+        println!("first import (20k tags / 6k files / 20k rels): {first:?}, re-import: {second:?}");
     }
 }

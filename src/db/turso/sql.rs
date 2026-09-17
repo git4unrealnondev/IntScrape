@@ -40,6 +40,12 @@ impl TursoDatabase {
         Ok(())
     }
 
+
+    /// Vacuums the db
+    pub(in crate::db::turso) async fn vacuum(&self, conn: &Connection) -> Result<()> {
+        conn.execute_batch("VACUUM;").await
+    }
+
     /// Loads settings into cache
     pub(in crate::db::turso) async fn settings_load(&self, conn: &Connection) -> Result<()> {
         let mut setting_guard = self.setting_cache.write().await;
@@ -232,6 +238,7 @@ impl TursoDatabase {
         }
 
         if !parents.is_empty() {
+            let parents: Vec<_> = parents.into_iter().collect();
             self.parents_bulk_add(conn, &parents).await?;
         }
 
@@ -242,17 +249,23 @@ impl TursoDatabase {
     pub(in crate::db::turso) async fn parents_bulk_add(
         &self,
         conn: &Connection,
-        parents: &HashSet<TagParents>,
+        parents: &[TagParents],
     ) -> Result<()> {
         if parents.is_empty() {
             return Ok(());
         }
 
-        let parents: Vec<&TagParents> = parents.iter().collect();
-
         for chunk in parents.chunks(SQL_CHUNK_SIZE) {
-            conn.execute(&parents_insert_sql(chunk.len()), parents_params(chunk))
-                .await?;
+            // Create a slice of references for the parameters function
+            let chunk_refs: Vec<&TagParents> = chunk.iter().collect();
+
+            log::info!("Adding {} Parents into db", chunk.len());
+
+            conn.execute(
+                &parents_insert_sql(chunk.len()),
+                parents_params(&chunk_refs),
+            )
+            .await?;
         }
 
         Ok(())

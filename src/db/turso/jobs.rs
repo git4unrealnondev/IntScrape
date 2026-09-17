@@ -250,6 +250,28 @@ impl TursoDatabase {
         Ok(())
     }
 
+    /// Gets every job in the database, highest-priority first.
+    pub(in crate::db::turso) async fn jobs_get_all_sql(
+        &self,
+        conn: &Connection,
+    ) -> Result<Vec<DbJobsObj>> {
+        let mut rows = conn
+            .query(
+                "SELECT id, time, reptime, priority, recreation, site, param, user_data, is_running
+                 FROM Jobs
+                 ORDER BY priority DESC, time, id;",
+                (),
+            )
+            .await?;
+
+        let mut jobs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            jobs.push(job_from_row(&row)?);
+        }
+
+        Ok(jobs)
+    }
+
     /// Gets all sites currently in db from Jobs.
     pub(in crate::db::turso) async fn jobs_get_all_sites_sql(
         &self,
@@ -390,6 +412,24 @@ impl TursoDatabase {
             Ok(jobs) => jobs,
             Err(error) => {
                 log::error!("Database error fetching jobs for site '{site}': {error}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Gets every job in the database, highest-priority first.
+    pub async fn jobs_get_all(&self) -> Vec<DbJobsObj> {
+        let conn = match self.connect() {
+            Ok(conn) => conn,
+            Err(error) => {
+                log::error!("Failed to connect while fetching all jobs: {error}");
+                return Vec::new();
+            }
+        };
+        match self.jobs_get_all_sql(&conn).await {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                log::error!("Database error fetching all jobs: {error}");
                 Vec::new()
             }
         }

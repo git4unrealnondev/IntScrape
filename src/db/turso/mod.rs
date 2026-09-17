@@ -45,6 +45,14 @@ pub struct TursoDatabase {
     setting_cache: Arc<RwLock<HashMap<String, DbSettingsObj>>>,
     plugin_manager: Arc<parking_lot::RwLock<Option<Arc<PluginManager>>>>,
     should_exit: Arc<std::sync::atomic::AtomicBool>,
+    slurping: Arc<std::sync::atomic::AtomicBool>,
+    /// Set while a slurp wants exclusive write access so the IPC accept loop
+    /// stops accepting new connections and drains in-flight handlers.
+    ipc_paused: Arc<std::sync::atomic::AtomicBool>,
+    /// Number of IPC request handler tasks currently running against this
+    /// database. The slurp waits for this to reach zero before beginning a
+    /// BEGIN IMMEDIATE transaction so no UI request pins a read snapshot.
+    ipc_active: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl TursoDatabase {
@@ -123,6 +131,9 @@ impl TursoDatabase {
             setting_cache: Arc::new(RwLock::new(HashMap::new())),
             plugin_manager: Arc::new(parking_lot::RwLock::new(None)),
             should_exit,
+            slurping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ipc_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ipc_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
 
         if create_db {
@@ -144,12 +155,59 @@ impl TursoDatabase {
         self.should_exit.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Whether a database slurp is currently running. Background pollers use
+    /// this to stay out of the destination database while the import streams
+    /// in: a long-lived reader snapshot prevents WAL truncation, so every
+    /// checkpoint has to re-sync an ever-growing WAL (measured as slow insert
+    /// batches climbing from ~1.5s to ~3.2s across a run).
+    pub fn is_slurping(&self) -> bool {
+        self.slurping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_slurping(&self, slurping: bool) {
+        self.slurping
+            .store(slurping, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the IPC server should refuse new connections so a slurp can
+    /// take the writer lock without contending with UI requests.
+    pub fn ipc_is_paused(&self) -> bool {
+        self.ipc_paused.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Marks an IPC request handler task as in flight.
+    pub(crate) fn ipc_task_started(&self) {
+        self.ipc_active
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Marks an IPC request handler task as finished.
+    pub(crate) fn ipc_task_finished(&self) {
+        self.ipc_active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Blocks the IPC accept loop from taking new connections, then waits for
+    /// every in-flight request handler to finish. Callers use this around a
+    /// slurp so BEGIN IMMEDIATE transactions never wait on a UI snapshot.
+    pub(crate) async fn ipc_pause(&self) {
+        self.ipc_paused
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        while self.ipc_active.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Lets the IPC accept loop resume accepting connections.
+    pub(crate) async fn ipc_resume(&self) {
+        self.ipc_paused
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Checks the db on first boot, manages updates
     async fn check_db(&self) -> Result<()> {
         let mut connection = self.connect()?;
         let conn = connection.transaction().await?;
-
-        self.table_create_tags(&conn).await;
 
         // Resetting is_running to false on every boot, mirroring the legacy
         // database so a crash never leaves a job stuck as "running".

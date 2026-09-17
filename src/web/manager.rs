@@ -545,9 +545,8 @@ impl Scraper {
                                 let (result_sender, result_receiver) =
                                     tokio::sync::oneshot::channel();
                                 self.download_manager.heavy_processing_pool.spawn(move || {
-                                    let _ = result_sender.send(
-                                        db.hashes_files_get_sync_blocking(&chunk_hashes),
-                                    );
+                                    let _ = result_sender
+                                        .send(db.hashes_files_get_sync_blocking(&chunk_hashes));
                                 });
                                 let existing_hash_files =
                                     Arc::new(result_receiver.await.map_err(|_| {
@@ -729,8 +728,7 @@ impl Scraper {
                     plugin_name,
                     job_id,
                 );
-                should_remove_job
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                should_remove_job.store(false, std::sync::atomic::Ordering::Relaxed);
             }
         }
         if self.manage_recreation().await {
@@ -1602,10 +1600,10 @@ impl DownloadsManager {
         for property in &plugin.properties {
             if let PluginProperties::Login((_loginneed, logintype)) = property {
                 if let LoginType::Cookie(name, _) = logintype {
-                    if let Some(api_key) = self
-                        .db
-                        .setting_get_sync_blocking(&format!("PLUGIN_{}_{}_COOKIE", plugin.name, name))
-                    {
+                    if let Some(api_key) = self.db.setting_get_sync_blocking(&format!(
+                        "PLUGIN_{}_{}_COOKIE",
+                        plugin.name, name
+                    )) {
                         out.push(ScraperParam::Login(LoginType::Cookie(
                             name.clone(),
                             Some(api_key.param.unwrap()),
@@ -1778,7 +1776,10 @@ impl DownloadsManager {
                     LoginType::Api(key, api) => {
                         if self
                             .db
-                            .setting_get_sync_blocking(&format!("PLUGIN_{}_{}", plugin.name, "API_KEY"))
+                            .setting_get_sync_blocking(&format!(
+                                "PLUGIN_{}_{}",
+                                plugin.name, "API_KEY"
+                            ))
                             .is_none()
                         {
                             dbg!(&plugin.name, &key, &api);

@@ -26,7 +26,7 @@ pub struct PluginManager {
     storage_site: RwLock<HashMap<String, String>>,
     storage_callbacks: RwLock<HashMap<GlobalCallbacks, HashSet<String>>>,
     storage_libs: RwLock<HashMap<String, Arc<Library>>>,
-db: Arc<TursoDatabase>,
+    db: Arc<TursoDatabase>,
     threads: RwLock<Vec<JoinHandle<()>>>,
     should_exit: Arc<AtomicBool>,
     regex_tags_cache: RwLock<HashMap<Tag, u64>>,

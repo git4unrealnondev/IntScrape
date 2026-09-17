@@ -11,11 +11,11 @@ use std::{
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::{
+    db::turso::TursoDatabase,
     db::{
         SYSTEM_DATABASE_BACKUP_SITE, SYSTEM_DATABASE_SLURP_SITE, SYSTEM_FILE_HASH_SITE,
         SYSTEM_FILE_SIZE_SITE, SYSTEM_STORAGE_CHECK_SITE,
     },
-    db::turso::TursoDatabase,
     ipc::IpcServer,
     plugins::PluginManager,
     web::manager::DownloadsManager,
@@ -141,6 +141,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         loop {
             if should_exit_for_spawner.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
+            }
+            // A slurp owns the database exclusively. Skip this poll so the
+            // jobs read does not pin an MVCC snapshot and stall WAL
+            // truncation (the lurking cost is every insert batch slowing down
+            // as an unreclaimable WAL grows); the claimed slurp job finishes on
+            // its own task and this loop resumes once it clears.
+            if db_spawn.is_slurping() {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
             }
             let mut sites = plugin_manager_clone.get_storage_sites();
             sites.push(SYSTEM_DATABASE_BACKUP_SITE.to_string());

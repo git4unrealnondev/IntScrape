@@ -8,8 +8,8 @@
 use std::collections::{HashMap, HashSet};
 
 use shared_types::{
-    DbSettingsObj, FileInternal, FileTagAction, GenericNamespaceObj, PluginJob, SearchObj, Tag,
-    TagParents, TagSearch,
+    DbJobsObj, DbSettingsObj, FileInternal, FileTagAction, GenericNamespaceObj, PluginJob,
+    SearchObj, Tag, TagParents, TagSearch,
 };
 
 use ipc_macro::export_ipc;
@@ -631,6 +631,30 @@ impl TursoDatabase {
     #[ipc(name = "jobs_add_single", request = "JobsAddSingle")]
     pub async fn ipc_jobs_add_single(&self, job: PluginJob) -> u64 {
         self.jobs_add_single(job).await
+    }
+
+    ///
+    /// Gets every job in the database, highest-priority first.
+    ///
+    #[ipc(name = "jobs_get_all", request = "JobsGetAll")]
+    pub async fn ipc_jobs_get_all(&self) -> Vec<DbJobsObj> {
+        self.jobs_get_all().await
+    }
+
+    ///
+    /// Updates an existing job's config.
+    ///
+    #[ipc(name = "jobs_update", request = "JobsUpdate")]
+    pub async fn ipc_jobs_update(&self, job: &DbJobsObj) -> bool {
+        self.jobs_update(job).await.is_ok()
+    }
+
+    ///
+    /// Removes a job from the database.
+    ///
+    #[ipc(name = "jobs_remove", request = "JobsRemove")]
+    pub async fn ipc_jobs_remove(&self, job: &DbJobsObj) -> bool {
+        self.job_remove(job).await.is_ok()
     }
 }
 

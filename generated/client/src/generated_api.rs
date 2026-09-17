@@ -570,6 +570,48 @@ pub fn jobs_add_single_async(
 ) -> impl std::future::Future<Output = Result<u64, Box<dyn std::error::Error + Send + Sync>>> {
     crate::init_data_request_async(crate::SupportedDBRequests::JobsAddSingle(job))
 }
+///
+/// Gets every job in the database, highest-priority first.
+///
+pub fn jobs_get_all() -> Result<Vec<DbJobsObj>, Box<dyn std::error::Error>> {
+    crate::init_data_request(crate::SupportedDBRequests::JobsGetAll())
+}
+///
+/// Gets every job in the database, highest-priority first.
+///
+pub fn jobs_get_all_async()
+-> impl std::future::Future<Output = Result<Vec<DbJobsObj>, Box<dyn std::error::Error + Send + Sync>>>
+{
+    crate::init_data_request_async(crate::SupportedDBRequests::JobsGetAll())
+}
+///
+/// Updates an existing job's config.
+///
+pub fn jobs_update(job: DbJobsObj) -> Result<bool, Box<dyn std::error::Error>> {
+    crate::init_data_request(crate::SupportedDBRequests::JobsUpdate(job))
+}
+///
+/// Updates an existing job's config.
+///
+pub fn jobs_update_async(
+    job: DbJobsObj,
+) -> impl std::future::Future<Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>> {
+    crate::init_data_request_async(crate::SupportedDBRequests::JobsUpdate(job))
+}
+///
+/// Removes a job from the database.
+///
+pub fn jobs_remove(job: DbJobsObj) -> Result<bool, Box<dyn std::error::Error>> {
+    crate::init_data_request(crate::SupportedDBRequests::JobsRemove(job))
+}
+///
+/// Removes a job from the database.
+///
+pub fn jobs_remove_async(
+    job: DbJobsObj,
+) -> impl std::future::Future<Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>> {
+    crate::init_data_request_async(crate::SupportedDBRequests::JobsRemove(job))
+}
 /// Returns whether the host application is shutting down.
 ///
 /// This lifecycle request is generated alongside the database client

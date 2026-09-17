@@ -21,6 +21,18 @@ impl TursoDatabase {
             return false;
         }
 
+        // A slurp owns the database and has already stopped the poller from
+        // claiming new work (including this job). If this job was claimed just
+        // before the slurp started, back off so its BEGIN IMMEDIATE writes are
+        // not contended by a maintenance reader.
+        if self.is_slurping() {
+            log::warn!(
+                "Paused system job {} while a database slurp is running",
+                job.id
+            );
+            return false;
+        }
+
         let success = match job.config.site.as_str() {
             SYSTEM_DATABASE_BACKUP_SITE => self.run_backup_job(job).await,
             SYSTEM_DATABASE_SLURP_SITE => self.run_slurp_job(job).await,

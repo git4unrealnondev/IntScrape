@@ -72,6 +72,14 @@ impl IpcServer {
                 if self_clone.should_exit.load(Ordering::Relaxed) {
                     break;
                 }
+                // A slurp owns the database. Refuse new connections entirely
+                // (instead of merely queueing them) so its BEGIN IMMEDIATE
+                // transactions never wait on a UI reader; the override wraps
+                // the database handle that both sides share.
+                if self_clone.db.ipc_is_paused() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
                 match listener.accept().await {
                     Ok(conn) => {
                         // Each connection gets its own task so clients can make
@@ -79,17 +87,17 @@ impl IpcServer {
                         let self_for_conn = self_clone.clone();
 
                         tokio::spawn(async move {
+                            self_for_conn.db.ipc_task_started();
                             let mut reader = BufReader::new(conn);
-                            let received_data = match client::recieve(&mut reader).await {
-                                Ok(data) => data,
-                                Err(_) => return,
-                            };
-
+                            let received_data = client::recieve(&mut reader).await;
                             // Turso handlers are asynchronous. Poll the request
                             // directly so one connection never consumes a
                             // blocking-pool worker while it waits on the database.
-                            let response = self_for_conn.conn_to_function(received_data).await;
-                            let _ = client::send_preserialize(&response, &mut reader).await;
+                            if let Ok(data) = received_data {
+                                let response = self_for_conn.clone().conn_to_function(data).await;
+                                let _ = client::send_preserialize(&response, &mut reader).await;
+                            }
+                            self_for_conn.db.ipc_task_finished();
                         });
                     }
                     Err(e) => {

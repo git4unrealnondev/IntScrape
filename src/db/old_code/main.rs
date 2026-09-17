@@ -17,7 +17,7 @@ impl MainDatabase {
     /// Gets namespace id if it exists
     ///
     #[must_use]
-        pub fn search_db_namespace_sync(&self, name: &String) -> Option<u64> {
+    pub fn search_db_namespace_sync(&self, name: &String) -> Option<u64> {
         // Uses cache where avilable
         {
             let cache_guard = self.namespace_cache.read();
@@ -41,7 +41,7 @@ impl MainDatabase {
     /// Gets a list of tags where the tag and limits the number of returnees
     ///
     #[must_use]
-        pub fn search_db_tags_fts(&self, tag: &str, limit: &Option<u64>) -> Vec<TagSearch> {
+    pub fn search_db_tags_fts(&self, tag: &str, limit: &Option<u64>) -> Vec<TagSearch> {
         let max_rows = limit.unwrap_or(10).min(usize::MAX as u64) as usize;
         if max_rows == 0 {
             return Vec::new();
@@ -122,13 +122,13 @@ impl MainDatabase {
     /// Resolves tag names across namespaces and searches for files matching
     /// every input name, while allowing any tag with that name.
     #[must_use]
-        pub fn search_db_files_by_tags_sync(&self, tags: &[String], limit: &Option<u64>) -> Vec<u64> {
+    pub fn search_db_files_by_tags_sync(&self, tags: &[String], limit: &Option<u64>) -> Vec<u64> {
         self.search_db_files_by_tag_groups_sync(&[], tags, &[], &[], &[], &[], limit)
     }
 
     /// Resolves tag names across namespaces while preserving boolean groups.
     #[must_use]
-        pub fn search_db_files_by_tag_groups_sync(
+    pub fn search_db_files_by_tag_groups_sync(
         &self,
         and_ids: &[u64],
         and_tags: &[String],
@@ -199,12 +199,12 @@ impl MainDatabase {
     /// Gets the file path of a fileid
     ///
     #[must_use]
-        pub fn file_get_physical_path_sync(&self, file_id: &u64) -> Option<String> {
+    pub fn file_get_physical_path_sync(&self, file_id: &u64) -> Option<String> {
         let conn = self.pool.get().unwrap();
         MainDatabase::internal_file_get_physical_path(&conn, file_id).ok()?
     }
 
-        pub fn file_hashes_get(&self, file_id: &u64) -> HashMap<String, String> {
+    pub fn file_hashes_get(&self, file_id: &u64) -> HashMap<String, String> {
         let conn = self.pool.get().unwrap();
         let mut statement = conn
             .prepare("SELECT algorithm, digest FROM FileHashes WHERE file_id = ?1")
@@ -219,14 +219,14 @@ impl MainDatabase {
     ///
     /// Gets all tag ids assocated with a namespace id
     ///
-        pub fn tag_id_get_namespace_id(&self, namespace_id: &u64) -> HashSet<u64> {
+    pub fn tag_id_get_namespace_id(&self, namespace_id: &u64) -> HashSet<u64> {
         let conn = self.pool.get().unwrap();
         self.internal_tag_id_get_namespace_id(&conn, namespace_id)
             .unwrap_or_default()
     }
 
     /// Gets every tag id in the database.
-        pub fn tag_id_get_all(&self) -> HashSet<u64> {
+    pub fn tag_id_get_all(&self) -> HashSet<u64> {
         let conn = self.pool.get().unwrap();
         let Ok(mut statement) = conn.prepare("SELECT id FROM Tags") else {
             return HashSet::new();
@@ -241,7 +241,7 @@ impl MainDatabase {
     /// Gets a file if a tag is associated with it
     ///
     #[must_use]
-        pub fn tag_get_file_sync(&self, tag: &Tag) -> Option<FileInternal> {
+    pub fn tag_get_file_sync(&self, tag: &Tag) -> Option<FileInternal> {
         let conn = self.pool.get().unwrap();
         self.internal_tag_get_fileinternal(&conn, tag)
     }
@@ -250,7 +250,7 @@ impl MainDatabase {
     /// Gets all `file_ids` with tags that have namespace id
     ///
     #[must_use]
-        pub fn file_id_get_namespace_id_sync(&self, namespace_id: &u64) -> HashSet<u64> {
+    pub fn file_id_get_namespace_id_sync(&self, namespace_id: &u64) -> HashSet<u64> {
         let conn = self.pool.get().unwrap();
         self.internal_file_id_get_namespace_id(&conn, namespace_id)
             .unwrap_or_default()
@@ -260,7 +260,7 @@ impl MainDatabase {
     /// Gets tag ids with a namespace_id associated with a file_id
     ///
     #[must_use]
-        pub fn internal_file_id_get_tag_ids_where_namespace_id_sync(
+    pub fn internal_file_id_get_tag_ids_where_namespace_id_sync(
         &self,
         file_id: &u64,
         namespace_id: &u64,
@@ -275,7 +275,7 @@ impl MainDatabase {
     /// Adds a relationship between a `file_id` and `tag_id`
     ///
     #[must_use]
-        pub fn file_relationship_tags_add_sync(&self, file_id: &u64, tag: &[FileTagAction]) -> bool {
+    pub fn file_relationship_tags_add_sync(&self, file_id: &u64, tag: &[FileTagAction]) -> bool {
         let started = std::time::Instant::now();
         let lock_started = std::time::Instant::now();
         let mut guard = self.writer_lock();
@@ -315,7 +315,7 @@ impl MainDatabase {
     /// Adds tag actions without creating a file/tag relationship.
     ///
     /// This is used by tag callbacks that create structural tag relationships.
-        pub fn tag_actions_add_sync(&self, tag_actions: &[FileTagAction]) -> bool {
+    pub fn tag_actions_add_sync(&self, tag_actions: &[FileTagAction]) -> bool {
         if tag_actions.is_empty() {
             return true;
         }
@@ -333,7 +333,7 @@ impl MainDatabase {
 
     /// Adds tags to multiple files in one SQLite transaction.
     #[must_use]
-        pub fn file_relationship_tags_add_bulk_sync(
+    pub fn file_relationship_tags_add_bulk_sync(
         &self,
         tags_by_file: &HashMap<u64, Vec<FileTagAction>>,
     ) -> bool {
@@ -376,7 +376,7 @@ impl MainDatabase {
     /// #Safety Returns None if an error occurs
     ///
     #[must_use]
-        pub fn file_id_get_all_sync(&self) -> HashSet<u64> {
+    pub fn file_id_get_all_sync(&self) -> HashSet<u64> {
         let conn = self.pool.get().unwrap();
 
         MainDatabase::internal_file_id_get_all(&conn).unwrap_or_default()
@@ -385,7 +385,7 @@ impl MainDatabase {
     ///
     /// Gets all tag ids associated with a fileid
     ///
-        pub fn relationship_get_tag_id_sync(&self, file_id: &u64) -> HashSet<u64> {
+    pub fn relationship_get_tag_id_sync(&self, file_id: &u64) -> HashSet<u64> {
         self.refresh_roaring_memory_if_dirty();
         let roaring_guard = self.relationship_roaring_storage.read();
         if let Some(roaring) = roaring_guard.as_ref()
@@ -404,7 +404,7 @@ impl MainDatabase {
     }
 
     /// Gets tag relationships for multiple files in one IPC request.
-        pub fn relationship_get_tag_id_many_sync(
+    pub fn relationship_get_tag_id_many_sync(
         &self,
         file_ids: &HashSet<u64>,
     ) -> HashMap<u64, HashSet<u64>> {
@@ -417,7 +417,7 @@ impl MainDatabase {
     ///
     /// Gets all file ids associated with a tag_id
     ///
-        pub fn relationship_get_file_id_sync(&self, tag_id: &u64) -> HashSet<u64> {
+    pub fn relationship_get_file_id_sync(&self, tag_id: &u64) -> HashSet<u64> {
         self.refresh_roaring_memory_if_dirty();
         if let Some(guard) = self.relationship_roaring_storage.read().as_ref()
             && let Some(file_ids) = guard.relationship_search_fileid_roaring_in_memory(*tag_id)
@@ -435,7 +435,7 @@ impl MainDatabase {
     }
 
     /// Gets file relationships for multiple tags in one IPC request.
-        pub fn relationship_get_file_id_many_sync(
+    pub fn relationship_get_file_id_many_sync(
         &self,
         tag_ids: &HashSet<u64>,
     ) -> HashMap<u64, HashSet<u64>> {
@@ -446,7 +446,7 @@ impl MainDatabase {
     }
 
     /// Gets files whose tag is the related parent of the supplied structural tag.
-        pub fn relationship_get_parent_file_id_sync(&self, tag_id: &u64) -> HashSet<u64> {
+    pub fn relationship_get_parent_file_id_sync(&self, tag_id: &u64) -> HashSet<u64> {
         let conn = self.pool.get().unwrap();
         let relationships = self.relationship_union_source(&conn, "relationships");
         let query = format!(
@@ -469,7 +469,7 @@ impl MainDatabase {
     }
 
     /// Gets every parent relation declared by a child tag.
-        pub fn parent_relationships_get_sync(&self, tag_id: &u64) -> Vec<shared_types::TagParents> {
+    pub fn parent_relationships_get_sync(&self, tag_id: &u64) -> Vec<shared_types::TagParents> {
         let conn = self.pool.get().unwrap();
         let Ok(mut statement) =
             conn.prepare("SELECT tag_id, relate_tag_id, limit_to FROM Parents WHERE tag_id = ?1")
@@ -489,7 +489,7 @@ impl MainDatabase {
     }
 
     /// Gets parent relations for multiple child tags in one IPC request.
-        pub fn parent_relationships_get_many_sync(
+    pub fn parent_relationships_get_many_sync(
         &self,
         tag_ids: &HashSet<u64>,
     ) -> HashMap<u64, Vec<shared_types::TagParents>> {
@@ -500,7 +500,7 @@ impl MainDatabase {
     }
 
     /// Gets every child relation that points at a parent tag.
-        pub fn child_relationships_get_sync(
+    pub fn child_relationships_get_sync(
         &self,
         relate_tag_id: &u64,
     ) -> Vec<shared_types::TagParents> {
@@ -523,7 +523,7 @@ impl MainDatabase {
     }
 
     /// Gets child relations for multiple parent tags in one IPC request.
-        pub fn child_relationships_get_many_sync(
+    pub fn child_relationships_get_many_sync(
         &self,
         tag_ids: &HashSet<u64>,
     ) -> HashMap<u64, Vec<shared_types::TagParents>> {
@@ -534,7 +534,7 @@ impl MainDatabase {
     }
 
     /// Gets one exact child-parent relation, including its optional limit tag.
-        pub fn parent_relationship_get_sync(
+    pub fn parent_relationship_get_sync(
         &self,
         tag_id: &u64,
         relate_tag_id: &u64,
@@ -561,7 +561,7 @@ impl MainDatabase {
     /// Adds tags into db in a bulk manner
     ///
     #[must_use]
-        pub fn tag_id_get_tag_sync(&self, tags: &HashSet<u64>) -> HashMap<u64, Tag> {
+    pub fn tag_id_get_tag_sync(&self, tags: &HashSet<u64>) -> HashMap<u64, Tag> {
         if tags.is_empty() {
             return HashMap::new();
         }
@@ -598,7 +598,7 @@ impl MainDatabase {
     ///
     /// Marks a url as being dead in the db
     ///
-        pub fn dead_url_add_sync(&self, dead_url: &String) -> bool {
+    pub fn dead_url_add_sync(&self, dead_url: &String) -> bool {
         let mut writer_conn = self.writer_lock();
         let conn = writer_conn.transaction().unwrap();
         let _ = self.internal_dead_url_add(&conn, dead_url);
@@ -610,7 +610,7 @@ impl MainDatabase {
     ///
     /// Checks if a lsit of urls are dead
     ///
-        pub fn dead_url_get_sync(&self, dead_urls: &[String]) -> HashMap<String, bool> {
+    pub fn dead_url_get_sync(&self, dead_urls: &[String]) -> HashMap<String, bool> {
         let conn = self.pool.get().unwrap();
 
         if let Ok(status) = self.internal_dead_url_exist(&conn, dead_urls) {
@@ -623,7 +623,7 @@ impl MainDatabase {
     /// Adds a namespace into the db
     ///
     #[must_use]
-        pub fn namespace_add_sync(&self, namespace: &GenericNamespaceObj) -> u64 {
+    pub fn namespace_add_sync(&self, namespace: &GenericNamespaceObj) -> u64 {
         let mut guard = self.writer_lock();
         let conn = guard.transaction().unwrap();
         let out = self.internal_namespace_get_or_create(&conn, namespace);
@@ -634,7 +634,7 @@ impl MainDatabase {
     ///
     /// Human written tag searching layer
     ///
-        #[allow(unreachable_code)]
+    #[allow(unreachable_code)]
     pub fn search_db_files_human_sync(&self, search: &SearchObj, limit: &Option<u64>) -> Vec<u64> {
         let mut out = Vec::new();
 
@@ -821,7 +821,7 @@ impl MainDatabase {
 
     /// A sync function to get a function
     #[must_use]
-        pub fn setting_get_sync(&self, name: &str) -> Option<DbSettingsObj> {
+    pub fn setting_get_sync(&self, name: &str) -> Option<DbSettingsObj> {
         let pool = self.pool.clone();
         let conn = pool.get().ok()?;
         self.internal_setting_get(&conn, name).ok().flatten()
@@ -831,7 +831,7 @@ impl MainDatabase {
     /// Sets the setting in the db. Updates it if the setting already exists
     ///
     #[must_use]
-        pub fn setting_set_sync(&self, obj: &DbSettingsObj) -> bool {
+    pub fn setting_set_sync(&self, obj: &DbSettingsObj) -> bool {
         let mut writer_conn = self.writer_lock();
         let conn = match writer_conn.transaction() {
             Ok(conn) => conn,
@@ -858,7 +858,7 @@ impl MainDatabase {
     /// Adds job into db
     ///
     #[must_use]
-        pub fn jobs_add_single_sync(&self, job: PluginJob) -> u64 {
+    pub fn jobs_add_single_sync(&self, job: PluginJob) -> u64 {
         let mut writer_conn = self.writer_lock();
         let conn = match writer_conn.transaction() {
             Ok(conn) => conn,

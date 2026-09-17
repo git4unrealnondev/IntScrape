@@ -115,7 +115,6 @@ fn test_database_initialization_and_settings() {
         .expect("Default user agent missing");
 
     assert_eq!(user_agent.param, Some("IntScrape V1.0".to_string()));
-
 }
 
 #[test]
