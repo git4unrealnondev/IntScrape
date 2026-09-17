@@ -47,12 +47,13 @@ ctrlc = "3.5.2"
 regex = "1.13.1"
 strsim = { version = "0.11.1", optional = true }
 strum = "0.28.0"
-ipfs-cid = {git="https://github.com/git4unrealnondev/ipfs-cid"}
+#ipfs-cid = {git="https://github.com/git4unrealnondev/ipfs-cid"}
 image_hasher = "3.1.1"
 image = "0.25.10"
 nohash-hasher = { version = "0.2.0", optional = true }
 turso = { version = "=0.8.0-pre.8", default-features = false, features = ["fts"] }
 smol_str = "0.3.6"
+multi-cid = "0.2.0"
 
 [workspace.dependencies]
 shared_types = { path = "./libs/shared_types" }

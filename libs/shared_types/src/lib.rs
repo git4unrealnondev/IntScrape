@@ -316,8 +316,8 @@ pub enum HashesSupported {
     Sha1(String),
     Sha256(String),
     Sha512(String),
-    IPFSCID(String),
-    IPFSCID1(String),
+   // IPFSCID(String),
+   // IPFSCID1(String),
     ImageHash(String),
 }
 

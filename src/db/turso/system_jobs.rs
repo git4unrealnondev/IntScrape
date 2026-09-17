@@ -228,10 +228,10 @@ impl TursoDatabase {
                 HashesSupported::Sha1(_) => ("SHA1", HashesSupported::Sha1(String::new())),
                 HashesSupported::Sha256(_) => ("SHA256", HashesSupported::Sha256(String::new())),
                 HashesSupported::Sha512(_) => ("SHA512", HashesSupported::Sha512(String::new())),
-                HashesSupported::IPFSCID(_) => ("IPFSCID", HashesSupported::IPFSCID(String::new())),
-                HashesSupported::IPFSCID1(_) => {
-                    ("IPFSCID1", HashesSupported::IPFSCID1(String::new()))
-                }
+               // HashesSupported::IPFSCID(_) => ("IPFSCID", HashesSupported::IPFSCID(String::new())),
+               // HashesSupported::IPFSCID1(_) => {
+               //     ("IPFSCID1", HashesSupported::IPFSCID1(String::new()))
+               // }
                 HashesSupported::ImageHash(_) => {
                     ("ImageHash", HashesSupported::ImageHash(String::new()))
                 }

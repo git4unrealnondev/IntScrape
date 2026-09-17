@@ -29,8 +29,8 @@ pub fn hashessupportedtoinner(hash: &HashesSupported) -> (&str, &String) {
         HashesSupported::Sha1(hash) => ("SHA1", hash),
         HashesSupported::Sha256(hash) => ("SHA256", hash),
         HashesSupported::Sha512(hash) => ("SHA512", hash),
-        HashesSupported::IPFSCID(hash) => ("IPFSCID", hash),
-        HashesSupported::IPFSCID1(hash) => ("IPFSCID1", hash),
+       // HashesSupported::IPFSCID(hash) => ("IPFSCID", hash),
+       // HashesSupported::IPFSCID1(hash) => ("IPFSCID1", hash),
         HashesSupported::ImageHash(hash) => ("ImageHash", hash),
     }
 }
