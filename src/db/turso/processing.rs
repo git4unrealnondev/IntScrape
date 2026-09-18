@@ -140,7 +140,9 @@ impl TursoDatabase {
         // used to re-run the entire chunk transaction with no limit; under
         // write-write contention from many concurrent jobs that burned wide
         // open on the shared tokio runtime and starved the network layer.
-        const MAX_SCRAPER_CHUNK_ATTEMPTS: u32 = 8;
+        // 25 attempts (~1.25s) rides out typical contention windows between
+        // the 10 concurrent rule34 jobs while staying strictly bounded.
+        const MAX_SCRAPER_CHUNK_ATTEMPTS: u32 = 25;
         self.process_scraper_chunk_attempt(map, audit_reason, MAX_SCRAPER_CHUNK_ATTEMPTS)
             .await
     }
