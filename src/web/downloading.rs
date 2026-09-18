@@ -63,7 +63,11 @@ impl Scraper {
         loop {
             // The client that does the downloading
             let mut client = reqwest::ClientBuilder::new()
-                .pool_max_idle_per_host(100)
+                // Keep a small number of idle keep-alives per host. Clients are
+                // now shared per-plugin, so this is no longer multiplied by the
+                // number of concurrent jobs; a large idle pool caused stale
+                // keep-alive resets and connection bursts toward Cloudflare.
+                .pool_max_idle_per_host(5)
                 .user_agent(&useragent)
                 .cookie_store(false)
                 .gzip(true)
@@ -281,6 +285,11 @@ impl Scraper {
                         url_parsed,
                         err,
                     );
+                    // Non-timeout errors (TLS resets, truncated streams, etc.) almost
+                    // always mean the endpoint is degraded or throttling us. Back off
+                    // before retrying instead of hammering it with immediate reconnects,
+                    // which can extend the outage window.
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             }
 

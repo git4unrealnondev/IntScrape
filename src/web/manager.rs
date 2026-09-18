@@ -282,6 +282,10 @@ pub struct DownloadsManager {
     processing_limiter: Arc<Semaphore>,
     should_exit: Arc<AtomicBool>,
     active_file_processing: Arc<AtomicUsize>,
+    // Reqwest clients are shared per-plugin (keyed by plugin name + text/file
+    // target) so concurrent jobs reuse one connection pool instead of each job
+    // opening its own pool of up to 100 idle connections per host.
+    client_cache: RwLock<HashMap<(String, bool), Arc<Client>>>,
 }
 
 struct FileProcessingGuard {
@@ -295,20 +299,17 @@ impl Drop for FileProcessingGuard {
 }
 
 impl Scraper {
-    pub fn new(
+    pub async fn new(
         job: DbJobsObj,
         ratelimiter: Arc<RatelimitManager>,
         plugin_manager: Arc<PluginManager>,
         plugin: Plugin,
         download_manager: Arc<DownloadsManager>,
     ) -> Arc<Self> {
-        let mut modifiers = Vec::new();
-
-        for modifier in &plugin.properties {
-            if let PluginProperties::Modifier(target) = modifier {
-                modifiers.push(target.clone());
-            }
-        }
+        // Use the per-plugin shared clients so concurrent jobs of the same
+        // plugin reuse one connection pool each for texts and files.
+        let text_client = download_manager.get_client(&plugin, true).await;
+        let file_client = download_manager.get_client(&plugin, false).await;
 
         let scraper = Self {
             job,
@@ -316,8 +317,8 @@ impl Scraper {
             plugin_manager,
             plugin,
             download_manager,
-            text_client: Arc::new(Self::client_create(modifiers.clone(), true)),
-            file_client: Arc::new(Self::client_create(modifiers.clone(), false)),
+            text_client,
+            file_client,
         };
 
         scraper.into()
@@ -1587,9 +1588,42 @@ impl DownloadsManager {
             processing_limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_PROCESSING)),
             should_exit,
             active_file_processing: Arc::new(AtomicUsize::new(0)),
+            client_cache: HashMap::new().into(),
         };
 
         dm.into()
+    }
+
+    /// Returns a shared reqwest client for the given plugin and download target.
+    ///
+    /// All jobs of a plugin reuse one client (and its connection pool) instead of
+    /// each job building its own client with a fresh pool. This stops concurrent
+    /// jobs from accumulating hundreds of idle keep-alives toward the same host,
+    /// which caused connection bursts and stale-connection resets against
+    /// Cloudflare-fronted endpoints (e.g. rule34).
+    pub async fn get_client(&self, plugin: &Plugin, is_text_download: bool) -> Arc<Client> {
+        {
+            let guard = self.client_cache.read().await;
+            if let Some(client) = guard.get(&(plugin.name.clone(), is_text_download)) {
+                return client.clone();
+            }
+        }
+
+        let modifiers = plugin
+            .properties
+            .iter()
+            .filter_map(|property| match property {
+                PluginProperties::Modifier(target) => Some(target.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let client = Arc::new(Scraper::client_create(modifiers, is_text_download));
+
+        self.client_cache
+            .write()
+            .await
+            .insert((plugin.name.clone(), is_text_download), client.clone());
+        client
     }
     ///
     /// Loads the logins in from the DB and inserts them into the job parameters.
@@ -1974,7 +2008,8 @@ impl DownloadsManager {
                     self.plugin_manager.clone(),
                     plugin,
                     self.clone(),
-                );
+                )
+                .await;
 
                 tokio::task::spawn(async move {
                     let _job_permit = job_permit;
