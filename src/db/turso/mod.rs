@@ -233,7 +233,7 @@ impl TursoDatabase {
         self.table_create_file(&conn).await;
         self.table_create_settings(&conn).await;
         self.table_create_dead_urls(&conn).await;
-        self.table_create_parents(&conn).await;
+        self.table_create_parents(&conn).await?;
         self.table_create_namespace(&conn).await;
         self.table_create_jobs(&conn).await;
 

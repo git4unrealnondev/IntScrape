@@ -7,10 +7,10 @@ default-run = "intscrape"
 [dependencies]
 fast_log = "1.7.8"
 log = "0.4.33"
-r2d2 = { version = "0.8.10", optional = true }
-r2d2_sqlite = { version = "*", default-features=false, features = [] }
+#r2d2 = { version = "0.8.10", optional = true }
+#r2d2_sqlite = { version = "*", default-features=false, features = [] }
 reqwest = {version = "0.12.22", default-features=false,features=["blocking", "cookies", "gzip", "deflate", "default", "rustls-tls"]}
-serde_rusqlite = { version = "*", optional = true }
+#serde_rusqlite = { version = "*", optional = true }
 tokio = { version = "1.52.3", default-features=false, features = ["rt-multi-thread", "macros", "fs", "time", "io-util", "signal"] }
 shared_types = {path = "./libs/shared_types", features=["strum"]}
 libloading = "0.9.0"
@@ -26,7 +26,7 @@ sha1 = "0.11.0"
 md5 = "0.8.0"
 hex = "0.4.3"
 rayon = "1.12.0"
-rusqlite = { version = "0.39.0", default-features=false, features = ["trace", "fallible_uint"] }
+#rusqlite = { version = "0.39.0", default-features=false, features = ["trace", "fallible_uint"] }
 #serde = { version = "1.0.228", features = ["derive"] }
 interprocess = { version = "2.4.2", features = ["tokio"] }
 #bitcode = { version = "0.6.9", features = ["serde"] }
@@ -92,7 +92,7 @@ strip = false
 [features]
 dhat-heap = []    # if you are doing heap profiling
 dhat-ad-hoc = []  # if you are doing ad hoc profiling
-legacy = ["dep:r2d2", "dep:serde_rusqlite", "dep:roaring", "dep:intmap", "dep:strsim", "dep:nohash-hasher"]
+#legacy = ["dep:r2d2", "dep:serde_rusqlite", "dep:roaring", "dep:intmap", "dep:strsim", "dep:nohash-hasher"]
 
 [dev-dependencies]
 criterion = "0.5"

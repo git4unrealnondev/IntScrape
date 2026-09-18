@@ -1,4 +1,4 @@
-use turso::Connection;
+use turso::{Connection, Result};
 
 use crate::db::turso::TursoDatabase;
 
@@ -85,7 +85,7 @@ CREATE INDEX idx_namespace ON Namespace (name);
         )
         .await;
     }
-    pub(in crate::db::turso) async fn table_create_parents(&self, conn: &Connection) {
+    pub(in crate::db::turso) async fn table_create_parents(&self, conn: &Connection) -> Result<()> {
         conn.execute_batch("
 CREATE TABLE Parents (
 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,7 +105,7 @@ id INTEGER PRIMARY KEY AUTOINCREMENT,
 CREATE INDEX idx_parents_lim ON Parents (limit_to);
 CREATE INDEX idx_parents_rel ON Parents (relate_tag_id);
 CREATE UNIQUE INDEX idx_unique_parents_null_safe ON Parents (tag_id, relate_tag_id, IFNULL(limit_to, -1));
-").await;
+").await
     }
     pub(in crate::db::turso) async fn table_create_tags(&self, conn: &Connection) {
         conn.execute_batch(

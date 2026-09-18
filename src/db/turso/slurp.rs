@@ -1,6 +1,6 @@
 //! Turso-native database import. Unlike the legacy SQLite implementation there
-//! is no `ATTACH DATABASE`: the source is opened read-only through rusqlite and
-//! every page is streamed into the turso database via the bulk-add helpers.
+//! is no `ATTACH DATABASE`: the source is opened read-only through turso and
+//! every row is streamed into the destination database via the bulk-add helpers.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -9,10 +9,10 @@ use std::time::Instant;
 use shared_types::{
     DbJobRecreation, FileInternal, GenericNamespaceObj, PluginJob, ScraperParam, Tag, TagParents,
 };
-use turso::{Connection, Result, Value, params_from_iter};
+use turso::{params_from_iter, Connection, Result, Value};
 
-use crate::db::SQL_CHUNK_SIZE;
 use crate::db::turso::TursoDatabase;
+use crate::db::SQL_CHUNK_SIZE;
 
 /// Destination batch size for the tags stage. Imported tags arrive in source
 /// id order, which is random relative to the (name, namespace) unique key, so
@@ -29,7 +29,11 @@ const SLURP_RELATIONSHIP_BATCH: usize = 25_000;
 /// the id 0, main.db's 6.8M-row File table has one). Seed the first read at
 /// -1 so `> -1` also covers id 0, then advance with real ids.
 fn keyset_bound(first_pass: bool, last: u64) -> i64 {
-    if first_pass { -1 } else { last as i64 }
+    if first_pass {
+        -1
+    } else {
+        last as i64
+    }
 }
 
 impl TursoDatabase {
@@ -41,9 +45,12 @@ impl TursoDatabase {
             ));
         }
 
-        let read_flags = r2d2_sqlite::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
-        let source_conn = r2d2_sqlite::rusqlite::Connection::open_with_flags(source, read_flags)
-            .map_err(db_error)?;
+        let sauce = turso::Builder::new_local(&source.to_string_lossy())
+            .read_only(true)
+            .experimental_without_rowid(true)
+            .build()
+            .await?;
+        let source_conn = sauce.connect()?;
 
         // Background pollers (system-job spawner) must stop reading the
         // destination while the import runs: an open reader snapshot keeps the
@@ -153,19 +160,16 @@ impl TursoDatabase {
     }
 
     /// Blocking variant of [`Self::db_slurp`] for use from async contexts that
-    /// must keep their own future `Send` (the rusqlite source connection is
-    /// not `Sync`, so holding it across awaits makes the async slurp future
-    /// thread-unsafe). Runs the slurp on the thread-local blocking runtime.
+    /// must keep their own future `Send` (the turso source connection shares
+    /// this runtime's IO handles, so holding it while awaiting the destination
+    /// helper could deadlock on the single-threaded blocking runtime).
     pub fn db_slurp_blocking(&self, source: &Path) -> Result<(u64, u64, u64)> {
         super::api::block_on(self.db_slurp(source))
     }
 
     /// Streams the source database's namespaces, tags, files, hashes,
     /// relationships, and parents into turso.
-    async fn internal_db_slurp(
-        &self,
-        source: &r2d2_sqlite::rusqlite::Connection,
-    ) -> Result<(u64, u64, u64)> {
+    async fn internal_db_slurp(&self, source: &Connection) -> Result<(u64, u64, u64)> {
         let mut conn = self.connect()?;
 
         // Namespaces, remembering id -> object and name -> target id.
@@ -175,20 +179,14 @@ impl TursoDatabase {
         {
             let mut stmt = source
                 .prepare("SELECT id, name, description FROM Namespace")
-                .map_err(db_error)?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, u64>(0)?,
-                        GenericNamespaceObj {
-                            name: row.get(1)?,
-                            description: row.get(2)?,
-                        },
-                    ))
-                })
-                .map_err(db_error)?;
-            for row in rows {
-                let (id, ns) = row.map_err(db_error)?;
+                .await?;
+            let mut rows = stmt.query(()).await?;
+            while let Some(row) = rows.next().await? {
+                let id: u64 = row.get(0)?;
+                let ns = GenericNamespaceObj {
+                    name: row.get(1)?,
+                    description: row.get(2)?,
+                };
                 ns_by_source_id.insert(id, ns.clone());
                 namespace_set.insert(ns);
             }
@@ -215,11 +213,11 @@ impl TursoDatabase {
         conn.execute("BEGIN IMMEDIATE", ()).await?;
         let mut locations = source
             .prepare("SELECT id, location FROM FileStorageLocations")
-            .map_err(db_error)?;
-        let mut location_rows = locations.query([]).map_err(db_error)?;
-        while let Some(row) = location_rows.next().map_err(db_error)? {
-            let source_id: u64 = row.get(0).map_err(db_error)?;
-            let location: String = row.get(1).map_err(db_error)?;
+            .await?;
+        let mut location_rows = locations.query(()).await?;
+        while let Some(row) = location_rows.next().await? {
+            let source_id: u64 = row.get(0)?;
+            let location: String = row.get(1)?;
             let target_id = self
                 .file_storage_location_get_or_create(&conn, &location)
                 .await?;
@@ -312,7 +310,8 @@ impl TursoDatabase {
                 .await?;
                 conn.execute("DROP INDEX IF EXISTS idx_tags_count_covering", ())
                     .await?;
-                conn.execute("DROP INDEX IF EXISTS idx_tags_fts", ()).await?;
+                conn.execute("DROP INDEX IF EXISTS idx_tags_fts", ())
+                    .await?;
                 log::info!("Slurp tags: cold import, inserting directly into indexed Tags");
             } else {
                 conn.execute_batch(
@@ -344,6 +343,17 @@ impl TursoDatabase {
                 .await?;
             }
 
+            // New rows are handed explicit ids in the staging table so they
+            // never collide with ids already owned by the canonical Tags
+            // table: the swap-back step copies every existing row across at
+            // its original id, and both id spaces start at 1. The cursor
+            // advances across batches; a cold import's freshly recreated
+            // (empty) canonical table has max id 0, matching the old
+            // auto-assignment behaviour.
+            let mut next_insert_id: i64 = {
+                let mut stmt = conn.prepare("SELECT COALESCE(MAX(id), 0) FROM Tags").await?;
+                stmt.query_row(()).await?.get(0)?
+            };
             let mut last_tag_id = 0_u64;
             let mut first_tag_pass = true;
             loop {
@@ -357,20 +367,14 @@ impl TursoDatabase {
                          ORDER BY s.id
                          LIMIT ?2",
                     )
-                    .map_err(db_error)?;
-                let rows = stmt
-                    .query_map(
-                        [keyset_bound(first_tag_pass, last_tag_id), SLURP_TAG_BATCH],
-                        |row| {
-                        Ok((
-                            row.get::<_, u64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, Option<String>>(3)?,
-                        ))
-                    })
-                    .map_err(db_error)?;
-                let batch: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+                    .await?;
+                let mut rows = stmt
+                    .query([keyset_bound(first_tag_pass, last_tag_id), SLURP_TAG_BATCH])
+                    .await?;
+                let mut batch: Vec<(u64, String, String, Option<String>)> = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    batch.push((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?));
+                }
                 drop(stmt);
                 let Some((last_id, _, _, _)) = batch.last() else {
                     break;
@@ -386,6 +390,7 @@ impl TursoDatabase {
                         &batch,
                         has_existing_tags,
                         if cold_import { "Tags" } else { "Tags_slurp" },
+                        &mut next_insert_id,
                     )
                     .await?;
                 conn.execute("COMMIT", ()).await?;
@@ -506,13 +511,15 @@ impl TursoDatabase {
         let mut slurp_files: HashMap<u64, u64> = HashMap::new();
         let mut file_count = 0_u64;
         {
-            let file_schema: String = source
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'File'",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(db_error)?;
+            let file_schema: String = {
+                let mut stmt = source
+                    .prepare(
+                        "SELECT sql FROM sqlite_master
+                         WHERE type = 'table' AND lower(name) = 'file'",
+                    )
+                    .await?;
+                stmt.query_row(()).await?.get(0)?
+            };
             let has_size_bytes = file_schema
                 .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
                 .any(|column| column.eq_ignore_ascii_case("size_bytes"));
@@ -533,21 +540,23 @@ impl TursoDatabase {
                      ORDER BY f.id
                      LIMIT ?2"
                 );
-                let mut stmt = source.prepare(&file_query).map_err(db_error)?;
-                let rows = stmt
-                    .query_map(
-                        [keyset_bound(first_file_pass, last_file_id), (SQL_CHUNK_SIZE * 8) as i64],
-                        |row| {
-                        Ok((
-                            row.get::<_, u64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, Option<u64>>(3)?,
-                            row.get::<_, Option<u64>>(4)?,
-                        ))
-                    })
-                    .map_err(db_error)?;
-                let batch: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+                let mut stmt = source.prepare(&file_query).await?;
+                let mut rows = stmt
+                    .query([
+                        keyset_bound(first_file_pass, last_file_id),
+                        (SQL_CHUNK_SIZE * 8) as i64,
+                    ])
+                    .await?;
+                let mut batch: Vec<(u64, String, String, Option<u64>, Option<u64>)> = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    batch.push((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ));
+                }
                 drop(stmt);
                 let Some((last_id, _, _, _, _)) = batch.last() else {
                     break;
@@ -602,17 +611,17 @@ impl TursoDatabase {
 
         // Secondary hashes, keyed through the source file id.
         {
-            let has_file_hashes = source
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM sqlite_master
-                         WHERE type = 'table' AND name = 'FileHashes'
-                     )",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map_err(db_error)?
-                == 1;
+            let has_file_hashes: bool = {
+                let mut stmt = source
+                    .prepare(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM sqlite_master
+                             WHERE type = 'table' AND lower(name) = 'filehashes'
+                         )",
+                    )
+                    .await?;
+                stmt.query_row(()).await?.get(0)?
+            };
             if has_file_hashes {
                 let mut last_file_id = 0_u64;
                 let mut first_hash_pass = true;
@@ -626,19 +635,17 @@ impl TursoDatabase {
                              ORDER BY h.file_id
                              LIMIT ?2",
                         )
-                        .map_err(db_error)?;
-                    let rows = stmt
-                        .query_map(
-                            [keyset_bound(first_hash_pass, last_file_id), SQL_CHUNK_SIZE as i64],
-                            |row| {
-                            Ok((
-                                row.get::<_, u64>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                            ))
-                        })
-                        .map_err(db_error)?;
-                    let batch: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+                        .await?;
+                    let mut rows = stmt
+                        .query([
+                            keyset_bound(first_hash_pass, last_file_id),
+                            SQL_CHUNK_SIZE as i64,
+                        ])
+                        .await?;
+                    let mut batch: Vec<(u64, String, String)> = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        batch.push((row.get(0)?, row.get(1)?, row.get(2)?));
+                    }
                     drop(stmt);
                     let Some((last_id, _, _)) = batch.last() else {
                         break;
@@ -685,14 +692,17 @@ impl TursoDatabase {
         // tag counts with one aggregate pass per namespace, then rebuild the
         // index once at the end.
         {
-            let source_table_exists = |name: &str| -> Result<bool> {
+            let source_table_exists = async |name: &str| -> Result<bool> {
                 let mut stmt = source
-                    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")
-                    .map_err(db_error)?;
-                let mut rows = stmt.query([name]).map_err(db_error)?;
-                Ok(rows.next().map_err(db_error)?.is_some())
+                    .prepare(
+                        "SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND lower(name) = lower(?1)",
+                    )
+                    .await?;
+                let mut rows = stmt.query((name,)).await?;
+                Ok(rows.next().await?.is_some())
             };
-            let has_legacy_relationship = source_table_exists("Relationship")?;
+            let has_legacy_relationship = source_table_exists("Relationship").await?;
 
             // The Tags count column drives idx_tags_count_covering (ordered by
             // count DESC). Recount UPDATEs churn this index so aggressively that
@@ -732,12 +742,15 @@ impl TursoDatabase {
             {
                 let mut stmt = source
                     .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
-                    .map_err(db_error)?;
-                let mut rows = stmt.query([]).map_err(db_error)?;
-                while let Some(row) = rows.next().map_err(db_error)? {
-                    let name: String = row.get(0).map_err(db_error)?;
+                    .await?;
+                let mut rows = stmt.query(()).await?;
+                while let Some(row) = rows.next().await? {
+                    let name: String = row.get(0)?;
+                    // Turso canonicalizes identifiers to lowercase on disk, so
+                    // match the Relationship_<id> partition prefix case-insensitively.
                     if let Some(id) = name
-                        .strip_prefix("Relationship_")
+                        .to_ascii_lowercase()
+                        .strip_prefix("relationship_")
                         .and_then(|suffix| suffix.parse::<u64>().ok())
                     {
                         partition_source_ids.insert(id);
@@ -816,18 +829,18 @@ impl TursoDatabase {
                              LIMIT ?3",
                             partition
                         ))
-                        .map_err(db_error)?;
-                    let rows = stmt
-                        .query_map(
-                            [
-                                keyset_bound(first_rel_pass, last_file_id),
-                                keyset_bound(first_rel_pass, last_tag_id),
-                                SLURP_RELATIONSHIP_BATCH as i64,
-                            ],
-                            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
-                        )
-                        .map_err(db_error)?;
-                    let batch: Vec<(u64, u64)> = rows.filter_map(|r| r.ok()).collect();
+                        .await?;
+                    let mut rows = stmt
+                        .query([
+                            keyset_bound(first_rel_pass, last_file_id),
+                            keyset_bound(first_rel_pass, last_tag_id),
+                            SLURP_RELATIONSHIP_BATCH as i64,
+                        ])
+                        .await?;
+                    let mut batch: Vec<(u64, u64)> = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        batch.push((row.get(0)?, row.get(1)?));
+                    }
                     drop(stmt);
                     let Some((source_file_id, source_tag_id)) = batch.last() else {
                         break;
@@ -946,24 +959,18 @@ impl TursoDatabase {
                              ORDER BY r.file_id, r.tag_id
                              LIMIT ?3",
                         )
-                        .map_err(db_error)?;
-                    let rows = stmt
-                        .query_map(
-                            [
-                                keyset_bound(first_legacy_rel_pass, last_file_id),
-                                keyset_bound(first_legacy_rel_pass, last_tag_id),
-                                SLURP_RELATIONSHIP_BATCH as i64,
-                            ],
-                            |row| {
-                                Ok((
-                                    row.get::<_, u64>(0)?,
-                                    row.get::<_, u64>(1)?,
-                                    row.get::<_, u64>(2)?,
-                                ))
-                            },
-                        )
-                        .map_err(db_error)?;
-                    let batch: Vec<(u64, u64, u64)> = rows.filter_map(|r| r.ok()).collect();
+                        .await?;
+                    let mut rows = stmt
+                        .query([
+                            keyset_bound(first_legacy_rel_pass, last_file_id),
+                            keyset_bound(first_legacy_rel_pass, last_tag_id),
+                            SLURP_RELATIONSHIP_BATCH as i64,
+                        ])
+                        .await?;
+                    let mut batch: Vec<(u64, u64, u64)> = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        batch.push((row.get(0)?, row.get(1)?, row.get(2)?));
+                    }
                     drop(stmt);
                     let Some(&(next_file_id, next_tag_id, _)) = batch.last() else {
                         break;
@@ -1091,20 +1098,13 @@ impl TursoDatabase {
         {
             let mut parents = source
                 .prepare("SELECT tag_id, relate_tag_id, limit_to FROM Parents")
-                .map_err(db_error)?;
-            let rows = parents
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, u64>(0)?,
-                        row.get::<_, u64>(1)?,
-                        row.get::<_, Option<u64>>(2)?,
-                    ))
-                })
-                .map_err(db_error)?;
+                .await?;
+            let mut rows = parents.query(()).await?;
 
             let mut parent_set = HashSet::new();
-            for row in rows {
-                let (tag_id, relate_tag_id, limit_to) = row.map_err(db_error)?;
+            while let Some(row) = rows.next().await? {
+                let (tag_id, relate_tag_id, limit_to): (u64, u64, Option<u64>) =
+                    (row.get(0)?, row.get(1)?, row.get(2)?);
                 if let (Some(&tag_id), Some(&relate_tag_id)) =
                     (slurp_tags.get(&tag_id), slurp_tags.get(&relate_tag_id))
                 {
@@ -1122,10 +1122,10 @@ impl TursoDatabase {
             // Parents will be missing/incomplete, but Parents_old will hold the good data.
             {
                 let mut check = conn
-            .prepare(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-            )
-            .await?;
+                    .prepare(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                    )
+                    .await?;
                 let has_parents: i64 = check.query_row(("Parents",)).await?.get(0)?;
                 let has_old: i64 = check.query_row(("Parents_old",)).await?.get(0)?;
 
@@ -1135,39 +1135,54 @@ impl TursoDatabase {
                     );
                     conn.execute("ALTER TABLE Parents_old RENAME TO Parents", ())
                         .await?;
+                    // The restored table may be missing the named indexes if the
+                    // interrupted run had already dropped them from Parents_old.
+                    conn.execute_batch(
+                        "CREATE INDEX IF NOT EXISTS idx_parents_lim ON Parents (limit_to);
+                         CREATE INDEX IF NOT EXISTS idx_parents_rel ON Parents (relate_tag_id);
+                         CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_parents_null_safe
+                             ON Parents (tag_id, relate_tag_id, IFNULL(limit_to, -1));",
+                    )
+                    .await?;
                 } else {
                     // Safe cleanup of any truly dead leftovers from old successful runs
                     conn.execute("DROP TABLE IF EXISTS Parents_old", ()).await?;
                 }
             }
 
-            // 1. Drop foreign keys and shift the current table aside safely
+            // 1. Drop foreign keys and shift the current table aside safely.
+            // The named indexes follow the renamed table, so their names would
+            // collide with the fresh Parents table that table_create_parents
+            // creates below. Drop them from Parents_old first so the new table
+            // gets its full index set, including the null-safe unique index
+            // that makes the bulk INSERT OR IGNORE dedupe warm re-slurps.
             conn.execute_batch("PRAGMA foreign_keys = OFF;").await?;
             conn.execute_batch(
-                "ALTER TABLE Parents RENAME TO Parents_old;",
+                "ALTER TABLE Parents RENAME TO Parents_old;
+                 DROP INDEX IF EXISTS idx_parents_lim;
+                 DROP INDEX IF EXISTS idx_parents_rel;
+                 DROP INDEX IF EXISTS idx_unique_parents_null_safe;",
             )
             .await?;
 
-            self.table_create_parents(&conn).await;
+            self.table_create_parents(&conn).await?;
 
-            // 2. Copy existing data from Parents_old into the new unconstrained Parents table
-            let max_copy_id: i64 = {
-                let mut stmt = conn
-                    .prepare("SELECT COALESCE(MAX(rowid), 0) FROM Parents_old")
-                    .await?;
-                let mut rows = stmt.query(()).await?;
-                rows.next().await?.unwrap().get::<i64>(0)?
-            };
-log::info!("Copying and deduplicating existing parents data");
+            // 2. Copy existing data from Parents_old into the freshly
+            // constrained Parents table, deduplicating with the same null-safe
+            // key the unique index uses.
+            log::info!("Copying and deduplicating existing parents data");
             conn.execute(
-    "INSERT INTO Parents (tag_id, relate_tag_id, limit_to)
-     SELECT tag_id, relate_tag_id, limit_to 
-     FROM Parents_old
-     GROUP BY tag_id, relate_tag_id, IFNULL(limit_to, -1)",
-    (),
-).await?;
+                "INSERT INTO Parents (tag_id, relate_tag_id, limit_to)
+                 SELECT tag_id, relate_tag_id, limit_to
+                 FROM Parents_old
+                 GROUP BY tag_id, relate_tag_id, IFNULL(limit_to, -1)",
+                (),
+            )
+            .await?;
 
-            // 3. Insert new parents in chunks
+            // 3. Insert new parents in chunks; the null-safe unique index on
+            // the new Parents table makes INSERT OR IGNORE skip rows already
+            // copied from Parents_old above.
             let parent_vec: Vec<_> = parent_set.into_iter().collect();
             for parent in parent_vec.chunks(SQL_CHUNK_SIZE * 8) {
                 let tx = conn.transaction().await?;
@@ -1175,28 +1190,12 @@ log::info!("Copying and deduplicating existing parents data");
                 tx.commit().await?;
             }
 
-            // 4. Deduplicate to ensure unique index creation won't fail
-         /*   conn.execute(
-                "DELETE FROM Parents
-         WHERE rowid NOT IN (
-             SELECT MIN(rowid) FROM Parents
-             GROUP BY tag_id, relate_tag_id, IFNULL(limit_to, -1)
-         )",
-                (),
-            )
-            .await?;
-*/
-            // 5. Cleanup old table, rebuild all indexes once, and restore foreign keys
-            log::info!("Recreating parents indexes");
-            conn.execute_batch(
-                "DROP TABLE Parents_old;
-         CREATE INDEX idx_parents_lim ON Parents (limit_to);
-         CREATE INDEX idx_parents_rel ON Parents (relate_tag_id);
-         CREATE UNIQUE INDEX idx_unique_parents_null_safe
-             ON Parents (tag_id, relate_tag_id, IFNULL(limit_to, -1));
-         PRAGMA foreign_keys = ON;",
-            )
-            .await?;
+            // 4. Cleanup the old table and restore foreign keys. The fresh
+            // Parents table was created fully indexed by table_create_parents,
+            // so no index rebuild is needed here.
+            log::info!("Dropping Parents_old");
+            conn.execute_batch("DROP TABLE Parents_old; PRAGMA foreign_keys = ON;")
+                .await?;
         }
 
         // Jobs. Source ids are intentionally not preserved: the target Jobs
@@ -1204,16 +1203,17 @@ log::info!("Copying and deduplicating existing parents data");
         // duplicate imports from creating duplicate work. The copy tolerates
         // both the IntScrape legacy schema (`recreation`/`user_data`) and
         // Rust-Hydrus-style schemas (`Manager`/`UserData`/optional `priority`).
-        let has_jobs: bool = source
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM sqlite_master
-                     WHERE type = 'table' AND name = 'Jobs'
-                 )",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(db_error)?;
+        let has_jobs: bool = {
+            let mut stmt = source
+                .prepare(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND lower(name) = 'jobs'
+                     )",
+                )
+                .await?;
+            stmt.query_row(()).await?.get(0)?
+        };
         if has_jobs {
             self.slurp_jobs(&conn, source).await?;
         }
@@ -1242,12 +1242,19 @@ log::info!("Copying and deduplicating existing parents data");
     /// constraint-free `Tags_slurp` staging table (warm import; the caller
     /// swaps it under the canonical name afterwards). The value is an internal
     /// constant, never user input.
+    ///
+    /// New rows are assigned explicit ids via `next_insert_id`, which the
+    /// caller seeds with the canonical table's max id. Auto-assignment would
+    /// restart the fresh staging table at id 1 and collide with the existing
+    /// rows the swap-back step later copies across at their original ids
+    /// (UNIQUE constraint failed: tags_slurp.id).
     async fn slurp_tags_bulk_add(
         &self,
         conn: &Connection,
         batch: &[(u64, String, String, Option<String>)],
         lookup_existing: bool,
         insert_target: &str,
+        next_insert_id: &mut i64,
     ) -> Result<(HashMap<Tag, i64>, usize)> {
         let mut namespace_ids = HashMap::new();
         for (_, _, namespace, _) in batch {
@@ -1315,9 +1322,11 @@ log::info!("Copying and deduplicating existing parents data");
             })
             .collect();
         let mut holders = Vec::with_capacity(new_rows.len());
-        let mut params = Vec::with_capacity(new_rows.len() * 2);
+        let mut params = Vec::with_capacity(new_rows.len() * 3);
         for (_, name, namespace, _) in &new_rows {
-            holders.push("(?, ?)");
+            *next_insert_id += 1;
+            holders.push("(?, ?, ?)");
+            params.push(Value::from(*next_insert_id));
             params.push(Value::from(name.as_str()));
             params.push(Value::from(namespace_ids[namespace] as i64));
         }
@@ -1326,7 +1335,7 @@ log::info!("Copying and deduplicating existing parents data");
             let mut rows = conn
                 .query(
                     format!(
-                        "INSERT INTO {insert_target} (name, namespace) VALUES {} \
+                        "INSERT INTO {insert_target} (id, name, namespace) VALUES {} \
                          RETURNING id, name, namespace",
                         holders.join(", ")
                     ),
@@ -1407,21 +1416,13 @@ log::info!("Copying and deduplicating existing parents data");
     /// `user_data` comes from `user_data` or `UserData`. Rows whose payloads
     /// cannot be parsed are skipped with a warning so one bad job never rolls
     /// back an otherwise complete slurp.
-    async fn slurp_jobs(
-        &self,
-        conn: &Connection,
-        source: &r2d2_sqlite::rusqlite::Connection,
-    ) -> Result<()> {
+    async fn slurp_jobs(&self, conn: &Connection, source: &Connection) -> Result<()> {
         let mut columns = HashSet::new();
         {
-            let mut stmt = source
-                .prepare("PRAGMA table_info(\"Jobs\")")
-                .map_err(db_error)?;
-            let rows = stmt
-                .query_map([], |row| row.get::<_, String>(1))
-                .map_err(db_error)?;
-            for row in rows {
-                columns.insert(row.map_err(db_error)?);
+            let mut stmt = source.prepare("PRAGMA table_info(\"Jobs\")").await?;
+            let mut rows = stmt.query(()).await?;
+            while let Some(row) = rows.next().await? {
+                columns.insert(row.get::<String>(1)?);
             }
         }
 
@@ -1460,26 +1461,19 @@ log::info!("Copying and deduplicating existing parents data");
             "SELECT time, reptime, {priority_expr}, {recreation_expr}, site, param, {user_data_expr}
              FROM Jobs ORDER BY id"
         );
-        let mut stmt = source.prepare(&select).map_err(db_error)?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, u64>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, Option<u64>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                ))
-            })
-            .map_err(db_error)?;
+        let mut stmt = source.prepare(&select).await?;
+        let mut rows = stmt.query(()).await?;
 
         let mut copied = 0_u64;
         let mut batch: Vec<PluginJob> = Vec::with_capacity(SQL_CHUNK_SIZE);
-        for row in rows {
-            let (time, reptime, priority, recreation_json, site, param, user_data_json) =
-                row.map_err(db_error)?;
+        while let Some(row) = rows.next().await? {
+            let time: u64 = row.get(0)?;
+            let reptime: u64 = row.get(1)?;
+            let priority: Option<u64> = row.get(2)?;
+            let recreation_json: Option<String> = row.get(3)?;
+            let site: String = row.get(4)?;
+            let param: String = row.get(5)?;
+            let user_data_json: Option<String> = row.get(6)?;
 
             let params = match serde_json::from_str::<Vec<ScraperParam>>(&param) {
                 Ok(params) => params,
@@ -1549,10 +1543,6 @@ fn parse_slurp_job_recreation(json: &str) -> Option<DbJobRecreation> {
             serde_json::from_value::<Option<DbJobRecreation>>(recreation.clone()).ok()
         })
         .flatten()
-}
-
-fn db_error(error: r2d2_sqlite::rusqlite::Error) -> turso::Error {
-    turso::Error::ConversionFailure(error.to_string())
 }
 
 /// Builds a single `UPDATE Tags SET count = CASE id WHEN ? THEN ? ... END
@@ -1634,8 +1624,8 @@ async fn slurp_recount_namespace(conn: &Connection, namespace_id: u64) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
     async fn new_target() -> Arc<TursoDatabase> {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1645,13 +1635,38 @@ mod tests {
     }
 
     /// Point a source sqlite file at `script` and return a connection to it.
-    /// The tempdir must outlive the connection, so both are returned.
-    fn new_source(script: &str) -> (r2d2_sqlite::rusqlite::Connection, tempfile::TempDir) {
+    /// The tempdir must outlive the connection and database, so all are returned.
+    async fn new_source(script: &str) -> (turso::Database, turso::Connection, tempfile::TempDir) {
         let temp_dir = tempfile::tempdir().unwrap();
         let source_path = temp_dir.path().join("source.db");
-        let conn = r2d2_sqlite::rusqlite::Connection::open(&source_path).unwrap();
-        conn.execute_batch(script).unwrap();
-        (conn, temp_dir)
+        let db = turso::Builder::new_local(&source_path.to_string_lossy())
+            .experimental_without_rowid(true)
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute_batch(script).await.unwrap();
+        (db, conn, temp_dir)
+    }
+
+    /// Create a standalone source database on disk and run `script` against it.
+    /// Returns only the path; dropping the local handles persists the file so a
+    /// later `db_slurp` can reopen it read-only.
+    async fn write_source(source_path: &std::path::Path, script: &str) {
+        let db = turso::Builder::new_local(&source_path.to_string_lossy())
+            .experimental_without_rowid(true)
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute_batch(script).await.unwrap();
+        // Fold the WAL into the main file so a read-only reopen sees the schema
+        // (matching a plain SQLite source file handed to db_slurp).
+        conn.pragma_update("journal_mode", "'delete'")
+            .await
+            .unwrap();
+        drop(conn);
+        drop(db);
     }
 
     async fn target_jobs(db: &TursoDatabase) -> Vec<(String, u64, Option<String>, Option<String>)> {
@@ -1678,7 +1693,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn slurp_jobs_copies_intscrape_legacy_schema() {
         let db = new_target().await;
-        let (source, _keep) = new_source(
+        let (_source_db, source, _keep) = new_source(
             "CREATE TABLE Jobs (
                  id INTEGER PRIMARY KEY, time INTEGER NOT NULL,
                  reptime INTEGER NOT NULL, priority INTEGER NOT NULL,
@@ -1687,7 +1702,8 @@ mod tests {
              INSERT INTO Jobs VALUES
                  (1, 100, 60, 5, '{\"OnTagId\":[12,null]}', 'e621', '[]', '{\"k\":\"v\"}'),
                  (2, 200, 0, 10, 'null', 'gelbooru', '[{\"Normal\":\"cute\"}]', '{}');",
-        );
+        )
+        .await;
 
         let conn = db.connect().unwrap();
         db.slurp_jobs(&conn, &source).await.unwrap();
@@ -1713,7 +1729,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn slurp_jobs_copies_rusthydrus_schema() {
         let db = new_target().await;
-        let (source, _keep) = new_source(
+        let (_source_db, source, _keep) = new_source(
             "CREATE TABLE Jobs (
                  id INTEGER PRIMARY KEY, time INTEGER NOT NULL,
                  reptime INTEGER NOT NULL, priority INTEGER,
@@ -1725,7 +1741,8 @@ mod tests {
                   'r34', '[{\"Normal\":\"kino\"}]', '{\"sys\":\"x\"}', '{\"user\":\"y\"}'),
                  (2, 400, 0, NULL, '{\"jobtype\":\"Params\",\"recreation\":null}',
                   'saucenao', '[]', '{}', '{}');",
-        );
+        )
+        .await;
 
         let conn = db.connect().unwrap();
         db.slurp_jobs(&conn, &source).await.unwrap();
@@ -1781,41 +1798,38 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let source_path = temp_dir.path().join("source.db");
-        {
-            let source = r2d2_sqlite::rusqlite::Connection::open(&source_path).unwrap();
-            source
-                .execute_batch(
-                    "CREATE TABLE Namespace (
-                         id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
-                     INSERT INTO Namespace (name, description) VALUES ('species', 'test');
+        write_source(
+            &source_path,
+            "CREATE TABLE Namespace (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
+             INSERT INTO Namespace (name, description) VALUES ('species', 'test');
 
-                     CREATE TABLE Tags (
-                         id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
-                         count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
-                     INSERT INTO Tags (name, namespace) VALUES ('mammal', 1), ('canine', 1);
+             CREATE TABLE Tags (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
+                 count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
+             INSERT INTO Tags (name, namespace) VALUES ('mammal', 1), ('canine', 1);
 
-                     CREATE TABLE FileStorageLocations (
-                         id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
-                     INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
+             CREATE TABLE FileStorageLocations (
+                 id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
+             INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
 
-                     CREATE TABLE File (
-                         id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
-                         storage_id INTEGER, size_bytes INTEGER);
-                     INSERT INTO File (hash, extension, storage_id, size_bytes)
-                         VALUES ('slurp-hash', 'jpg', 1, 42);
+             CREATE TABLE File (
+                 id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
+                 storage_id INTEGER, size_bytes INTEGER);
+             INSERT INTO File (hash, extension, storage_id, size_bytes)
+                 VALUES ('slurp-hash', 'jpg', 1, 42);
 
-                     CREATE TABLE Relationship_1 (
-                         file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
-                         PRIMARY KEY (tag_id, file_id));
-                     INSERT INTO Relationship_1 (file_id, tag_id) VALUES (1, 1), (1, 2);
+             CREATE TABLE Relationship_1 (
+                 file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                 PRIMARY KEY (tag_id, file_id));
+             INSERT INTO Relationship_1 (file_id, tag_id) VALUES (1, 1), (1, 2);
 
-                     CREATE TABLE Parents (
-                         id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
-                         relate_tag_id INTEGER NOT NULL, limit_to INTEGER);
-                     INSERT INTO Parents (tag_id, relate_tag_id, limit_to) VALUES (1, 2, NULL);",
-                )
-                .unwrap();
-        }
+             CREATE TABLE Parents (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
+                 relate_tag_id INTEGER NOT NULL, limit_to INTEGER);
+             INSERT INTO Parents (tag_id, relate_tag_id, limit_to) VALUES (1, 2, NULL);",
+        )
+        .await;
 
         let counts = db.db_slurp(&source_path).await.unwrap();
         assert_eq!(counts, (1, 2, 1));
@@ -1895,46 +1909,43 @@ mod tests {
         // count recompute and file_id index rebuild afterwards.
         let temp_dir = tempfile::tempdir().unwrap();
         let source_path = temp_dir.path().join("source.db");
-        {
-            let source = r2d2_sqlite::rusqlite::Connection::open(&source_path).unwrap();
-            source
-                .execute_batch(
-                    "CREATE TABLE Namespace (
-                         id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
-                     INSERT INTO Namespace (name, description) VALUES
-                         ('species', 'test'), ('artist', 'test');
+        write_source(
+            &source_path,
+            "CREATE TABLE Namespace (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
+             INSERT INTO Namespace (name, description) VALUES
+                 ('species', 'test'), ('artist', 'test');
 
-                     CREATE TABLE Tags (
-                         id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
-                         count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
-                     INSERT INTO Tags (name, namespace) VALUES
-                         ('mammal', 1), ('canine', 1), ('painter', 2);
+             CREATE TABLE Tags (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
+                 count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
+             INSERT INTO Tags (name, namespace) VALUES
+                 ('mammal', 1), ('canine', 1), ('painter', 2);
 
-                     CREATE TABLE FileStorageLocations (
-                         id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
-                     INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
+             CREATE TABLE FileStorageLocations (
+                 id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
+             INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
 
-                     CREATE TABLE File (
-                         id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
-                         storage_id INTEGER, size_bytes INTEGER);
-                     INSERT INTO File (hash, extension, storage_id, size_bytes) VALUES
-                         ('slurp-hash', 'jpg', 1, 42), ('legacy-hash', 'png', 1, 43);
+             CREATE TABLE File (
+                 id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
+                 storage_id INTEGER, size_bytes INTEGER);
+             INSERT INTO File (hash, extension, storage_id, size_bytes) VALUES
+                 ('slurp-hash', 'jpg', 1, 42), ('legacy-hash', 'png', 1, 43);
 
-                     CREATE TABLE Relationship (
-                         file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
-                         PRIMARY KEY (file_id, tag_id)) WITHOUT ROWID;
-                     INSERT INTO Relationship (file_id, tag_id) VALUES
-                         (1, 1), (1, 2), (2, 3),
-                         (2, 99),  -- tag id missing from Tags -> dropped
-                         (99, 1);  -- file id missing from File -> dropped
+             CREATE TABLE Relationship (
+                 file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                 PRIMARY KEY (file_id, tag_id)) WITHOUT ROWID;
+             INSERT INTO Relationship (file_id, tag_id) VALUES
+                 (1, 1), (1, 2), (2, 3),
+                 (2, 99),  -- tag id missing from Tags -> dropped
+                 (99, 1);  -- file id missing from File -> dropped
 
-                     CREATE TABLE Parents (
-                         id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
-                         relate_tag_id INTEGER NOT NULL, limit_to INTEGER);
-                     INSERT INTO Parents (tag_id, relate_tag_id, limit_to) VALUES (1, 2, NULL);",
-                )
-                .unwrap();
-        }
+             CREATE TABLE Parents (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
+                 relate_tag_id INTEGER NOT NULL, limit_to INTEGER);
+             INSERT INTO Parents (tag_id, relate_tag_id, limit_to) VALUES (1, 2, NULL);",
+        )
+        .await;
 
         let counts = db.db_slurp(&source_path).await.unwrap();
         assert_eq!(counts, (2, 3, 2));
@@ -2039,42 +2050,39 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let source_path = temp_dir.path().join("source.db");
-        {
-            let source = r2d2_sqlite::rusqlite::Connection::open(&source_path).unwrap();
-            source
-                .execute_batch(
-                    "CREATE TABLE Namespace (
-                         id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
-                     INSERT INTO Namespace (name, description) VALUES
-                         ('species', 'test'), ('artist', 'test');
+        write_source(
+            &source_path,
+            "CREATE TABLE Namespace (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
+             INSERT INTO Namespace (name, description) VALUES
+                 ('species', 'test'), ('artist', 'test');
 
-                     CREATE TABLE Tags (
-                         id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
-                         count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
-                     INSERT INTO Tags (name, namespace) VALUES
-                         ('mammal', 1), ('canine', 1), ('painter', 2);
+             CREATE TABLE Tags (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
+                 count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
+             INSERT INTO Tags (name, namespace) VALUES
+                 ('mammal', 1), ('canine', 1), ('painter', 2);
 
-                     CREATE TABLE FileStorageLocations (
-                         id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
-                     INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
+             CREATE TABLE FileStorageLocations (
+                 id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
+             INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
 
-                     CREATE TABLE File (
-                         id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
-                         storage_id INTEGER, size_bytes INTEGER);
-                     INSERT INTO File (hash, extension, storage_id, size_bytes) VALUES
-                         ('slurp-hash', 'jpg', 1, 42), ('legacy-hash', 'png', 1, 43);
+             CREATE TABLE File (
+                 id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
+                 storage_id INTEGER, size_bytes INTEGER);
+             INSERT INTO File (hash, extension, storage_id, size_bytes) VALUES
+                 ('slurp-hash', 'jpg', 1, 42), ('legacy-hash', 'png', 1, 43);
 
-                     CREATE TABLE Relationship (
-                         file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
-                         PRIMARY KEY (file_id, tag_id)) WITHOUT ROWID;
-                     INSERT INTO Relationship (file_id, tag_id) VALUES (1, 1), (1, 2), (2, 3);
+             CREATE TABLE Relationship (
+                 file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                 PRIMARY KEY (file_id, tag_id)) WITHOUT ROWID;
+             INSERT INTO Relationship (file_id, tag_id) VALUES (1, 1), (1, 2), (2, 3);
 
-                     CREATE TABLE Parents (
-                         id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
-                         relate_tag_id INTEGER NOT NULL, limit_to INTEGER);",
-                )
-                .unwrap();
-        }
+             CREATE TABLE Parents (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
+                 relate_tag_id INTEGER NOT NULL, limit_to INTEGER);",
+        )
+        .await;
 
         // Fresh destination: the tags stage swaps Tags for the
         // constraint-free copy (fast path) and restores the named unique
@@ -2196,41 +2204,38 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let source_path = temp_dir.path().join("source.db");
-        {
-            let source = r2d2_sqlite::rusqlite::Connection::open(&source_path).unwrap();
-            source
-                .execute_batch(
-                    "CREATE TABLE Namespace (
-                         id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
-                     INSERT INTO Namespace (name, description) VALUES ('species', 'test');
+        write_source(
+            &source_path,
+            "CREATE TABLE Namespace (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
+             INSERT INTO Namespace (name, description) VALUES ('species', 'test');
 
-                     CREATE TABLE Tags (
-                         id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
-                         count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
-                     INSERT INTO Tags (name, namespace) VALUES ('mammal', 1), ('canine', 1);
+             CREATE TABLE Tags (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
+                 count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
+             INSERT INTO Tags (name, namespace) VALUES ('mammal', 1), ('canine', 1);
 
-                     CREATE TABLE FileStorageLocations (
-                         id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
-                     INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
+             CREATE TABLE FileStorageLocations (
+                 id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
+             INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
 
-                     CREATE TABLE File (
-                         id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
-                         storage_id INTEGER, size_bytes INTEGER);
-                     INSERT INTO File (hash, extension, storage_id, size_bytes)
-                         VALUES ('slurp-hash', 'jpg', 1, 42);
+             CREATE TABLE File (
+                 id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
+                 storage_id INTEGER, size_bytes INTEGER);
+             INSERT INTO File (hash, extension, storage_id, size_bytes)
+                 VALUES ('slurp-hash', 'jpg', 1, 42);
 
-                     CREATE TABLE Relationship_1 (
-                         file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
-                         PRIMARY KEY (tag_id, file_id));
-                     INSERT INTO Relationship_1 (file_id, tag_id) VALUES (1, 1), (1, 2);
+             CREATE TABLE Relationship_1 (
+                 file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                 PRIMARY KEY (tag_id, file_id));
+             INSERT INTO Relationship_1 (file_id, tag_id) VALUES (1, 1), (1, 2);
 
-                     CREATE TABLE Parents (
-                         id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
-                         relate_tag_id INTEGER NOT NULL, limit_to INTEGER);
-                     INSERT INTO Parents (tag_id, relate_tag_id, limit_to) VALUES (1, 2, NULL);",
-                )
-                .unwrap();
-        }
+             CREATE TABLE Parents (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
+                 relate_tag_id INTEGER NOT NULL, limit_to INTEGER);
+             INSERT INTO Parents (tag_id, relate_tag_id, limit_to) VALUES (1, 2, NULL);",
+        )
+        .await;
 
         let counts = db.db_slurp(&source_path).await.unwrap();
         assert_eq!(counts, (1, 2, 1));
@@ -2254,7 +2259,10 @@ mod tests {
         );
 
         // Counts recomputed per namespace from the partition aggregate pass.
-        let mut rows = conn.query("SELECT name, count FROM Tags ORDER BY name;", ()).await.unwrap();
+        let mut rows = conn
+            .query("SELECT name, count FROM Tags ORDER BY name;", ())
+            .await
+            .unwrap();
         let mut tag_counts = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             tag_counts.push((row.get::<String>(0).unwrap(), row.get::<u64>(1).unwrap()));
@@ -2273,7 +2281,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(), 2);
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+            2
+        );
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM sqlite_schema
@@ -2282,11 +2293,20 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(), 1);
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+            1
+        );
 
         // The parent landed once.
-        let mut rows = conn.query("SELECT COUNT(*) FROM Parents;", ()).await.unwrap();
-        assert_eq!(rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(), 1);
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM Parents;", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+            1
+        );
 
         // Journal mode was restored to MVCC by the import.
         let mut mode = String::new();
@@ -2302,11 +2322,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn slurp_jobs_skips_incomplete_jobs_table() {
         let db = new_target().await;
-        let (source, _keep) = new_source(
+        let (_source_db, source, _keep) = new_source(
             "CREATE TABLE Jobs (
                  id INTEGER PRIMARY KEY, time INTEGER NOT NULL,
                  site TEXT NOT NULL, param TEXT NOT NULL);",
-        );
+        )
+        .await;
 
         let conn = db.connect().unwrap();
         db.slurp_jobs(&conn, &source).await.unwrap();
@@ -2331,7 +2352,12 @@ mod tests {
         let source_path = temp_dir.path().join("source.db");
         let db = new_target().await;
         {
-            let mut source = r2d2_sqlite::rusqlite::Connection::open(&source_path).unwrap();
+            let source_db = turso::Builder::new_local(&source_path.to_string_lossy())
+                .experimental_without_rowid(true)
+                .build()
+                .await
+                .unwrap();
+            let mut source = source_db.connect().unwrap();
             source
                 .execute_batch(
                     "PRAGMA synchronous = OFF;
@@ -2354,12 +2380,13 @@ mod tests {
                          id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
                          relate_tag_id INTEGER NOT NULL, limit_to INTEGER);",
                 )
+                .await
                 .unwrap();
             let tags = 20_000_u32;
             let files = 6_000_u32;
             let rels = 20_000_u32;
             {
-                let tx = source.transaction().unwrap();
+                let tx = source.transaction().await.unwrap();
                 for chunk in (1..=tags).collect::<Vec<_>>().chunks(10_000) {
                     let values = chunk
                         .iter()
@@ -2371,6 +2398,7 @@ mod tests {
                             &format!("INSERT INTO Tags (id, name, namespace) VALUES {values};"),
                             (),
                         )
+                        .await
                         .unwrap();
                 }
                 for chunk in (1..=files).collect::<Vec<_>>().chunks(10_000) {
@@ -2387,6 +2415,7 @@ mod tests {
                             ),
                             (),
                         )
+                        .await
                         .unwrap();
                 }
                 for chunk in (1..=rels).collect::<Vec<_>>().chunks(10_000) {
@@ -2400,10 +2429,17 @@ mod tests {
                             &format!("INSERT INTO Relationship (file_id, tag_id) VALUES {values};"),
                             (),
                         )
+                        .await
                         .unwrap();
                 }
-                tx.commit().unwrap();
+                tx.commit().await.unwrap();
             }
+            source
+                .pragma_update("journal_mode", "'delete'")
+                .await
+                .unwrap();
+            drop(source);
+            drop(source_db);
         }
 
         eprintln!("source built: 20k tags, 6k files, 20k rels");
