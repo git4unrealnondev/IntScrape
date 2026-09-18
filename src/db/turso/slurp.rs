@@ -3,8 +3,8 @@
 //! every row is streamed into the destination database via the bulk-add helpers.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::time::{Instant, SystemTime};
 
 use shared_types::{
     DbJobRecreation, FileInternal, GenericNamespaceObj, PluginJob, ScraperParam, Tag, TagParents,
@@ -36,6 +36,47 @@ fn keyset_bound(first_pass: bool, last: u64) -> i64 {
     }
 }
 
+/// A temporary sanitized copy of a slurp source. Removed on drop, including
+/// when the slurp retries or bails out part-way.
+struct SlurpSourceTemp {
+    path: PathBuf,
+}
+
+impl Drop for SlurpSourceTemp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Runs the sqlite3 CLI with the given arguments (extra arguments are joined
+/// with spaces and executed as SQL, exactly like the interactive tool).
+fn sqlite3_cli(args: &[&str]) -> std::result::Result<(), String> {
+    match std::process::Command::new("sqlite3").args(args).output() {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(format!(
+            "sqlite3 exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )),
+        Err(error) => Err(format!("cannot spawn sqlite3: {error}")),
+    }
+}
+
+/// Runs the sqlite3 CLI and returns its stdout on success.
+fn sqlite3_cli_output(args: &[&str]) -> std::result::Result<String, String> {
+    match std::process::Command::new("sqlite3").args(args).output() {
+        Ok(output) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        Ok(output) => Err(format!(
+            "sqlite3 exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )),
+        Err(error) => Err(format!("cannot spawn sqlite3: {error}")),
+    }
+}
+
 impl TursoDatabase {
     /// Copies the supported data from another SQLite database into turso.
     pub async fn db_slurp(&self, source: &Path) -> Result<(u64, u64, u64)> {
@@ -45,11 +86,7 @@ impl TursoDatabase {
             ));
         }
 
-        let sauce = turso::Builder::new_local(&source.to_string_lossy())
-            .read_only(true)
-            .experimental_without_rowid(true)
-            .build()
-            .await?;
+        let (sauce, _slurp_source_temp) = self.open_slurp_source(source).await?;
         let source_conn = sauce.connect()?;
 
         // Background pollers (system-job spawner) must stop reading the
@@ -111,6 +148,127 @@ impl TursoDatabase {
         self.ipc_resume().await;
         self.set_slurping(false);
         result
+    }
+
+    /// Opens a turso database handle for the slurp source. When the source's
+    /// schema contains virtual-table rows the limbo parser cannot load — for
+    /// example an FTS5 table whose stored SQL quotes the tokenizer arguments
+    /// with double quotes — the direct open fails with a parse error. In that
+    /// case the source is backed up with the sqlite3 CLI, the virtual tables
+    /// and triggers are dropped from the copy, and the sanitized copy is
+    /// opened instead. The returned guard removes the copy when the slurp
+    /// finishes.
+    async fn open_slurp_source(
+        &self,
+        source: &Path,
+    ) -> Result<(turso::Database, Option<SlurpSourceTemp>)> {
+        match turso::Builder::new_local(&source.to_string_lossy())
+            .read_only(true)
+            .experimental_without_rowid(true)
+            .build()
+            .await
+        {
+            Ok(db) => Ok((db, None)),
+            Err(open_error) => {
+                log::warn!(
+                    "Turso cannot open slurp source {}; retrying through a sanitized copy: {open_error}",
+                    source.display()
+                );
+                let temp = match Self::sanitize_slurp_source_copy(source).await {
+                    Ok(temp) => temp,
+                    Err(sanitize_error) => {
+                        log::warn!("Slurp source sanitization failed: {sanitize_error}");
+                        return Err(open_error);
+                    }
+                };
+                match turso::Builder::new_local(&temp.path.to_string_lossy())
+                    .read_only(true)
+                    .experimental_without_rowid(true)
+                    .build()
+                    .await
+                {
+                    Ok(db) => Ok((db, Some(temp))),
+                    Err(error) => {
+                        log::warn!("Sanitized slurp source copy still cannot be opened: {error}");
+                        Err(open_error)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Copies `source` to a temp file and drops every virtual table and
+    /// trigger from the copy. The slurp only reads plain tables, so removing
+    /// FTS virtual tables (and every trigger, which may reference them) from
+    /// a disposable copy is safe. The copy is made with the `.backup` dot
+    /// command so a WAL-mode source is checkpointed into one consistent
+    /// standalone file. Returns a guard that removes the copy on drop.
+    ///
+    /// The sqlite3 CLI ships with the project's production image (see the
+    /// Dockerfile) and most Linux distributions.
+    async fn sanitize_slurp_source_copy(source: &Path) -> Result<SlurpSourceTemp> {
+        let unique = format!(
+            "intscrape_slurp_{}_{:x}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        );
+        let copy = std::env::temp_dir().join(unique);
+        let source_str = source.to_string_lossy().into_owned();
+        let copy_str = copy.to_string_lossy().into_owned();
+
+        if let Err(error) = sqlite3_cli(&[&source_str, &format!(".backup {copy_str}")]) {
+            let _ = std::fs::remove_file(&copy);
+            return Err(turso::Error::ConversionFailure(format!(
+                "sqlite3 .backup of {} failed: {error}",
+                source.display()
+            )));
+        }
+
+        // Default `list` mode separates columns with `|`, one row per line.
+        let query = "SELECT type, name FROM sqlite_master \
+                     WHERE (type = 'table' AND rootpage = 0) OR type = 'trigger'";
+        let output = match sqlite3_cli_output(&[&copy_str, query]) {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = std::fs::remove_file(&copy);
+                return Err(turso::Error::ConversionFailure(format!(
+                    "sqlite3 schema scan of {} failed: {error}",
+                    copy.display()
+                )));
+            }
+        };
+
+        let mut drops = String::new();
+        for line in output.lines() {
+            let mut parts = line.splitn(3, '|');
+            let (Some(kind), Some(name), None) = (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let quoted = format!("\"{}\"", name.replace('"', "\"\""));
+            let statement = match kind {
+                "table" => format!("DROP TABLE IF EXISTS {quoted};"),
+                "trigger" => format!("DROP TRIGGER IF EXISTS {quoted};"),
+                _ => continue,
+            };
+            drops.push_str(&statement);
+            drops.push('\n');
+        }
+
+        if !drops.is_empty() {
+            if let Err(error) = sqlite3_cli(&[&copy_str, &drops]) {
+                let _ = std::fs::remove_file(&copy);
+                return Err(turso::Error::ConversionFailure(format!(
+                    "sqlite3 schema sanitization of {} failed: {error}",
+                    copy.display()
+                )));
+            }
+        }
+
+        Ok(SlurpSourceTemp { path: copy })
     }
 
     /// Sets the destination's journal mode and confirms the resulting mode.
@@ -2475,5 +2633,173 @@ mod tests {
         );
 
         println!("first import (20k tags / 6k files / 20k rels): {first:?}, re-import: {second:?}");
+    }
+
+    /// Write a standalone slurp source with `count` tags named `{prefix}_{i}`
+    /// at source ids 1..=count plus the tables a slurp needs.
+    async fn write_tag_source(source_path: &std::path::Path, prefix: &str, count: u32) {
+        let values = (1..=count)
+            .map(|i| format!("({i}, '{prefix}_{i}', 1)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let script = format!(
+            "CREATE TABLE Namespace (id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT);
+             INSERT INTO Namespace (id, name) VALUES (1, 'ns');
+             CREATE TABLE Tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
+                                count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
+             CREATE TABLE FileStorageLocations (id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
+             INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
+             CREATE TABLE File (id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
+                                storage_id INTEGER, size_bytes INTEGER);
+             CREATE TABLE Relationship (file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                                        PRIMARY KEY (file_id, tag_id)) WITHOUT ROWID;
+             CREATE TABLE Parents (id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
+                                   relate_tag_id INTEGER NOT NULL, limit_to INTEGER);
+             INSERT INTO Tags (id, name, namespace) VALUES {values};"
+        );
+        write_source(source_path, &script).await;
+    }
+
+    /// A warm import that adds genuinely new tags must not collide with the
+    /// destination's existing ids: the staging table hands new rows ids past
+    /// the canonical table's max, so the swap-back row copy
+    /// (`INSERT INTO Tags_slurp ... SELECT ... FROM Tags`) cannot hit
+    /// `UNIQUE constraint failed: tags_slurp.id`. Regression test for the
+    /// production error at src/db/turso/system_jobs.rs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slurp_warm_import_new_tags_do_not_collide_with_existing_ids() {
+        let db = new_target().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Cold import fills the destination with a_* tags at ids 1..=3000.
+        let source_a = temp_dir.path().join("source_a.db");
+        write_tag_source(&source_a, "a", 3_000).await;
+        assert_eq!(
+            db.db_slurp(&source_a).await.unwrap(),
+            (1, 3_000, 0),
+            "cold import"
+        );
+
+        // Warm import of overlapping source ids 1..=200 with different names;
+        // these are all genuinely new so the swap-back path runs.
+        let source_b = temp_dir.path().join("source_b.db");
+        write_tag_source(&source_b, "b", 200).await;
+        assert_eq!(
+            db.db_slurp(&source_b).await.unwrap(),
+            (1, 200, 0),
+            "warm import must succeed without a tags_slurp.id collision"
+        );
+
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query("SELECT COUNT(*) FROM Tags;", ()).await.unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+            3_200,
+            "all old and new tags survive"
+        );
+        // Every tag id must exist exactly once: the new rows got fresh ids
+        // past the old max and the old rows were copied back unchanged.
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM (
+                     SELECT id, COUNT(*) AS seen FROM Tags GROUP BY id HAVING seen <> 1
+                 );",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+            0,
+            "no duplicate or missing tag ids"
+        );
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM Tags WHERE name LIKE 'a_%';", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+            3_000
+        );
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM Tags WHERE name LIKE 'b_%';", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+            200
+        );
+    }
+
+    /// A source whose schema contains a virtual table the limbo parser cannot
+    /// load (an FTS5 table whose stored SQL quotes the tokenizer arg with
+    /// double quotes, as some hydrus databases ship) must still slurp: the
+    /// source is backed up with the sqlite3 CLI, the virtual tables and
+    /// triggers are dropped from the copy, and the copy is imported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slurp_source_with_double_quoted_fts_falls_back_to_sanitized_copy() {
+        let db = new_target().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source_path = temp_dir.path().join("source.db");
+        let script = "CREATE TABLE Namespace (id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT);
+             INSERT INTO Namespace (id, name) VALUES (1, 'ns');
+             CREATE TABLE Tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
+                                count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
+             INSERT INTO Tags (id, name, namespace) VALUES (1, 'cat', 1), (2, 'dog', 1);
+             CREATE TABLE FileStorageLocations (id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
+             INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
+             CREATE TABLE File (id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
+                                storage_id INTEGER, size_bytes INTEGER);
+             CREATE TABLE Relationship (file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                                        PRIMARY KEY (file_id, tag_id)) WITHOUT ROWID;
+             CREATE TABLE Parents (id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
+                                   relate_tag_id INTEGER NOT NULL, limit_to INTEGER);
+             CREATE VIRTUAL TABLE Tags_Popular_fts USING fts5(
+                 name,
+                 tokenize = \"unicode61 separators '_/'\"
+             );";
+        let status = std::process::Command::new("sqlite3")
+            .arg(&source_path)
+            .arg(script)
+            .status()
+            .unwrap();
+        assert!(status.success(), "sqlite3 must be installed to run this test");
+
+        // Precondition: turso cannot load that stored SQL directly.
+        assert!(
+            turso::Builder::new_local(&source_path.to_string_lossy())
+                .read_only(true)
+                .experimental_without_rowid(true)
+                .build()
+                .await
+                .is_err(),
+            "direct open must fail on the double-quoted FTS SQL"
+        );
+
+        // The full import routes through the sanitized copy.
+        assert_eq!(
+            db.db_slurp(&source_path).await.unwrap(),
+            (1, 2, 0),
+            "slurp must succeed through the sanitized copy"
+        );
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query("SELECT COUNT(*) FROM Tags;", ()).await.unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+            2
+        );
+
+        // No temp copies may be left behind.
+        let leftover = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("intscrape_slurp_")
+            })
+            .count();
+        assert_eq!(leftover, 0, "sanitized copies must be cleaned up");
     }
 }
