@@ -75,7 +75,14 @@ fn setup_log() -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+// The whole daemon (all plugin jobs, the turso write layer, and every
+// reqwest/TLS connection future) shares this runtime. 4 workers was too few:
+// when the DB layer saturated them, in-flight TLS handshakes stopped being
+// polled for tens of seconds and the servers killed the stalled connections
+// ("tls handshake eof"). Give the runtime headroom so network futures are
+// always serviced promptly. The host has 72 cores; per-container CPU quota is
+// uncapped, so 16 workers is well within the box.
+#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // ctrl C handler
     let should_exit = Arc::new(AtomicBool::new(false));

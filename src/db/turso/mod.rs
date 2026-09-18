@@ -65,10 +65,26 @@ impl TursoDatabase {
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
     {
+        // Cap the retry storm. The MVCC conflict is expected to clear within a
+        // few attempts; if it does not, the conflicting writer is holding the
+        // transaction open and infinite retrying only burns CPU on the shared
+        // tokio runtime, starving the network layer (observed as stalled TLS
+        // handshakes against the scraper endpoints). Give up and surface the
+        // error after a bounded number of attempts so callers can log and move
+        // on instead of saturating every worker thread forever.
+        const MAX_MVCC_RETRIES: u32 = 8;
+        let mut attempts = 0u32;
         loop {
             match operation().await {
                 Ok(value) => return Ok(value),
                 Err(error) if Self::is_concurrency_conflict(&error) => {
+                    attempts += 1;
+                    if attempts >= MAX_MVCC_RETRIES {
+                        log::warn!(
+                            "MVCC transaction still conflicted after {MAX_MVCC_RETRIES} retries; giving up: {error}"
+                        );
+                        return Err(error);
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
                 Err(error) => return Err(error),

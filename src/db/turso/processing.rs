@@ -136,6 +136,21 @@ impl TursoDatabase {
         map: HashMap<FileManager, Vec<FileTagAction>>,
         audit_reason: &str,
     ) -> bool {
+        // Bounded retry cap for the whole chunk. Each conflict path below
+        // used to re-run the entire chunk transaction with no limit; under
+        // write-write contention from many concurrent jobs that burned wide
+        // open on the shared tokio runtime and starved the network layer.
+        const MAX_SCRAPER_CHUNK_ATTEMPTS: u32 = 8;
+        self.process_scraper_chunk_attempt(map, audit_reason, MAX_SCRAPER_CHUNK_ATTEMPTS)
+            .await
+    }
+
+    async fn process_scraper_chunk_attempt(
+        &self,
+        map: HashMap<FileManager, Vec<FileTagAction>>,
+        audit_reason: &str,
+        attempts_left: u32,
+    ) -> bool {
         if map.is_empty() {
             return true;
         }
@@ -171,7 +186,17 @@ impl TursoDatabase {
                 log::warn!("Scraper file transaction conflicted; retrying in 50ms: {error}");
                 let _ = conn.execute("ROLLBACK", ()).await;
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                return Box::pin(self.process_scraper_chunk(map, audit_reason)).await;
+                return if attempts_left <= 1 {
+                    log::error!("Scraper file transaction kept conflicting; giving up on chunk");
+                    false
+                } else {
+                    Box::pin(self.process_scraper_chunk_attempt(
+                        map,
+                        audit_reason,
+                        attempts_left - 1,
+                    ))
+                    .await
+                };
             }
             Err(error) => {
                 log::error!("Failed to insert scraper files: {error}");
@@ -233,7 +258,17 @@ impl TursoDatabase {
                 log::warn!("Scraper tag transaction conflicted; retrying in 50ms: {error}");
                 let _ = conn.execute("ROLLBACK", ()).await;
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                return Box::pin(self.process_scraper_chunk(map, audit_reason)).await;
+                return if attempts_left <= 1 {
+                    log::error!("Scraper tag transaction kept conflicting; giving up on chunk");
+                    false
+                } else {
+                    Box::pin(self.process_scraper_chunk_attempt(
+                        map,
+                        audit_reason,
+                        attempts_left - 1,
+                    ))
+                    .await
+                };
             }
             Err(error) => {
                 log::error!("Failed to add scraper tags: {error}");
@@ -357,7 +392,17 @@ impl TursoDatabase {
             if Self::is_concurrency_conflict(&error) {
                 log::warn!("Scraper relationship delete conflicted; retrying in 50ms: {error}");
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                return Box::pin(self.process_scraper_chunk(map, audit_reason)).await;
+                return if attempts_left <= 1 {
+                    log::error!("Scraper relationship delete kept conflicting; giving up on chunk");
+                    false
+                } else {
+                    Box::pin(self.process_scraper_chunk_attempt(
+                        map,
+                        audit_reason,
+                        attempts_left - 1,
+                    ))
+                    .await
+                };
             }
             log::error!("Failed to delete relationships in scraper chunk: {error}");
             return false;
@@ -370,7 +415,17 @@ impl TursoDatabase {
             if Self::is_concurrency_conflict(&error) {
                 log::warn!("Scraper relationship add conflicted; retrying in 50ms: {error}");
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                return Box::pin(self.process_scraper_chunk(map, audit_reason)).await;
+                return if attempts_left <= 1 {
+                    log::error!("Scraper relationship add kept conflicting; giving up on chunk");
+                    false
+                } else {
+                    Box::pin(self.process_scraper_chunk_attempt(
+                        map,
+                        audit_reason,
+                        attempts_left - 1,
+                    ))
+                    .await
+                };
             }
             log::error!("Failed to add relationships in scraper chunk: {error}");
             return false;
@@ -384,7 +439,17 @@ impl TursoDatabase {
                 log::warn!("Concurrent scraper commit conflicted; retrying in 50ms: {error}");
                 let _ = conn.execute("ROLLBACK", ()).await;
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                Box::pin(self.process_scraper_chunk(map, audit_reason)).await
+                if attempts_left <= 1 {
+                    log::error!("Scraper chunk commit kept conflicting; giving up on chunk");
+                    false
+                } else {
+                    Box::pin(self.process_scraper_chunk_attempt(
+                        map,
+                        audit_reason,
+                        attempts_left - 1,
+                    ))
+                    .await
+                }
             }
             Err(error) => {
                 log::error!("Failed to commit concurrent scraper transaction: {error}");
