@@ -114,7 +114,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         should_exit.clone(),
     );
 
-    let ipc_server = IpcServer::new(db.clone(), should_exit.clone(), plugin_manager.clone());
+    // The `ipc_channel_count` database setting controls how many independent
+    // IPC sockets (channels) are started; see `client::IPC_CHANNELS_SETTING`.
+    let ipc_channels = db
+        .setting_get_sync(client::IPC_CHANNELS_SETTING)
+        .await
+        .and_then(|setting| setting.num)
+        .map(|count| count as usize)
+        .unwrap_or(client::IPC_CHANNEL_DEFAULT);
+    log::info!("Starting {ipc_channels} IPC channels");
+
+    let ipc_server = IpcServer::new(
+        db.clone(),
+        should_exit.clone(),
+        plugin_manager.clone(),
+        ipc_channels,
+    );
 
     // handler for ctrl c
     {

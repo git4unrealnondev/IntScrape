@@ -431,4 +431,148 @@ mod tests {
                 .is_some()
         );
     }
+
+    /// Keeps the temp dir alive for the whole test so the DB file persists.
+    async fn new_test_db_owned() -> (Arc<TursoDatabase>, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let should_exit = Arc::new(AtomicBool::new(false));
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit).await;
+        (db, temp_dir)
+    }
+
+    fn test_file(hash: &str, size: Option<u64>) -> FileInternal {
+        FileInternal {
+            id: None,
+            hash: hash.to_string(),
+            extension: "jpg".to_string(),
+            storage_id: 1,
+            size_bytes: size,
+        }
+    }
+
+    fn sorted_ids(files: &HashSet<FileInternal>) -> Vec<u64> {
+        let mut ids: Vec<u64> = files.iter().flat_map(|file| file.id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_add_bulk_inserts_new_files_and_resolves_existing() {
+        let (db, _temp_dir) = new_test_db_owned().await;
+        let conn = db.connect().unwrap();
+
+        let resolved = db
+            .file_add_bulk(
+                &conn,
+                &[test_file("aaa", Some(100)), test_file("bbb", None)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.len(), 2, "both files must resolve an id");
+        let first_ids = sorted_ids(&resolved);
+        assert_eq!(first_ids.len(), 2);
+        assert_ne!(first_ids[0], first_ids[1], "new files get distinct ids");
+
+        // Re-adding the same hashes resolves the same ids without inserting
+        // any rows (no upsert, no duplicate entries).
+        let re_resolved = db
+            .file_add_bulk(
+                &conn,
+                &[test_file("aaa", Some(999)), test_file("bbb", Some(999))],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sorted_ids(&re_resolved),
+            first_ids,
+            "existing hashes must resolve to the same ids"
+        );
+
+        let count: i64 = conn
+            .query("SELECT COUNT(*) FROM File;", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(count, 2, "re-adding existing hashes must not write rows");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_add_bulk_does_not_refresh_existing_metadata() {
+        let (db, _temp_dir) = new_test_db_owned().await;
+        let conn = db.connect().unwrap();
+
+        let original = db
+            .file_add_bulk(&conn, &[test_file("aaa", Some(100))])
+            .await
+            .unwrap();
+        let original = original.iter().next().unwrap();
+        let id = original.id.unwrap();
+
+        // A re-scrape with different metadata must leave the stored row
+        // untouched: INSERT OR IGNORE skips the conflicting hash with no write
+        // (the previous ON CONFLICT ... DO UPDATE rewrote these columns).
+        let re_scraped = db
+            .file_add_bulk(&conn, &[test_file("aaa", Some(999))])
+            .await
+            .unwrap();
+        let re_scraped = re_scraped.iter().next().unwrap();
+        assert_eq!(re_scraped.id.unwrap(), id, "same hash -> same id");
+
+        let stored = db.file_get(&conn, &id).await.unwrap();
+        assert_eq!(
+            stored.size_bytes,
+            Some(100),
+            "existing rows must not be rewritten on re-scrape"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_add_bulk_dedupes_duplicate_hashes_in_one_chunk() {
+        let (db, _temp_dir) = new_test_db_owned().await;
+        let conn = db.connect().unwrap();
+
+        // Two entries with the same hash in one chunk produce one id, one
+        // stored row — matching the single-entry-per-hash RETURNING shape the
+        // old upsert handed back.
+        let resolved = db
+            .file_add_bulk(
+                &conn,
+                &[test_file("aaa", Some(100)), test_file("aaa", Some(200))],
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.len(), 1, "one output entry per hash");
+
+        let count: i64 = conn
+            .query("SELECT COUNT(*) FROM File;", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(count, 1, "duplicate hashes must insert one row");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_add_bulk_honors_pinned_id() {
+        let (db, _temp_dir) = new_test_db_owned().await;
+        let conn = db.connect().unwrap();
+
+        let mut pinned = test_file("aaa", None);
+        pinned.id = Some(777);
+
+        let resolved = db.file_add_bulk(&conn, &[pinned]).await.unwrap();
+        assert_eq!(resolved.iter().next().unwrap().id, Some(777));
+        let stored = db.file_get(&conn, &777).await.unwrap();
+        assert_eq!(stored.hash, "aaa");
+    }
 }

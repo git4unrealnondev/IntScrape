@@ -506,7 +506,14 @@ impl TursoDatabase {
         Ok(out)
     }
 
-    /// Adds a list of files into the db and sets their id if not already set
+    /// Adds a list of files into the db and sets their id if not already set.
+    ///
+    /// Existing files are resolved read-only through the UNIQUE(hash) index;
+    /// only genuinely new files are inserted (`INSERT OR IGNORE`), so a
+    /// re-scraped file costs a unique-index seek and no write is issued. This
+    /// replaces the previous `ON CONFLICT ... DO UPDATE` upsert, which rewrote
+    /// every already-present row on every re-scrape (extension, storage, size)
+    /// — at millions of files that rewrite dominated ingest.
     pub(in crate::db::turso) async fn file_add_bulk(
         &self,
         conn: &Connection,
@@ -518,14 +525,51 @@ impl TursoDatabase {
             return Ok(out);
         }
 
-        for file_list in file_list.chunks(SQL_CHUNK_SIZE) {
-            let mut holders = Vec::with_capacity(file_list.len());
-            let mut params = Vec::with_capacity(file_list.len() * 5);
-            let mut file_map = HashMap::with_capacity(file_list.len());
+        let mut resolve_existing = conn.prepare("SELECT id FROM File WHERE hash = ?1").await?;
 
-            for file in file_list.iter() {
-                holders.push("(?, ?, ?, ?, ?)");
+        for chunk in file_list.chunks(SQL_CHUNK_SIZE) {
+            // Map hash -> file (last entry wins for duplicate hashes), so the
+            // resolved output shape matches the previous single-entry-per-hash
+            // RETURNING handling.
+            let mut file_map: HashMap<&str, &FileInternal> = HashMap::with_capacity(chunk.len());
+            for file in chunk {
                 file_map.insert(file.hash.as_str(), file);
+            }
+
+            // Split the chunk into already-known hashes (resolved id) and
+            // genuinely new ones. Only the novel hashes are written.
+            let mut existing: HashMap<&str, i64> = HashMap::with_capacity(chunk.len());
+            let mut novel: HashMap<&str, &FileInternal> = HashMap::new();
+            for file in chunk {
+                let params = vec![Value::from(file.hash.as_str())];
+                let mut rows = resolve_existing.query(params_from_iter(params)).await?;
+                match rows.next().await? {
+                    Some(row) => {
+                        let id: i64 = row.get(0)?;
+                        existing.insert(file.hash.as_str(), id);
+                    }
+                    None => {
+                        novel.insert(file.hash.as_str(), file);
+                    }
+                }
+            }
+
+            if novel.is_empty() {
+                for (hash, id) in existing {
+                    if let Some(file) = file_map.get(hash) {
+                        let mut file = (*file).clone().clone();
+                        file.id = Some(id as u64);
+                        out.insert(file);
+                    }
+                }
+                continue;
+            }
+
+            let mut holders = Vec::with_capacity(novel.len());
+            let mut params = Vec::with_capacity(novel.len() * 5);
+
+            for file in novel.values() {
+                holders.push("(?, ?, ?, ?, ?)");
                 params.push(Value::from(file.id.map(|f| f as i64)));
                 params.push(Value::from(file.hash.as_str()));
                 params.push(Value::from(file.extension.as_str()));
@@ -533,21 +577,47 @@ impl TursoDatabase {
                 params.push(Value::from(file.size_bytes.map(|f| f as i64)));
             }
             let sql_str = format!(
-                "INSERT INTO File (id, hash, extension, storage_id, size_bytes) VALUES {} \
-             ON CONFLICT(hash) DO UPDATE SET \
-                 extension = excluded.extension, \
-                 storage_id = excluded.storage_id, \
-                 size_bytes = COALESCE(excluded.size_bytes, File.size_bytes) \
-             RETURNING id, hash;",
+                "INSERT OR IGNORE INTO File (id, hash, extension, storage_id, size_bytes) \
+                 VALUES {} RETURNING id, hash;",
                 holders.join(", ")
             );
 
             let mut rows = conn.query(sql_str, params_from_iter(params)).await?;
+            let mut inserted_new: HashSet<String> = HashSet::with_capacity(novel.len());
             while let Some(row) = rows.next().await? {
                 let id: i64 = row.get(0)?;
                 let hash: String = row.get(1)?;
 
                 if let Some(file) = file_map.get(hash.as_str()) {
+                    let mut file = (*file).clone().clone();
+                    file.id = Some(id as u64);
+                    out.insert(file);
+                    inserted_new.insert(hash.clone());
+                }
+            }
+
+            // A novel file can still lose the insert race with another
+            // connection; OR IGNORE then skips it and RETURNING omits it.
+            // Resolve any such straggler so no file is ever dropped from the
+            // caller's id mapping.
+            if inserted_new.len() < novel.len() {
+                for (hash, file) in &novel {
+                    if inserted_new.contains(*hash) {
+                        continue;
+                    }
+                    let params = vec![Value::from(*hash)];
+                    let mut rows = resolve_existing.query(params_from_iter(params)).await?;
+                    if let Some(row) = rows.next().await? {
+                        let id: i64 = row.get(0)?;
+                        let mut file = (*file).clone().clone();
+                        file.id = Some(id as u64);
+                        out.insert(file);
+                    }
+                }
+            }
+
+            for (hash, id) in existing {
+                if let Some(file) = file_map.get(hash) {
                     let mut file = (*file).clone().clone();
                     file.id = Some(id as u64);
                     out.insert(file);
