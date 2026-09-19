@@ -1726,29 +1726,13 @@ impl DownloadsManager {
     ///
     pub async fn all_jobs_complete(&self) -> bool {
         let jobs = self.jobs.read().await;
-        let empty = jobs.is_empty();
-        log::info!(
-            "DBG-SHUTDOWN: all_jobs_complete jobmap_len={} keys={:?} => {empty}",
-            jobs.len(),
-            jobs.keys()
-                .map(|p| format!(
-                    "{p}[jobs={}]",
-                    jobs.get(p).map_or(0, |s| s.job_storage.len())
-                ))
-                .collect::<Vec<_>>()
-        );
-        empty
+        jobs.is_empty()
     }
 
     pub async fn downloads_complete(&self) -> bool {
         let durl = self.downloading_urls.read().await;
         let afp = self.active_file_processing.load(Ordering::SeqCst);
-        let done = durl.is_empty() && afp == 0;
-        log::info!(
-            "DBG-SHUTDOWN: downloads_complete durl={} afp={afp} => {done}",
-            durl.len()
-        );
-        done
+        durl.is_empty() && afp == 0
     }
 
     ///

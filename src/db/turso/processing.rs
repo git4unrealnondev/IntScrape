@@ -177,8 +177,7 @@ impl TursoDatabase {
             let mapped_map: HashMap<_, _> = corrected_files
                 .into_iter()
                 .filter_map(|file| {
-                    if let Some((tag_actions, identifying_hashes)) =
-                        better_mapping.get(&file.hash)
+                    if let Some((tag_actions, identifying_hashes)) = better_mapping.get(&file.hash)
                     {
                         for file_hash in identifying_hashes {
                             let (algo, algo_hash) = crate::db::hashessupportedtoinner(file_hash);
@@ -269,7 +268,9 @@ impl TursoDatabase {
             }
 
             match tn.commit().await {
-                Ok(_) => {return Ok(true);},
+                Ok(_) => {
+                    return Ok(true);
+                }
                 Err(err) => {
                     if Self::is_concurrency_conflict(&err) {
                         log::warn!("Scraper chunk commit conflicted; retrying in 50ms: {err}");
@@ -280,8 +281,6 @@ impl TursoDatabase {
                     }
                 }
             }
-
-
 
             if cnt >= 25 {
                 return Ok(false);

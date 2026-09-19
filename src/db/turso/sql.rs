@@ -390,13 +390,8 @@ impl TursoDatabase {
             let mut existing = HashMap::with_capacity(chunk.len());
             let mut novel: Vec<(&Tag, u64)> = Vec::with_capacity(chunk.len());
             for (tag, ns_id) in chunk {
-                let params = vec![
-                    Value::from(tag.name.as_str()),
-                    Value::from(*ns_id as i64),
-                ];
-                let mut rows = resolve_existing
-                    .query(params_from_iter(params))
-                    .await?;
+                let params = vec![Value::from(tag.name.as_str()), Value::from(*ns_id as i64)];
+                let mut rows = resolve_existing.query(params_from_iter(params)).await?;
                 match rows.next().await? {
                     Some(row) => {
                         let id: i64 = row.get(0)?;
@@ -425,11 +420,8 @@ impl TursoDatabase {
                     holders.join(", ")
                 );
 
-                let mut rows = conn
-                    .query(tag_sql_str, params_from_iter(params))
-                    .await?;
-                let mut inserted_new: HashSet<(String, i64)> =
-                    HashSet::with_capacity(novel.len());
+                let mut rows = conn.query(tag_sql_str, params_from_iter(params)).await?;
+                let mut inserted_new: HashSet<(String, i64)> = HashSet::with_capacity(novel.len());
                 while let Some(row) = rows.next().await? {
                     let id: i64 = row.get(0)?;
                     let name: String = row.get(1)?;
@@ -462,13 +454,9 @@ impl TursoDatabase {
                         if inserted_new.contains(&(tag.name.clone(), *ns_id as i64)) {
                             continue;
                         }
-                        let params = vec![
-                            Value::from(tag.name.as_str()),
-                            Value::from(*ns_id as i64),
-                        ];
-                        let mut rows = resolve_existing
-                            .query(params_from_iter(params))
-                            .await?;
+                        let params =
+                            vec![Value::from(tag.name.as_str()), Value::from(*ns_id as i64)];
+                        let mut rows = resolve_existing.query(params_from_iter(params)).await?;
                         if let Some(row) = rows.next().await? {
                             let id: i64 = row.get(0)?;
                             out.insert(TagDb {
