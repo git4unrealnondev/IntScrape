@@ -9,10 +9,10 @@ use std::time::{Instant, SystemTime};
 use shared_types::{
     DbJobRecreation, FileInternal, GenericNamespaceObj, PluginJob, ScraperParam, Tag, TagParents,
 };
-use turso::{params_from_iter, Connection, Result, Value};
+use turso::{Connection, Result, Value, params_from_iter};
 
-use crate::db::turso::TursoDatabase;
 use crate::db::SQL_CHUNK_SIZE;
+use crate::db::turso::TursoDatabase;
 
 /// Destination batch size for the tags stage. Imported tags arrive in source
 /// id order, which is random relative to the (name, namespace) unique key, so
@@ -29,11 +29,7 @@ const SLURP_RELATIONSHIP_BATCH: usize = 25_000;
 /// the id 0, main.db's 6.8M-row File table has one). Seed the first read at
 /// -1 so `> -1` also covers id 0, then advance with real ids.
 fn keyset_bound(first_pass: bool, last: u64) -> i64 {
-    if first_pass {
-        -1
-    } else {
-        last as i64
-    }
+    if first_pass { -1 } else { last as i64 }
 }
 
 /// A temporary sanitized copy of a slurp source. Removed on drop, including
@@ -244,8 +240,7 @@ impl TursoDatabase {
         let mut drops = String::new();
         for line in output.lines() {
             let mut parts = line.splitn(3, '|');
-            let (Some(kind), Some(name), None) = (parts.next(), parts.next(), parts.next())
-            else {
+            let (Some(kind), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
                 continue;
             };
             let quoted = format!("\"{}\"", name.replace('"', "\"\""));
@@ -509,7 +504,9 @@ impl TursoDatabase {
             // (empty) canonical table has max id 0, matching the old
             // auto-assignment behaviour.
             let mut next_insert_id: i64 = {
-                let mut stmt = conn.prepare("SELECT COALESCE(MAX(id), 0) FROM Tags").await?;
+                let mut stmt = conn
+                    .prepare("SELECT COALESCE(MAX(id), 0) FROM Tags")
+                    .await?;
                 stmt.query_row(()).await?.get(0)?
             };
             let mut last_tag_id = 0_u64;
@@ -1782,8 +1779,8 @@ async fn slurp_recount_namespace(conn: &Connection, namespace_id: u64) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     async fn new_target() -> Arc<TursoDatabase> {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -2763,7 +2760,10 @@ mod tests {
             .arg(script)
             .status()
             .unwrap();
-        assert!(status.success(), "sqlite3 must be installed to run this test");
+        assert!(
+            status.success(),
+            "sqlite3 must be installed to run this test"
+        );
 
         // Precondition: turso cannot load that stored SQL directly.
         assert!(

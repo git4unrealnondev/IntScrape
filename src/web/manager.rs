@@ -187,8 +187,8 @@ enum DownloadHasher {
     Sha1(sha1::Sha1),
     Sha256(Sha256),
     Sha512(Sha512),
-  //  IpfsCid(Vec<u8>),
-  //  IpfsCid1(Vec<u8>),
+    //  IpfsCid(Vec<u8>),
+    //  IpfsCid1(Vec<u8>),
     ImageHash(Vec<u8>),
 }
 
@@ -199,8 +199,8 @@ impl DownloadHasher {
             HashesSupported::Sha1(_) => Self::Sha1(sha1::Sha1::new()),
             HashesSupported::Sha256(_) => Self::Sha256(Sha256::new()),
             HashesSupported::Sha512(_) => Self::Sha512(Sha512::new()),
-        //    HashesSupported::IPFSCID(_) => Self::IpfsCid(Vec::new()),
-         //   HashesSupported::IPFSCID1(_) => Self::IpfsCid1(Vec::new()),
+            //    HashesSupported::IPFSCID(_) => Self::IpfsCid(Vec::new()),
+            //   HashesSupported::IPFSCID1(_) => Self::IpfsCid1(Vec::new()),
             HashesSupported::ImageHash(_) => Self::ImageHash(Vec::new()),
         }
     }
@@ -211,8 +211,8 @@ impl DownloadHasher {
             Self::Sha1(hasher) => hasher.update(bytes),
             Self::Sha256(hasher) => hasher.update(bytes),
             Self::Sha512(hasher) => hasher.update(bytes),
-           // Self::IpfsCid(store) => store.append(&mut bytes.to_vec()),
-           // Self::IpfsCid1(store) => store.append(&mut bytes.to_vec()),
+            // Self::IpfsCid(store) => store.append(&mut bytes.to_vec()),
+            // Self::IpfsCid1(store) => store.append(&mut bytes.to_vec()),
             Self::ImageHash(store) => store.append(&mut bytes.to_vec()),
         }
     }
@@ -223,8 +223,8 @@ impl DownloadHasher {
             Self::Sha1(hasher) => Some(encode_upper(hasher.finalize())),
             Self::Sha256(hasher) => Some(encode_upper(hasher.finalize())),
             Self::Sha512(hasher) => Some(encode_upper(hasher.finalize())),
-           // Self::IpfsCid(storage) => ipfs_cid::generate_cid_v0(&storage).ok(),
-           // Self::IpfsCid1(storage) => ipfs_cid::generate_cid_v1(&storage).ok(),
+            // Self::IpfsCid(storage) => ipfs_cid::generate_cid_v0(&storage).ok(),
+            // Self::IpfsCid1(storage) => ipfs_cid::generate_cid_v1(&storage).ok(),
             Self::ImageHash(storage) => {
                 let hasher = HasherConfig::new()
                     .hash_alg(image_hasher::HashAlg::Median)
@@ -1398,7 +1398,7 @@ impl Scraper {
 
                 // Adds hash for other types onto hash if they dont exist
                 for hash_type in HashesSupported::iter() {
-                  /*  if matches!(
+                    /*  if matches!(
                         hash_type,
                     //    HashesSupported::IPFSCID(_) | HashesSupported::IPFSCID1(_)
                     ) {
@@ -1433,7 +1433,7 @@ impl Scraper {
                             image_hash_from_path(&processing_file_path)
                         }
                         HashesSupported::ImageHash(_) => None,
-                      //  HashesSupported::IPFSCID(_) | HashesSupported::IPFSCID1(_) => None,
+                        //  HashesSupported::IPFSCID(_) | HashesSupported::IPFSCID1(_) => None,
                     }) else {
                         continue;
                     };
@@ -1443,8 +1443,8 @@ impl Scraper {
                         HashesSupported::Sha1(_) => HashesSupported::Sha1(hash_string),
                         HashesSupported::Sha256(_) => HashesSupported::Sha256(hash_string),
                         HashesSupported::Sha512(_) => HashesSupported::Sha512(hash_string),
-                       // HashesSupported::IPFSCID(_) => HashesSupported::IPFSCID(hash_string),
-                       // HashesSupported::IPFSCID1(_) => HashesSupported::IPFSCID1(hash_string),
+                        // HashesSupported::IPFSCID(_) => HashesSupported::IPFSCID(hash_string),
+                        // HashesSupported::IPFSCID1(_) => HashesSupported::IPFSCID1(hash_string),
                         HashesSupported::ImageHash(_) => HashesSupported::ImageHash(hash_string),
                     };
 
@@ -1671,9 +1671,36 @@ impl DownloadsManager {
         let mut remove_plugin = false;
 
         if let Some(internal_storage) = self.jobs.write().await.get_mut(&plugin.name) {
-            internal_storage.job_storage.retain(|f| f != job);
+            log::info!(
+                "DBG-REMOVEJOB-CONTENT: stored job_storage ids+isrunning: {:?}",
+                internal_storage
+                    .job_storage
+                    .iter()
+                    .map(|j| (j.id, j.isrunning))
+                    .collect::<Vec<_>>()
+            );
+            log::info!(
+                "DBG-REMOVEJOB-CONTENT: passed job id={} isrunning={}",
+                job.id,
+                job.isrunning
+            );
+            internal_storage.job_storage.retain(|f| f.id != job.id);
+            log::info!(
+                "DBG-REMOVEJOB-CONTENT: after retain ids+isrunning: {:?}",
+                internal_storage
+                    .job_storage
+                    .iter()
+                    .map(|j| (j.id, j.isrunning))
+                    .collect::<Vec<_>>()
+            );
             if should_remove_db {
+                log::info!("DBG-REMOVEJOB-REMOVE_DB: before job_remove");
+                let t1 = tokio::time::Instant::now();
                 self.db.job_remove(job).await;
+                log::info!(
+                    "DBG-REMOVEJOB-REMOVE_DB: after job_remove in {:?}",
+                    t1.elapsed()
+                );
             }
             if internal_storage.job_storage.is_empty() {
                 remove_plugin = true;
@@ -1681,7 +1708,13 @@ impl DownloadsManager {
         }
 
         if remove_plugin {
+            log::info!("DBG-REMOVEJOB-MAP: before jobs.write().remove");
+            let t2 = tokio::time::Instant::now();
             self.jobs.write().await.remove(&plugin.name);
+            log::info!(
+                "DBG-REMOVEJOB-MAP: after jobs.write().remove in {:?}",
+                t2.elapsed()
+            );
 
             // Rebuild counts and entries once the final queued job has finished.
             self.db.refresh_tag_search_cache();
@@ -1692,12 +1725,30 @@ impl DownloadsManager {
     /// Returns status of any Plugins or such
     ///
     pub async fn all_jobs_complete(&self) -> bool {
-        self.jobs.read().await.is_empty()
+        let jobs = self.jobs.read().await;
+        let empty = jobs.is_empty();
+        log::info!(
+            "DBG-SHUTDOWN: all_jobs_complete jobmap_len={} keys={:?} => {empty}",
+            jobs.len(),
+            jobs.keys()
+                .map(|p| format!(
+                    "{p}[jobs={}]",
+                    jobs.get(p).map_or(0, |s| s.job_storage.len())
+                ))
+                .collect::<Vec<_>>()
+        );
+        empty
     }
 
     pub async fn downloads_complete(&self) -> bool {
-        self.downloading_urls.read().await.is_empty()
-            && self.active_file_processing.load(Ordering::SeqCst) == 0
+        let durl = self.downloading_urls.read().await;
+        let afp = self.active_file_processing.load(Ordering::SeqCst);
+        let done = durl.is_empty() && afp == 0;
+        log::info!(
+            "DBG-SHUTDOWN: downloads_complete durl={} afp={afp} => {done}",
+            durl.len()
+        );
+        done
     }
 
     ///
@@ -2044,8 +2095,8 @@ pub fn expected_hash(hash: &HashesSupported) -> &str {
         | HashesSupported::Sha1(value)
         | HashesSupported::Sha256(value)
         | HashesSupported::Sha512(value) => value,
-       // HashesSupported::IPFSCID(value) => value,
-       // HashesSupported::IPFSCID1(value) => value,
+        // HashesSupported::IPFSCID(value) => value,
+        // HashesSupported::IPFSCID1(value) => value,
         HashesSupported::ImageHash(value) => value,
     }
 }

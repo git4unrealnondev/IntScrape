@@ -2,11 +2,12 @@
 //! relationships, and pending plugin jobs.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use shared_types::{
     FileInternal, FileManager, FileTagAction, GenericNamespaceObj, ScraperDataReturn, TagOperation,
 };
-use turso::{Value, params_from_iter};
+use turso::{Result, Value, params_from_iter};
 
 use crate::db::SourceUrlFileStatus;
 use crate::db::turso::TursoDatabase;
@@ -25,6 +26,7 @@ impl TursoDatabase {
         if map.is_empty() && jobs.is_empty() {
             return true;
         }
+        let _ = &audit_reason;
 
         let database = self.clone();
 
@@ -120,8 +122,12 @@ impl TursoDatabase {
             let chunk_map: HashMap<FileManager, Vec<FileTagAction>> =
                 chunk.iter().cloned().collect();
             if !database
-                .process_scraper_chunk(chunk_map, &audit_reason)
+                .process_scraper_chunk_human(chunk_map)
                 .await
+                .unwrap_or_else(|error| {
+                    log::error!("Failed to process scraper chunk: {error}");
+                    false
+                })
             {
                 return false;
             }
@@ -129,9 +135,163 @@ impl TursoDatabase {
         true
     }
 
+    async fn process_scraper_chunk_human(
+        &self,
+        map: HashMap<FileManager, Vec<FileTagAction>>,
+    ) -> Result<bool> {
+        let mut cnt = 0;
+        loop {
+            // Early Exit
+            if map.is_empty() {
+                return Ok(true);
+            }
+
+            // doing processing outside of transaction ideally
+            let mut file_hashes = Vec::new();
+            let better_mapping: HashMap<_, _> = map
+                .iter()
+                .map(|(filemanager, tag_actions)| {
+                    (
+                        filemanager.internal.hash.clone(),
+                        (tag_actions, filemanager.identifying_hashes.clone()),
+                    )
+                })
+                .collect();
+
+            let all_tags: Vec<FileTagAction> = map.values().flatten().cloned().collect();
+
+            let unique_files: HashSet<FileInternal> =
+                map.keys().map(|f| f.internal.clone()).collect();
+            let file_list: Vec<FileInternal> = unique_files.into_iter().collect();
+
+            // Cant connect to db?
+            let mut conn = self.connect()?;
+
+            let tn = conn
+                .transaction_with_behavior(turso::transaction::TransactionBehavior::Concurrent)
+                .await?;
+
+            let corrected_files = self.file_add_bulk(&tn, &file_list).await?;
+
+            // Gets a file with id with a list of filetagaction
+            let mapped_map: HashMap<_, _> = corrected_files
+                .into_iter()
+                .filter_map(|file| {
+                    if let Some((tag_actions, identifying_hashes)) =
+                        better_mapping.get(&file.hash)
+                    {
+                        for file_hash in identifying_hashes {
+                            let (algo, algo_hash) = crate::db::hashessupportedtoinner(file_hash);
+                            file_hashes.push((file.id.unwrap(), algo, algo_hash.as_str()));
+                        }
+                        Some((file, tag_actions))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Adds file hashes into the db
+            if !file_hashes.is_empty() {
+                self.file_hashes_add_bulk(&tn, &file_hashes).await?;
+            }
+
+            let tag_id_mapping = self.tag_action_bulk_add(&tn, &all_tags).await?;
+            let mut rels_to_add = HashSet::new();
+            let mut rels_to_del = HashSet::new();
+
+            for (file, tag_actions) in mapped_map {
+                let mut incoming_ns: HashMap<&str, HashSet<u64>> = HashMap::new();
+
+                for tag_action in *tag_actions {
+                    match tag_action.operation {
+                        TagOperation::Add => {
+                            for tag in tag_action.tags.iter() {
+                                if let Some(tag_id) = tag_id_mapping.get(&tag.tag) {
+                                    rels_to_add.insert((file.id.unwrap(), *tag_id as u64));
+                                }
+                            }
+                        }
+                        TagOperation::Set => {
+                            for tag in tag_action.tags.iter() {
+                                let ns_name = &tag.tag.namespace.name;
+                                if ns_name == "source_url" || ns_name.is_empty() {
+                                    continue;
+                                }
+
+                                if let Some(tag_id) = tag_id_mapping.get(&tag.tag) {
+                                    incoming_ns
+                                        .entry(ns_name.as_str())
+                                        .or_default()
+                                        .insert(*tag_id as u64);
+                                }
+                            }
+                        }
+                        TagOperation::Del => {
+                            for tag in tag_action.tags.iter() {
+                                if let Some(tag_id) = tag_id_mapping.get(&tag.tag) {
+                                    rels_to_del.insert((file.id.unwrap(), *tag_id as u64));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !incoming_ns.is_empty() {
+                    for (ns_name, tag_ids) in incoming_ns {
+                        if let Some(ns_id) = self.namespace_get_id(&tn, ns_name).await? {
+                            let current_tag_ids = self
+                                .file_id_get_tag_ids_filtered(&tn, file.id.unwrap(), ns_id)
+                                .await?;
+
+                            for tag_id_to_remove in tag_ids.difference(&current_tag_ids) {
+                                rels_to_add.insert((file.id.unwrap(), *tag_id_to_remove));
+                            }
+
+                            for tag_id_to_add in current_tag_ids.difference(&tag_ids) {
+                                rels_to_del.insert((file.id.unwrap(), *tag_id_to_add));
+                            }
+                        }
+                    }
+                }
+            }
+
+            for rel in rels_to_del.iter() {
+                rels_to_add.remove(rel);
+            }
+
+            if !rels_to_del.is_empty() {
+                self.relationship_bulk_delete(&tn, &rels_to_del).await?;
+            }
+
+            if !rels_to_add.is_empty() {
+                self.relationships_bulk_add(&tn, &rels_to_add).await?;
+            }
+
+            match tn.commit().await {
+                Ok(_) => {return Ok(true);},
+                Err(err) => {
+                    if Self::is_concurrency_conflict(&err) {
+                        log::warn!("Scraper chunk commit conflicted; retrying in 50ms: {err}");
+                        cnt += 1;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+
+
+
+            if cnt >= 25 {
+                return Ok(false);
+            }
+        }
+    }
+
     /// Persists one chunk of a scraper result inside its own connection.
     /// Returns `false` if any database operation in the chunk failed.
-    async fn process_scraper_chunk(
+    async fn process_scraper_chunk_old(
         &self,
         map: HashMap<FileManager, Vec<FileTagAction>>,
         audit_reason: &str,

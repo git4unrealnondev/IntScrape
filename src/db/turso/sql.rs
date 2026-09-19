@@ -40,7 +40,6 @@ impl TursoDatabase {
         Ok(())
     }
 
-
     /// Vacuums the db
     pub(in crate::db::turso) async fn vacuum(&self, conn: &Connection) -> Result<()> {
         conn.execute_batch("VACUUM;").await
@@ -375,27 +374,67 @@ impl TursoDatabase {
 
         let max_id = self.tag_get_max_id(conn).await?;
 
+        // Existing tags are resolved read-only through the UNIQUE(name,
+        // namespace) index; only genuinely new tags are inserted. This
+        // replaces the previous single upsert, whose `ON CONFLICT ... DO
+        // UPDATE` arm rewrote every already-present tag on every re-scrape —
+        // and with the tantivy FTS index attached, deleted/re-inserted each
+        // document and rewrote the covering index for the whole chunk. At
+        // millions of tags that rewrite dominated ingest; a re-scraped tag now
+        // costs a unique-index seek and nothing is written.
+        let mut resolve_existing = conn
+            .prepare("SELECT id FROM Tags WHERE name = ?1 AND namespace = ?2")
+            .await?;
+
         for chunk in pending_tags.chunks(SQL_CHUNK_SIZE) {
-            let mut params: Vec<Value> = Vec::with_capacity(chunk.len() * 2);
-            let mut holders = Vec::with_capacity(chunk.len());
+            let mut existing = HashMap::with_capacity(chunk.len());
+            let mut novel: Vec<(&Tag, u64)> = Vec::with_capacity(chunk.len());
             for (tag, ns_id) in chunk {
-                holders.push("(?, ?)");
-                params.push(Value::from(tag.name.as_str()));
-                params.push(Value::from(*ns_id as i64));
+                let params = vec![
+                    Value::from(tag.name.as_str()),
+                    Value::from(*ns_id as i64),
+                ];
+                let mut rows = resolve_existing
+                    .query(params_from_iter(params))
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => {
+                        let id: i64 = row.get(0)?;
+                        existing.insert((tag.name.clone(), *ns_id), id);
+                    }
+                    None => novel.push((tag, *ns_id)),
+                }
             }
 
-            let tag_sql_str: String = format!(
-                "INSERT INTO Tags (name, namespace) VALUES {} \
-                 ON CONFLICT(name, namespace) DO UPDATE SET name = excluded.name \
-                 RETURNING id, name, namespace;",
-                holders.join(", ")
-            );
+            // Insert only the tags that do not exist yet. `INSERT OR IGNORE`
+            // skips conflicting rows individually without touching them, so a
+            // tag that slips in concurrently never triggers a write, an FTS
+            // document update, or a covering-index rewrite either.
+            if !novel.is_empty() {
+                let mut params: Vec<Value> = Vec::with_capacity(novel.len() * 2);
+                let mut holders = Vec::with_capacity(novel.len());
+                for (tag, ns_id) in &novel {
+                    holders.push("(?, ?)");
+                    params.push(Value::from(tag.name.as_str()));
+                    params.push(Value::from(*ns_id as i64));
+                }
 
-            if let Ok(mut rows) = conn.query(tag_sql_str, params_from_iter(params)).await {
+                let tag_sql_str = format!(
+                    "INSERT OR IGNORE INTO Tags (name, namespace) VALUES {} \
+                     RETURNING id, name, namespace;",
+                    holders.join(", ")
+                );
+
+                let mut rows = conn
+                    .query(tag_sql_str, params_from_iter(params))
+                    .await?;
+                let mut inserted_new: HashSet<(String, i64)> =
+                    HashSet::with_capacity(novel.len());
                 while let Some(row) = rows.next().await? {
                     let id: i64 = row.get(0)?;
                     let name: String = row.get(1)?;
                     let namespace_id: i64 = row.get(2)?;
+                    inserted_new.insert((name.clone(), namespace_id));
 
                     let name: SmolStr = name.into();
 
@@ -413,6 +452,41 @@ impl TursoDatabase {
                         namespace_id,
                     });
                 }
+
+                // A novel tag can still lose the insert race with another
+                // connection; OR IGNORE then skips it and RETURNING omits it.
+                // Resolve any such straggler so no tag is ever dropped from
+                // the caller's id mapping.
+                if inserted_new.len() < novel.len() {
+                    for (tag, ns_id) in &novel {
+                        if inserted_new.contains(&(tag.name.clone(), *ns_id as i64)) {
+                            continue;
+                        }
+                        let params = vec![
+                            Value::from(tag.name.as_str()),
+                            Value::from(*ns_id as i64),
+                        ];
+                        let mut rows = resolve_existing
+                            .query(params_from_iter(params))
+                            .await?;
+                        if let Some(row) = rows.next().await? {
+                            let id: i64 = row.get(0)?;
+                            out.insert(TagDb {
+                                id,
+                                name: tag.name.clone().into(),
+                                namespace_id: *ns_id as i64,
+                            });
+                        }
+                    }
+                }
+            }
+
+            for ((name, ns_id), id) in existing {
+                out.insert(TagDb {
+                    id,
+                    name: name.into(),
+                    namespace_id: ns_id as i64,
+                });
             }
         }
 
