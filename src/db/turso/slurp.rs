@@ -794,7 +794,7 @@ impl TursoDatabase {
                     let mut rows = stmt
                         .query([
                             keyset_bound(first_hash_pass, last_file_id),
-                            SQL_CHUNK_SIZE as i64,
+                            (SQL_CHUNK_SIZE*32) as i64,
                         ])
                         .await?;
                     let mut batch: Vec<(u64, String, String)> = Vec::new();
