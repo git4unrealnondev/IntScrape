@@ -114,507 +114,305 @@ impl TursoDatabase {
             return false;
         }
 
-        // The scraper result is chunked into several small connections so one
-        // huge page cannot hold the database busy for too long.
-        const PROCESS_CHUNK_SIZE: usize = 100;
-        let map_entries: Vec<(FileManager, Vec<FileTagAction>)> = map.into_iter().collect();
-        for chunk in map_entries.chunks(PROCESS_CHUNK_SIZE) {
-            let chunk_map: HashMap<FileManager, Vec<FileTagAction>> =
-                chunk.iter().cloned().collect();
-            if !database
-                .process_scraper_chunk_human(chunk_map)
-                .await
-                .unwrap_or_else(|error| {
-                    log::error!("Failed to process scraper chunk: {error}");
-                    false
-                })
-            {
-                return false;
-            }
+        // The whole scraper result is persisted as one `BEGIN CONCURRENT`
+        // transaction. Chunking is gone: every bulk write below is idempotent
+        // (`INSERT OR IGNORE`) and write-write conflicts are retried
+        // indefinitely, so a transaction of any size converges once contention
+        // clears.
+        if !database
+            .process_scraper_chunk_human(map)
+            .await
+            .unwrap_or_else(|error| {
+                log::error!("Failed to process scraper: {error}");
+                false
+            })
+        {
+            return false;
         }
         true
     }
 
+    /// Persists the whole remaining scraper result inside its own
+    /// `BEGIN CONCURRENT` transaction, restarting the transaction from
+    /// scratch on any concurrency conflict. Every bulk write here is
+    /// idempotent (`INSERT OR IGNORE`), and an MVCC snapshot from a
+    /// conflicted transaction is stale, so the only way to make progress is
+    /// to roll back and re-run in a fresh transaction. Retries are unbounded.
     async fn process_scraper_chunk_human(
         &self,
         map: HashMap<FileManager, Vec<FileTagAction>>,
     ) -> Result<bool> {
-        let mut cnt = 0;
-        loop {
-            // Early Exit
-            if map.is_empty() {
-                return Ok(true);
-            }
+        // Early Exit
+        if map.is_empty() {
+            return Ok(true);
+        }
 
-            // doing processing outside of transaction ideally
-            let mut file_hashes = Vec::new();
-            let better_mapping: HashMap<_, _> = map
-                .iter()
-                .map(|(filemanager, tag_actions)| {
-                    (
-                        filemanager.internal.hash.clone(),
-                        (tag_actions, filemanager.identifying_hashes.clone()),
-                    )
-                })
-                .collect();
+        // Pure-Rust prep, computed once outside the retry loop.
+        let all_tags: Vec<FileTagAction> = map.values().flatten().cloned().collect();
 
-            let all_tags: Vec<FileTagAction> = map.values().flatten().cloned().collect();
+        let unique_files: HashSet<FileInternal> = map.keys().map(|f| f.internal.clone()).collect();
+        let file_list: Vec<FileInternal> = unique_files.into_iter().collect();
 
-            let unique_files: HashSet<FileInternal> =
-                map.keys().map(|f| f.internal.clone()).collect();
-            let file_list: Vec<FileInternal> = unique_files.into_iter().collect();
-
+        'retry: loop {
             // Cant connect to db?
             let mut conn = self.connect()?;
 
-            let tn = conn
-                .transaction_with_behavior(turso::transaction::TransactionBehavior::Concurrent)
-                .await?;
-
-            let corrected_files = self.file_add_bulk(&tn, &file_list).await?;
-
-            // Gets a file with id with a list of filetagaction
-            let mapped_map: HashMap<_, _> = corrected_files
-                .into_iter()
-                .filter_map(|file| {
-                    if let Some((tag_actions, identifying_hashes)) = better_mapping.get(&file.hash)
-                    {
-                        for file_hash in identifying_hashes {
-                            let (algo, algo_hash) = crate::db::hashessupportedtoinner(file_hash);
-                            file_hashes.push((file.id.unwrap(), algo, algo_hash.as_str()));
-                        }
-                        Some((file, tag_actions))
-                    } else {
-                        None
+            let tn = loop {
+                match conn
+                    .transaction_with_behavior(turso::transaction::TransactionBehavior::Concurrent)
+                    .await
+                {
+                    Ok(tn) => break tn,
+                    Err(error) if Self::is_concurrency_conflict(&error) => {
+                        log::warn!("Scraper begin conflicted; retrying in 50ms: {error}");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                     }
-                })
-                .collect();
+                    Err(error) => return Err(error),
+                }
+            };
 
-            // Adds file hashes into the db
-            if !file_hashes.is_empty() {
-                self.file_hashes_add_bulk(&tn, &file_hashes).await?;
+            // Phase 1: files.
+            let corrected_files = match self.file_add_bulk(&tn, &file_list).await {
+                Ok(out) => out,
+                Err(error) if Self::is_concurrency_conflict(&error) => {
+                    let _ = tn.rollback().await;
+                    log::warn!("Scraper file insert conflicted; retrying in 50ms: {error}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue 'retry;
+                }
+                Err(error) => return Err(error),
+            };
+
+            let mut file_cache = HashMap::with_capacity(corrected_files.len());
+            for file in &corrected_files {
+                if let Some(db_id) = file.id {
+                    file_cache.insert(file.hash.clone(), db_id);
+                }
             }
 
-            let tag_id_mapping = self.tag_action_bulk_add(&tn, &all_tags).await?;
+            // Phase 1b: identifying hashes.
+            let mut file_hashes: Vec<(u64, &str, &str)> = Vec::new();
+            for (filemanager, _) in &map {
+                let Some(file_id) = file_cache.get(&filemanager.internal.hash) else {
+                    continue;
+                };
+                for file_hash in &filemanager.identifying_hashes {
+                    let (algorithm, digest) = crate::db::hashessupportedtoinner(file_hash);
+                    file_hashes.push((*file_id, algorithm, digest.as_str()));
+                }
+            }
+            if !file_hashes.is_empty()
+                && let Err(error) = self.file_hashes_add_bulk(&tn, &file_hashes).await
+            {
+                if Self::is_concurrency_conflict(&error) {
+                    let _ = tn.rollback().await;
+                    log::warn!("Scraper hash insert conflicted; retrying in 50ms: {error}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue 'retry;
+                }
+                return Err(error);
+            }
+
+            // Phase 2: tags + parent relations. The returned id mapping is
+            // what the relationship phase resolves against.
+            let tag_id_mapping = match self.tag_action_bulk_add(&tn, &all_tags).await {
+                Ok(mapping) => mapping,
+                Err(error) if Self::is_concurrency_conflict(&error) => {
+                    let _ = tn.rollback().await;
+                    log::warn!("Scraper tag insert conflicted; retrying in 50ms: {error}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue 'retry;
+                }
+                Err(error) => return Err(error),
+            };
+
+            // Phase 3: relationships, computed against one bulk read of the
+            // current file/tag state instead of per-file queries.
+            let file_ids: Vec<u64> = file_cache.values().copied().collect();
+            let current_file_relationships =
+                match self.file_id_get_tag_ids_bulk(&tn, &file_ids).await {
+                    Ok(rels) => rels,
+                    Err(error) if Self::is_concurrency_conflict(&error) => {
+                        let _ = tn.rollback().await;
+                        log::warn!("Scraper relationship read conflicted; retrying in 50ms: {error}");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue 'retry;
+                    }
+                    Err(error) => return Err(error),
+                };
+
+            // Resolve the namespace of every current tag id: chunk tags come
+            // from the mapping above, and pre-existing current tags (ones this
+            // chunk does not touch) get their namespace resolved in one bulk
+            // query, so a Set evaluates deletions against the file's *full*
+            // current state instead of only the tags this chunk happens to
+            // reference.
+            let mut tag_id_to_ns_name: HashMap<u64, String> =
+                HashMap::with_capacity(tag_id_mapping.len());
+            for (tag_obj, &tag_id) in &tag_id_mapping {
+                tag_id_to_ns_name.insert(tag_id as u64, tag_obj.namespace.name.to_string());
+            }
+            let mut missing: HashSet<u64> = HashSet::new();
+            for current_tag_ids in current_file_relationships.values() {
+                for &tag_id in current_tag_ids {
+                    if !tag_id_to_ns_name.contains_key(&tag_id) {
+                        missing.insert(tag_id);
+                    }
+                }
+            }
+            for missing in missing
+                .into_iter()
+                .collect::<Vec<_>>()
+                .chunks(crate::db::SQL_CHUNK_SIZE)
+            {
+                let placeholders = std::iter::repeat_n("?", missing.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT t.id, n.name FROM Tags t JOIN Namespace n ON n.id = t.namespace \
+                     WHERE t.id IN ({placeholders});"
+                );
+                let params: Vec<Value> =
+                    missing.iter().map(|id| Value::from(*id as i64)).collect();
+                let mut rows = match tn.query(&sql, params_from_iter(params)).await {
+                    Ok(rows) => rows,
+                    Err(error) if Self::is_concurrency_conflict(&error) => {
+                        let _ = tn.rollback().await;
+                        log::warn!("Scraper tag namespace read conflicted; retrying in 50ms: {error}");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue 'retry;
+                    }
+                    Err(error) => return Err(error),
+                };
+                while let Some(row) = rows.next().await? {
+                    tag_id_to_ns_name.insert(row.get(0)?, row.get(1)?);
+                }
+            }
+
             let mut rels_to_add = HashSet::new();
             let mut rels_to_del = HashSet::new();
+            let mut current_ns_tags: HashMap<&str, HashSet<u64>> = HashMap::new();
+            let mut incoming_ns_tags: HashMap<&str, HashSet<u64>> = HashMap::new();
+            let mut explicit_adds = HashSet::new();
+            let mut set_deletions = HashSet::new();
 
-            for (file, tag_actions) in mapped_map {
-                let mut incoming_ns: HashMap<&str, HashSet<u64>> = HashMap::new();
+            for (file_manager, tag_list) in &map {
+                let file_id = match file_cache.get(&file_manager.internal.hash) {
+                    Some(&id) => id,
+                    None => continue,
+                };
 
-                for tag_action in *tag_actions {
-                    match tag_action.operation {
-                        TagOperation::Add => {
-                            for tag in tag_action.tags.iter() {
-                                if let Some(tag_id) = tag_id_mapping.get(&tag.tag) {
-                                    rels_to_add.insert((file.id.unwrap(), *tag_id as u64));
-                                }
+                current_ns_tags.clear();
+                explicit_adds.clear();
+                set_deletions.clear();
+
+                // Current database state for this file: Namespace -> tag ids.
+                if let Some(current_tag_ids) = current_file_relationships.get(&file_id) {
+                    for &tag_id in current_tag_ids {
+                        if let Some(ns_name) = tag_id_to_ns_name.get(&tag_id) {
+                            if ns_name != "source_url" && !ns_name.is_empty() {
+                                current_ns_tags
+                                    .entry(ns_name.as_str())
+                                    .or_default()
+                                    .insert(tag_id);
                             }
                         }
-                        TagOperation::Set => {
-                            for tag in tag_action.tags.iter() {
-                                let ns_name = &tag.tag.namespace.name;
-                                if ns_name == "source_url" || ns_name.is_empty() {
-                                    continue;
-                                }
+                    }
+                }
 
-                                if let Some(tag_id) = tag_id_mapping.get(&tag.tag) {
-                                    incoming_ns
-                                        .entry(ns_name.as_str())
-                                        .or_default()
-                                        .insert(*tag_id as u64);
+                for tag_action in tag_list {
+                    match tag_action.operation {
+                        TagOperation::Add => {
+                            for tag in &tag_action.tags {
+                                if let Some(&tag_id) = tag_id_mapping.get(&tag.tag) {
+                                    rels_to_add.insert((file_id, tag_id as u64));
+                                    explicit_adds.insert(tag_id as u64);
                                 }
                             }
                         }
                         TagOperation::Del => {
-                            for tag in tag_action.tags.iter() {
-                                if let Some(tag_id) = tag_id_mapping.get(&tag.tag) {
-                                    rels_to_del.insert((file.id.unwrap(), *tag_id as u64));
+                            for tag in &tag_action.tags {
+                                if let Some(&tag_id) = tag_id_mapping.get(&tag.tag) {
+                                    rels_to_del.insert((file_id, tag_id as u64));
                                 }
                             }
                         }
-                    }
-                }
+                        TagOperation::Set => {
+                            incoming_ns_tags.clear();
 
-                if !incoming_ns.is_empty() {
-                    for (ns_name, tag_ids) in incoming_ns {
-                        if let Some(ns_id) = self.namespace_get_id(&tn, ns_name).await? {
-                            let current_tag_ids = self
-                                .file_id_get_tag_ids_filtered(&tn, file.id.unwrap(), ns_id)
-                                .await?;
-
-                            for tag_id_to_remove in tag_ids.difference(&current_tag_ids) {
-                                rels_to_add.insert((file.id.unwrap(), *tag_id_to_remove));
+                            for tag in &tag_action.tags {
+                                let ns_name = &tag.tag.namespace.name;
+                                if ns_name == "source_url" || ns_name.is_empty() {
+                                    continue;
+                                }
+                                if let Some(&tag_id) = tag_id_mapping.get(&tag.tag) {
+                                    incoming_ns_tags
+                                        .entry(ns_name.as_str())
+                                        .or_default()
+                                        .insert(tag_id as u64);
+                                    rels_to_add.insert((file_id, tag_id as u64));
+                                }
                             }
 
-                            for tag_id_to_add in current_tag_ids.difference(&tag_ids) {
-                                rels_to_del.insert((file.id.unwrap(), *tag_id_to_add));
-                            }
-                        }
-                    }
-                }
-            }
-
-            for rel in rels_to_del.iter() {
-                rels_to_add.remove(rel);
-            }
-
-            if !rels_to_del.is_empty() {
-                self.relationship_bulk_delete(&tn, &rels_to_del).await?;
-            }
-
-            if !rels_to_add.is_empty() {
-                self.relationships_bulk_add(&tn, &rels_to_add).await?;
-            }
-
-            match tn.commit().await {
-                Ok(_) => {
-                    return Ok(true);
-                }
-                Err(err) => {
-                    if Self::is_concurrency_conflict(&err) {
-                        log::warn!("Scraper chunk commit conflicted; retrying in 50ms: {err}");
-                        cnt += 1;
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    } else {
-                        return Err(err);
-                    }
-                }
-            }
-
-            if cnt >= 25 {
-                return Ok(false);
-            }
-        }
-    }
-
-    /// Persists one chunk of a scraper result inside its own connection.
-    /// Returns `false` if any database operation in the chunk failed.
-    async fn process_scraper_chunk_old(
-        &self,
-        map: HashMap<FileManager, Vec<FileTagAction>>,
-        audit_reason: &str,
-    ) -> bool {
-        // Bounded retry cap for the whole chunk. Each conflict path below
-        // used to re-run the entire chunk transaction with no limit; under
-        // write-write contention from many concurrent jobs that burned wide
-        // open on the shared tokio runtime and starved the network layer.
-        // 25 attempts (~1.25s) rides out typical contention windows between
-        // the 10 concurrent rule34 jobs while staying strictly bounded.
-        const MAX_SCRAPER_CHUNK_ATTEMPTS: u32 = 25;
-        self.process_scraper_chunk_attempt(map, audit_reason, MAX_SCRAPER_CHUNK_ATTEMPTS)
-            .await
-    }
-
-    async fn process_scraper_chunk_attempt(
-        &self,
-        map: HashMap<FileManager, Vec<FileTagAction>>,
-        audit_reason: &str,
-        attempts_left: u32,
-    ) -> bool {
-        if map.is_empty() {
-            return true;
-        }
-
-        let Ok(conn) = self.connect() else {
-            log::error!("Failed to connect while processing scraper chunk");
-            return false;
-        };
-        // The scraper chunk is DML-only here: namespaces were pre-ensured
-        // (rows + partitions + in-memory cache) before the chunk loop started,
-        // so tag adds resolve namespace ids from the cache and never run the
-        // namespace-partition DDL that turso forbids in concurrent
-        // transactions. BEGIN CONCURRENT lets unrelated writers keep going.
-        loop {
-            match conn.execute("BEGIN CONCURRENT", ()).await {
-                Ok(_) => break,
-                Err(error) if Self::is_concurrency_conflict(&error) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-                Err(error) => {
-                    log::error!("Failed to begin concurrent scraper transaction: {error}");
-                    return false;
-                }
-            }
-        }
-        let _ = audit_reason;
-
-        let unique_files: HashSet<FileInternal> = map.keys().map(|f| f.internal.clone()).collect();
-        let file_list: Vec<FileInternal> = unique_files.into_iter().collect();
-        let resolved_files = match self.file_add_bulk(&conn, &file_list).await {
-            Ok(files) => files,
-            Err(error) if Self::is_concurrency_conflict(&error) => {
-                log::warn!("Scraper file transaction conflicted; retrying in 50ms: {error}");
-                let _ = conn.execute("ROLLBACK", ()).await;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                return if attempts_left <= 1 {
-                    log::error!("Scraper file transaction kept conflicting; giving up on chunk");
-                    false
-                } else {
-                    Box::pin(self.process_scraper_chunk_attempt(
-                        map,
-                        audit_reason,
-                        attempts_left - 1,
-                    ))
-                    .await
-                };
-            }
-            Err(error) => {
-                log::error!("Failed to insert scraper files: {error}");
-                let _ = conn.execute("ROLLBACK", ()).await;
-                return false;
-            }
-        };
-        let resolved_files: Vec<FileInternal> = resolved_files.into_iter().collect();
-
-        let resolved_files_by_hash: HashMap<&str, &FileInternal> = resolved_files
-            .iter()
-            .map(|file| (file.hash.as_str(), file))
-            .collect();
-        let mapped_files: Vec<_> = map
-            .keys()
-            .filter_map(|file_manager| {
-                let matching_res =
-                    resolved_files_by_hash.get(file_manager.internal.hash.as_str())?;
-                let mut temp = file_manager.clone();
-                temp.internal = (*matching_res).clone();
-                Some(temp)
-            })
-            .collect();
-
-        let mut identifying_hashes: Vec<(u64, String, String)> = Vec::new();
-        for file in mapped_files {
-            if let Some(file_id) = file.internal.id {
-                for hash in &file.identifying_hashes {
-                    let (algo, hash_str) = crate::db::hashessupportedtoinner(hash);
-                    identifying_hashes.push((file_id, algo.to_string(), hash_str.clone()));
-                }
-            }
-        }
-        if !identifying_hashes.is_empty() {
-            let entries: Vec<(u64, &str, &str)> = identifying_hashes
-                .iter()
-                .map(|(id, algo, digest)| (*id, algo.as_str(), digest.as_str()))
-                .collect();
-            if let Err(error) = self.file_hashes_add_bulk(&conn, &entries).await {
-                log::error!("Failed to add identifying hashes: {error}");
-                let _ = conn.execute("ROLLBACK", ()).await;
-                return false;
-            }
-        }
-
-        // Build a quick lookup mapping: hash -> database id.
-        let mut file_cache = HashMap::with_capacity(resolved_files.len());
-        for file in &resolved_files {
-            if let Some(db_id) = file.id {
-                file_cache.insert(file.hash.clone(), db_id);
-            }
-        }
-
-        // Collect all action definitions across every file block into one flat vector.
-        let all_tag_actions: Vec<FileTagAction> = map.values().flatten().cloned().collect();
-        let tag_cache = match self.tag_action_bulk_add(&conn, &all_tag_actions).await {
-            Ok(tag_cache) => tag_cache,
-            Err(error) if Self::is_concurrency_conflict(&error) => {
-                log::warn!("Scraper tag transaction conflicted; retrying in 50ms: {error}");
-                let _ = conn.execute("ROLLBACK", ()).await;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                return if attempts_left <= 1 {
-                    log::error!("Scraper tag transaction kept conflicting; giving up on chunk");
-                    false
-                } else {
-                    Box::pin(self.process_scraper_chunk_attempt(
-                        map,
-                        audit_reason,
-                        attempts_left - 1,
-                    ))
-                    .await
-                };
-            }
-            Err(error) => {
-                log::error!("Failed to add scraper tags: {error}");
-                let _ = conn.execute("ROLLBACK", ()).await;
-                return false;
-            }
-        };
-
-        let file_ids: Vec<u64> = file_cache.values().copied().collect();
-        let Ok(current_file_relationships) = self.file_id_get_tag_ids_bulk(&conn, &file_ids).await
-        else {
-            log::error!("Failed to read current file relationships");
-            let _ = conn.execute("ROLLBACK", ()).await;
-            return false;
-        };
-
-        let mut rels_to_add = HashSet::new();
-        let mut rels_to_del = HashSet::new();
-
-        let mut current_ns_tags: HashMap<&str, HashSet<u64>> = HashMap::new();
-        let mut incoming_ns_tags: HashMap<&str, HashSet<u64>> = HashMap::new();
-        let mut explicit_adds = HashSet::new();
-        let mut set_deletions = HashSet::new();
-
-        let mut tag_id_to_obj = HashMap::with_capacity(tag_cache.len());
-        for (tag_obj, &tag_id) in &tag_cache {
-            tag_id_to_obj.insert(tag_id as u64, tag_obj);
-        }
-
-        for (file_internal, tag_list) in &map {
-            let file_id = match file_cache.get(&file_internal.internal.hash) {
-                Some(&id) => id,
-                None => continue,
-            };
-
-            current_ns_tags.clear();
-            explicit_adds.clear();
-            set_deletions.clear();
-
-            // Map current database state for this file: Namespace -> set of tag ids.
-            if let Some(current_tag_ids) = current_file_relationships.get(&file_id) {
-                for &tag_id in current_tag_ids {
-                    if let Some(tag) = tag_id_to_obj.get(&tag_id) {
-                        let ns_name = &tag.namespace.name;
-                        if ns_name != "source_url" && !ns_name.is_empty() {
-                            current_ns_tags
-                                .entry(ns_name.as_str())
-                                .or_default()
-                                .insert(tag_id);
-                        }
-                    }
-                }
-            }
-
-            for tag_action in tag_list {
-                match tag_action.operation {
-                    TagOperation::Add => {
-                        for tag in &tag_action.tags {
-                            if let Some(&tag_id) = tag_cache.get(&tag.tag) {
-                                rels_to_add.insert((file_id, tag_id as u64));
-                                explicit_adds.insert(tag_id as u64);
-                            }
-                        }
-                    }
-                    TagOperation::Del => {
-                        for tag in &tag_action.tags {
-                            if let Some(&tag_id) = tag_cache.get(&tag.tag) {
-                                rels_to_del.insert((file_id, tag_id as u64));
-                            }
-                        }
-                    }
-                    TagOperation::Set => {
-                        incoming_ns_tags.clear();
-
-                        for tag in &tag_action.tags {
-                            let ns_name = &tag.tag.namespace.name;
-                            if ns_name == "source_url" || ns_name.is_empty() {
-                                continue;
-                            }
-                            if let Some(&tag_id) = tag_cache.get(&tag.tag) {
-                                incoming_ns_tags
-                                    .entry(ns_name.as_str())
-                                    .or_default()
-                                    .insert(tag_id as u64);
-                                rels_to_add.insert((file_id, tag_id as u64));
-                            }
-                        }
-
-                        // Evaluate deletions only for namespaces explicitly
-                        // targeted by this Set operation.
-                        for (ns_name, incoming_set) in &incoming_ns_tags {
-                            if let Some(current_tag_ids) = current_ns_tags.get(ns_name) {
-                                for current_tag_id in current_tag_ids {
-                                    if !incoming_set.contains(current_tag_id) {
-                                        set_deletions.insert((file_id, *current_tag_id));
+                            // Evaluate deletions only for namespaces explicitly
+                            // targeted by this Set operation.
+                            for (ns_name, incoming_set) in &incoming_ns_tags {
+                                if let Some(current_tag_ids) = current_ns_tags.get(ns_name) {
+                                    for &current_tag_id in current_tag_ids {
+                                        if !incoming_set.contains(&current_tag_id) {
+                                            set_deletions.insert((file_id, current_tag_id));
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
-            }
 
-            // Apply targeted "Add overrides Set" rule.
-            for (f_id, tag_id) in &set_deletions {
-                if !explicit_adds.contains(tag_id) {
-                    rels_to_del.insert((*f_id, *tag_id));
+                // Apply targeted "Add overrides Set" rule.
+                for (f_id, tag_id) in &set_deletions {
+                    if !explicit_adds.contains(tag_id) {
+                        rels_to_del.insert((*f_id, *tag_id));
+                    }
                 }
             }
-        }
 
-        // Global sanitation check for any edge deletions.
-        for del in &rels_to_del {
-            rels_to_add.remove(del);
-        }
-
-        if !rels_to_del.is_empty()
-            && let Err(error) = self.relationship_bulk_delete(&conn, &rels_to_del).await
-        {
-            let _ = conn.execute("ROLLBACK", ()).await;
-            if Self::is_concurrency_conflict(&error) {
-                log::warn!("Scraper relationship delete conflicted; retrying in 50ms: {error}");
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                return if attempts_left <= 1 {
-                    log::error!("Scraper relationship delete kept conflicting; giving up on chunk");
-                    false
-                } else {
-                    Box::pin(self.process_scraper_chunk_attempt(
-                        map,
-                        audit_reason,
-                        attempts_left - 1,
-                    ))
-                    .await
-                };
+            // Global sanitation check for any edge deletions.
+            for del in &rels_to_del {
+                rels_to_add.remove(del);
             }
-            log::error!("Failed to delete relationships in scraper chunk: {error}");
-            return false;
-        }
 
-        if !rels_to_add.is_empty()
-            && let Err(error) = self.relationships_bulk_add(&conn, &rels_to_add).await
-        {
-            let _ = conn.execute("ROLLBACK", ()).await;
-            if Self::is_concurrency_conflict(&error) {
-                log::warn!("Scraper relationship add conflicted; retrying in 50ms: {error}");
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                return if attempts_left <= 1 {
-                    log::error!("Scraper relationship add kept conflicting; giving up on chunk");
-                    false
-                } else {
-                    Box::pin(self.process_scraper_chunk_attempt(
-                        map,
-                        audit_reason,
-                        attempts_left - 1,
-                    ))
-                    .await
-                };
-            }
-            log::error!("Failed to add relationships in scraper chunk: {error}");
-            return false;
-        }
-
-        match conn.execute("COMMIT", ()).await {
-            Ok(_) => true,
-            Err(error) if Self::is_concurrency_conflict(&error) => {
-                // The caller owns the input map, so the whole chunk can be
-                // safely reconstructed from the same snapshot on retry.
-                log::warn!("Concurrent scraper commit conflicted; retrying in 50ms: {error}");
-                let _ = conn.execute("ROLLBACK", ()).await;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                if attempts_left <= 1 {
-                    log::error!("Scraper chunk commit kept conflicting; giving up on chunk");
-                    false
-                } else {
-                    Box::pin(self.process_scraper_chunk_attempt(
-                        map,
-                        audit_reason,
-                        attempts_left - 1,
-                    ))
-                    .await
+            if !rels_to_del.is_empty()
+                && let Err(error) = self.relationship_bulk_delete(&tn, &rels_to_del).await
+            {
+                if Self::is_concurrency_conflict(&error) {
+                    let _ = tn.rollback().await;
+                    log::warn!("Scraper relationship delete conflicted; retrying in 50ms: {error}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue 'retry;
                 }
+                return Err(error);
             }
-            Err(error) => {
-                log::error!("Failed to commit concurrent scraper transaction: {error}");
-                false
+
+            if !rels_to_add.is_empty()
+                && let Err(error) = self.relationships_bulk_add(&tn, &rels_to_add).await
+            {
+                if Self::is_concurrency_conflict(&error) {
+                    let _ = tn.rollback().await;
+                    log::warn!("Scraper relationship add conflicted; retrying in 50ms: {error}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue 'retry;
+                }
+                return Err(error);
+            }
+
+            match tn.commit().await {
+                Ok(_) => return Ok(true),
+                Err(error) if Self::is_concurrency_conflict(&error) => {
+                    log::warn!("Scraper chunk commit conflicted; retrying in 50ms: {error}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error),
             }
         }
     }

@@ -97,10 +97,6 @@ dhat-ad-hoc = []  # if you are doing ad hoc profiling
 [dev-dependencies]
 criterion = "0.5"
 
-[[bench]]
-name = "tag_search_cache"
-harness = false
-
 ## Source: https://www.namtao.com/rust/
 #[lints.clippy]
 ## UM, ACTUALLY

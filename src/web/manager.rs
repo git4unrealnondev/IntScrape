@@ -1671,36 +1671,9 @@ impl DownloadsManager {
         let mut remove_plugin = false;
 
         if let Some(internal_storage) = self.jobs.write().await.get_mut(&plugin.name) {
-            log::info!(
-                "DBG-REMOVEJOB-CONTENT: stored job_storage ids+isrunning: {:?}",
-                internal_storage
-                    .job_storage
-                    .iter()
-                    .map(|j| (j.id, j.isrunning))
-                    .collect::<Vec<_>>()
-            );
-            log::info!(
-                "DBG-REMOVEJOB-CONTENT: passed job id={} isrunning={}",
-                job.id,
-                job.isrunning
-            );
             internal_storage.job_storage.retain(|f| f.id != job.id);
-            log::info!(
-                "DBG-REMOVEJOB-CONTENT: after retain ids+isrunning: {:?}",
-                internal_storage
-                    .job_storage
-                    .iter()
-                    .map(|j| (j.id, j.isrunning))
-                    .collect::<Vec<_>>()
-            );
             if should_remove_db {
-                log::info!("DBG-REMOVEJOB-REMOVE_DB: before job_remove");
-                let t1 = tokio::time::Instant::now();
                 self.db.job_remove(job).await;
-                log::info!(
-                    "DBG-REMOVEJOB-REMOVE_DB: after job_remove in {:?}",
-                    t1.elapsed()
-                );
             }
             if internal_storage.job_storage.is_empty() {
                 remove_plugin = true;
@@ -1708,13 +1681,7 @@ impl DownloadsManager {
         }
 
         if remove_plugin {
-            log::info!("DBG-REMOVEJOB-MAP: before jobs.write().remove");
-            let t2 = tokio::time::Instant::now();
             self.jobs.write().await.remove(&plugin.name);
-            log::info!(
-                "DBG-REMOVEJOB-MAP: after jobs.write().remove in {:?}",
-                t2.elapsed()
-            );
 
             // Rebuild counts and entries once the final queued job has finished.
             self.db.refresh_tag_search_cache();
