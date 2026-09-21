@@ -5,7 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use shared_types::{
-    FileInternal, FileManager, FileTagAction, GenericNamespaceObj, ScraperDataReturn, TagOperation,
+    FileInternal, FileManager, FileTagAction, GenericNamespaceObj, ScraperDataReturn, Tag,
+    TagOperation,
 };
 use turso::{Result, Value, params_from_iter};
 
@@ -33,6 +34,7 @@ impl TursoDatabase {
         // Pending scrape jobs are small and independent of the file/tag work
         // below, so they get their own connection.
         if !jobs.is_empty() {
+            let mut attempts = 0u32;
             loop {
                 let conn = match database.connect() {
                     Ok(conn) => conn,
@@ -76,10 +78,16 @@ impl TursoDatabase {
                         ) =>
                     {
                         log::warn!(
-                            "Concurrent scrape-job commit conflicted; retrying in 50ms: {error}"
+                            "Concurrent scrape-job commit conflicted; retrying: {error}"
                         );
                         let _ = conn.execute("ROLLBACK", ()).await;
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        if scraper_backoff(&mut attempts).await {
+                            log::error!(
+                                "Concurrent scrape-job commit still conflicted after \
+                                 {SCRAPER_MAX_RETRIES} retries; giving up"
+                            );
+                            return false;
+                        }
                     }
                     Err(error) => {
                         log::error!("Failed to commit concurrent scrape-job transaction: {error}");
@@ -114,11 +122,12 @@ impl TursoDatabase {
             return false;
         }
 
-        // The whole scraper result is persisted as one `BEGIN CONCURRENT`
-        // transaction. Chunking is gone: every bulk write below is idempotent
-        // (`INSERT OR IGNORE`) and write-write conflicts are retried
-        // indefinitely, so a transaction of any size converges once contention
-        // clears.
+        // The scraper result is persisted through three small, idempotent
+        // (`INSERT OR IGNORE`) `BEGIN CONCURRENT` transactions — files, tags,
+        // then relationships. Each phase retries its own write-write
+        // conflicts with jittered backoff, so a contention spike on a shared
+        // popular tag only restarts the relationship phase instead of the
+        // whole chunk.
         if !database
             .process_scraper_chunk_human(map)
             .await
@@ -132,12 +141,22 @@ impl TursoDatabase {
         true
     }
 
-    /// Persists the whole remaining scraper result inside its own
-    /// `BEGIN CONCURRENT` transaction, restarting the transaction from
-    /// scratch on any concurrency conflict. Every bulk write here is
+    /// Persists the whole remaining scraper result through three small
+    /// `BEGIN CONCURRENT` transactions — files, tags, then relationships —
+    /// instead of one giant MVCC transaction. Every bulk write here is
     /// idempotent (`INSERT OR IGNORE`), and an MVCC snapshot from a
     /// conflicted transaction is stale, so the only way to make progress is
-    /// to roll back and re-run in a fresh transaction. Retries are unbounded.
+    /// to roll back and re-run in a fresh transaction.
+    ///
+    /// Splitting matters because the relationship phase is where contention
+    /// concentrates: every new relationship also bumps the shared
+    /// `Tags.count` row, so two scraper chunks that both touch a popular tag
+    /// collide exactly there. With one giant transaction that collision
+    /// rolled back the file and tag inserts too; now only the conflicted
+    /// phase retries, and each phase's smaller write set overlaps concurrent
+    /// writers far less. Retries use jittered exponential backoff (see
+    /// `scraper_backoff`) and are capped so a pathological contention storm
+    /// cannot spin on the shared tokio runtime forever.
     async fn process_scraper_chunk_human(
         &self,
         map: HashMap<FileManager, Vec<FileTagAction>>,
@@ -147,16 +166,39 @@ impl TursoDatabase {
             return Ok(true);
         }
 
-        // Pure-Rust prep, computed once outside the retry loop.
+        // Pure-Rust prep, computed once outside the retry loops.
         let all_tags: Vec<FileTagAction> = map.values().flatten().cloned().collect();
 
         let unique_files: HashSet<FileInternal> = map.keys().map(|f| f.internal.clone()).collect();
         let file_list: Vec<FileInternal> = unique_files.into_iter().collect();
 
-        'retry: loop {
+        // Phase 1: files + identifying hashes, in their own transaction.
+        let file_cache = self.scraper_phase_files(&map, &file_list).await?;
+
+        // Phase 2: tags + parent relations, in their own transaction. The
+        // returned id mapping is what the relationship phase resolves against.
+        let tag_id_mapping = self.scraper_phase_tags(&all_tags).await?;
+
+        // Phase 3: relationships, computed against one bulk read of the
+        // current file/tag state instead of per-file queries.
+        self.scraper_phase_relationships(&map, &file_cache, &tag_id_mapping)
+            .await?;
+
+        Ok(true)
+    }
+
+    /// Phase 1 of a scraper chunk: persists files and their identifying
+    /// hashes in one small concurrent transaction, returning the
+    /// `hash -> db id` cache the relationship phase resolves against.
+    async fn scraper_phase_files(
+        &self,
+        map: &HashMap<FileManager, Vec<FileTagAction>>,
+        file_list: &[FileInternal],
+    ) -> Result<HashMap<String, u64>> {
+        let mut attempts = 0u32;
+        loop {
             // Cant connect to db?
             let mut conn = self.connect()?;
-
             let tn = loop {
                 match conn
                     .transaction_with_behavior(turso::transaction::TransactionBehavior::Concurrent)
@@ -164,21 +206,24 @@ impl TursoDatabase {
                 {
                     Ok(tn) => break tn,
                     Err(error) if Self::is_concurrency_conflict(&error) => {
-                        log::warn!("Scraper begin conflicted; retrying in 50ms: {error}");
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        log::warn!("Scraper begin conflicted; retrying: {error}");
+                        if scraper_backoff(&mut attempts).await {
+                            return Err(scraper_give_up("begin"));
+                        }
                     }
                     Err(error) => return Err(error),
                 }
             };
 
-            // Phase 1: files.
-            let corrected_files = match self.file_add_bulk(&tn, &file_list).await {
+            let corrected_files = match self.file_add_bulk(&tn, file_list).await {
                 Ok(out) => out,
                 Err(error) if Self::is_concurrency_conflict(&error) => {
                     let _ = tn.rollback().await;
-                    log::warn!("Scraper file insert conflicted; retrying in 50ms: {error}");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue 'retry;
+                    log::warn!("Scraper file insert conflicted; retrying: {error}");
+                    if scraper_backoff(&mut attempts).await {
+                        return Err(scraper_give_up("file insert"));
+                    }
+                    continue;
                 }
                 Err(error) => return Err(error),
             };
@@ -190,9 +235,9 @@ impl TursoDatabase {
                 }
             }
 
-            // Phase 1b: identifying hashes.
+            // Identifying hashes.
             let mut file_hashes: Vec<(u64, &str, &str)> = Vec::new();
-            for (filemanager, _) in &map {
+            for filemanager in map.keys() {
                 let Some(file_id) = file_cache.get(&filemanager.internal.hash) else {
                     continue;
                 };
@@ -206,37 +251,125 @@ impl TursoDatabase {
             {
                 if Self::is_concurrency_conflict(&error) {
                     let _ = tn.rollback().await;
-                    log::warn!("Scraper hash insert conflicted; retrying in 50ms: {error}");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue 'retry;
+                    log::warn!("Scraper hash insert conflicted; retrying: {error}");
+                    if scraper_backoff(&mut attempts).await {
+                        return Err(scraper_give_up("hash insert"));
+                    }
+                    continue;
                 }
                 return Err(error);
             }
 
-            // Phase 2: tags + parent relations. The returned id mapping is
-            // what the relationship phase resolves against.
-            let tag_id_mapping = match self.tag_action_bulk_add(&tn, &all_tags).await {
+            match tn.commit().await {
+                Ok(_) => return Ok(file_cache),
+                Err(error) if Self::is_concurrency_conflict(&error) => {
+                    log::warn!("Scraper file phase commit conflicted; retrying: {error}");
+                    if scraper_backoff(&mut attempts).await {
+                        return Err(scraper_give_up("file phase commit"));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Phase 2 of a scraper chunk: persists tags (and their parent
+    /// relations) in one small concurrent transaction, returning the
+    /// `Tag -> id` mapping the relationship phase resolves against.
+    async fn scraper_phase_tags(
+        &self,
+        all_tags: &[FileTagAction],
+    ) -> Result<HashMap<Tag, i64>> {
+        let mut attempts = 0u32;
+        loop {
+            // Cant connect to db?
+            let mut conn = self.connect()?;
+            let tn = loop {
+                match conn
+                    .transaction_with_behavior(turso::transaction::TransactionBehavior::Concurrent)
+                    .await
+                {
+                    Ok(tn) => break tn,
+                    Err(error) if Self::is_concurrency_conflict(&error) => {
+                        log::warn!("Scraper begin conflicted; retrying: {error}");
+                        if scraper_backoff(&mut attempts).await {
+                            return Err(scraper_give_up("begin"));
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+
+            let tag_id_mapping = match self.tag_action_bulk_add(&tn, all_tags).await {
                 Ok(mapping) => mapping,
                 Err(error) if Self::is_concurrency_conflict(&error) => {
                     let _ = tn.rollback().await;
-                    log::warn!("Scraper tag insert conflicted; retrying in 50ms: {error}");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue 'retry;
+                    log::warn!("Scraper tag insert conflicted; retrying: {error}");
+                    if scraper_backoff(&mut attempts).await {
+                        return Err(scraper_give_up("tag insert"));
+                    }
+                    continue;
                 }
                 Err(error) => return Err(error),
             };
 
-            // Phase 3: relationships, computed against one bulk read of the
-            // current file/tag state instead of per-file queries.
+            match tn.commit().await {
+                Ok(_) => return Ok(tag_id_mapping),
+                Err(error) if Self::is_concurrency_conflict(&error) => {
+                    log::warn!("Scraper tag phase commit conflicted; retrying: {error}");
+                    if scraper_backoff(&mut attempts).await {
+                        return Err(scraper_give_up("tag phase commit"));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Phase 3 of a scraper chunk: reads the current file/tag relationship
+    /// state in one bulk pass, computes the adds/deletes each `TagOperation`
+    /// implies (including `Set` deletions evaluated against each file's
+    /// *full* current state), and applies them. This is the phase where
+    /// write-write conflicts concentrate — every new relationship also bumps
+    /// the shared `Tags.count` row — so it retries on its own with jittered
+    /// backoff instead of redoing the file/tag phases.
+    async fn scraper_phase_relationships(
+        &self,
+        map: &HashMap<FileManager, Vec<FileTagAction>>,
+        file_cache: &HashMap<String, u64>,
+        tag_id_mapping: &HashMap<Tag, i64>,
+    ) -> Result<()> {
+        let mut attempts = 0u32;
+        'retry: loop {
+            // Cant connect to db?
+            let mut conn = self.connect()?;
+            let tn = loop {
+                match conn
+                    .transaction_with_behavior(turso::transaction::TransactionBehavior::Concurrent)
+                    .await
+                {
+                    Ok(tn) => break tn,
+                    Err(error) if Self::is_concurrency_conflict(&error) => {
+                        log::warn!("Scraper begin conflicted; retrying: {error}");
+                        if scraper_backoff(&mut attempts).await {
+                            return Err(scraper_give_up("begin"));
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+
             let file_ids: Vec<u64> = file_cache.values().copied().collect();
             let current_file_relationships =
                 match self.file_id_get_tag_ids_bulk(&tn, &file_ids).await {
                     Ok(rels) => rels,
                     Err(error) if Self::is_concurrency_conflict(&error) => {
                         let _ = tn.rollback().await;
-                        log::warn!("Scraper relationship read conflicted; retrying in 50ms: {error}");
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        continue 'retry;
+                        log::warn!("Scraper relationship read conflicted; retrying: {error}");
+                        if scraper_backoff(&mut attempts).await {
+                            return Err(scraper_give_up("relationship read"));
+                        }
+                        continue;
                     }
                     Err(error) => return Err(error),
                 };
@@ -249,7 +382,7 @@ impl TursoDatabase {
             // reference.
             let mut tag_id_to_ns_name: HashMap<u64, String> =
                 HashMap::with_capacity(tag_id_mapping.len());
-            for (tag_obj, &tag_id) in &tag_id_mapping {
+            for (tag_obj, &tag_id) in tag_id_mapping {
                 tag_id_to_ns_name.insert(tag_id as u64, tag_obj.namespace.name.to_string());
             }
             let mut missing: HashSet<u64> = HashSet::new();
@@ -278,8 +411,12 @@ impl TursoDatabase {
                     Ok(rows) => rows,
                     Err(error) if Self::is_concurrency_conflict(&error) => {
                         let _ = tn.rollback().await;
-                        log::warn!("Scraper tag namespace read conflicted; retrying in 50ms: {error}");
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        log::warn!(
+                            "Scraper tag namespace read conflicted; retrying: {error}"
+                        );
+                        if scraper_backoff(&mut attempts).await {
+                            return Err(scraper_give_up("tag namespace read"));
+                        }
                         continue 'retry;
                     }
                     Err(error) => return Err(error),
@@ -296,7 +433,7 @@ impl TursoDatabase {
             let mut explicit_adds = HashSet::new();
             let mut set_deletions = HashSet::new();
 
-            for (file_manager, tag_list) in &map {
+            for (file_manager, tag_list) in map {
                 let file_id = match file_cache.get(&file_manager.internal.hash) {
                     Some(&id) => id,
                     None => continue,
@@ -382,35 +519,62 @@ impl TursoDatabase {
                 rels_to_add.remove(del);
             }
 
-            if !rels_to_del.is_empty()
-                && let Err(error) = self.relationship_bulk_delete(&tn, &rels_to_del).await
-            {
-                if Self::is_concurrency_conflict(&error) {
-                    let _ = tn.rollback().await;
-                    log::warn!("Scraper relationship delete conflicted; retrying in 50ms: {error}");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue 'retry;
+            // Bulk add/delete return the per-tag count deltas instead of
+            // bumping the shared `Tags.count` row inside this concurrent
+            // transaction; the deltas are folded in after commit through the
+            // serialized `tag_counts_apply` writer.
+            let mut del_deltas = HashMap::new();
+            if !rels_to_del.is_empty() {
+                match self.relationship_bulk_delete(&tn, &rels_to_del).await {
+                    Ok(deltas) => del_deltas = deltas,
+                    Err(error) if Self::is_concurrency_conflict(&error) => {
+                        let _ = tn.rollback().await;
+                        log::warn!("Scraper relationship delete conflicted; retrying: {error}");
+                        if scraper_backoff(&mut attempts).await {
+                            return Err(scraper_give_up("relationship delete"));
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error),
                 }
-                return Err(error);
             }
 
-            if !rels_to_add.is_empty()
-                && let Err(error) = self.relationships_bulk_add(&tn, &rels_to_add).await
-            {
-                if Self::is_concurrency_conflict(&error) {
-                    let _ = tn.rollback().await;
-                    log::warn!("Scraper relationship add conflicted; retrying in 50ms: {error}");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue 'retry;
+            let mut add_deltas = HashMap::new();
+            if !rels_to_add.is_empty() {
+                match self.relationships_bulk_add(&tn, &rels_to_add).await {
+                    Ok(deltas) => add_deltas = deltas,
+                    Err(error) if Self::is_concurrency_conflict(&error) => {
+                        let _ = tn.rollback().await;
+                        log::warn!("Scraper relationship add conflicted; retrying: {error}");
+                        if scraper_backoff(&mut attempts).await {
+                            return Err(scraper_give_up("relationship add"));
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error),
                 }
-                return Err(error);
             }
 
             match tn.commit().await {
-                Ok(_) => return Ok(true),
+                Ok(_) => {
+                    // Relationship rows are committed; apply the deferred count
+                    // deltas through the single serialized writer so the shared
+                    // `Tags.count` row is never part of two concurrent write
+                    // sets. A failure here only leaves a stale count (healed by
+                    // the next slurp recount), never lost rows, so it must not
+                    // fail the whole chunk.
+                    if let Err(error) = self.tag_counts_apply(&add_deltas, &del_deltas).await {
+                        log::error!("Failed to apply deferred tag counts: {error}");
+                    }
+                    return Ok(());
+                }
                 Err(error) if Self::is_concurrency_conflict(&error) => {
-                    log::warn!("Scraper chunk commit conflicted; retrying in 50ms: {error}");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    log::warn!(
+                        "Scraper relationship phase commit conflicted; retrying: {error}"
+                    );
+                    if scraper_backoff(&mut attempts).await {
+                        return Err(scraper_give_up("relationship phase commit"));
+                    }
                 }
                 Err(error) => return Err(error),
             }
@@ -517,6 +681,37 @@ impl TursoDatabase {
 
         out
     }
+}
+
+/// Ceiling on how many times a scraper chunk phase retries a conflicting
+/// MVCC transaction before giving up. The conflict is expected to clear after
+/// a few jittered attempts; past this, it is cheaper to let the caller keep
+/// the job for the next boot than to keep spinning on the shared tokio
+/// runtime (the same rationale as `retry_mvcc`'s cap).
+const SCRAPER_MAX_RETRIES: u32 = 32;
+
+/// Sleeps for a jittered, exponentially growing delay between MVCC retries
+/// and reports whether the retry budget is exhausted. The old fixed 50ms
+/// sleep synchronized every conflicted writer: they all woke at the same
+/// instant, instantly re-collided, and the herd repeated forever. Jitter
+/// spreads retries across the interval so each round has only a subset of
+/// the writers competing and at least one transaction makes progress.
+async fn scraper_backoff(attempt: &mut u32) -> bool {
+    let current = *attempt;
+    *attempt += 1;
+    // 25ms -> 50 -> 100 -> 200 -> 400 -> 800ms (capped).
+    let base_ms = 25u64 << current.min(5);
+    // Half to full base, randomized, so simultaneous retriers land apart.
+    let jittered = base_ms / 2 + rand::random::<u64>() % (base_ms / 2 + 1);
+    tokio::time::sleep(Duration::from_millis(jittered)).await;
+    *attempt >= SCRAPER_MAX_RETRIES
+}
+
+/// Builds the error surfaced once a scraper phase exhausts its retry budget.
+fn scraper_give_up(what: &str) -> turso::Error {
+    turso::Error::Error(format!(
+        "scraper {what} still conflicted after {SCRAPER_MAX_RETRIES} MVCC retries"
+    ))
 }
 #[cfg(test)]
 mod tests {

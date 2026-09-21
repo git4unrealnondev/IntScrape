@@ -24,6 +24,24 @@ const SLURP_TAG_BATCH: i64 = 25_000;
 /// namespace partition.
 const SLURP_RELATIONSHIP_BATCH: usize = 25_000;
 
+/// Source read batch for the secondary-hash keyset scan. Deliberately huge and
+/// independent of the destination write chunk: on the production source the
+/// reader full-scans the FileHashes b-tree for every keyset position (a batch
+/// costs ~25-30s whether it returns 4.6k or 883k rows), so larger reads mean
+/// fewer scans and near-linear total-time savings. Memory is the only limit on
+/// the read side: ~200 B/row in the tuple vec, so 4M rows is ~800 MB and
+/// finishes the whole 45.8M-row hash stage in ~9 min (52 scans at 883k).
+const SLURP_HASH_READ_BATCH: i64 = SQL_CHUNK_SIZE as i64 * 192; // 883,200
+
+/// Destination transaction size for the hash write. The read batch above can
+/// be orders of magnitude larger than this. A single shared transaction that
+/// absorbs the whole read batch grows superlinearly on the slurp target
+/// (measured ~57x write time for a 6x bigger batch: 37-41s at 883k rows when
+/// the same rows take ~0.7s in 147k-row transactions), so the write is split
+/// into bounded sub-transactions; each sub-transaction then chunks its
+/// INSERT OR IGNORE statements at SQL_CHUNK_SIZE inside `file_hashes_add_bulk`.
+const SLURP_HASH_WRITE_BATCH: usize = 25_000;
+
 /// Keyset scans build `{column} > last` from a seed of 0, which silently drops
 /// a source row whose id is 0 (some hydrus databases genuinely assign a File
 /// the id 0, main.db's 6.8M-row File table has one). Seed the first read at
@@ -794,7 +812,7 @@ impl TursoDatabase {
                     let mut rows = stmt
                         .query([
                             keyset_bound(first_hash_pass, last_file_id),
-                            (SQL_CHUNK_SIZE*192) as i64,
+                            SLURP_HASH_READ_BATCH,
                         ])
                         .await?;
                     let mut batch: Vec<(u64, String, String)> = Vec::new();
@@ -817,9 +835,15 @@ impl TursoDatabase {
                     log::info!("Slurping {} hashes into the db.", tuples.len());
                     if !tuples.is_empty() {
                         let target_started = Instant::now();
-                        conn.execute("BEGIN IMMEDIATE", ()).await?;
-                        self.file_hashes_add_bulk(&conn, &tuples).await?;
-                        conn.execute("COMMIT", ()).await?;
+                        // Commit in bounded sub-transactions: one giant
+                        // transaction for the whole read batch grows
+                        // superlinearly on the slurp target (see
+                        // SLURP_HASH_WRITE_BATCH).
+                        for sub in tuples.chunks(SLURP_HASH_WRITE_BATCH) {
+                            conn.execute("BEGIN IMMEDIATE", ()).await?;
+                            self.file_hashes_add_bulk(&conn, sub).await?;
+                            conn.execute("COMMIT", ()).await?;
+                        }
                         log::info!(
                             "Slurp hashes batch target complete: {} rows in {:?} (total {:?})",
                             tuples.len(),

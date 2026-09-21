@@ -270,14 +270,22 @@ impl TursoDatabase {
         Ok(())
     }
 
-    /// Bulk adds `(file_id, tag_id)` relationships, incrementing tag counts.
+    /// Bulk adds `(file_id, tag_id)` relationships.
+    ///
+    /// Returns the per-tag count deltas — only tags whose insert actually
+    /// created a row are counted. The `Tags.count` rows are deliberately NOT
+    /// updated inside this transaction: bumping a shared popular tag's count
+    /// is the hottest write-write conflict in the system, so the deltas are
+    /// returned and applied afterwards through `tag_counts_apply`, which
+    /// serializes those writes behind a single lock.
     pub(in crate::db::turso) async fn relationships_bulk_add(
         &self,
         conn: &Connection,
         relationships: &HashSet<(u64, u64)>,
-    ) -> Result<()> {
+    ) -> Result<HashMap<u64, u64>> {
+        let mut aggregated_deltas = HashMap::new();
         if relationships.is_empty() {
-            return Ok(());
+            return Ok(aggregated_deltas);
         }
 
         // Resolve every tag's namespace with chunked lookups instead of one
@@ -327,30 +335,32 @@ impl TursoDatabase {
                         params_from_iter(params),
                     )
                     .await?;
-                let mut count_deltas: HashMap<u64, u64> = HashMap::new();
+                // Only genuinely inserted rows appear in RETURNING; OR IGNORE
+                // rows are skips and must not bump the count.
                 while let Some(row) = inserted_rows.next().await? {
                     let tag_id: u64 = row.get(0)?;
-                    *count_deltas.entry(tag_id).or_default() += 1;
-                }
-                if !count_deltas.is_empty() {
-                    let (count_sql, count_params) = tag_count_update_sql(&count_deltas, false);
-                    conn.execute(count_sql, params_from_iter(count_params))
-                        .await?;
+                    *aggregated_deltas.entry(tag_id).or_default() += 1;
                 }
             }
         }
 
-        Ok(())
+        Ok(aggregated_deltas)
     }
 
-    /// Deletes `(file_id, tag_id)` relationships, decrementing tag counts.
+    /// Deletes `(file_id, tag_id)` relationships.
+    ///
+    /// Returns the per-tag count deltas to subtract (again: only rows the
+    /// DELETE actually removed). Like `relationships_bulk_add`, the
+    /// `Tags.count` maintenance is deferred to `tag_counts_apply` so the
+    /// shared count row stays out of the concurrent write set.
     pub(in crate::db::turso) async fn relationship_bulk_delete(
         &self,
         conn: &Connection,
         relationships: &HashSet<(u64, u64)>,
-    ) -> Result<()> {
+    ) -> Result<HashMap<u64, u64>> {
+        let mut aggregated_deltas = HashMap::new();
         if relationships.is_empty() {
-            return Ok(());
+            return Ok(aggregated_deltas);
         }
 
         let mut tag_namespaces = HashMap::new();
@@ -396,23 +406,69 @@ impl TursoDatabase {
                         params_from_iter(params),
                     )
                     .await?;
-                let mut count_deltas: HashMap<u64, u64> = HashMap::new();
                 while let Some(row) = deleted_rows.next().await? {
                     let tag_id: u64 = row.get(0)?;
-                    *count_deltas.entry(tag_id).or_default() += 1;
-                }
-                if !count_deltas.is_empty() {
-                    let (count_sql, count_params) = tag_count_update_sql(&count_deltas, true);
-                    conn.execute(count_sql, params_from_iter(count_params))
-                        .await?;
+                    *aggregated_deltas.entry(tag_id).or_default() += 1;
                 }
             }
         }
 
-        Ok(())
+        Ok(aggregated_deltas)
     }
 
-    /// Deletes a single `(file_id, tag_id)` relationship.
+    /// Applies accumulated relationship count deltas to `Tags.count`.
+    ///
+    /// Relationship rows are written by many concurrent `BEGIN CONCURRENT`
+    /// transactions, but the shared `Tags.count` row they each need to bump
+    /// is one hot row: two chunks touching the same popular tag guarantee a
+    /// write-write conflict there. So the deltas returned by
+    /// `relationships_bulk_add` / `relationship_bulk_delete` are folded in
+    /// here — one short `BEGIN IMMEDIATE` transaction at a time, serialized
+    /// behind `tag_count_lock` — after the relationship inserts have already
+    /// committed. The heavy parallel inserts stay concurrent; only the tiny
+    /// count bookkeeping serializes, which is the point: the count row is
+    /// never written by two transactions at once anymore.
+    pub(in crate::db::turso) async fn tag_counts_apply(
+        &self,
+        add_deltas: &HashMap<u64, u64>,
+        del_deltas: &HashMap<u64, u64>,
+    ) -> Result<()> {
+        if add_deltas.is_empty() && del_deltas.is_empty() {
+            return Ok(());
+        }
+
+        // One mutex guard for the whole fold-in, so no two callers ever
+        // update the same count row concurrently.
+        let _guard = self.tag_count_lock.lock().await;
+        let add_deltas = add_deltas.clone();
+        let del_deltas = del_deltas.clone();
+        self.retry_mvcc(|| async {
+            let conn = self.connect()?;
+            conn.execute("BEGIN IMMEDIATE", ()).await?;
+            if !add_deltas.is_empty() {
+                let (sql, params) = tag_count_update_sql(&add_deltas, false);
+                if let Err(error) = conn.execute(sql, params_from_iter(params)).await {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(error);
+                }
+            }
+            if !del_deltas.is_empty() {
+                let (sql, params) = tag_count_update_sql(&del_deltas, true);
+                if let Err(error) = conn.execute(sql, params_from_iter(params)).await {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(error);
+                }
+            }
+            match conn.execute("COMMIT", ()).await {
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    Err(error)
+                }
+            }
+        })
+        .await
+    }
     pub(in crate::db::turso) async fn relationship_delete(
         &self,
         conn: &Connection,
@@ -662,7 +718,13 @@ mod tests {
 
         let relationships: HashSet<(u64, u64)> =
             file_ids.iter().map(|file_id| (*file_id, tag_id)).collect();
-        db.relationships_bulk_add(&conn, &relationships)
+        // The bulk add returns deltas instead of applying counts inline;
+        // production folds them in after commit via `tag_counts_apply`.
+        let add_deltas = db
+            .relationships_bulk_add(&conn, &relationships)
+            .await
+            .unwrap();
+        db.tag_counts_apply(&add_deltas, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(
@@ -671,7 +733,11 @@ mod tests {
             "two relationships must increment the count twice"
         );
 
-        db.relationship_bulk_delete(&conn, &relationships)
+        let del_deltas = db
+            .relationship_bulk_delete(&conn, &relationships)
+            .await
+            .unwrap();
+        db.tag_counts_apply(&HashMap::new(), &del_deltas)
             .await
             .unwrap();
         assert_eq!(tag_count(&db, &conn, tag_id).await, 0);

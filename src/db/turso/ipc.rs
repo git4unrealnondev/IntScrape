@@ -240,8 +240,8 @@ impl TursoDatabase {
                 .map(|tag_id| (*file_id, *tag_id as u64))
                 .collect();
 
-            match self.relationships_bulk_add(&conn, &relationships).await {
-                Ok(()) => {}
+            let add_deltas = match self.relationships_bulk_add(&conn, &relationships).await {
+                Ok(deltas) => deltas,
                 Err(error) if TursoDatabase::is_concurrency_conflict(&error) => {
                     let _ = conn.execute("ROLLBACK", ()).await;
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -252,10 +252,20 @@ impl TursoDatabase {
                     let _ = conn.execute("ROLLBACK", ()).await;
                     return false;
                 }
-            }
+            };
 
             match conn.execute("COMMIT", ()).await {
-                Ok(_) => return true,
+                Ok(_) => {
+                    // Relationship rows committed; fold the deferred count
+                    // deltas in through the serialized writer. Failure only
+                    // leaves a stale count, so it must not fail the request.
+                    if let Err(error) = self.tag_counts_apply(&add_deltas, &HashMap::new()).await {
+                        log::error!(
+                            "Failed to apply deferred tag counts for file {file_id}: {error}"
+                        );
+                    }
+                    return true;
+                }
                 Err(error) if TursoDatabase::is_concurrency_conflict(&error) => {
                     log::warn!(
                         "Tag transaction for file {file_id} conflicted; retrying in 50ms: {error}"
@@ -356,23 +366,35 @@ impl TursoDatabase {
                 continue;
             }
 
-            if !relationships.is_empty()
-                && let Err(error) = self.relationships_bulk_add(&conn, &relationships).await
-            {
-                let _ = conn.execute("ROLLBACK", ()).await;
-                if TursoDatabase::is_concurrency_conflict(&error) {
-                    log::warn!(
-                        "Bulk relationship transaction conflicted; retrying in 50ms: {error}"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    continue;
+            let add_deltas = if relationships.is_empty() {
+                HashMap::new()
+            } else {
+                match self.relationships_bulk_add(&conn, &relationships).await {
+                    Ok(deltas) => deltas,
+                    Err(error) => {
+                        let _ = conn.execute("ROLLBACK", ()).await;
+                        if TursoDatabase::is_concurrency_conflict(&error) {
+                            log::warn!(
+                                "Bulk relationship transaction conflicted; retrying in 50ms: {error}"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            continue;
+                        }
+                        log::error!("Failed to add bulk relationships: {error}");
+                        return false;
+                    }
                 }
-                log::error!("Failed to add bulk relationships: {error}");
-                return false;
-            }
+            };
 
             match conn.execute("COMMIT", ()).await {
-                Ok(_) => return true,
+                Ok(_) => {
+                    // Fold the deferred count deltas in via the serialized
+                    // writer; a failure only leaves a stale count.
+                    if let Err(error) = self.tag_counts_apply(&add_deltas, &HashMap::new()).await {
+                        log::error!("Failed to apply deferred tag counts: {error}");
+                    }
+                    return true;
+                }
                 Err(error) if TursoDatabase::is_concurrency_conflict(&error) => {
                     log::warn!(
                         "Bulk tag transaction conflicted at commit; retrying in 50ms: {error}"

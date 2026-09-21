@@ -2,7 +2,7 @@ use std::{collections::HashMap, future::Future, path::Path, sync::Arc};
 
 use shared_types::DbSettingsObj;
 use smol_str::SmolStr;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use turso::{Builder, Database, Result, transaction::Transaction};
 
 use crate::DB_VERSION;
@@ -53,6 +53,12 @@ pub struct TursoDatabase {
     /// database. The slurp waits for this to reach zero before beginning a
     /// BEGIN IMMEDIATE transaction so no UI request pins a read snapshot.
     ipc_active: Arc<std::sync::atomic::AtomicUsize>,
+    /// Serializes the tiny `Tags.count` maintenance writes that follow
+    /// relationship inserts. Concurrent scrapers bump the same popular tag's
+    /// count row, which is the hottest write-write conflict in the system;
+    /// count deltas are deferred out of the `BEGIN CONCURRENT` transactions
+    /// and folded in one short transaction at a time through this lock.
+    tag_count_lock: Arc<Mutex<()>>,
 }
 
 impl TursoDatabase {
@@ -150,6 +156,7 @@ impl TursoDatabase {
             slurping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ipc_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ipc_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            tag_count_lock: Arc::new(Mutex::new(())),
         };
 
         if create_db {
