@@ -2,6 +2,24 @@ use turso::{Connection, Result};
 
 use crate::db::turso::TursoDatabase;
 
+/// One-time rebuild trigger for the popular-tag FTS shadow.
+///
+/// Every graceful ensure records this in `Settings(name='fts_shadow_schema'),
+/// and a Database whose marker differs from this constant gets a wholesale
+/// shadow rebuild on its next boot, so all segments match the on-disk FTS
+/// schema this binary writes.
+///
+/// Limbo changed its tantivy index format between pre-releases: since
+/// `turso_core 0.8.0-pre.12` the schema carries `doc_identity_hi` /
+/// `doc_identity_lo` FAST fields, and the merge path requires them on every
+/// segment. Indexes written by < pre.12 lack them and the first write (not a
+/// search) fails with `FTS segment ... has no document identity high column`.
+/// **Bump this constant whenever the turso/limbo FTS index format changes** —
+/// e.g. `"pre12-docid"` when the database is served by a core that writes the
+/// identity columns.
+pub(in crate::db::turso) const FTS_SHADOW_SCHEMA_GENERATION: &str = "pre11-v1";
+const FTS_SHADOW_MARKER_NAME: &str = "fts_shadow_schema";
+
 impl TursoDatabase {
     /// Creates the file tables.
     pub(in crate::db::turso) async fn table_create_file(&self, conn: &Connection) {
@@ -140,11 +158,18 @@ CREATE INDEX IF NOT EXISTS idx_tags_count_covering ON Tags(count DESC, name, nam
     ///
     /// First boot / upgrade: create the shadow, mirror already-popular tags,
     /// drop the old Tags-level index (moved onto the shadow), build it and
-    /// merge segments once. Steady state: verify-only — make sure the index
-    /// exists and actually resolves, but never rebuild or OPTIMIZE a healthy
-    /// index. A registered-but-torn index (process died mid-rebuild) is
-    /// detected by the probe query and rebuilt, so databases already touched
-    /// by a broken boot heal on their next restart without manual SQL.
+    /// merge segments once, then record the shadow's schema generation in
+    /// Settings. A shadow whose generation marker differs from this binary's
+    /// (built by an older core, or a boot that died before the marker landed)
+    /// gets a one-time wholesale rebuild — the tantivy index format changed
+    /// between limbo pre-releases (≥ 0.8.0-pre.12 requires identity fast
+    /// fields on every segment), and a search probe cannot detect a
+    /// write-path schema mismatch. Steady state with a matching marker:
+    /// verify-only — make sure the index exists and actually resolves, but
+    /// never rebuild or OPTIMIZE a healthy index. A registered-but-torn index
+    /// (process died mid-rebuild) is detected by the probe query and rebuilt,
+    /// so databases already touched by a broken boot heal on their next
+    /// restart without manual SQL.
     ///
     /// Both branches report their errors instead of being discarded: a failed
     /// rebuild here leaves search permanently dead (`fts_match` has no index),
@@ -192,44 +217,100 @@ CREATE TABLE IF NOT EXISTS Tags_Popular (
                  OPTIMIZE INDEX idx_tags_fts;",
             )
             .await?;
+            self.fts_shadow_write_marker(conn).await?;
         } else {
-            // Steady state: make sure the index exists (no-op on healthy DBs),
-            // then confirm it actually resolves. Tantivy segments live inside
-            // the DB file, so a crash mid-rebuild can leave the index
-            // registered in sqlite_master but torn — `IF NOT EXISTS` alone
-            // would never repair that, and neither would the case-sensitive
-            // probe on an already-upgraded database.
-            conn.execute_batch(
-                "CREATE INDEX IF NOT EXISTS idx_tags_fts ON Tags_Popular USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);",
-            )
-            .await?;
-            // Cheap probe: one term-dictionary lookup, no document scan, so
-            // steady-state boots stay fast.
-            let mut healthy = false;
-            if let Ok(mut rows) = conn
-                .query(
-                    "SELECT fts_score(name, ?1)
-                     FROM Tags_Popular
-                     WHERE fts_match(name, ?1)
-                     LIMIT 1;",
-                    ("zq9",),
-                )
-                .await
-            {
-                healthy = rows.next().await.is_ok();
-            }
-            if !healthy {
+            let marker = self.fts_shadow_read_marker(conn).await?;
+            if marker != Some(FTS_SHADOW_SCHEMA_GENERATION.to_string()) {
+                // The shadow exists but its segments were written by an older
+                // index format (or a boot died before the marker landed). The
+                // search probe below cannot detect this — the read path never
+                // touches the identity columns the merge path requires — so
+                // rebuild wholesale so every segment matches this binary's
+                // schema, then record the generation.
                 log::warn!(
-                    "Popular-tag FTS index is registered but does not resolve; rebuilding it."
+                    "Popular-tag FTS shadow was built by an older core (schema marker {marker:?}, want {FTS_SHADOW_SCHEMA_GENERATION}); rebuilding it once."
                 );
                 conn.execute_batch(
-                    "DROP INDEX IF EXISTS idx_tags_fts;
+                    "DROP TABLE IF EXISTS Tags_Popular;
+                     CREATE TABLE Tags_Popular (
+                         tag_id INTEGER PRIMARY KEY,
+                         name TEXT NOT NULL
+                     );
+                     INSERT INTO Tags_Popular(tag_id, name)
+                     SELECT id, name FROM Tags WHERE count >= 5;
                      CREATE INDEX idx_tags_fts ON Tags_Popular USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);
                      OPTIMIZE INDEX idx_tags_fts;",
                 )
                 .await?;
+                self.fts_shadow_write_marker(conn).await?;
+            } else {
+                // Steady state: make sure the index exists (no-op on healthy
+                // DBs), then confirm it actually resolves. Tantivy segments
+                // live inside the DB file, so a crash mid-rebuild can leave
+                // the index registered in sqlite_master but torn — `IF NOT
+                // EXISTS` alone would never repair that, and neither would the
+                // case-sensitive probe on an already-upgraded database.
+                conn.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS idx_tags_fts ON Tags_Popular USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);",
+                )
+                .await?;
+                // Cheap probe: one term-dictionary lookup, no document scan,
+                // so steady-state boots stay fast.
+                let mut healthy = false;
+                if let Ok(mut rows) = conn
+                    .query(
+                        "SELECT fts_score(name, ?1)
+                         FROM Tags_Popular
+                         WHERE fts_match(name, ?1)
+                         LIMIT 1;",
+                        ("zq9",),
+                    )
+                    .await
+                {
+                    healthy = rows.next().await.is_ok();
+                }
+                if !healthy {
+                    log::warn!(
+                        "Popular-tag FTS index is registered but does not resolve; rebuilding it."
+                    );
+                    conn.execute_batch(
+                        "DROP INDEX IF EXISTS idx_tags_fts;
+                         CREATE INDEX idx_tags_fts ON Tags_Popular USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);
+                         OPTIMIZE INDEX idx_tags_fts;",
+                    )
+                    .await?;
+                }
             }
         }
+        Ok(())
+    }
+
+    /// Reads `Settings(name = 'fts_shadow_schema').param` directly (bypasses
+    /// the cache — the ensure runs at boot before `load_cache`).
+    async fn fts_shadow_read_marker(&self, conn: &Connection) -> Result<Option<String>> {
+        let mut rows = conn
+            .query(
+                "SELECT param FROM Settings WHERE name = ?1 LIMIT 1;",
+                (FTS_SHADOW_MARKER_NAME,),
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            Ok(row.get(0)?)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Records that this binary built the popular-tag FTS shadow with its own
+    /// index format. Written only after a successful build/rebuild, so a
+    /// failed rebuild stays unmarked and retries next boot.
+    async fn fts_shadow_write_marker(&self, conn: &Connection) -> Result<()> {
+        conn.execute(
+            "INSERT OR REPLACE INTO Settings (name, description, num, param)
+             VALUES (?1, NULL, NULL, ?2);",
+            (FTS_SHADOW_MARKER_NAME, FTS_SHADOW_SCHEMA_GENERATION.to_string()),
+        )
+        .await?;
         Ok(())
     }
 

@@ -815,6 +815,72 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn steady_state_boot_rebuilds_old_generation_shadow() {
+        // Legacy/generation-mismatched shadow: DB whose FTS segments were
+        // written by an older core, simulated by a stale schema marker. The
+        // search probe cannot detect this (the read path never needs the
+        // identity columns the merge path requires), so the marker must drive
+        // a one-time wholesale rebuild on the next boot.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("gen.db");
+        let should_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "INSERT INTO Namespace (name, description) VALUES ('subject', NULL);",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO Tags (name, namespace, count) VALUES ('genmark', 1, 12);",
+                (),
+            )
+            .await
+            .unwrap();
+            // Simulate the post-build state of an older core: shadow + index
+            // both fine, but the schema generation marker is stale.
+            conn.execute(
+                "INSERT OR REPLACE INTO Settings (name, description, num, param)
+                 VALUES ('fts_shadow_schema', NULL, NULL, 'ancient');",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        db.shutdown().await;
+        drop(db);
+
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit).await;
+        let conn = db.connect().unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT param FROM Settings WHERE name = 'fts_shadow_schema';",
+                (),
+            )
+            .await
+            .unwrap();
+        let marker: String = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("marker must be written after a generation rebuild")
+            .get(0)
+            .unwrap();
+        assert_eq!(
+            marker,
+            super::super::schema_current::FTS_SHADOW_SCHEMA_GENERATION,
+            "stale-generation shadow must be rebuilt and re-marked with the current generation"
+        );
+        drop(conn);
+        let found = db.tags_search_fts("genmark", 10).await.unwrap();
+        assert_eq!(found.len(), 1, "rebuilt shadow must serve search");
+        db.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn process_scraper_creates_namespace_partition_without_ddl_error() {
         use shared_types::{
             FileManager, GenericNamespaceObj, PluginTag, ScraperDataReturn, Tag, TagType,
