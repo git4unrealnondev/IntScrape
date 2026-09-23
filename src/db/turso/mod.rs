@@ -242,10 +242,13 @@ impl TursoDatabase {
 
         // Popular-tag FTS shadow: create/index on first boot or upgrade,
         // verify-only on steady boots. Runs here (every boot) because
-        // `create_db` only fires for a brand-new file.
+        // `create_db` only fires for a brand-new file. Failures are surfaced
+        // so a broken search index is never invisible.
         {
             let connection = self.connect()?;
-            self.table_ensure_tags_popular(&connection).await;
+            if let Err(error) = self.table_ensure_tags_popular(&connection).await {
+                log::error!("Failed to ensure popular-tag FTS shadow: {error}");
+            }
         }
 
         self.load_cache().await?;

@@ -730,6 +730,91 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn steady_state_boot_sees_popular_shadow() {
+        // Regression: limbo lowercases identifiers in sqlite_master, so a
+        // probe comparing `name = 'Tags_Popular'` returns 0 on EVERY boot and
+        // silently re-runs the full DROP/rebuild/OPTIMIZE cycle. Fixing the
+        // probe is what keeps steady-state boots verify-only.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("probe.db");
+        let should_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+        db.shutdown().await;
+        drop(db);
+        // Second boot = steady state: the shadow created by the first boot
+        // must be visible to the ensure probe.
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit).await;
+        let conn = db.connect().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND LOWER(name) = 'tags_popular'
+                 )",
+            )
+            .await
+            .unwrap();
+        let probe: i64 = stmt.query_row(()).await.unwrap().get(0).unwrap();
+        assert_eq!(probe, 1, "steady-state boot must see the shadow");
+        db.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn steady_state_boot_rebuilds_missing_fts_index() {
+        // The state a torn/crashed index rebuild leaves behind: the shadow
+        // exists but `idx_tags_fts` is gone. The next boot (steady branch)
+        // must recreate the index via IF NOT EXISTS so search works again —
+        // this is what repairs databases that were already touched by a
+        // broken boot.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("indexgap.db");
+        let should_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "INSERT INTO Namespace (name, description) VALUES ('subject', NULL);",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO Tags (name, namespace, count) VALUES ('fancyt', 1, 9);",
+                (),
+            )
+            .await
+            .unwrap();
+            // Wholesale shadow build (same batch the slurp end-of-run uses),
+            // then break only the index, keeping the shadow rows.
+            let batch = "DROP TABLE IF EXISTS Tags_Popular;
+                 CREATE TABLE Tags_Popular (
+                     tag_id INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL
+                 );
+                 INSERT INTO Tags_Popular(tag_id, name)
+                     SELECT id, name FROM Tags WHERE count >= 5;
+                 CREATE INDEX idx_tags_fts ON Tags_Popular USING fts
+                     (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);
+                 OPTIMIZE INDEX idx_tags_fts;";
+            conn.execute_batch(batch).await.unwrap();
+            conn.execute("DROP INDEX idx_tags_fts", ()).await.unwrap();
+        }
+        db.shutdown().await;
+        drop(db);
+
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit).await;
+        let found = db.tags_search_fts("fancy", 10).await.unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "reopen must rebuild the missing FTS index so search works"
+        );
+        db.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn process_scraper_creates_namespace_partition_without_ddl_error() {
         use shared_types::{
             FileManager, GenericNamespaceObj, PluginTag, ScraperDataReturn, Tag, TagType,

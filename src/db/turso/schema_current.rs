@@ -140,15 +140,30 @@ CREATE INDEX IF NOT EXISTS idx_tags_count_covering ON Tags(count DESC, name, nam
     ///
     /// First boot / upgrade: create the shadow, mirror already-popular tags,
     /// drop the old Tags-level index (moved onto the shadow), build it and
-    /// merge segments once. Steady state: just make sure the index exists —
-    /// no per-boot rebuild or OPTIMIZE.
-    pub(in crate::db::turso) async fn table_ensure_tags_popular(&self, conn: &Connection) {
+    /// merge segments once. Steady state: verify-only — make sure the index
+    /// exists and actually resolves, but never rebuild or OPTIMIZE a healthy
+    /// index. A registered-but-torn index (process died mid-rebuild) is
+    /// detected by the probe query and rebuilt, so databases already touched
+    /// by a broken boot heal on their next restart without manual SQL.
+    ///
+    /// Both branches report their errors instead of being discarded: a failed
+    /// rebuild here leaves search permanently dead (`fts_match` has no index),
+    /// and `check_db` swallows failures, so this is the only place the failure
+    /// can surface in the logs.
+    pub(in crate::db::turso) async fn table_ensure_tags_popular(
+        &self,
+        conn: &Connection,
+    ) -> Result<()> {
         let shadow_existed: i64 = {
             let mut stmt = conn
                 .prepare(
+                    // Limbo lowercases identifiers in sqlite_master, so this
+                    // comparison must be case-insensitive. A case-sensitive
+                    // `name = 'Tags_Popular'` returns 0 on every boot and
+                    // silently re-runs the whole DROP/rebuild/OPTIMIZE cycle.
                     "SELECT EXISTS(
                          SELECT 1 FROM sqlite_master
-                         WHERE type = 'table' AND name = 'Tags_Popular'
+                         WHERE type = 'table' AND LOWER(name) = 'tags_popular'
                      )",
                 )
                 .await
@@ -167,7 +182,7 @@ CREATE TABLE IF NOT EXISTS Tags_Popular (
 );
 ",
         )
-        .await;
+        .await?;
         if shadow_existed == 0 {
             conn.execute_batch(
                 "INSERT OR IGNORE INTO Tags_Popular(tag_id, name)
@@ -176,13 +191,46 @@ CREATE TABLE IF NOT EXISTS Tags_Popular (
                  CREATE INDEX IF NOT EXISTS idx_tags_fts ON Tags_Popular USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);
                  OPTIMIZE INDEX idx_tags_fts;",
             )
-            .await;
+            .await?;
         } else {
+            // Steady state: make sure the index exists (no-op on healthy DBs),
+            // then confirm it actually resolves. Tantivy segments live inside
+            // the DB file, so a crash mid-rebuild can leave the index
+            // registered in sqlite_master but torn — `IF NOT EXISTS` alone
+            // would never repair that, and neither would the case-sensitive
+            // probe on an already-upgraded database.
             conn.execute_batch(
                 "CREATE INDEX IF NOT EXISTS idx_tags_fts ON Tags_Popular USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);",
             )
-            .await;
+            .await?;
+            // Cheap probe: one term-dictionary lookup, no document scan, so
+            // steady-state boots stay fast.
+            let mut healthy = false;
+            if let Ok(mut rows) = conn
+                .query(
+                    "SELECT fts_score(name, ?1)
+                     FROM Tags_Popular
+                     WHERE fts_match(name, ?1)
+                     LIMIT 1;",
+                    ("zq9",),
+                )
+                .await
+            {
+                healthy = rows.next().await.is_ok();
+            }
+            if !healthy {
+                log::warn!(
+                    "Popular-tag FTS index is registered but does not resolve; rebuilding it."
+                );
+                conn.execute_batch(
+                    "DROP INDEX IF EXISTS idx_tags_fts;
+                     CREATE INDEX idx_tags_fts ON Tags_Popular USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);
+                     OPTIMIZE INDEX idx_tags_fts;",
+                )
+                .await?;
+            }
         }
+        Ok(())
     }
 
     pub(in crate::db::turso) async fn table_create_dead_urls(&self, conn: &Connection) {
