@@ -246,6 +246,65 @@ impl TursoDatabase {
         Ok(out)
     }
 
+    /// Mirrors the given tags' current popularity into the search shadow:
+    /// `Tags_Popular` keeps exactly the `count >= 5` tags that the FTS index
+    /// covers. Must run on the same connection (and, for the batch path, the
+    /// same transaction) that applied the `Tags.count` change so counts and
+    /// searchability can never diverge. One DELETE for the below-threshold
+    /// rows and one INSERT OR IGNORE for the qualifying ones, chunked at
+    /// SQL_CHUNK_SIZE so a big recount fold-in never builds one giant
+    /// statement.
+    pub(in crate::db::turso) async fn sync_tags_popular(
+        &self,
+        conn: &Connection,
+        tag_ids: &[u64],
+    ) -> Result<()> {
+        if tag_ids.is_empty() {
+            return Ok(());
+        }
+        for chunk in tag_ids.chunks(SQL_CHUNK_SIZE) {
+            // Owned value buffers only: nothing borrowed may cross the await
+            // below, or the future stops proving Send inside the IPC/scraper
+            // task chains (rustc reports a higher-ranked `Send` for the
+            // whole handler).
+            let values: Vec<i64> = chunk.iter().map(|id| *id as i64).collect();
+            let mut placeholders = String::with_capacity(chunk.len() * 2);
+            for (index, _) in chunk.iter().enumerate() {
+                if index > 0 {
+                    placeholders.push(',');
+                }
+                placeholders.push('?');
+            }
+            // No correlated subquery: limbo cannot parse an outer reference to
+            // the DELETEd table (`Parse error: no such table`). The `tag_id IN`
+            // guard narrows the scan to this batch; the NOT IN subquery is then
+            // scoped to the same batch ids (PK point lookups) so a single
+            // relationship add/delete never scans the whole popular set.
+            conn.execute(
+                format!(
+                    "DELETE FROM Tags_Popular
+                     WHERE tag_id IN ({placeholders}) AND tag_id NOT IN (
+                         SELECT id FROM Tags
+                         WHERE id IN ({placeholders}) AND count >= 5
+                     )"
+                ),
+                // Both placeholders lists get the same owned batch values.
+                params_from_iter(values.clone().into_iter().chain(values.clone())),
+            )
+            .await?;
+            conn.execute(
+                format!(
+                    "INSERT OR IGNORE INTO Tags_Popular(tag_id, name)
+                     SELECT id, name FROM Tags
+                     WHERE id IN ({placeholders}) AND count >= 5"
+                ),
+                params_from_iter(values),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Adds a `file_id` -> `tag_id` relationship into its namespace partition.
     pub(in crate::db::turso) async fn relationship_add(
         &self,
@@ -266,6 +325,7 @@ impl TursoDatabase {
                 (tag_id as i64,),
             )
             .await?;
+            self.sync_tags_popular(conn, &[tag_id]).await?;
         }
         Ok(())
     }
@@ -428,7 +488,7 @@ impl TursoDatabase {
     /// committed. The heavy parallel inserts stay concurrent; only the tiny
     /// count bookkeeping serializes, which is the point: the count row is
     /// never written by two transactions at once anymore.
-    pub(in crate::db::turso) async fn tag_counts_apply(
+    pub(crate) async fn tag_counts_apply(
         &self,
         add_deltas: &HashMap<u64, u64>,
         del_deltas: &HashMap<u64, u64>,
@@ -459,6 +519,17 @@ impl TursoDatabase {
                     return Err(error);
                 }
             }
+            // Mirrors popularity into the FTS shadow inside the same
+            // transaction, so a count that crossed the threshold becomes (or
+            // stops being) searchable atomically with the count itself.
+            let mut touched: Vec<u64> = add_deltas.keys().copied().collect();
+            touched.extend(del_deltas.keys().copied());
+            touched.sort_unstable();
+            touched.dedup();
+            if let Err(error) = self.sync_tags_popular(&conn, &touched).await {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(error);
+            }
             match conn.execute("COMMIT", ()).await {
                 Ok(_) => Ok(()),
                 Err(error) => {
@@ -487,6 +558,7 @@ impl TursoDatabase {
                 (tag_id as i64,),
             )
             .await?;
+            self.sync_tags_popular(conn, &[tag_id]).await?;
         }
         Ok(())
     }
@@ -741,5 +813,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tag_count(&db, &conn, tag_id).await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relationship_activity_crosses_popularity_threshold_both_ways() {
+        let db = new_test_db().await;
+        let conn = db.connect().unwrap();
+
+        let tags: HashSet<Tag> = HashSet::from([Tag {
+            name: "red fox".into(),
+            namespace: GenericNamespaceObj {
+                name: "subject".into(),
+                description: None,
+            },
+        }]);
+        let tag_db_set = db.tag_add_bulk(&conn, &tags).await.unwrap();
+        let tag_db: &TagDb = tag_db_set.iter().next().unwrap();
+        let tag_id = tag_db.id as u64;
+
+        // The FTS index only covers `count >= 5`: four relationships (count 4)
+        // must stay unsearchable, the fifth crossing to 5 becomes searchable,
+        // and one delete (back to 4) drops it again.
+        for file_id in 1_u64..=4 {
+            db.relationship_add(&conn, file_id, tag_id).await.unwrap();
+        }
+        assert_eq!(
+            db.tags_search_fts("red f", 10).await.unwrap(),
+            Vec::new(),
+            "count 4 must not be searchable"
+        );
+
+        db.relationship_add(&conn, 5_u64, tag_id).await.unwrap();
+        let found = db.tags_search_fts("red f", 10).await.unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "count 5 must cross into the popular FTS index"
+        );
+
+        db.relationship_delete(&conn, 5_u64, tag_id).await.unwrap();
+        assert_eq!(
+            db.tags_search_fts("red f", 10).await.unwrap(),
+            Vec::new(),
+            "count 4 must drop back out of the popular FTS index"
+        );
     }
 }

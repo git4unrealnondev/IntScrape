@@ -121,11 +121,68 @@ CREATE TABLE IF NOT EXISTS Tags (
     FOREIGN KEY (namespace) REFERENCES Namespace(id) ON DELETE CASCADE ON UPDATE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_tags_count_covering ON Tags(count DESC, name, namespace);
-CREATE INDEX IF NOT EXISTS idx_tags_fts ON Tags USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);
-OPTIMIZE INDEX idx_tags_fts;
 ",
         )
         .await;
+    }
+
+    /// Ensures the popular-tag FTS shadow exists and is indexed. Runs on every
+    /// boot via `check_db` (not only on fresh creation, since `create_db` only
+    /// fires when the database file is brand new).
+    ///
+    /// The Tantivy-backed FTS index only covers popular tags: search is backed
+    /// by the small `Tags_Popular` table holding exactly the `count >= 5`
+    /// rows, so the ngram index stays tiny and unpopular tags never show up
+    /// in autocomplete. Limbo rejects a partial `USING fts` index (`WHERE
+    /// count >= 5`), so the filter lives in the shadow table instead. The
+    /// shadow is kept in sync by the count-change sites in relationship.rs and
+    /// rebuilt wholesale at the end of every slurp.
+    ///
+    /// First boot / upgrade: create the shadow, mirror already-popular tags,
+    /// drop the old Tags-level index (moved onto the shadow), build it and
+    /// merge segments once. Steady state: just make sure the index exists —
+    /// no per-boot rebuild or OPTIMIZE.
+    pub(in crate::db::turso) async fn table_ensure_tags_popular(&self, conn: &Connection) {
+        let shadow_existed: i64 = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND name = 'Tags_Popular'
+                     )",
+                )
+                .await
+                .expect("table_ensure_tags_popular shadow probe");
+            stmt.query_row(())
+                .await
+                .expect("table_ensure_tags_popular shadow probe row")
+                .get(0)
+                .expect("table_ensure_tags_popular shadow probe value")
+        };
+        conn.execute_batch(
+            "
+CREATE TABLE IF NOT EXISTS Tags_Popular (
+    tag_id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL
+);
+",
+        )
+        .await;
+        if shadow_existed == 0 {
+            conn.execute_batch(
+                "INSERT OR IGNORE INTO Tags_Popular(tag_id, name)
+                 SELECT id, name FROM Tags WHERE count >= 5;
+                 DROP INDEX IF EXISTS idx_tags_fts;
+                 CREATE INDEX IF NOT EXISTS idx_tags_fts ON Tags_Popular USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);
+                 OPTIMIZE INDEX idx_tags_fts;",
+            )
+            .await;
+        } else {
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_tags_fts ON Tags_Popular USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);",
+            )
+            .await;
+        }
     }
 
     pub(in crate::db::turso) async fn table_create_dead_urls(&self, conn: &Connection) {

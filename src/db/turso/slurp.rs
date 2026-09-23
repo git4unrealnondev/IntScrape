@@ -574,8 +574,7 @@ impl TursoDatabase {
         // New rows the destination actually absorbed. The relationship stage
         // below reads it (together with its own inserted-relationship count)
         // to skip recounting when nothing changed: recounting rewrites every
-        // Tags.count row, which maintains the ngram index per row and is
-        // pathological on destinations that already carry idx_tags_fts.
+        // Tags.count row (each rewrite churns the MVCC image).
         let mut tags_added = 0_usize;
         {
             // Tags arrive in source id order, random relative to the
@@ -647,8 +646,6 @@ impl TursoDatabase {
                 )
                 .await?;
                 conn.execute("DROP INDEX IF EXISTS idx_tags_count_covering", ())
-                    .await?;
-                conn.execute("DROP INDEX IF EXISTS idx_tags_fts", ())
                     .await?;
                 log::info!("Slurp tags: cold import, inserting directly into indexed Tags");
             } else {
@@ -767,8 +764,8 @@ impl TursoDatabase {
             if cold_import {
                 // idx_tags_name_namespace carried every insert up front; the
                 // covering index is rebuilt once here (counts were all 0
-                // through the copy), and the final stage rebuilds the dropped
-                // ngram-FTS index over the whole table.
+                // through the copy), and the final stage rebuilds the popular
+                // ngram-FTS shadow (`Tags_Popular`) over the whole table.
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_tags_count_covering
                      ON Tags(count DESC, name, namespace)",
@@ -787,19 +784,15 @@ impl TursoDatabase {
                 // restore uniqueness and the covering index now that the bulk
                 // insert (which would re-bloat them per row) is done. Ids
                 // keep their values through the rename, so relationship
-                // mapping stays valid.
-                //
-                // The FTS index is dropped first because SQLite rewrites
-                // dependent indexes on table renames; it is rebuilt once at
-                // the very end. The row copy is done in chunks of
-                // SLURP_TAG_BATCH under their own short transactions: a single
-                // `INSERT ... SELECT` over all rows is one multi-GB MVCC
-                // commit that serializes the whole delta into an in-memory
-                // log (measured ~14.5 min and ~11 GB RAM for 15M rows),
-                // whereas chunking (~25k per commit) runs ~2x faster and uses
-                // ~100x less memory (measured ~6.8 min, ~90 MB).
-                conn.execute("DROP INDEX IF EXISTS idx_tags_fts", ())
-                    .await?;
+                // mapping stays valid — the popular-FTS shadow references
+                // those same ids and survives the rename untouched. The row
+                // copy is done in chunks of SLURP_TAG_BATCH under their own
+                // short transactions: a single `INSERT ... SELECT` over all
+                // rows is one multi-GB MVCC commit that serializes the whole
+                // delta into an in-memory log (measured ~14.5 min and ~11 GB
+                // RAM for 15M rows), whereas chunking (~25k per commit) runs
+                // ~2x faster and uses ~100x less memory (measured ~6.8 min,
+                // ~90 MB).
                 let copy_started = Instant::now();
                 let max_copy_id: i64 = {
                     let mut stmt = conn
@@ -1728,8 +1721,23 @@ impl TursoDatabase {
             self.slurp_jobs(&conn, source).await?;
         }
 
+        // Rebuild the popular-tag FTS shadow once, after every stage (and
+        // every recount) is done: the shadow only carries `count >= 5` tags
+        // and the ngram index is built on that filtered set, so it stays
+        // small. Replacing the whole table also resets any stale rows left by
+        // an interrupted earlier run. The bulk `INSERT ... SELECT` lands in a
+        // bare table, then one index build + OPTIMIZE merge worth of segment
+        // churn happens exactly once — unlike a per-row trigger design, the
+        // recount paths never maintain the index incrementally.
         conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_tags_fts ON Tags USING fts
+            "DROP TABLE IF EXISTS Tags_Popular;
+             CREATE TABLE Tags_Popular (
+                 tag_id INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL
+             );
+             INSERT INTO Tags_Popular(tag_id, name)
+                 SELECT id, name FROM Tags WHERE count >= 5;
+             CREATE INDEX idx_tags_fts ON Tags_Popular USING fts
                  (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);
              OPTIMIZE INDEX idx_tags_fts;",
         )
@@ -2504,6 +2512,87 @@ mod tests {
             4,
             "all bulk-import indexes recreated: {present:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slurp_builds_popular_only_fts_shadow() {
+        let db = new_target().await;
+
+        // Source tags: 'popular' related to five files (count 5 — must be
+        // FTS-searchable) and 'rare' related to one (count 1 — must not).
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source_path = temp_dir.path().join("source.db");
+        write_source(
+            &source_path,
+            "CREATE TABLE Namespace (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
+             INSERT INTO Namespace (name, description) VALUES ('species', 'test');
+
+             CREATE TABLE Tags (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
+                 count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
+             INSERT INTO Tags (name, namespace) VALUES ('popular', 1), ('rare', 1);
+
+             CREATE TABLE FileStorageLocations (
+                 id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
+             INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
+
+             CREATE TABLE File (
+                 id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
+                 storage_id INTEGER, size_bytes INTEGER);
+             INSERT INTO File (hash, extension, storage_id, size_bytes) VALUES
+                 ('h1', 'jpg', 1, 1), ('h2', 'jpg', 1, 2), ('h3', 'jpg', 1, 3),
+                 ('h4', 'jpg', 1, 4), ('h5', 'jpg', 1, 5);
+
+             CREATE TABLE Relationship_1 (
+                 file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                 PRIMARY KEY (tag_id, file_id));
+             INSERT INTO Relationship_1 (file_id, tag_id) VALUES
+                 (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (1, 2);
+
+             CREATE TABLE Parents (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
+                 relate_tag_id INTEGER NOT NULL, limit_to INTEGER);",
+        )
+        .await;
+
+        let counts = db.db_slurp(&source_path).await.unwrap();
+        assert_eq!(counts, (1, 2, 5));
+
+        let conn = db.connect().unwrap();
+
+        let mut rows = conn
+            .query("SELECT name, count FROM Tags ORDER BY id;", ())
+            .await
+            .unwrap();
+        let mut tag_counts = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            tag_counts.push((
+                row.get::<String>(0).unwrap(),
+                row.get::<u64>(1).unwrap(),
+            ));
+        }
+        assert_eq!(
+            tag_counts,
+            vec![("popular".to_string(), 5), ("rare".to_string(), 1)]
+        );
+
+        // Only the popular tag is mirrored into the search shadow.
+        let mut rows = conn
+            .query("SELECT name FROM Tags_Popular ORDER BY tag_id;", ())
+            .await
+            .unwrap();
+        let mut shadow = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            shadow.push(row.get::<String>(0).unwrap());
+        }
+        assert_eq!(shadow, vec!["popular".to_string()]);
+
+        // And only it is searchable (ngram typo/prefix tolerance intact).
+        let popular = db.tags_search_fts("pop", 10).await.unwrap();
+        assert!(!popular.is_empty(), "popular tag must be searchable");
+        let rare = db.tags_search_fts("rar", 10).await.unwrap();
+        assert!(rare.is_empty(), "rare tag (count 1) must not be searchable");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3641,6 +3730,7 @@ mod tests {
             "resumed hash stage must keep every row"
         );
     }
+
 
 
 

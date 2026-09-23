@@ -352,6 +352,29 @@ mod tests {
         .unwrap();
         assert!(added, "tag action add over IPC failed");
 
+        // The FTS index only covers popular tags (count >= 5), so raise this
+        // one past the threshold through the same count machinery that real
+        // tag floods use (`tag_counts_apply` also mirrors the tag into the
+        // `Tags_Popular` search shadow).
+        let red_fox_id: i64 = {
+            let mut stmt = server
+                .db
+                .connect()
+                .unwrap()
+                .prepare("SELECT id FROM Tags WHERE name = 'red fox'")
+                .await
+                .unwrap();
+            stmt.query_row(()).await.unwrap().get(0).unwrap()
+        };
+        server
+            .db
+            .tag_counts_apply(
+                &std::collections::HashMap::from([(red_fox_id as u64, 5)]),
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+
         // Typo + prefix queries must resolve over the same channel.
         let typo = client::search_tag_fts("red fxo".into(), Some(10)).unwrap();
         let prefix = client::search_tag_fts("red f".into(), Some(10)).unwrap();
@@ -376,6 +399,24 @@ mod tests {
         }])
         .unwrap();
         assert!(female_added, "female tag add over IPC failed");
+        let female_id: i64 = {
+            let mut stmt = server
+                .db
+                .connect()
+                .unwrap()
+                .prepare("SELECT id FROM Tags WHERE name = 'female'")
+                .await
+                .unwrap();
+            stmt.query_row(()).await.unwrap().get(0).unwrap()
+        };
+        server
+            .db
+            .tag_counts_apply(
+                &std::collections::HashMap::from([(female_id as u64, 5)]),
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
         assert!(
             !client::search_tag_fts("fem".into(), Some(10))
                 .unwrap()

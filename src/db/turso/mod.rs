@@ -107,7 +107,7 @@ impl TursoDatabase {
 
     /// Opens a Turso connection without installing a busy handler. Transaction
     /// conflicts are handled by the operation that owns the transaction.
-    pub(in crate::db::turso) fn connect(&self) -> Result<turso::Connection> {
+    pub(crate) fn connect(&self) -> Result<turso::Connection> {
         self.db.connect()
     }
 
@@ -239,6 +239,14 @@ impl TursoDatabase {
         conn.pragma_update("journal_mode", "'mvcc'").await?;
 
         conn.commit().await?;
+
+        // Popular-tag FTS shadow: create/index on first boot or upgrade,
+        // verify-only on steady boots. Runs here (every boot) because
+        // `create_db` only fires for a brand-new file.
+        {
+            let connection = self.connect()?;
+            self.table_ensure_tags_popular(&connection).await;
+        }
 
         self.load_cache().await?;
 

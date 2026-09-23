@@ -201,7 +201,8 @@ impl TursoDatabase {
     }
 
     /// Resolves each human tag name to up to `FTS_NAME_LIMIT` tag ids via the
-    /// `idx_tags_fts` index. A name that normalizes to empty or matches nothing
+    /// popular-tag FTS index (`Tags_Popular`, `count >= 5`). A name that
+    /// normalizes to empty, belongs to an unpopular tag, or matches nothing
     /// resolves to `None`.
     async fn resolve_tag_names(&self, tag_names: &[String]) -> Result<Vec<Option<Vec<u64>>>> {
         let mut out = Vec::with_capacity(tag_names.len());

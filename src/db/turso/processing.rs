@@ -878,7 +878,9 @@ mod tests {
 
         let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
         let conn = db.connect().unwrap();
-        let batch = "DROP INDEX IF EXISTS idx_tags_fts;\nCREATE INDEX IF NOT EXISTS idx_tags_fts ON Tags USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);\nOPTIMIZE INDEX idx_tags_fts;";
+        // Full rebuild of the popular-tag FTS shadow: drop, refill from
+        // `count >= 5`, rebuild the ngram index, optimize.
+        let batch = "DROP TABLE IF EXISTS Tags_Popular;\nCREATE TABLE Tags_Popular (tag_id INTEGER PRIMARY KEY, name TEXT NOT NULL);\nINSERT INTO Tags_Popular(tag_id, name) SELECT id, name FROM Tags WHERE count >= 5;\nCREATE INDEX idx_tags_fts ON Tags_Popular USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);\nOPTIMIZE INDEX idx_tags_fts;";
         conn.execute_batch(batch).await.unwrap();
         conn.execute_batch(batch).await.unwrap();
         drop(conn);
@@ -887,6 +889,88 @@ mod tests {
 
         let db = TursoDatabase::new_with_exit(&db_path, should_exit).await;
         assert!(db.setting_get_sync_blocking("SYSTEM_VERSION").is_some());
+        db.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upgrading_old_fts_schema_moves_index_onto_popular_shadow() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("upgrade.db");
+        let should_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Build a pre-shadow database: FTS index on Tags itself, no
+        // Tags_Popular, one popular tag (count 6) and one unpopular (count 1).
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+        {
+            let conn = db.connect().unwrap();
+            conn.execute("DROP INDEX idx_tags_fts", ()).await.unwrap();
+            conn.execute("DROP TABLE Tags_Popular", ()).await.unwrap();
+            conn.execute(
+                "CREATE INDEX idx_tags_fts ON Tags USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO Namespace (name, description) VALUES ('subject', NULL);",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO Tags (name, namespace, count) VALUES ('wantable', 1, 6), ('shy', 1, 1);",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        db.shutdown().await;
+        drop(db);
+
+        // Reopen: check_db must create the shadow, copy the count >= 5 tag,
+        // drop the old Tags-level index and re-point it at Tags_Popular.
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit).await;
+        let conn = db.connect().unwrap();
+        let shadow_names: Vec<String> = {
+            let mut rows = conn
+                .query("SELECT name FROM Tags_Popular ORDER BY tag_id;", ())
+                .await
+                .unwrap();
+            let mut names = Vec::new();
+            while let Ok(Some(row)) = rows.next().await {
+                names.push(row.get::<String>(0).unwrap());
+            }
+            names
+        };
+        assert_eq!(
+            shadow_names,
+            vec!["wantable".to_string()],
+            "only the count >= 5 tag is mirrored on upgrade"
+        );
+        let index_targets: Vec<String> = {
+            let mut rows = conn
+                .query(
+                    "SELECT LOWER(tbl_name) FROM sqlite_schema
+                     WHERE type = 'index' AND LOWER(name) = 'idx_tags_fts';",
+                    (),
+                )
+                .await
+                .unwrap();
+            let mut targets = Vec::new();
+            while let Ok(Some(row)) = rows.next().await {
+                targets.push(row.get::<String>(0).unwrap());
+            }
+            targets
+        };
+        assert_eq!(
+            index_targets,
+            vec!["tags_popular".to_string()],
+            "the FTS index must live on the shadow after upgrade"
+        );
+        let found = db.tags_search_fts("want", 10).await.unwrap();
+        assert_eq!(found.len(), 1, "upgraded db must search popular tags");
+        let shy = db.tags_search_fts("shy", 10).await.unwrap();
+        assert!(shy.is_empty(), "unpopular tag must stay unsearchable");
         db.shutdown().await;
     }
 }

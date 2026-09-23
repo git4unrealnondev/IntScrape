@@ -129,7 +129,10 @@ impl TursoDatabase {
 
     /// Searches tags through the Tantivy-backed FTS index.
     ///
-    /// Returns the most-used matching tags, with BM25 relevance breaking ties.
+    /// Only popular tags (`Tags.count >= 5`, mirrored into `Tags_Popular`)
+    /// are indexed and searchable; unpopular tags never match, which keeps
+    /// the ngram index small. Returns the most-used matching tags, with BM25
+    /// relevance breaking ties.
     pub async fn tags_search_fts(
         &self,
         search_string: &str,
@@ -141,12 +144,16 @@ impl TursoDatabase {
         }
         let conn = self.db.connect()?;
         let fts_query = search_string.trim().to_owned();
+        // The FTS index only covers popular tags (`Tags_Popular.count >= 5`),
+        // so search joins back to Tags for the authoritative count used to
+        // rank and return. Unpopular tags are intentionally not searchable.
         let mut rows = conn
             .query(
-                "SELECT id, count, fts_score(name, ?1) AS score \
-                 FROM Tags \
-                 WHERE fts_match(name, ?1) \
-                 ORDER BY count DESC, score ASC, id ASC \
+                "SELECT t.id, t.count, fts_score(p.name, ?1) AS score \
+                 FROM Tags t \
+                 JOIN Tags_Popular p ON p.tag_id = t.id \
+                 WHERE fts_match(p.name, ?1) \
+                 ORDER BY t.count DESC, score DESC, t.id ASC \
                  LIMIT ?2;",
                 (fts_query, limit as i64),
             )
