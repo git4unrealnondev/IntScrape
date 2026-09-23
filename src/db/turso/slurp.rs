@@ -20,9 +20,23 @@ use crate::db::turso::TursoDatabase;
 /// index; 25k-row batches measured best on the slurp target hardware.
 const SLURP_TAG_BATCH: i64 = 25_000;
 
-/// Destination batch size for the relationship copy, per read and per target
-/// namespace partition.
-const SLURP_RELATIONSHIP_BATCH: usize = 25_000;
+/// Source read batch for the relationship keyset scan, per partition and for
+/// the legacy table. Deliberately huge and independent of the destination
+/// write chunk, for the same reason as the hash read above: the production
+/// source full-scans the partition for every keyset position (a batch costs
+/// ~40 s whether it returns 25k or 883k rows — the relationship copy alone
+/// measures ~9.5 h of source reads), so larger reads mean fewer scans and
+/// near-linear total-time savings. Memory is the only limit on the read side:
+/// ~883k x 16 B/row keeps each batch well under 100 MB.
+const SLURP_RELATIONSHIP_READ_BATCH: i64 = SQL_CHUNK_SIZE as i64 * 192; // 883,200
+
+/// Destination transaction size for the relationship write. The read batch
+/// above is orders of magnitude larger than this; a single shared transaction
+/// that absorbs the whole read batch grows superlinearly on the slurp target
+/// (see SLURP_HASH_WRITE_BATCH for the measured numbers), so the write is split
+/// into bounded sub-transactions, each chunking its INSERT OR IGNORE at
+/// SLURP_RELATIONSHIP_WRITE_BATCH inside `slurp_relationships_bulk_add`.
+const SLURP_RELATIONSHIP_WRITE_BATCH: usize = 25_000;
 
 /// Source read batch for the secondary-hash keyset scan. Deliberately huge and
 /// independent of the destination write chunk: on the production source the
@@ -42,12 +56,107 @@ const SLURP_HASH_READ_BATCH: i64 = SQL_CHUNK_SIZE as i64 * 192; // 883,200
 /// INSERT OR IGNORE statements at SQL_CHUNK_SIZE inside `file_hashes_add_bulk`.
 const SLURP_HASH_WRITE_BATCH: usize = 25_000;
 
+/// Destination table that persists where an interrupted slurp got to. Each
+/// stage records the last source key whose rows fully committed, so a
+/// rescheduled run (after a disk-full, a kill, or an MVCC-conflict retry)
+/// skips the batches that already imported instead of re-reading the whole
+/// source — the relationship copy alone measures ~9.5 h of source reads on
+/// the production source. The table is dropped when a slurp completes, and a
+/// `meta` row keys the cursors to the exact source file so stale progress is
+/// never applied to a different database.
+const SLURP_CHECKPOINT_TABLE: &str = "_slurp_checkpoint";
+
 /// Keyset scans build `{column} > last` from a seed of 0, which silently drops
 /// a source row whose id is 0 (some hydrus databases genuinely assign a File
 /// the id 0, main.db's 6.8M-row File table has one). Seed the first read at
 /// -1 so `> -1` also covers id 0, then advance with real ids.
 fn keyset_bound(first_pass: bool, last: u64) -> i64 {
     if first_pass { -1 } else { last as i64 }
+}
+
+/// Whether the source's `table` has an index its (file_id, tag_id) keyset
+/// scan can use: a composite PRIMARY KEY starting with file_id, or an explicit
+/// index whose leading columns are file_id, tag_id. The slurp opens the source
+/// read-only, so a missing index can only be reported, not created here — but
+/// it is the measured ~9.5 h bottleneck in the relationship copy, so the
+/// operator needs to know. Pure diagnostics: any introspection failure returns
+/// None and is silently skipped, never aborting the slurp.
+async fn slurp_source_keyset_indexed(
+    source: &Connection,
+    table: &str,
+) -> Option<bool> {
+    // Composite PRIMARY KEY (file_id, tag_id) — clustered (WITHOUT ROWID) or
+    // autoindexed (rowid table) — already serves the keyset. `PRAGMA table_info`
+    // reports pk positions 1..n in key order.
+    let mut pk_columns: Vec<(u64, String)> = Vec::new();
+    {
+        let mut stmt = source
+            .prepare(&format!("PRAGMA table_info(\"{table}\")"))
+            .await
+            .ok()?;
+        let mut rows = stmt.query(()).await.ok()?;
+        loop {
+            let row = match rows.next().await {
+                Ok(Some(row)) => row,
+                Ok(None) => break,
+                Err(_) => return None,
+            };
+            let position = row.get::<u64>(5).ok()?;
+            let name = row.get::<String>(1).ok()?;
+            if position > 0 {
+                pk_columns.push((position, name));
+            }
+        }
+    }
+    pk_columns.sort_by_key(|&(position, _)| position);
+    let pk_order: Vec<String> = pk_columns.into_iter().map(|(_, name)| name).collect();
+    if pk_order.len() >= 2 && pk_order[0] == "file_id" && pk_order[1] == "tag_id" {
+        return Some(true);
+    }
+
+    // Explicit indexes: check each one's leading columns.
+    let mut stmt = source
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'index' AND lower(tbl_name) = lower(?1)",
+        )
+        .await
+        .ok()?;
+    let mut rows = stmt.query((table,)).await.ok()?;
+    while let Some(row) = rows.next().await.ok().flatten() {
+        let index_name: String = row.get(0).ok()?;
+        if slurp_index_leading_keyset_columns(source, &index_name).await {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Whether a single index's leading columns are (file_id, tag_id).
+async fn slurp_index_leading_keyset_columns(source: &Connection, index: &str) -> bool {
+    let mut stmt = match source
+        .prepare(&format!("PRAGMA index_info(\"{index}\")"))
+        .await
+    {
+        Ok(stmt) => stmt,
+        Err(_) => return false,
+    };
+    let mut rows = match stmt.query(()).await {
+        Ok(rows) => rows,
+        Err(_) => return false,
+    };
+    let mut columns = Vec::new();
+    loop {
+        match rows.next().await {
+            Ok(Some(row)) => match row.get::<String>(2) {
+                Ok(name) => columns.push(name),
+                Err(_) => return false,
+            },
+            Ok(None) => break,
+            Err(_) => return false,
+        }
+    }
+    columns.len() >= 2 && columns[0] == "file_id" && columns[1] == "tag_id"
 }
 
 /// A temporary sanitized copy of a slurp source. Removed on drop, including
@@ -131,7 +240,7 @@ impl TursoDatabase {
             );
         }
         let result = loop {
-            match self.internal_db_slurp(&source_conn).await {
+            match self.internal_db_slurp(&source_conn, source).await {
                 Ok(result) => break Ok(result),
                 Err(error)
                     if matches!(error, turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) =>
@@ -340,8 +449,66 @@ impl TursoDatabase {
 
     /// Streams the source database's namespaces, tags, files, hashes,
     /// relationships, and parents into turso.
-    async fn internal_db_slurp(&self, source: &Connection) -> Result<(u64, u64, u64)> {
+    async fn internal_db_slurp(
+        &self,
+        source: &Connection,
+        source_path: &Path,
+    ) -> Result<(u64, u64, u64)> {
         let mut conn = self.connect()?;
+
+        // Resume support: read any progress an interrupted earlier run left in
+        // the destination. The checkpoint table records, per stage, the last
+        // source key whose rows fully committed to the destination, so a
+        // rescheduled run skips every batch that already landed instead of
+        // re-reading the whole source. Cursors are scoped to the exact source
+        // file: when the source changed, stale progress is discarded. The
+        // MVCC-conflict retry loop in `db_slurp` also benefits: a retry
+        // resumes past the batches the failed attempt already committed.
+        conn.execute(
+            format!(
+                "CREATE TABLE IF NOT EXISTS {SLURP_CHECKPOINT_TABLE} (
+                     stage TEXT PRIMARY KEY,
+                     finished INTEGER NOT NULL DEFAULT 0,
+                     last_file_id INTEGER NOT NULL DEFAULT 0,
+                     last_tag_id INTEGER NOT NULL DEFAULT 0,
+                     source_key TEXT NOT NULL DEFAULT '');"
+            ),
+            (),
+        )
+        .await?;
+        let source_key = slurp_source_key(source_path);
+        {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT source_key FROM {SLURP_CHECKPOINT_TABLE}
+                     WHERE stage = 'meta'"
+                ))
+                .await?;
+            let stored_source: Option<String> = match stmt.query_row(()).await {
+                Ok(row) => Some(row.get(0)?),
+                Err(_) => None,
+            };
+            if stored_source.as_deref() != Some(source_key.as_str()) {
+                if stored_source.is_some() {
+                    log::info!(
+                        "Slurp source changed since the last run; discarding resume progress."
+                    );
+                }
+                conn.execute(format!("DELETE FROM {SLURP_CHECKPOINT_TABLE}"), ())
+                    .await?;
+            }
+        }
+        conn.execute(
+            &format!(
+                "INSERT INTO {SLURP_CHECKPOINT_TABLE}
+                     (stage, finished, last_file_id, last_tag_id, source_key)
+                 VALUES ('meta', 0, 0, 0, ?1)
+                 ON CONFLICT(stage) DO UPDATE SET source_key = excluded.source_key"
+            ),
+            (source_key.as_str(),),
+        )
+        .await?;
+        let checkpoint = slurp_checkpoint_load(&conn).await?;
 
         // Namespaces, remembering id -> object and name -> target id.
         let slurp_started = Instant::now();
@@ -796,8 +963,16 @@ impl TursoDatabase {
                 stmt.query_row(()).await?.get(0)?
             };
             if has_file_hashes {
-                let mut last_file_id = 0_u64;
-                let mut first_hash_pass = true;
+                // Resume: every FileHashes row with file_id <= the recorded
+                // cursor already committed, so the keyset scan jumps straight
+                // past it. A stage that previously finished resumes with one
+                // empty read. The cursor only ever advances past committed
+                // batches (the sub-transactions above land before the write
+                // below), so re-running at worst re-reads a partially imported
+                // batch into INSERT OR IGNORE, never skips missing rows.
+                let previous = checkpoint.get("hashes").copied().unwrap_or_default();
+                let mut last_file_id = previous.last_file_id;
+                let mut first_hash_pass = last_file_id == 0;
                 loop {
                     let batch_started = Instant::now();
                     let mut stmt = source
@@ -851,6 +1026,17 @@ impl TursoDatabase {
                             batch_started.elapsed()
                         );
                     }
+                    // Persist only after the whole read batch committed above.
+                    slurp_checkpoint_write(
+                        &conn,
+                        "hashes",
+                        SlurpStageCheckpoint {
+                            finished: false,
+                            last_file_id: *last_id,
+                            last_tag_id: 0,
+                        },
+                    )
+                    .await?;
                     last_file_id = *last_id;
                 }
             }
@@ -888,7 +1074,23 @@ impl TursoDatabase {
             // turso's commit-log materialization pins memory with no wal
             // progress at prod scale. Drop the index around every recount and
             // restore it once after all recalcs complete.
-            let mut covering_dropped = false;
+            // A recount dropped the covering index in an interrupted earlier
+            // run, then crashed before the end-of-stage restore. Detect a
+            // missing index and treat it as though this run dropped it, so the
+            // single shared restore below re-creates it even when this run
+            // never recounts. (The tags stage creates the index on cold
+            // imports, so its absence here always means a crashed recount.)
+            let mut covering_dropped = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM sqlite_master
+                             WHERE type = 'index' AND name = 'idx_tags_count_covering'
+                         )",
+                    )
+                    .await?;
+                stmt.query_row(()).await?.get::<i64>(0)? == 0
+            };
 
             // Recount markers, persisted across runs. The recount for a
             // namespace is skipped when its stream inserted nothing, but an
@@ -993,13 +1195,43 @@ impl TursoDatabase {
                 }
 
                 let partition = format!("Relationship_{source_namespace}");
-                let mut last_file_id = 0_u64;
-                let mut last_tag_id = 0_u64;
-                let mut first_rel_pass = true;
-                let mut added_here = 0_usize;
-                loop {
-                    let batch_started = Instant::now();
-                    let mut stmt = source
+                // The source is opened read-only, so a missing keyset index can
+                // only be reported, not created here: without it every batch
+                // re-scans the whole partition (~40 s each measured), which is
+                // the ~9.5 h relationship-stage bottleneck. Adding
+                // `CREATE INDEX ... ON <table>(file_id, tag_id)` to the source
+                // (or a local copy of it) makes the scan index-driven.
+                if let Some(indexed) = slurp_source_keyset_indexed(&source, &partition).await {
+                    if !indexed {
+                        log::warn!(
+                            "Slurp: source table {partition} has no (file_id, tag_id) index; \
+                             the keyset scan re-scans the whole table per batch. Add \
+                             `CREATE INDEX idx_{partition}_file_tag \
+                             ON {partition}(file_id, tag_id)` to the source (or a copy of it)."
+                        );
+                    }
+                }
+                // Resume: a partition whose scan already reached its natural
+                // end (empty batch) with its recount and index restore
+                // finished is skipped whole by a re-run; one cut short by a
+                // crash resumes its keyset scan at the recorded cursor. Only
+                // fully committed batches lie behind the cursor, so rows never
+                // fall through, and namespaces that gained rows in the tail of
+                // an interrupted run still get their recount via
+                // `_slurp_pending_recount`.
+                let stage_key = format!("relationship_partition_{source_namespace}");
+                let resume = checkpoint.get(&stage_key).copied().unwrap_or_default();
+                let already_done = resume.finished;
+                if !already_done {
+                    let mut last_file_id = resume.last_file_id;
+                    let mut last_tag_id = resume.last_tag_id;
+                    let mut first_rel_pass = last_file_id == 0 && last_tag_id == 0;
+                    let mut added_here = 0_usize;
+                    // Prepared once per partition. Recompiling the keyset SELECT
+                    // per batch adds pure overhead to a hot path already paying
+                    // ~40 s per keyset position on sources that re-scan the whole
+                    // partition (see SLURP_RELATIONSHIP_*).
+                    let mut source_scan = source
                         .prepare(&format!(
                             "SELECT r.file_id, r.tag_id
                              FROM {} r
@@ -1009,82 +1241,120 @@ impl TursoDatabase {
                             partition
                         ))
                         .await?;
-                    let mut rows = stmt
-                        .query([
-                            keyset_bound(first_rel_pass, last_file_id),
-                            keyset_bound(first_rel_pass, last_tag_id),
-                            SLURP_RELATIONSHIP_BATCH as i64,
-                        ])
-                        .await?;
-                    let mut batch: Vec<(u64, u64)> = Vec::new();
-                    while let Some(row) = rows.next().await? {
-                        batch.push((row.get(0)?, row.get(1)?));
-                    }
-                    drop(stmt);
-                    let Some((source_file_id, source_tag_id)) = batch.last() else {
-                        break;
-                    };
-                    first_rel_pass = false;
+                    loop {
+                        let batch_started = Instant::now();
+                        let mut rows = source_scan
+                            .query([
+                                keyset_bound(first_rel_pass, last_file_id),
+                                keyset_bound(first_rel_pass, last_tag_id),
+                                SLURP_RELATIONSHIP_READ_BATCH,
+                            ])
+                            .await?;
+                        let mut batch: Vec<(u64, u64)> = Vec::new();
+                        while let Some(row) = rows.next().await? {
+                            batch.push((row.get(0)?, row.get(1)?));
+                        }
+                        drop(rows);
+                        let Some((source_file_id, source_tag_id)) = batch.last() else {
+                            break;
+                        };
+                        first_rel_pass = false;
 
-                    let mut relationships = batch
-                        .iter()
-                        .filter_map(|(file_id, tag_id)| {
-                            let target_file = slurp_files.get(file_id)?;
-                            let target_tag = slurp_tags.get(tag_id)?;
-                            Some((*target_file, *target_tag))
-                        })
-                        .collect::<Vec<_>>();
-                    // The partition's PRIMARY KEY is (tag_id, file_id); the
-                    // keyset scan returns rows in file order, so insert them
-                    // sorted by the key to keep the destination pages hot.
-                    relationships.sort_unstable_by_key(|&(file_id, tag_id)| (tag_id, file_id));
-                    log::info!(
-                        "Slurping {} relationships into the db.",
-                        relationships.len()
-                    );
-                    let target_started = Instant::now();
-                    conn.execute("BEGIN IMMEDIATE", ()).await?;
-                    let added = self
-                        .slurp_relationships_bulk_add(&conn, target_namespace, &relationships)
-                        .await?;
-                    added_here += added;
-                    if added > 0 {
-                        conn.execute(
-                            "INSERT OR IGNORE INTO _slurp_pending_recount (namespace) VALUES (?1)",
-                            (target_namespace as i64,),
+                        let mut relationships = batch
+                            .iter()
+                            .filter_map(|(file_id, tag_id)| {
+                                let target_file = slurp_files.get(file_id)?;
+                                let target_tag = slurp_tags.get(tag_id)?;
+                                Some((*target_file, *target_tag))
+                            })
+                            .collect::<Vec<_>>();
+                        // The partition's PRIMARY KEY is (tag_id, file_id); the
+                        // keyset scan returns rows in file order, so insert them
+                        // sorted by the key to keep the destination pages hot.
+                        relationships.sort_unstable_by_key(|&(file_id, tag_id)| (tag_id, file_id));
+                        log::info!(
+                            "Slurping {} relationships into the db.",
+                            relationships.len()
+                        );
+                        let target_started = Instant::now();
+                        // Write the large read batch in bounded sub-transactions,
+                        // mirroring the hash stage: destination commits lose
+                        // superlinearly above ~25k rows, while the source read is
+                        // the real bottleneck (see SLURP_RELATIONSHIP_*).
+                        for sub in relationships.chunks(SLURP_RELATIONSHIP_WRITE_BATCH) {
+                            conn.execute("BEGIN IMMEDIATE", ()).await?;
+                            let added = self
+                                .slurp_relationships_bulk_add(&conn, target_namespace, sub)
+                                .await?;
+                            added_here += added;
+                            if added > 0 {
+                                conn.execute(
+                                    "INSERT OR IGNORE INTO _slurp_pending_recount (namespace) VALUES (?1)",
+                                    (target_namespace as i64,),
+                                )
+                                .await?;
+                            }
+                            conn.execute("COMMIT", ()).await?;
+                        }
+
+                        // The batch committed above; only now may the cursor
+                        // advance past it.
+                        slurp_checkpoint_write(
+                            &conn,
+                            &stage_key,
+                            SlurpStageCheckpoint {
+                                finished: false,
+                                last_file_id: *source_file_id,
+                                last_tag_id: *source_tag_id,
+                            },
                         )
                         .await?;
+                        last_file_id = *source_file_id;
+                        last_tag_id = *source_tag_id;
+                        log::info!(
+                            "Slurp relationships source read: {} rows, total {:?}; target write {:?}",
+                            batch.len(),
+                            batch_started.elapsed(),
+                            target_started.elapsed()
+                        );
                     }
-                    conn.execute("COMMIT", ()).await?;
 
-                    last_file_id = *source_file_id;
-                    last_tag_id = *source_tag_id;
-                    log::info!(
-                        "Slurp relationships batch complete: {} rows, target {:?}, total {:?}",
-                        relationships.len(),
-                        target_started.elapsed(),
-                        batch_started.elapsed()
-                    );
-                }
-
-                if cold_import || added_here > 0 || pending_recount.contains(&target_namespace) {
-                    // Tags.count churns idx_tags_count_covering (ordered by
-                    // count) on every recount UPDATE: each reordering mutates
-                    // the count b-tree and turso's commit-log materialization
-                    // pins memory with no wal progress until it is rebuilt.
-                    // Drop it once around every recount and restore after all
-                    // recalcs land, mirroring the cold path.
-                    if !covering_dropped {
-                        conn.execute("DROP INDEX IF EXISTS idx_tags_count_covering", ())
-                            .await?;
-                        covering_dropped = true;
+                    if cold_import
+                        || added_here > 0
+                        || pending_recount.contains(&target_namespace)
+                    {
+                        // Tags.count churns idx_tags_count_covering (ordered by
+                        // count) on every recount UPDATE: each reordering
+                        // mutates the count b-tree and turso's commit-log
+                        // materialization pins memory with no wal progress
+                        // until it is rebuilt. Drop it once around every
+                        // recount and restore after all recalcs land, mirroring
+                        // the cold path.
+                        if !covering_dropped {
+                            conn.execute("DROP INDEX IF EXISTS idx_tags_count_covering", ())
+                                .await?;
+                            covering_dropped = true;
+                        }
+                        slurp_recount_namespace(&conn, target_namespace).await?;
+                        log::info!(
+                            "Slurp count recalculation for namespace {} complete in {:?}",
+                            target_namespace,
+                            slurp_started.elapsed()
+                        );
                     }
-                    slurp_recount_namespace(&conn, target_namespace).await?;
-                    log::info!(
-                        "Slurp count recalculation for namespace {} complete in {:?}",
-                        target_namespace,
-                        slurp_started.elapsed()
-                    );
+
+                    // The whole partition landed and its post-scan work is
+                    // done; later runs can skip it entirely.
+                    slurp_checkpoint_write(
+                        &conn,
+                        &stage_key,
+                        SlurpStageCheckpoint {
+                            finished: true,
+                            last_file_id,
+                            last_tag_id,
+                        },
+                    )
+                    .await?;
                 }
 
                 // A cold import dropped the index before the copy; warm deltas insert
@@ -1109,6 +1379,18 @@ impl TursoDatabase {
             if !legacy_namespaces.is_empty() {
                 let target_by_source_namespace: HashMap<u64, u64> =
                     legacy_namespaces.iter().copied().collect();
+                if let Some(indexed) =
+                    slurp_source_keyset_indexed(&source, "Relationship").await
+                {
+                    if !indexed {
+                        log::warn!(
+                            "Slurp: source table Relationship has no (file_id, tag_id) \
+                             index; the keyset scan re-scans the whole table per batch. \
+                             Add `CREATE INDEX idx_Relationship_file_tag \
+                             ON Relationship(file_id, tag_id)` to the source (or a copy of it)."
+                        );
+                    }
+                }
                 // Only cold imports tear the file_id indexes down; see the
                 // partition path for the rationale.
                 if cold_import {
@@ -1123,13 +1405,25 @@ impl TursoDatabase {
                     }
                 }
 
-                let mut last_file_id = 0_u64;
-                let mut last_tag_id = 0_u64;
-                let mut first_legacy_rel_pass = true;
-                let mut added_by_namespace: HashMap<u64, usize> = HashMap::new();
-                loop {
-                    let batch_started = Instant::now();
-                    let mut stmt = source
+                // Resume: same cursor scheme as the per-partition path, over
+                // the single shared scan. A finished pass is skipped whole; an
+                // interrupted one resumes at the recorded (file_id, tag_id)
+                // boundary. The per-namespace recount loop below still runs
+                // for the tail of the row stream — namespaces that gained rows
+                // carry a `_slurp_pending_recount` marker.
+                let resume = checkpoint
+                    .get("relationship_legacy")
+                    .copied()
+                    .unwrap_or_default();
+                let already_done = resume.finished;
+                if !already_done {
+                    let mut last_file_id = resume.last_file_id;
+                    let mut last_tag_id = resume.last_tag_id;
+                    let mut first_legacy_rel_pass = last_file_id == 0 && last_tag_id == 0;
+                    let mut added_by_namespace: HashMap<u64, usize> = HashMap::new();
+                    // Prepared once for the whole legacy pass (see the partition
+                    // path for why re-preparing per batch is pure overhead).
+                    let mut source_scan = source
                         .prepare(
                             "SELECT r.file_id, r.tag_id, t.namespace
                              FROM Relationship r
@@ -1139,104 +1433,141 @@ impl TursoDatabase {
                              LIMIT ?3",
                         )
                         .await?;
-                    let mut rows = stmt
-                        .query([
-                            keyset_bound(first_legacy_rel_pass, last_file_id),
-                            keyset_bound(first_legacy_rel_pass, last_tag_id),
-                            SLURP_RELATIONSHIP_BATCH as i64,
-                        ])
-                        .await?;
-                    let mut batch: Vec<(u64, u64, u64)> = Vec::new();
-                    while let Some(row) = rows.next().await? {
-                        batch.push((row.get(0)?, row.get(1)?, row.get(2)?));
-                    }
-                    drop(stmt);
-                    let Some(&(next_file_id, next_tag_id, _)) = batch.last() else {
-                        break;
-                    };
-                    first_legacy_rel_pass = false;
-
-                    let mut namespace_groups: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
-                    for &(file_id, tag_id, source_namespace) in &batch {
-                        let Some(&target_namespace) =
-                            target_by_source_namespace.get(&source_namespace)
-                        else {
-                            continue;
-                        };
-                        let (Some(&target_file), Some(&target_tag)) =
-                            (slurp_files.get(&file_id), slurp_tags.get(&tag_id))
-                        else {
-                            continue;
-                        };
-                        namespace_groups
-                            .entry(target_namespace)
-                            .or_default()
-                            .push((target_file, target_tag));
-                    }
-                    for (target_namespace, relationships) in namespace_groups.iter_mut() {
-                        // Align with the partition PRIMARY KEY (tag_id, file_id)
-                        // so the destination pages stay hot despite the source
-                        // scan arriving in file order.
-                        relationships.sort_unstable_by_key(|&(file_id, tag_id)| (tag_id, file_id));
-                        log::info!(
-                            "Slurping {} relationships into the db.",
-                            relationships.len()
-                        );
-                        let target_started = Instant::now();
-                        let tn = conn.transaction().await?;
-                        let added = self
-                            .slurp_relationships_bulk_add(
-                                &tn,
-                                *target_namespace,
-                                relationships.as_slice(),
-                            )
+                    loop {
+                        let batch_started = Instant::now();
+                        let mut rows = source_scan
+                            .query([
+                                keyset_bound(first_legacy_rel_pass, last_file_id),
+                                keyset_bound(first_legacy_rel_pass, last_tag_id),
+                                SLURP_RELATIONSHIP_READ_BATCH,
+                            ])
                             .await?;
-                        *added_by_namespace.entry(*target_namespace).or_default() += added;
-                        if added > 0 {
-                            tn.execute(
-                                "INSERT OR IGNORE INTO _slurp_pending_recount (namespace) VALUES (?1)",
-                                (*target_namespace as i64,),
-                            )
-                            .await?;
+                        let mut batch: Vec<(u64, u64, u64)> = Vec::new();
+                        while let Some(row) = rows.next().await? {
+                            batch.push((row.get(0)?, row.get(1)?, row.get(2)?));
                         }
-                        tn.commit().await?;
+                        drop(rows);
+                        let Some(&(next_file_id, next_tag_id, _)) = batch.last() else {
+                            break;
+                        };
+                        first_legacy_rel_pass = false;
+
+                        let mut namespace_groups: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+                        for &(file_id, tag_id, source_namespace) in &batch {
+                            let Some(&target_namespace) =
+                                target_by_source_namespace.get(&source_namespace)
+                            else {
+                                continue;
+                            };
+                            let (Some(&target_file), Some(&target_tag)) =
+                                (slurp_files.get(&file_id), slurp_tags.get(&tag_id))
+                            else {
+                                continue;
+                            };
+                            namespace_groups
+                                .entry(target_namespace)
+                                .or_default()
+                                .push((target_file, target_tag));
+                        }
+                        let target_started = Instant::now();
+                        for (target_namespace, relationships) in namespace_groups.iter_mut() {
+                            // Align with the partition PRIMARY KEY (tag_id, file_id)
+                            // so the destination pages stay hot despite the source
+                            // scan arriving in file order.
+                            relationships
+                                .sort_unstable_by_key(|&(file_id, tag_id)| (tag_id, file_id));
+                            log::info!(
+                                "Slurping {} relationships into the db.",
+                                relationships.len()
+                            );
+                            // Bounded sub-transactions per chunk (see the partition
+                            // path): the source read is the bottleneck, so large
+                            // reads must not balloon into one huge destination
+                            // commit.
+                            for sub in relationships.chunks(SLURP_RELATIONSHIP_WRITE_BATCH) {
+                                let tn = conn.transaction().await?;
+                                let added = self
+                                    .slurp_relationships_bulk_add(
+                                        &tn,
+                                        *target_namespace,
+                                        sub,
+                                    )
+                                    .await?;
+                                *added_by_namespace.entry(*target_namespace).or_default() += added;
+                                if added > 0 {
+                                    tn.execute(
+                                        "INSERT OR IGNORE INTO _slurp_pending_recount (namespace) VALUES (?1)",
+                                        (*target_namespace as i64,),
+                                    )
+                                    .await?;
+                                }
+                                tn.commit().await?;
+                            }
+                        }
+
+                        // Every namespace transaction in this read committed
+                        // above; only now may the cursor advance past it.
+                        slurp_checkpoint_write(
+                            &conn,
+                            "relationship_legacy",
+                            SlurpStageCheckpoint {
+                                finished: false,
+                                last_file_id: next_file_id,
+                                last_tag_id: next_tag_id,
+                            },
+                        )
+                        .await?;
+                        last_file_id = next_file_id;
+                        last_tag_id = next_tag_id;
                         log::info!(
-                            "Slurp relationships batch complete: {} rows, target {:?}",
-                            relationships.len(),
+                            "Slurp relationships source read: {} rows, total {:?}; target write {:?}",
+                            batch.len(),
+                            batch_started.elapsed(),
                             target_started.elapsed()
                         );
                     }
 
-                    last_file_id = next_file_id;
-                    last_tag_id = next_tag_id;
-                    log::info!(
-                        "Slurp relationships source read: {} rows, total {:?}",
-                        batch.len(),
-                        batch_started.elapsed()
-                    );
+                    for &(_, target_namespace) in &legacy_namespaces {
+                        if cold_import
+                            || added_by_namespace
+                                .get(&target_namespace)
+                                .copied()
+                                .unwrap_or(0)
+                                > 0
+                            || pending_recount.contains(&target_namespace)
+                        {
+                            if !covering_dropped {
+                                conn.execute(
+                                    "DROP INDEX IF EXISTS idx_tags_count_covering",
+                                    (),
+                                )
+                                .await?;
+                                covering_dropped = true;
+                            }
+                            slurp_recount_namespace(&conn, target_namespace).await?;
+                            log::info!(
+                                "Slurp count recalculation for namespace {} complete in {:?}",
+                                target_namespace,
+                                slurp_started.elapsed()
+                            );
+                        }
+                    }
+
+                    // The whole shared scan plus its recounts are done; later
+                    // runs can skip the legacy pass entirely.
+                    slurp_checkpoint_write(
+                        &conn,
+                        "relationship_legacy",
+                        SlurpStageCheckpoint {
+                            finished: true,
+                            last_file_id,
+                            last_tag_id,
+                        },
+                    )
+                    .await?;
                 }
 
                 for &(_, target_namespace) in &legacy_namespaces {
-                    if cold_import
-                        || added_by_namespace
-                            .get(&target_namespace)
-                            .copied()
-                            .unwrap_or(0)
-                            > 0
-                        || pending_recount.contains(&target_namespace)
-                    {
-                        if !covering_dropped {
-                            conn.execute("DROP INDEX IF EXISTS idx_tags_count_covering", ())
-                                .await?;
-                            covering_dropped = true;
-                        }
-                        slurp_recount_namespace(&conn, target_namespace).await?;
-                        log::info!(
-                            "Slurp count recalculation for namespace {} complete in {:?}",
-                            target_namespace,
-                            slurp_started.elapsed()
-                        );
-                    }
                     // Only cold imports rebuilt the dropped partition indexes; on warm
                     // runs the index either exists (`IF NOT EXISTS` no-ops or
                     // stays) or is missing from a crashed earlier run and is
@@ -1404,6 +1735,16 @@ impl TursoDatabase {
         )
         .await?;
 
+        // The whole import reached its end. Drop the progress table so the
+        // next scheduled slurp starts clean: a warm destination re-imports
+        // cheaply because every stage dedupes with INSERT OR IGNORE and
+        // skips recounts, exactly like the pre-existing warm re-slurp path.
+        conn.execute(
+            format!("DROP TABLE IF EXISTS {SLURP_CHECKPOINT_TABLE}"),
+            (),
+        )
+        .await?;
+
         Ok((namespace_count, tag_count, file_count))
     }
 
@@ -1565,7 +1906,7 @@ impl TursoDatabase {
         relationships: &[(u64, u64)],
     ) -> Result<usize> {
         let mut added = 0_u64;
-        for chunk in relationships.chunks(SLURP_RELATIONSHIP_BATCH) {
+        for chunk in relationships.chunks(SLURP_RELATIONSHIP_WRITE_BATCH) {
             let mut holders = Vec::with_capacity(chunk.len());
             let mut params = Vec::with_capacity(chunk.len() * 2);
             for &(file_id, tag_id) in chunk {
@@ -1705,6 +2046,94 @@ impl TursoDatabase {
         log::info!("Slurping {copied} jobs into the db.");
 
         Ok(())
+    }
+}
+
+/// One persisted cursor row in [`SLURP_CHECKPOINT_TABLE`]: how far a stage's
+/// keyset scan had committed to the destination, and whether the stage's
+/// post-scan work (tail batches, recounts, index restores) had finished before
+/// the run stopped.
+#[derive(Default, Clone, Copy)]
+struct SlurpStageCheckpoint {
+    finished: bool,
+    last_file_id: u64,
+    last_tag_id: u64,
+}
+
+/// Loads every slurp cursor left by a previous (interrupted) run. A fresh
+/// destination, or one whose last slurp fully completed, has none.
+async fn slurp_checkpoint_load(
+    conn: &Connection,
+) -> Result<HashMap<String, SlurpStageCheckpoint>> {
+    let mut out = HashMap::new();
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT stage, finished, last_file_id, last_tag_id
+             FROM {SLURP_CHECKPOINT_TABLE}
+             WHERE stage != 'meta'"
+        ))
+        .await?;
+    let mut rows = stmt.query(()).await?;
+    while let Some(row) = rows.next().await? {
+        out.insert(
+            row.get(0)?,
+            SlurpStageCheckpoint {
+                finished: row.get::<i64>(1)? != 0,
+                last_file_id: row.get::<i64>(2)? as u64,
+                last_tag_id: row.get::<i64>(3)? as u64,
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// Persists a stage cursor. Must be called only after the batch's writes have
+/// fully committed: the next run ignores every source row the cursor already
+/// covered, so the cursor must never advance past data that did not land.
+/// (A partially imported batch that was not yet checkpointed is simply re-read
+/// and deduplicated by the destination's INSERT OR IGNORE bulk-add helpers.)
+async fn slurp_checkpoint_write(
+    conn: &Connection,
+    stage: &str,
+    progress: SlurpStageCheckpoint,
+) -> Result<()> {
+    conn.execute(
+        &format!(
+            "INSERT INTO {SLURP_CHECKPOINT_TABLE}
+                 (stage, finished, last_file_id, last_tag_id)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(stage) DO UPDATE SET
+                 finished = excluded.finished,
+                 last_file_id = excluded.last_file_id,
+                 last_tag_id = excluded.last_tag_id"
+        ),
+        params_from_iter([
+            Value::from(stage),
+            Value::from(progress.finished as i64),
+            Value::from(progress.last_file_id as i64),
+            Value::from(progress.last_tag_id as i64),
+        ]),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Builds a stable fingerprint of the slurp source so cursors from a previous
+/// run are never applied to a different database. The path plus the file's
+/// length and mtime are enough to detect a replaced source.
+fn slurp_source_key(source: &Path) -> String {
+    match std::fs::metadata(source) {
+        Ok(meta) => format!(
+            "{}:{}:{}",
+            source.to_string_lossy(),
+            meta.len(),
+            meta.modified()
+                .ok()
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ),
+        Err(_) => source.to_string_lossy().into_owned(),
     }
 }
 
@@ -2825,5 +3254,459 @@ mod tests {
             })
             .count();
         assert_eq!(leftover, 0, "sanitized copies must be cleaned up");
+    }
+
+    /// Seeds the destination with the exact state a crashed slurp leaves
+    /// behind: the progress table (keyed to `source_path`'s fingerprint) and
+    /// the pending-recount markers of namespaces whose rows landed before the
+    /// crash. The next `db_slurp` must resume from this state.
+    async fn seed_interrupted_slurp_state(
+        db: &TursoDatabase,
+        source_path: &std::path::Path,
+        legacy_checkpoint: SlurpStageCheckpoint,
+        pending_namespaces: &[u64],
+    ) {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            &format!(
+                "CREATE TABLE IF NOT EXISTS {SLURP_CHECKPOINT_TABLE} (
+                     stage TEXT PRIMARY KEY,
+                     finished INTEGER NOT NULL DEFAULT 0,
+                     last_file_id INTEGER NOT NULL DEFAULT 0,
+                     last_tag_id INTEGER NOT NULL DEFAULT 0,
+                     source_key TEXT NOT NULL DEFAULT '');"
+            ),
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute("DELETE FROM _slurp_checkpoint", ())
+            .await
+            .unwrap();
+        conn.execute(
+            "INSERT INTO _slurp_checkpoint
+                 (stage, finished, last_file_id, last_tag_id, source_key)
+             VALUES ('meta', 0, 0, 0, ?1)",
+            (slurp_source_key(source_path).as_str(),),
+        )
+        .await
+        .unwrap();
+        slurp_checkpoint_write(&conn, "relationship_legacy", legacy_checkpoint)
+            .await
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _slurp_pending_recount (namespace INTEGER PRIMARY KEY);",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute("DELETE FROM _slurp_pending_recount", ())
+            .await
+            .unwrap();
+        for namespace in pending_namespaces {
+            conn.execute(
+                "INSERT OR IGNORE INTO _slurp_pending_recount (namespace) VALUES (?1)",
+                (*namespace as i64,),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// After a slurp fully completes, a restarted run whose checkpoint says the
+    /// staging work already finished must skip it, land on the identical final
+    /// state, and clean its progress tables up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slurp_resume_skips_finished_stages_and_cleans_up() {
+        let db = new_target().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source_path = temp_dir.path().join("source.db");
+        let script = "CREATE TABLE Namespace (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
+             INSERT INTO Namespace (name, description) VALUES ('species', 'test');
+             CREATE TABLE Tags (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
+                 count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
+             INSERT INTO Tags (name, namespace) VALUES ('mammal', 1), ('canine', 1);
+             CREATE TABLE FileStorageLocations (
+                 id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
+             INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
+             CREATE TABLE File (
+                 id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
+                 storage_id INTEGER, size_bytes INTEGER);
+             INSERT INTO File (hash, extension, storage_id, size_bytes)
+                 VALUES ('slurp-hash', 'jpg', 1, 42);
+             CREATE TABLE Relationship (
+                 file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                 PRIMARY KEY (file_id, tag_id)) WITHOUT ROWID;
+             INSERT INTO Relationship (file_id, tag_id) VALUES (1, 1), (1, 2);
+             CREATE TABLE Parents (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
+                 relate_tag_id INTEGER NOT NULL, limit_to INTEGER);
+             INSERT INTO Parents (tag_id, relate_tag_id, limit_to) VALUES (1, 2, NULL);";
+        write_source(&source_path, script).await;
+
+        assert_eq!(db.db_slurp(&source_path).await.unwrap(), (1, 2, 1));
+        // The successful run must have cleaned its progress tables.
+        let conn = db.connect().unwrap();
+        slurp_assert_no_progress_tables(&db).await;
+
+        // Simulate a crash after the legacy relationship pass, but before the
+        // tables were dropped at the end of the stage.
+        let species_id = db.namespace_get_name_cache("species").await.unwrap();
+        seed_interrupted_slurp_state(
+            &db,
+            &source_path,
+            SlurpStageCheckpoint {
+                finished: true,
+                last_file_id: 0,
+                last_tag_id: 0,
+            },
+            &[species_id],
+        )
+        .await;
+
+        assert_eq!(
+            db.db_slurp(&source_path).await.unwrap(),
+            (1, 2, 1),
+            "resumed run must import the same data"
+        );
+
+        // Identical final contents, and no leftover inter-run tables.
+        slurp_assert_no_progress_tables(&db).await;
+        let mut rows = conn
+            .query("SELECT name, count FROM Tags ORDER BY name;", ())
+            .await
+            .unwrap();
+        let mut tag_counts = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            tag_counts.push((
+                row.get::<String>(0).unwrap(),
+                row.get::<u64>(1).unwrap(),
+            ));
+        }
+        assert_eq!(
+            tag_counts,
+            vec![("canine".to_string(), 1), ("mammal".to_string(), 1)]
+        );
+    }
+
+    /// A crash that cut the legacy relationship scan short leaves its cursor
+    /// behind; the resume must continue from that boundary, still recount any
+    /// namespace whose freshly landed rows never got their recount, and keep
+    /// the final state identical to an uninterrupted import.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slurp_resume_mid_legacy_scan_recounts_pending_namespaces() {
+        let db = new_target().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source_path = temp_dir.path().join("source.db");
+        let script = "CREATE TABLE Namespace (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
+             INSERT INTO Namespace (name, description) VALUES
+                 ('species', 'test'), ('artist', 'test');
+             CREATE TABLE Tags (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
+                 count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
+             INSERT INTO Tags (name, namespace) VALUES
+                 ('mammal', 1), ('canine', 1), ('painter', 2);
+             CREATE TABLE FileStorageLocations (
+                 id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
+             INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
+             CREATE TABLE File (
+                 id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
+                 storage_id INTEGER, size_bytes INTEGER);
+             INSERT INTO File (hash, extension, storage_id, size_bytes) VALUES
+                 ('slurp-hash', 'jpg', 1, 42), ('legacy-hash', 'png', 1, 43);
+             CREATE TABLE Relationship (
+                 file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                 PRIMARY KEY (file_id, tag_id)) WITHOUT ROWID;
+             INSERT INTO Relationship (file_id, tag_id) VALUES
+                 (1, 1), (1, 2), (2, 3);
+             CREATE TABLE Parents (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
+                 relate_tag_id INTEGER NOT NULL, limit_to INTEGER);";
+        write_source(&source_path, script).await;
+
+        assert_eq!(db.db_slurp(&source_path).await.unwrap(), (2, 3, 2));
+        let conn = db.connect().unwrap();
+
+        // Simulate a crash part-way through the shared relationship scan: only
+        // the (1, 1) row's batch had committed, and neither namespace's recount
+        // had run yet, so both carry their pending markers.
+        let species_id = db.namespace_get_name_cache("species").await.unwrap();
+        let artist_id = db.namespace_get_name_cache("artist").await.unwrap();
+        seed_interrupted_slurp_state(
+            &db,
+            &source_path,
+            SlurpStageCheckpoint {
+                finished: false,
+                last_file_id: 1,
+                last_tag_id: 0,
+            },
+            &[species_id, artist_id],
+        )
+        .await;
+
+        assert_eq!(
+            db.db_slurp(&source_path).await.unwrap(),
+            (2, 3, 2),
+            "resumed run must import the same data"
+        );
+
+        // The tail of the scan was re-read and deduplicated, and the pending
+        // recounts fired: counts are authoritative again.
+        let mut rows = conn.query("SELECT name, count FROM Tags ORDER BY name;", ()).await.unwrap();
+        let mut tag_counts = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            tag_counts.push((
+                row.get::<String>(0).unwrap(),
+                row.get::<u64>(1).unwrap(),
+            ));
+        }
+        assert_eq!(
+            tag_counts,
+            vec![
+                ("canine".to_string(), 1),
+                ("mammal".to_string(), 1),
+                ("painter".to_string(), 1),
+            ],
+            "pending recounts must run on resume"
+        );
+        slurp_assert_no_progress_tables(&db).await;
+    }
+
+    /// Cursors are scoped to the exact source file: a changed source must
+    /// discard the stale progress instead of blindly skipping source rows a
+    /// different database never imported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slurp_resume_discards_stale_progress_when_source_changes() {
+        let db = new_target().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source_a = temp_dir.path().join("source_a.db");
+        let source_b = temp_dir.path().join("source_b.db");
+        let script = "CREATE TABLE Namespace (id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT);
+             INSERT INTO Namespace (id, name) VALUES (1, 'ns');
+             CREATE TABLE Tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
+                                count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
+             INSERT INTO Tags (id, name, namespace) VALUES {tags};
+             CREATE TABLE FileStorageLocations (id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
+             INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
+             CREATE TABLE File (id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
+                                storage_id INTEGER, size_bytes INTEGER);
+             INSERT INTO File (id, hash, extension, storage_id, size_bytes) VALUES (1, 'h1', 'jpg', 1, 10);
+             CREATE TABLE Relationship (file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                                        PRIMARY KEY (file_id, tag_id)) WITHOUT ROWID;
+             INSERT INTO Relationship (file_id, tag_id) VALUES (1, 1);
+             CREATE TABLE Parents (id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
+                                   relate_tag_id INTEGER NOT NULL, limit_to INTEGER);";
+        write_source(&source_a, &script.replace("{tags}", "(1, 'one', 1), (2, 'two', 1)")).await;
+        write_source(&source_b, &script.replace("{tags}", "(1, 'three', 1), (2, 'four', 1)")).await;
+
+        assert_eq!(db.db_slurp(&source_a).await.unwrap(), (1, 2, 1));
+
+        // Simulate an interrupted run that recorded "relationship pass fully
+        // done" against source_a, then the operator pointed the slurp at a
+        // different source. The wait check is that source_b's relationships
+        // must still land: a stale `finished` cursor applied to another
+        // database would skip them entirely.
+        seed_interrupted_slurp_state(
+            &db,
+            &source_a,
+            SlurpStageCheckpoint {
+                finished: true,
+                last_file_id: 0,
+                last_tag_id: 0,
+            },
+            &[],
+        )
+        .await;
+
+        assert_eq!(db.db_slurp(&source_b).await.unwrap(), (1, 2, 1));
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query("SELECT COUNT(*) FROM Tags;", ()).await.unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+            4,
+            "source_b's tags must all be imported, not skipped by stale cursors"
+        );
+        // The relationship stage was not skipped by source_a's finished
+        // marker: source_b's relationship row landed in the namespace
+        // partition.
+        let ns_id = db.namespace_get_name_cache("ns").await.unwrap();
+        let mut rows = conn
+            .query(
+                format!(
+                    "SELECT COUNT(*) FROM Relationship_{ns_id} r
+                     JOIN Tags t ON t.id = r.tag_id
+                     WHERE t.name IN ('one', 'two', 'three', 'four');"
+                ),
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+            2,
+            "both runs' relationships must land: source_a's row plus source_b's,
+             not source_a's alone (which is what a stale finished cursor would leave)"
+        );
+    }
+
+    /// The secondary-hash stage resumes from its persisted cursor: committed
+    /// batches are never re-read, and a re-run lands the exact same hash set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slurp_resume_reimports_hash_tail() {
+        let db = new_target().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source_path = temp_dir.path().join("source.db");
+        let script = "CREATE TABLE Namespace (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
+             INSERT INTO Namespace (name, description) VALUES ('ns', 'test');
+             CREATE TABLE Tags (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
+                 count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
+             INSERT INTO Tags (name, namespace) VALUES ('cat', 1), ('dog', 1);
+             CREATE TABLE FileStorageLocations (
+                 id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
+             INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
+             CREATE TABLE File (
+                 id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
+                 storage_id INTEGER, size_bytes INTEGER);
+             INSERT INTO File (hash, extension, storage_id, size_bytes) VALUES
+                 ('h1', 'jpg', 1, 10), ('h2', 'png', 1, 20);
+             CREATE TABLE FileHashes (
+                 file_id INTEGER NOT NULL, algorithm TEXT NOT NULL, digest TEXT NOT NULL,
+                 PRIMARY KEY (file_id, algorithm));
+             INSERT INTO FileHashes VALUES
+                 (1, 'MD5', 'a'), (1, 'SHA1', 'b'), (2, 'MD5', 'c'), (2, 'SHA1', 'd');
+             CREATE TABLE Relationship (
+                 file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                 PRIMARY KEY (file_id, tag_id)) WITHOUT ROWID;
+             INSERT INTO Relationship (file_id, tag_id) VALUES (1, 1), (2, 2);
+             CREATE TABLE Parents (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
+                 relate_tag_id INTEGER NOT NULL, limit_to INTEGER);";
+        write_source(&source_path, script).await;
+
+        assert_eq!(db.db_slurp(&source_path).await.unwrap(), (1, 2, 2));
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query("SELECT COUNT(*) FROM FileHashes;", ()).await.unwrap();
+        assert_eq!(rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(), 4);
+
+        // Simulate a crash after file 1's hashes committed: the resume must
+        // jump past file 1's batch and still import file 2's tail.
+        seed_interrupted_slurp_state(
+            &db,
+            &source_path,
+            SlurpStageCheckpoint {
+                finished: false,
+                last_file_id: 0,
+                last_tag_id: 0,
+            },
+            &[],
+        )
+        .await;
+        let conn = db.connect().unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO {SLURP_CHECKPOINT_TABLE}
+                     (stage, finished, last_file_id, last_tag_id)
+                 VALUES ('hashes', 0, 1, 0)"
+            ),
+            (),
+        )
+        .await
+        .unwrap();
+        // A stale row-keyed state would drop file 1's hashes; the resume must
+        // not. Verify the cursor row exists and feeds the resume.
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT last_file_id FROM {SLURP_CHECKPOINT_TABLE} WHERE stage = 'hashes'"
+                ),
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+            1
+        );
+
+        assert_eq!(db.db_slurp(&source_path).await.unwrap(), (1, 2, 2));
+        let mut rows = conn.query("SELECT COUNT(*) FROM FileHashes;", ()).await.unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+            4,
+            "resumed hash stage must keep every row"
+        );
+    }
+
+
+
+    async fn slurp_assert_no_progress_tables(db: &TursoDatabase) {
+        let conn = db.connect().unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name IN ('_slurp_checkpoint', '_slurp_pending_recount');",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+            0,
+            "progress tables must be dropped once the slurp completes"
+        );
+    }
+
+    /// The source-index diagnostic must tell a keyset-serving index apart from
+    /// a table that forces a full re-scan per batch: composite PKs and explicit
+    /// indexes leading with (file_id, tag_id) qualify; a (tag_id, file_id) PK
+    /// does not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slurp_diagnoses_missing_keyset_index() {
+        let (_, conn, _temp) = new_source(
+            "CREATE TABLE Relationship_x (
+                 file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                 PRIMARY KEY (tag_id, file_id));
+             INSERT INTO Relationship_x (file_id, tag_id) VALUES (1, 2);",
+        )
+        .await;
+        assert_eq!(
+            slurp_source_keyset_indexed(&conn, "Relationship_x")
+                .await
+                .unwrap(),
+            false,
+            "a (tag_id, file_id) PK does not serve the (file_id, tag_id) keyset"
+        );
+        conn.execute(
+            "CREATE INDEX idx_x_file_tag ON Relationship_x (file_id, tag_id)",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            slurp_source_keyset_indexed(&conn, "Relationship_x")
+                .await
+                .unwrap(),
+            true,
+            "an explicit (file_id, tag_id) index must be detected"
+        );
+
+        let (_, conn, _temp) = new_source(
+            "CREATE TABLE Relationship_y (
+                 file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                 PRIMARY KEY (file_id, tag_id)) WITHOUT ROWID;",
+        )
+        .await;
+        assert_eq!(
+            slurp_source_keyset_indexed(&conn, "Relationship_y")
+                .await
+                .unwrap(),
+            true,
+            "a clustered (file_id, tag_id) PK must be detected"
+        );
     }
 }
