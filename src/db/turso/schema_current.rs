@@ -115,12 +115,9 @@ id INTEGER PRIMARY KEY AUTOINCREMENT,
     FOREIGN KEY (relate_tag_id) REFERENCES Tags(id) ON DELETE CASCADE ON UPDATE CASCADE,
     FOREIGN KEY (limit_to) REFERENCES Tags(id) ON DELETE SET NULL ON UPDATE CASCADE,
 
-    CHECK (tag_id != relate_tag_id),
-
-    UNIQUE(tag_id, relate_tag_id, limit_to)
+    CHECK (tag_id != relate_tag_id)
 );
 
-CREATE INDEX idx_parents_lim ON Parents (limit_to);
 CREATE INDEX idx_parents_rel ON Parents (relate_tag_id);
 CREATE UNIQUE INDEX idx_unique_parents_null_safe ON Parents (tag_id, relate_tag_id, IFNULL(limit_to, -1));
 ").await

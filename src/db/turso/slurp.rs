@@ -1617,9 +1617,12 @@ impl TursoDatabase {
                     conn.execute("ALTER TABLE Parents_old RENAME TO Parents", ())
                         .await?;
                     // The restored table may be missing the named indexes if the
-                    // interrupted run had already dropped them from Parents_old.
+                    // interrupted run had already dropped them from Parents_old,
+                    // and may carry a stale idx_parents_lim if the run predates
+                    // the lean Parents schema (dropped here so a restored table
+                    // never pays its per-insert tax).
                     conn.execute_batch(
-                        "CREATE INDEX IF NOT EXISTS idx_parents_lim ON Parents (limit_to);
+                        "DROP INDEX IF EXISTS idx_parents_lim;
                          CREATE INDEX IF NOT EXISTS idx_parents_rel ON Parents (relate_tag_id);
                          CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_parents_null_safe
                              ON Parents (tag_id, relate_tag_id, IFNULL(limit_to, -1));",
@@ -2467,14 +2470,15 @@ mod tests {
 
         // Every index dropped for the bulk load must be back in place. Turso
         // canonicalizes identifiers to lowercase on disk, so the partition
-        // index is queried in its lowercase form.
+        // index is queried in its lowercase form. The lean Parents schema
+        // carries two indexes (relate_tag_id + null-safe unique); the legacy
+        // idx_parents_lim is intentionally never recreated.
         let mut rows = conn
             .query(
                 "SELECT LOWER(name) FROM sqlite_schema
-                 WHERE type = 'index' AND LOWER(name) IN (?1, ?2, ?3, ?4);",
+                 WHERE type = 'index' AND LOWER(name) IN (?1, ?2, ?3);",
                 (
                     "idx_relationship_1_tag_file",
-                    "idx_parents_lim",
                     "idx_parents_rel",
                     "idx_unique_parents_null_safe",
                 ),
@@ -2487,7 +2491,7 @@ mod tests {
         }
         assert_eq!(
             present.len(),
-            4,
+            3,
             "all bulk-import indexes recreated: {present:?}"
         );
     }

@@ -733,6 +733,133 @@ mod tests {
         TursoDatabase::new_with_exit(&db_path, should_exit).await
     }
 
+    #[test]
+    #[ignore = "manual benchmark: Parents write path, lean (2-index) vs legacy (4-index) schema"]
+    fn parents_add_schema_bench() {
+        // The "Adding X parents into db" hot spot: the tags phase of a scraper
+        // chunk cold-inserts new parent (tag -> relate -> limit_to) rows via
+        // parents_bulk_add. Legacy Parents schemas maintained four indexes per
+        // insert (inline UNIQUE autoindex + limit_to + relate_tag_id +
+        // null-safe unique); the lean schema keeps only the two that reads
+        // need (relate_tag_id + the null-safe unique that also does the
+        // dedupe). This bench drives the real scraper_phase_tags path with
+        // 5000 brand-new related tags on each schema and compares.
+        use shared_types::{PluginTag, RelationContext, TagOperation, TagType};
+
+        let db_stem = if std::path::Path::new("/dev/shm").exists() {
+            std::path::PathBuf::from("/dev/shm")
+        } else {
+            std::env::temp_dir()
+        }
+        .join(format!("intscrape-parents-bench-{}", std::process::id()));
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            async fn side(base: &std::path::Path, label: &str, legacy_indexes: bool) {
+                let db_path = base.with_file_name(format!(
+                    "{}-{label}.db",
+                    base.file_name().unwrap().to_string_lossy()
+                ));
+                let _ = std::fs::remove_file(&db_path);
+                let db = TursoDatabase::new_with_exit(
+                    &db_path,
+                    std::sync::Arc::new(AtomicBool::new(false)),
+                )
+                .await;
+
+                if legacy_indexes {
+                    // Boot creates the lean Parents table; rebuild it to the
+                    // legacy 4-index shape (inline UNIQUE + limit_to +
+                    // relate_tag_id + null-safe unique) on the still-empty
+                    // table so only the index set differs.
+                    let conn = db.connect().unwrap();
+                    conn.execute_batch(
+                        "CREATE TABLE Parents_legacy (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            tag_id INTEGER NOT NULL,
+                            relate_tag_id INTEGER NOT NULL,
+                            limit_to INTEGER,
+                            UNIQUE(tag_id, relate_tag_id, limit_to)
+                         );
+                         INSERT INTO Parents_legacy (tag_id, relate_tag_id, limit_to)
+                             SELECT tag_id, relate_tag_id, limit_to FROM Parents;
+                         DROP TABLE Parents;
+                         ALTER TABLE Parents_legacy RENAME TO Parents;
+                         CREATE INDEX idx_parents_lim ON Parents (limit_to);
+                         CREATE INDEX idx_parents_rel ON Parents (relate_tag_id);
+                         CREATE UNIQUE INDEX idx_unique_parents_null_safe
+                             ON Parents (tag_id, relate_tag_id, IFNULL(limit_to, -1));",
+                    )
+                    .await
+                    .unwrap();
+                    drop(conn);
+                }
+
+                let ns = GenericNamespaceObj {
+                    name: "parentbench".into(),
+                    description: None,
+                };
+                db.namespace_ensure_set(&HashSet::from([ns.clone()]))
+                    .await
+                    .unwrap();
+
+                // 5000 new tags, each with a parent (50 shared hubs) and a
+                // limit tag (25 shared), half with no limit_to at all: the
+                // realistic "first scrape of new content" parent mix.
+                let mut plugins = Vec::with_capacity(5000);
+                for i in 0..5000u64 {
+                    let limit_to = if i % 2 == 0 {
+                        Some(Tag {
+                            name: format!("parentlim{}", i % 25),
+                            namespace: ns.clone(),
+                        })
+                    } else {
+                        None
+                    };
+                    plugins.push(PluginTag {
+                        tag: Tag {
+                            name: format!("parentchip{i}"),
+                            namespace: ns.clone(),
+                        },
+                        tag_type: TagType::NormalNoRegex,
+                        relates_to: Some(RelationContext {
+                            tag: Tag {
+                                name: format!("parenthub{}", i % 50),
+                                namespace: ns.clone(),
+                            },
+                            tag_type: TagType::NormalNoRegex,
+                            limit_to,
+                        }),
+                    });
+                }
+                let all_tags = vec![FileTagAction {
+                    operation: TagOperation::Add,
+                    tags: plugins,
+                }];
+
+                let t = Instant::now();
+                let mapping = db.scraper_phase_tags(&all_tags).await.unwrap();
+                let phase_s = t.elapsed().as_secs_f64();
+
+                let conn = db.connect().unwrap();
+                let parents: i64 = {
+                    let mut stmt = conn.prepare("SELECT COUNT(*) FROM Parents").await.unwrap();
+                    stmt.query_row(()).await.unwrap().get(0).unwrap()
+                };
+                eprintln!(
+                    "PARENTSBENCH {label}: tags phase {phase_s:.2}s, mapped {} tags, {parents} parents rows",
+                    mapping.len()
+                );
+                drop(conn);
+                db.shutdown().await;
+                let _ = std::fs::remove_file(&db_path);
+            }
+
+            side(&db_stem, "legacy", true).await;
+            side(&db_stem, "lean", false).await;
+        });
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn steady_state_boot_sees_popular_shadow() {
         // Regression: limbo lowercases identifiers in sqlite_master, so a
@@ -763,6 +890,7 @@ mod tests {
         assert_eq!(probe, 1, "steady-state boot must see the shadow");
         db.shutdown().await;
     }
+
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn steady_state_boot_rebuilds_missing_fts_index() {
@@ -881,6 +1009,109 @@ mod tests {
         drop(conn);
         let found = db.tags_search_fts("genmark", 10).await.unwrap();
         assert_eq!(found.len(), 1, "rebuilt shadow must serve search");
+        db.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn boot_migrates_legacy_parents_index_set() {
+        // A database created before the lean Parents schema still carries the
+        // redundant idx_parents_lim (and inline UNIQUE autoindex). The boot
+        // migration must drop idx_parents_lim in place while leaving dedupe
+        // and reads intact on the null-safe unique index.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("legacy_parents.db");
+        let should_exit = Arc::new(AtomicBool::new(false));
+
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+        let conn = db.connect().unwrap();
+        // Bake the legacy 4-index Parents schema onto the fresh database.
+        conn.execute_batch(
+            "CREATE TABLE Parents_legacy (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tag_id INTEGER NOT NULL,
+                relate_tag_id INTEGER NOT NULL,
+                limit_to INTEGER,
+                UNIQUE(tag_id, relate_tag_id, limit_to)
+             );
+             INSERT INTO Parents_legacy (tag_id, relate_tag_id, limit_to)
+                 SELECT tag_id, relate_tag_id, limit_to FROM Parents;
+             DROP TABLE Parents;
+             ALTER TABLE Parents_legacy RENAME TO Parents;
+             CREATE INDEX idx_parents_lim ON Parents (limit_to);
+             CREATE INDEX idx_parents_rel ON Parents (relate_tag_id);
+             CREATE UNIQUE INDEX idx_unique_parents_null_safe
+                 ON Parents (tag_id, relate_tag_id, IFNULL(limit_to, -1));",
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        db.shutdown().await;
+        drop(db);
+
+        // Reboot: check_db's Parents migration must run.
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit).await;
+        let conn = db.connect().unwrap();
+
+        let lim_present: i64 = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type = 'index' AND LOWER(name) = 'idx_parents_lim'
+                     )",
+                )
+                .await
+                .unwrap();
+            stmt.query_row(()).await.unwrap().get(0).unwrap()
+        };
+        assert_eq!(lim_present, 0, "boot must drop the legacy idx_parents_lim");
+
+        let uidx_present: i64 = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type = 'index' AND LOWER(name) = 'idx_unique_parents_null_safe'
+                     )",
+                )
+                .await
+                .unwrap();
+            stmt.query_row(()).await.unwrap().get(0).unwrap()
+        };
+        assert_eq!(uidx_present, 1, "null-safe unique index must survive the migration");
+
+        // Dedupe still works after the migration: the OR IGNORE probes the
+        // null-safe index, not the dropped inline UNIQUE.
+        let conn2 = db.connect().unwrap();
+        let tags = vec![
+            shared_types::TagParents {
+                tag_id: 1,
+                relate_tag_id: 2,
+                limit_to: None,
+            },
+            shared_types::TagParents {
+                tag_id: 1,
+                relate_tag_id: 2,
+                limit_to: Some(3),
+            },
+        ];
+        db.parents_bulk_add(&conn2, &tags).await.unwrap();
+        let count: i64 = {
+            let mut stmt = conn2.prepare("SELECT COUNT(*) FROM Parents").await.unwrap();
+            stmt.query_row(()).await.unwrap().get(0).unwrap()
+        };
+        assert_eq!(count, 2, "two distinct parents insert");
+        db.parents_bulk_add(&conn2, &tags).await.unwrap();
+        let count2: i64 = {
+            let mut stmt = conn2.prepare("SELECT COUNT(*) FROM Parents").await.unwrap();
+            stmt.query_row(()).await.unwrap().get(0).unwrap()
+        };
+        assert_eq!(
+            count2, 2,
+            "re-asserting the same parents must dedupe through the null-safe index"
+        );
+        drop(conn2);
+        drop(conn);
         db.shutdown().await;
     }
 

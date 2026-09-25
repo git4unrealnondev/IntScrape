@@ -299,6 +299,40 @@ impl TursoDatabase {
             }
         }
 
+        // Parents write-path migration (see table_create_parents): legacy
+        // schemas maintained two redundant indexes per insert — the inline
+        // UNIQUE(tag_id, relate_tag_id, limit_to) autoindex (fully covered by
+        // idx_unique_parents_null_safe, which additionally dedupes NULL
+        // limit_to rows the plain UNIQUE cannot) and idx_parents_lim (no query
+        // filters limit_to alone). Both tax every cold parent insert (~7s and
+        // ~14s per 50k rows on the bench). idx_parents_lim drops in place;
+        // the inline UNIQUE needs a table rebuild, so it lingers until the
+        // next parents import (db-slurp) rebuilds Parents from the lean
+        // table_create_parents. Failures surface instead of silently shipping
+        // a slower write path.
+        if let Err(error) = conn
+            .execute("DROP INDEX IF EXISTS idx_parents_lim;", ())
+            .await
+        {
+            log::error!("Failed to migrate Parents index set (idx_parents_lim): {error}");
+        }
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type = 'index' AND LOWER(name) = 'sqlite_autoindex_parents_1'
+                     )",
+                )
+                .await?;
+            let legacy_unique: i64 = stmt.query_row(()).await?.get(0)?;
+            if legacy_unique != 0 {
+                log::info!(
+                    "Legacy Parents inline UNIQUE index detected; the next parents import (db-slurp) rebuilds Parents lean and drops it."
+                );
+            }
+        }
+
         conn.commit().await?;
 
         // Popular-tag FTS shadow: create/index on first boot or upgrade,
