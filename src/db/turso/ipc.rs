@@ -181,9 +181,9 @@ impl TursoDatabase {
         }
 
         // Tag adds resolve namespace ids from the cache; creating an uncached
-        // namespace runs the partition DDL that turso forbids in concurrent
-        // transactions. Ensure namespaces up front so the write transaction
-        // below can stay BEGIN CONCURRENT (DML-only).
+        // namespace runs the partition DDL, which must run outside the write
+        // transaction below. Ensure namespaces up front so the write
+        // transaction stays DML-only.
         let namespace_set: HashSet<GenericNamespaceObj> = tag
             .iter()
             .flat_map(|action| action.tags.iter())
@@ -208,14 +208,14 @@ impl TursoDatabase {
                 return false;
             };
             loop {
-                match conn.execute("BEGIN CONCURRENT", ()).await {
+                match conn.execute("BEGIN IMMEDIATE", ()).await {
                     Ok(_) => break,
                     Err(error) if TursoDatabase::is_concurrency_conflict(&error) => {
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                     Err(error) => {
                         log::error!(
-                            "Failed to begin concurrent tag transaction for file {file_id}: {error}"
+                            "Failed to begin tag transaction for file {file_id}: {error}"
                         );
                         return false;
                     }
@@ -301,7 +301,7 @@ impl TursoDatabase {
         }
 
         // Ensure all referenced namespaces exist (see put_tags_to_file) so
-        // the transaction below stays DML-only inside BEGIN CONCURRENT.
+        // the transaction below stays DML-only.
         let namespace_set: HashSet<GenericNamespaceObj> = tags_by_file
             .values()
             .flatten()
@@ -327,13 +327,13 @@ impl TursoDatabase {
                 return false;
             };
             loop {
-                match conn.execute("BEGIN CONCURRENT", ()).await {
+                match conn.execute("BEGIN IMMEDIATE", ()).await {
                     Ok(_) => break,
                     Err(error) if TursoDatabase::is_concurrency_conflict(&error) => {
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                     Err(error) => {
-                        log::error!("Failed to begin concurrent bulk tag transaction: {error}");
+                        log::error!("Failed to begin bulk tag transaction: {error}");
                         return false;
                     }
                 }

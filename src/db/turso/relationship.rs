@@ -6,6 +6,17 @@ use turso::{Connection, Result, Value, params_from_iter};
 use crate::db::SQL_CHUNK_SIZE;
 use crate::db::turso::TursoDatabase;
 
+/// Cap on the size of a single popularity fold-in statement.
+///
+/// `tag_counts_apply` feeds a whole chunk's deltas into `Tags.count` and the
+/// FTS shadow. Limbo's planner is roughly quadratic in one statement's
+/// expression size: a single `UPDATE` carrying a multi-thousand-term
+/// `CASE`/`IN` tree costs seconds for 5k deltas and minutes for 50k (a big
+/// scrape page), which stalls every job behind `tag_count_lock`. Statements of
+/// a few hundred terms stay close to the real per-row cost (b-tree MVCC
+/// writes), so the fold-in is split into pieces this size.
+const POPULARITY_FOLD_CHUNK: usize = 100;
+
 impl TursoDatabase {
     /// Builds the inlined `SELECT file_id, tag_id FROM Relationship_x UNION ALL ...`
     /// source that spans every namespace's relationship partition.
@@ -252,8 +263,8 @@ impl TursoDatabase {
     /// same transaction) that applied the `Tags.count` change so counts and
     /// searchability can never diverge. One DELETE for the below-threshold
     /// rows and one INSERT OR IGNORE for the qualifying ones, chunked at
-    /// SQL_CHUNK_SIZE so a big recount fold-in never builds one giant
-    /// statement.
+    /// POPULARITY_FOLD_CHUNK so a big recount fold-in never builds one giant
+    /// statement (limbo's planner cost is ~quadratic in statement size).
     pub(in crate::db::turso) async fn sync_tags_popular(
         &self,
         conn: &Connection,
@@ -262,7 +273,7 @@ impl TursoDatabase {
         if tag_ids.is_empty() {
             return Ok(());
         }
-        for chunk in tag_ids.chunks(SQL_CHUNK_SIZE) {
+        for chunk in tag_ids.chunks(POPULARITY_FOLD_CHUNK) {
             // Owned value buffers only: nothing borrowed may cross the await
             // below, or the future stops proving Send inside the IPC/scraper
             // task chains (rustc reports a higher-ranked `Send` for the
@@ -376,7 +387,14 @@ impl TursoDatabase {
         }
 
         for (namespace_id, namespace_relationships) in by_namespace {
-            let rels: Vec<(u64, u64)> = namespace_relationships.into_iter().collect();
+            // Feed each namespace's table rows in (tag_id, file_id) key order.
+            // Tuned for the MVCC commit-log path (sequential b-tree extension
+            // avoided the ~22s COW commit for a 24k-row chunk re-tagging
+            // popular tags: 12.3s -> 5.0s). Under the WAL journal it is
+            // neutral (A/B: 18.8s unsorted vs 19.0s sorted for the same 24k
+            // rows) — kept for deterministic insert order.
+            let mut rels: Vec<(u64, u64)> = namespace_relationships.into_iter().collect();
+            rels.sort_unstable();
             for chunk in rels.chunks(SQL_CHUNK_SIZE) {
                 let mut holders = Vec::with_capacity(chunk.len());
                 let mut params = Vec::with_capacity(chunk.len() * 2);
@@ -478,16 +496,16 @@ impl TursoDatabase {
 
     /// Applies accumulated relationship count deltas to `Tags.count`.
     ///
-    /// Relationship rows are written by many concurrent `BEGIN CONCURRENT`
-    /// transactions, but the shared `Tags.count` row they each need to bump
-    /// is one hot row: two chunks touching the same popular tag guarantee a
-    /// write-write conflict there. So the deltas returned by
+    /// Relationship rows are written by many concurrent write transactions,
+    /// but the shared `Tags.count` row they each need to bump is one hot row:
+    /// two chunks touching the same popular tag guarantee a write-write
+    /// conflict there. So the deltas returned by
     /// `relationships_bulk_add` / `relationship_bulk_delete` are folded in
     /// here — one short `BEGIN IMMEDIATE` transaction at a time, serialized
     /// behind `tag_count_lock` — after the relationship inserts have already
-    /// committed. The heavy parallel inserts stay concurrent; only the tiny
-    /// count bookkeeping serializes, which is the point: the count row is
-    /// never written by two transactions at once anymore.
+    /// committed. The heavy relationship inserts stay out of this writer;
+    /// only the tiny count bookkeeping serializes, which is the point: the
+    /// count row is never written by two transactions at once anymore.
     pub(crate) async fn tag_counts_apply(
         &self,
         add_deltas: &HashMap<u64, u64>,
@@ -505,30 +523,37 @@ impl TursoDatabase {
         self.retry_mvcc(|| async {
             let conn = self.connect()?;
             conn.execute("BEGIN IMMEDIATE", ()).await?;
-            if !add_deltas.is_empty() {
-                let (sql, params) = tag_count_update_sql(&add_deltas, false);
-                if let Err(error) = conn.execute(sql, params_from_iter(params)).await {
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    return Err(error);
+            // Fold the deltas in POPULARITY_FOLD_CHUNK pieces inside this one
+            // transaction: one count UPDATE plus its matching shadow sync per
+            // piece. The whole apply still commits atomically (a failed piece
+            // rolls everything back and `retry_mvcc` re-runs it), and a single
+            // commit keeps the FTS writer from producing one tiny segment per
+            // piece. Chunking exists because limbo's planner is ~quadratic in
+            // one statement's expression size: a single unbounded UPDATE with
+            // a multi-thousand-term CASE/IN tree cost seconds for 5k deltas
+            // and *minutes* for 50k, holding `tag_count_lock` — and every
+            // other job's fold-in — hostage the whole time.
+            for (deltas, decrement) in [(&add_deltas, false), (&del_deltas, true)] {
+                let entries: Vec<(u64, u64)> =
+                    deltas.iter().map(|(&k, &v)| (k, v)).collect();
+                for piece in entries.chunks(POPULARITY_FOLD_CHUNK) {
+                    let piece_map: HashMap<u64, u64> = piece.iter().copied().collect();
+                    let (sql, params) = tag_count_update_sql(&piece_map, decrement);
+                    if let Err(error) = conn.execute(sql, params_from_iter(params)).await {
+                        let _ = conn.execute("ROLLBACK", ()).await;
+                        return Err(error);
+                    }
+                    // Mirrors popularity into the FTS shadow in the same
+                    // transaction, so a count that crossed the threshold
+                    // becomes (or stops being) searchable atomically with the
+                    // count itself. Idempotent, so piece-wise is equivalent
+                    // to the old single unioned call.
+                    let ids: Vec<u64> = piece_map.keys().copied().collect();
+                    if let Err(error) = self.sync_tags_popular(&conn, &ids).await {
+                        let _ = conn.execute("ROLLBACK", ()).await;
+                        return Err(error);
+                    }
                 }
-            }
-            if !del_deltas.is_empty() {
-                let (sql, params) = tag_count_update_sql(&del_deltas, true);
-                if let Err(error) = conn.execute(sql, params_from_iter(params)).await {
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    return Err(error);
-                }
-            }
-            // Mirrors popularity into the FTS shadow inside the same
-            // transaction, so a count that crossed the threshold becomes (or
-            // stops being) searchable atomically with the count itself.
-            let mut touched: Vec<u64> = add_deltas.keys().copied().collect();
-            touched.extend(del_deltas.keys().copied());
-            touched.sort_unstable();
-            touched.dedup();
-            if let Err(error) = self.sync_tags_popular(&conn, &touched).await {
-                let _ = conn.execute("ROLLBACK", ()).await;
-                return Err(error);
             }
             match conn.execute("COMMIT", ()).await {
                 Ok(_) => Ok(()),

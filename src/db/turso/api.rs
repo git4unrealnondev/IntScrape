@@ -232,7 +232,7 @@ impl TursoDatabase {
         }
 
         // Ensure all referenced namespaces exist (see put_tags_to_file) so
-        // this transaction stays DML-only inside BEGIN CONCURRENT.
+        // this transaction stays DML-only.
         let namespace_set: std::collections::HashSet<GenericNamespaceObj> = tag_actions
             .iter()
             .flat_map(|action| action.tags.iter())
@@ -261,13 +261,13 @@ impl TursoDatabase {
                 }
             };
             loop {
-                match conn.execute("BEGIN CONCURRENT", ()).await {
+                match conn.execute("BEGIN IMMEDIATE", ()).await {
                     Ok(_) => break,
                     Err(error) if Self::is_concurrency_conflict(&error) => {
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                     Err(error) => {
-                        log::error!("Failed to begin concurrent tag-actions transaction: {error}");
+                        log::error!("Failed to begin tag-actions transaction: {error}");
                         return false;
                     }
                 }

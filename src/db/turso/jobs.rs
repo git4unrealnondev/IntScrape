@@ -331,7 +331,7 @@ impl TursoDatabase {
                 }
             };
 
-            if let Err(error) = conn.execute("BEGIN CONCURRENT", ()).await {
+            if let Err(error) = conn.execute("BEGIN IMMEDIATE", ()).await {
                 if Self::is_concurrency_conflict(&error) {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     continue;

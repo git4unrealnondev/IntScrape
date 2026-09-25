@@ -43,8 +43,8 @@ impl TursoDatabase {
                         return false;
                     }
                 };
-                if let Err(error) = conn.execute("BEGIN CONCURRENT", ()).await {
-                    log::error!("Failed to begin concurrent scrape-job transaction: {error}");
+                if let Err(error) = conn.execute("BEGIN IMMEDIATE", ()).await {
+                    log::error!("Failed to begin scrape-job transaction: {error}");
                     return false;
                 }
 
@@ -78,19 +78,19 @@ impl TursoDatabase {
                         ) =>
                     {
                         log::warn!(
-                            "Concurrent scrape-job commit conflicted; retrying: {error}"
+                            "Scrape-job commit conflicted; retrying: {error}"
                         );
                         let _ = conn.execute("ROLLBACK", ()).await;
                         if scraper_backoff(&mut attempts).await {
                             log::error!(
-                                "Concurrent scrape-job commit still conflicted after \
+                                "Scrape-job commit still conflicted after \
                                  {SCRAPER_MAX_RETRIES} retries; giving up"
                             );
                             return false;
                         }
                     }
                     Err(error) => {
-                        log::error!("Failed to commit concurrent scrape-job transaction: {error}");
+                        log::error!("Failed to commit scrape-job transaction: {error}");
                         return false;
                     }
                 }
@@ -100,8 +100,8 @@ impl TursoDatabase {
         // Namespace rows + Relationship_{id} partitions are created with DDL,
         // which turso only permits inside an exclusive transaction. Ensure
         // every namespace this scrape references exists (and is cached) up
-        // front so the chunk transactions below stay BEGIN CONCURRENT and are
-        // DML-only. The ensure is a fast no-op once everything is cached.
+        // front so the chunk transactions below are DML-only. The ensure is a
+        // fast no-op once everything is cached.
         let namespace_set: HashSet<GenericNamespaceObj> = map
             .iter()
             .flat_map(|(_, actions)| actions.iter())
@@ -123,11 +123,14 @@ impl TursoDatabase {
         }
 
         // The scraper result is persisted through three small, idempotent
-        // (`INSERT OR IGNORE`) `BEGIN CONCURRENT` transactions — files, tags,
-        // then relationships. Each phase retries its own write-write
-        // conflicts with jittered backoff, so a contention spike on a shared
-        // popular tag only restarts the relationship phase instead of the
-        // whole chunk.
+        // (`INSERT OR IGNORE`) plain-BEGIN transactions — files, tags, then
+        // relationships. Each phase begins Deferred, so its reads run without
+        // a write lock; the first write upgrades the transaction to the
+        // single writer, and a conflict at that upgrade point (or at commit)
+        // is retried by that phase alone. Each phase retries its own
+        // write-write conflicts with jittered backoff, so a contention spike
+        // on a shared popular tag only restarts the relationship phase
+        // instead of the whole chunk.
         if !database
             .process_scraper_chunk_human(map)
             .await
@@ -142,18 +145,18 @@ impl TursoDatabase {
     }
 
     /// Persists the whole remaining scraper result through three small
-    /// `BEGIN CONCURRENT` transactions — files, tags, then relationships —
-    /// instead of one giant MVCC transaction. Every bulk write here is
-    /// idempotent (`INSERT OR IGNORE`), and an MVCC snapshot from a
-    /// conflicted transaction is stale, so the only way to make progress is
-    /// to roll back and re-run in a fresh transaction.
+    /// plain-BEGIN transactions — files, tags, then relationships — instead
+    /// of one giant transaction. Every bulk write here is idempotent
+    /// (`INSERT OR IGNORE`), and a snapshot taken before a conflicted write
+    /// is stale (the conflict aborts the transaction), so the only way to
+    /// make progress is to roll back and re-run in a fresh transaction.
     ///
     /// Splitting matters because the relationship phase is where contention
     /// concentrates: every new relationship also bumps the shared
     /// `Tags.count` row, so two scraper chunks that both touch a popular tag
     /// collide exactly there. With one giant transaction that collision
     /// rolled back the file and tag inserts too; now only the conflicted
-    /// phase retries, and each phase's smaller write set overlaps concurrent
+    /// phase retries, and each phase's smaller write set overlaps other
     /// writers far less. Retries use jittered exponential backoff (see
     /// `scraper_backoff`) and are capped so a pathological contention storm
     /// cannot spin on the shared tokio runtime forever.
@@ -188,7 +191,7 @@ impl TursoDatabase {
     }
 
     /// Phase 1 of a scraper chunk: persists files and their identifying
-    /// hashes in one small concurrent transaction, returning the
+    /// hashes in one small plain-BEGIN transaction, returning the
     /// `hash -> db id` cache the relationship phase resolves against.
     async fn scraper_phase_files(
         &self,
@@ -201,7 +204,7 @@ impl TursoDatabase {
             let mut conn = self.connect()?;
             let tn = loop {
                 match conn
-                    .transaction_with_behavior(turso::transaction::TransactionBehavior::Concurrent)
+                    .transaction_with_behavior(turso::transaction::TransactionBehavior::Deferred)
                     .await
                 {
                     Ok(tn) => break tn,
@@ -274,7 +277,7 @@ impl TursoDatabase {
     }
 
     /// Phase 2 of a scraper chunk: persists tags (and their parent
-    /// relations) in one small concurrent transaction, returning the
+    /// relations) in one small plain-BEGIN transaction, returning the
     /// `Tag -> id` mapping the relationship phase resolves against.
     async fn scraper_phase_tags(
         &self,
@@ -286,7 +289,7 @@ impl TursoDatabase {
             let mut conn = self.connect()?;
             let tn = loop {
                 match conn
-                    .transaction_with_behavior(turso::transaction::TransactionBehavior::Concurrent)
+                    .transaction_with_behavior(turso::transaction::TransactionBehavior::Deferred)
                     .await
                 {
                     Ok(tn) => break tn,
@@ -345,7 +348,7 @@ impl TursoDatabase {
             let mut conn = self.connect()?;
             let tn = loop {
                 match conn
-                    .transaction_with_behavior(turso::transaction::TransactionBehavior::Concurrent)
+                    .transaction_with_behavior(turso::transaction::TransactionBehavior::Deferred)
                     .await
                 {
                     Ok(tn) => break tn,
@@ -721,6 +724,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
 
     async fn new_test_db() -> Arc<TursoDatabase> {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -878,6 +882,624 @@ mod tests {
         let found = db.tags_search_fts("genmark", 10).await.unwrap();
         assert_eq!(found.len(), 1, "rebuilt shadow must serve search");
         db.shutdown().await;
+    }
+
+    #[test]
+    #[ignore = "manual benchmark: FTS shadow write-path throughput on RAM-backed storage"]
+    fn fts_shadow_write_path_throughput_bench() {
+        // Reproduces the production hot spot: every scraper chunk that bumps a
+        // popular tag runs `sync_tags_popular`, which DELETEs + INSERTs rows
+        // into Tags_Popular and makes the tantivy FTS writer maintain the
+        // ngram index. Prod runs the DB on tmpfs ("ram"), so this bench runs
+        // on /dev/shm too — any slowness is then CPU (segment loads / identity
+        // reads / merges), not disk.
+        use std::time::Instant;
+
+        let db_path = if std::path::Path::new("/dev/shm").exists() {
+            std::path::PathBuf::from("/dev/shm").join(format!(
+                "intscrape-fts-bench-{}.db",
+                std::process::id()
+            ))
+        } else {
+            std::env::temp_dir().join(format!("intscrape-fts-bench-{}.db", std::process::id()))
+        };
+        let _ = std::fs::remove_file(&db_path);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let should_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "INSERT INTO Namespace (name, description) VALUES ('bench', NULL);",
+                (),
+            )
+            .await
+            .unwrap();
+
+            // Seed popular tags (count >= 5) in flat row chunks.
+            let popular: u64 = 20_000;
+            let (seed_s, build_s) = bench_seed_db(&db, popular).await;
+            let shadow_rows = bench_shadow_rows(&db).await;
+
+            // The write path: R rounds, each touching B popular tags through
+            // the real sync_tags_popular (DELETE + INSERT OR IGNORE), with
+            // counts bumped beforehand exactly like relationship_add does.
+            let rounds: u32 = 20;
+            let per_round: u64 = 50;
+            let total = Instant::now();
+            let mut touched = Vec::new();
+            for r in 0..rounds {
+                let start = (r as u64 * per_round) % popular + 1;
+                touched.clear();
+                for id in start..start + per_round {
+                    touched.push((id - 1) % popular + 1);
+                }
+                let now = Instant::now();
+                db.sync_tags_popular(&conn, &touched).await.unwrap();
+                eprintln!(
+                    "round {r}: {per_round} shadow writes took {:.3?} ({} rows in shadow)",
+                    now.elapsed(),
+                    shadow_rows
+                );
+            }
+            let writes = rounds as u64 * per_round;
+            let total_s = total.elapsed().as_secs_f64();
+            let per_write_ms = total_s * 1000.0 / writes as f64;
+
+            eprintln!(
+                "FTS bench (tmpfs): seed {popular} tags {seed_s:.2}s, shadow build+optimize {build_s:.2}s, {writes} shadow writes {total_s:.2}s ({per_write_ms:.3}ms/write), shadow rows {shadow_rows}"
+            );
+        });
+        drop(db_path);
+    }
+
+    #[test]
+    #[ignore = "manual benchmark: end-to-end scraper chunk persist on RAM-backed storage"]
+    fn scraper_chunk_persist_throughput_bench() {
+        use shared_types::{PluginTag, TagType};
+
+        let db_path = if std::path::Path::new("/dev/shm").exists() {
+            std::path::PathBuf::from("/dev/shm").join(format!(
+                "intscrape-chunk-bench-{}.db",
+                std::process::id()
+            ))
+        } else {
+            std::env::temp_dir().join(format!("intscrape-chunk-bench-{}.db", std::process::id()))
+        };
+        let _ = std::fs::remove_file(&db_path);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let should_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+            let (seed_s, build_s) = bench_seed_db(&db, 10_000).await;
+            let popular_count = 10_000u64;
+
+            let conn = db.connect().unwrap();
+            let storage_id = db
+                .file_storage_location_get_or_create(&conn, "bench_storage")
+                .await
+                .unwrap();
+            drop(conn);
+
+            let ns = GenericNamespaceObj {
+                name: "bench".into(),
+                description: None,
+            };
+            // 200 files x 24 tags (20 popular + 4 brand-new) each.
+            let (map, file_list, all_tags) = bench_chunk_map(storage_id, popular_count, 200, 0, &ns);
+
+            // Fresh chunk (all 200 files new).
+            let entries = map.len();
+            let t = Instant::now();
+            let persisted = db
+                .clone()
+                .process_scraper(map.clone(), Vec::new(), "bench".into())
+                .await;
+            let fresh_s = t.elapsed().as_secs_f64();
+            eprintln!("CHUNK fresh {entries} files persisted={persisted} in {fresh_s:.2}s");
+
+            // Steady re-persist: same map again (idempotent bulk writes).
+            let t = Instant::now();
+            let persisted = db
+                .clone()
+                .process_scraper(map.clone(), Vec::new(), "bench".into())
+                .await;
+            let reap_s = t.elapsed().as_secs_f64();
+            eprintln!("CHUNK re-persist {entries} files persisted={persisted} in {reap_s:.2}s");
+
+            // Contention: two identical chunks touching the same 10k popular
+            // tags in parallel. Phase 3 bumps shared Tags.count rows, so the
+            // write transactions collide and retry with jittered backoff.
+            let t = Instant::now();
+            let a = db.clone().process_scraper(map.clone(), Vec::new(), "a".into());
+            let b = db.clone().process_scraper(map.clone(), Vec::new(), "b".into());
+            let (ra, rb) = tokio::join!(a, b);
+            let both_s = t.elapsed().as_secs_f64();
+            eprintln!(
+                "CHUNK concurrent x2 persisted=({ra},{rb}) in {both_s:.2}s (sequential would be {:.2}s)",
+                fresh_s + reap_s
+            );
+
+            // Prod-scale: a 1000-file fresh chunk (24k relationship rows, 14k
+            // count deltas). This is the regime that produced the 73-93s gaps
+            // in prod logs: the old unbounded count UPDATE was ~quadratic in
+            // statement size (a 24k-clause CASE tree is ~2 minutes of planner
+            // cost); the folded path should be ~linear in real work.
+            //
+            // Replicate process_scraper's exact steps with per-step timing so
+            // the end-to-end cost is attributable.
+            let (big_map, _, _) = bench_chunk_map(storage_id, popular_count, 1000, 1000, &ns);
+            let big_entries = big_map.len();
+            let all_tags_big: Vec<FileTagAction> =
+                big_map.values().flatten().cloned().collect();
+            let file_list_big: Vec<FileInternal> =
+                big_map.keys().map(|f| f.internal.clone()).collect();
+            let mut ns_set = HashSet::new();
+            ns_set.insert(ns.clone());
+            let t = Instant::now();
+            db.namespace_ensure_set(&ns_set).await.unwrap();
+            let ns_s = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let fc = db.scraper_phase_files(&big_map, &file_list_big).await.unwrap();
+            let files_s = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let mapping_big = db.scraper_phase_tags(&all_tags_big).await.unwrap();
+            let tags_s = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            db.scraper_phase_relationships(&big_map, &fc, &mapping_big)
+                .await
+                .unwrap();
+            let rels_s = t.elapsed().as_secs_f64();
+            let big_s = ns_s + files_s + tags_s + rels_s;
+            eprintln!("CHUNK big {big_entries} files replicated: ns {ns_s:.2}s + files {files_s:.2}s + tags {tags_s:.2}s + relationships {rels_s:.2}s = {big_s:.2}s");
+
+            eprintln!(
+                "CHUNK summary: seed {seed_s:.2}s build {build_s:.2}s | fresh {fresh_s:.2}s | re-persist {reap_s:.2}s | concurrent x2 {both_s:.2}s | big 1000-file {big_s:.2}s"
+            );
+        });
+        drop(db_path);
+    }
+
+    /// Seeds `popular` count>=5 tags and builds the FTS shadow wholesale (the
+    /// same batch slurp's end-of-run uses). Returns (seed_s, build_s).
+    async fn bench_seed_db(db: &TursoDatabase, popular: u64) -> (f64, f64) {
+        let conn = db.connect().unwrap();
+        let seed_start = Instant::now();
+        for chunk in (1u64..=popular).collect::<Vec<_>>().chunks(256) {
+            let mut sql = String::from("INSERT OR REPLACE INTO Tags (name, namespace, count) VALUES ");
+            let mut params: Vec<Value> = Vec::with_capacity(chunk.len() * 3);
+            for (i, id) in chunk.iter().enumerate() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                let base = (i * 3) + 1;
+                sql.push_str(&format!("(?{base}, ?{}, ?{})", base + 1, base + 2));
+                params.push(Value::from(format!("benchtag{id}")));
+                params.push(Value::from(1i64));
+                params.push(Value::from(9i64));
+            }
+            sql.push(';');
+            conn.execute(&sql, params_from_iter(params)).await.unwrap();
+        }
+        let seed_s = seed_start.elapsed().as_secs_f64();
+
+        let build_start = Instant::now();
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS Tags_Popular;
+             CREATE TABLE Tags_Popular (
+                 tag_id INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL
+             );
+             INSERT INTO Tags_Popular(tag_id, name)
+                 SELECT id, name FROM Tags WHERE count >= 5;
+             CREATE INDEX idx_tags_fts ON Tags_Popular USING fts
+                 (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);
+             OPTIMIZE INDEX idx_tags_fts;",
+        )
+        .await
+        .unwrap();
+        let build_s = build_start.elapsed().as_secs_f64();
+        (seed_s, build_s)
+    }
+
+    async fn bench_shadow_rows(db: &TursoDatabase) -> i64 {
+        let conn = db.connect().unwrap();
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM Tags_Popular;", ())
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .expect("shadow row count")
+            .get(0)
+            .unwrap()
+    }
+
+    /// Builds a scraper chunk: `files` FileManagers (starting at index
+    /// `start` so multiple chunks on one db stay disjoint), each with
+    /// `per_file_tags` tags cycling [`popular_count`] popular tags plus
+    /// brand-new ones. Returns (map, file_list, all_tags) mirroring
+    /// process_scraper_chunk_human.
+    fn bench_chunk_map(
+        storage_id: u64,
+        popular_count: u64,
+        files: u64,
+        start: u64,
+        ns: &GenericNamespaceObj,
+    ) -> (
+        HashMap<FileManager, Vec<FileTagAction>>,
+        Vec<FileInternal>,
+        Vec<FileTagAction>,
+    ) {
+        use shared_types::{PluginTag, TagType};
+        let mut map: HashMap<FileManager, Vec<FileTagAction>> = HashMap::new();
+        for i in 0..files {
+            let f = start + i;
+            let file = FileManager {
+                internal: FileInternal {
+                    id: None,
+                    hash: format!("benchfilehash{f:016x}"),
+                    extension: "png".into(),
+                    storage_id,
+                    size_bytes: Some(1024),
+                },
+                identifying_hashes: vec![],
+            };
+            let mut action_tags = Vec::new();
+            for t in 0..20u64 {
+                let tag_name = format!("benchtag{}", ((f * 20 + t) % popular_count) + 1);
+                action_tags.push(PluginTag {
+                    tag: Tag {
+                        name: tag_name,
+                        namespace: ns.clone(),
+                    },
+                    tag_type: TagType::NormalNoRegex,
+                    relates_to: None,
+                });
+            }
+            for t in 0..4u64 {
+                action_tags.push(PluginTag {
+                    tag: Tag {
+                        name: format!("newtag{f}_{t}"),
+                        namespace: ns.clone(),
+                    },
+                    tag_type: TagType::NormalNoRegex,
+                    relates_to: None,
+                });
+            }
+            map.insert(
+                file,
+                vec![FileTagAction {
+                    operation: TagOperation::Add,
+                    tags: action_tags,
+                }],
+            );
+        }
+        let all_tags: Vec<FileTagAction> = map.values().flatten().cloned().collect();
+        let file_list: Vec<FileInternal> = map.keys().map(|f| f.internal.clone()).collect();
+        (map, file_list, all_tags)
+    }
+
+    #[test]
+    #[ignore = "manual benchmark: split phase-3 cost into bulk-add vs count-apply vs shadow"]
+    fn scraper_write_path_micro_dissection_bench() {
+        let db_path = if std::path::Path::new("/dev/shm").exists() {
+            std::path::PathBuf::from("/dev/shm").join(format!(
+                "intscrape-micro-bench-{}.db",
+                std::process::id()
+            ))
+        } else {
+            std::env::temp_dir().join(format!("intscrape-micro-bench-{}.db", std::process::id()))
+        };
+        let _ = std::fs::remove_file(&db_path);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let should_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+            let popular_count = 10_000u64;
+            let _ = bench_seed_db(&db, popular_count).await;
+
+            let conn = db.connect().unwrap();
+            let storage_id = db
+                .file_storage_location_get_or_create(&conn, "bench_storage")
+                .await
+                .unwrap();
+            let ns = GenericNamespaceObj {
+                name: "bench".into(),
+                description: None,
+            };
+            let mut ns_set = HashSet::new();
+            ns_set.insert(ns.clone());
+            db.namespace_ensure_set(&ns_set).await.expect("pre-ensure ns");
+
+            let (map, file_list, all_tags) = bench_chunk_map(storage_id, popular_count, 200, 0, &ns);
+            let file_cache = db
+                .scraper_phase_files(&map, &file_list)
+                .await
+                .expect("files phase");
+            let mapping = db.scraper_phase_tags(&all_tags).await.expect("tags phase");
+
+            // Rebuild the rels_to_add set exactly as scraper_phase_relationships does.
+            let mut rels_to_add = HashSet::new();
+            for (file, actions) in &map {
+                let file_id = file_cache[&file.internal.hash];
+                for action in actions {
+                    for tag in &action.tags {
+                        if let Some(&tag_id) = mapping.get(&tag.tag) {
+                            rels_to_add.insert((file_id, tag_id as u64));
+                        }
+                    }
+                }
+            }
+            let rels_count = rels_to_add.len();
+            eprintln!("MICRO rels_to_add {rels_count}");
+
+            // 1) Bulk relationship insert inside a concurrent tx + commit.
+            let mut bulk_conn = db.connect().unwrap();
+            let tn = bulk_conn
+                .transaction_with_behavior(turso::transaction::TransactionBehavior::Deferred)
+                .await
+                .unwrap();
+            let t = Instant::now();
+            let add_deltas = db
+                .relationships_bulk_add(&tn, &rels_to_add)
+                .await
+                .unwrap();
+            let bulk_s = t.elapsed().as_secs_f64();
+            tn.commit().await.unwrap();
+            eprintln!(
+                "MICRO relationships_bulk_add: {bulk_s:.3}s ({} deltas)",
+                add_deltas.len()
+            );
+
+            // 2) Full count apply (count UPDATE + shadow sync), the serialized
+            //    BEGIN IMMEDIATE path.
+            let deltas_count = add_deltas.len();
+            let t = Instant::now();
+            db.tag_counts_apply(&add_deltas, &HashMap::new())
+                .await
+                .unwrap();
+            let apply_s = t.elapsed().as_secs_f64();
+            eprintln!("MICRO tag_counts_apply ({} deltas): {apply_s:.3}s", deltas_count);
+
+            let shadow_conn = db.connect().unwrap();
+            let touched: Vec<u64> = add_deltas.keys().copied().collect();
+
+            // 3) Shadow sync alone, one giant batch.
+            let t = Instant::now();
+            db.sync_tags_popular(&shadow_conn, &touched).await.unwrap();
+            let shadow_big_s = t.elapsed().as_secs_f64();
+            eprintln!("MICRO sync_tags_popular big-batch ({} ids): {shadow_big_s:.3}s", touched.len());
+
+            // 4) Same shadow sync in 100-id small batches: isolates statement
+            //    compile cost from real FTS/index work.
+            let t = Instant::now();
+            for chunk in touched.chunks(100) {
+                db.sync_tags_popular(&shadow_conn, chunk).await.unwrap();
+            }
+            let shadow_small_s = t.elapsed().as_secs_f64();
+            eprintln!(
+                "MICRO sync_tags_popular small-batch ({} id, 100/batch): {shadow_small_s:.3}s",
+                touched.len()
+            );
+
+            // 5) Count-only update, one giant CASE statement vs small batches.
+            //    (Mirrors tag_count_update_sql; private upstream, duplicated
+            //    here so the bench isolates statement-size compile cost.)
+            let count_update_sql = |part: &HashMap<u64, u64>| -> (String, Vec<Value>) {
+                let mut clauses = Vec::with_capacity(part.len());
+                let mut params = Vec::with_capacity(part.len() * 3);
+                for (tag_id, delta) in part {
+                    clauses.push("WHEN ? THEN ?".to_string());
+                    params.push(Value::from(*tag_id as i64));
+                    params.push(Value::from(*delta as i64));
+                }
+                let placeholders = std::iter::repeat_n("?", part.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                for tag_id in part.keys() {
+                    params.push(Value::from(*tag_id as i64));
+                }
+                (
+                    format!(
+                        "UPDATE Tags SET count = count + CASE id {} ELSE 0 END WHERE id IN ({placeholders});",
+                        clauses.join(" ")
+                    ),
+                    params,
+                )
+            };
+            let big = count_update_sql(&add_deltas);
+            let t = Instant::now();
+            shadow_conn
+                .execute(big.0, params_from_iter(big.1))
+                .await
+                .unwrap();
+            let update_big_s = t.elapsed().as_secs_f64();
+            eprintln!("MICRO count UPDATE giant CASE ({} deltas): {update_big_s:.3}s", deltas_count);
+
+            let t = Instant::now();
+            for chunk in add_deltas.iter().collect::<Vec<_>>().chunks(100) {
+                let part: HashMap<u64, u64> = chunk
+                    .iter()
+                    .map(|(k, v)| (**k, **v))
+                    .collect();
+                let (sql, params) = count_update_sql(&part);
+                shadow_conn
+                    .execute(sql, params_from_iter(params))
+                    .await
+                    .unwrap();
+            }
+            let update_small_s = t.elapsed().as_secs_f64();
+            eprintln!("MICRO count UPDATE small-batch: {update_small_s:.3}s");
+
+            // 6) Scaling: a 10k-delta count UPDATE in one giant statement vs
+            //    100-id batches. The count-UPDATE path does NOT chunk (the
+            //    whole apply delta set is one statement), so this predicts
+            //    prod-size chunks.
+            let mut tenk: HashMap<u64, u64> = HashMap::new();
+            for tag_id in 1..=10_000u64 {
+                tenk.insert(tag_id, 1);
+            }
+            let (big, params) = count_update_sql(&tenk);
+            let t = Instant::now();
+            shadow_conn.execute(big, params_from_iter(params)).await.unwrap();
+            let update_10k_big_s = t.elapsed().as_secs_f64();
+            eprintln!("MICRO count UPDATE 10k giant CASE: {update_10k_big_s:.3}s");
+
+            let t = Instant::now();
+            for chunk in tenk.iter().collect::<Vec<_>>().chunks(100) {
+                let part: HashMap<u64, u64> = chunk
+                    .iter()
+                    .map(|(k, v)| (**k, **v))
+                    .collect();
+                let (sql, params) = count_update_sql(&part);
+                shadow_conn
+                    .execute(sql, params_from_iter(params))
+                    .await
+                    .unwrap();
+            }
+            let update_10k_small_s = t.elapsed().as_secs_f64();
+            eprintln!("MICRO count UPDATE 10k small-batch: {update_10k_small_s:.3}s");
+
+            eprintln!(
+                "MICRO summary: bulk_add {bulk_s:.3}s + apply {apply_s:.3}s | shadow big {shadow_big_s:.3}s vs small {shadow_small_s:.3}s | count-update big {update_big_s:.3}s vs small {update_small_s:.3}s | count-update 10k big {update_10k_big_s:.3}s vs small {update_10k_small_s:.3}s"
+            );
+        });
+        drop(db_path);
+    }
+
+    #[test]
+    #[ignore = "manual benchmark: per-phase cost of a fresh scraper chunk"]
+    fn scraper_chunk_phase_dissection_bench() {
+        let db_path = if std::path::Path::new("/dev/shm").exists() {
+            std::path::PathBuf::from("/dev/shm").join(format!(
+                "intscrape-phase-bench-{}.db",
+                std::process::id()
+            ))
+        } else {
+            std::env::temp_dir().join(format!("intscrape-phase-bench-{}.db", std::process::id()))
+        };
+        let _ = std::fs::remove_file(&db_path);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let should_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+            let popular_count = 10_000u64;
+            let (_, _) = bench_seed_db(&db, popular_count).await;
+
+            let conn = db.connect().unwrap();
+            let storage_id = db
+                .file_storage_location_get_or_create(&conn, "bench_storage")
+                .await
+                .unwrap();
+            drop(conn);
+
+            let ns = GenericNamespaceObj {
+                name: "bench".into(),
+                description: None,
+            };
+
+            // process_scraper pre-ensures namespaces before chunk_human; the
+            // phase calls need that DDL already done (a namespace can only be
+            // partitioned once, and the relationship inserts require the
+            // partition table to exist).
+            let mut ns_set = HashSet::new();
+            ns_set.insert(ns.clone());
+            db.namespace_ensure_set(&ns_set).await.expect("pre-ensure ns");
+
+            // Run the phases at two chunk sizes (disjoint file ranges) so the
+            // per-phase scaling is visible: a 200-file fresh chunk vs a
+            // 1000-file prod-scale chunk. Phase 3 is split into its two
+            // sub-steps (bulk relationship insert inside the phase's write
+            // transaction + the serialized count/shadow apply) so whichever
+            // one stays super-linear at scale shows up directly.
+            let mut real_fids: Vec<u64> = Vec::new();
+            for (files, start) in [(200u64, 0u64), (1000u64, 1000u64)] {
+                let (map, file_list, all_tags) =
+                    bench_chunk_map(storage_id, popular_count, files, start, &ns);
+
+                let t = Instant::now();
+                let file_cache = db
+                    .scraper_phase_files(&map, &file_list)
+                    .await
+                    .expect("files phase");
+                let files_s = t.elapsed().as_secs_f64();
+                eprintln!("PHASE[{files}] files: {files_s:.2}s");
+                real_fids.extend(file_cache.values().copied());
+
+                let t = Instant::now();
+                let mapping = db.scraper_phase_tags(&all_tags).await.expect("tags phase");
+                let tags_s = t.elapsed().as_secs_f64();
+                eprintln!("PHASE[{files}] tags: {tags_s:.2}s ({} mapped)", mapping.len());
+
+                let mut rels_to_add = HashSet::new();
+                for (file, actions) in &map {
+                    let file_id = file_cache[&file.internal.hash];
+                    for action in actions {
+                        for tag in &action.tags {
+                            if let Some(&tag_id) = mapping.get(&tag.tag) {
+                                rels_to_add.insert((file_id, tag_id as u64));
+                            }
+                        }
+                    }
+                }
+                let rels = rels_to_add.len();
+
+                let mut bulk_conn = db.connect().unwrap();
+                let tn = bulk_conn
+                    .transaction_with_behavior(turso::transaction::TransactionBehavior::Deferred)
+                    .await
+                    .expect("begin");
+                let t = Instant::now();
+                let add_deltas = db
+                    .relationships_bulk_add(&tn, &rels_to_add)
+                    .await
+                    .expect("bulk add");
+                let bulk_s = t.elapsed().as_secs_f64();
+                tn.commit().await.expect("commit");
+                eprintln!("PHASE[{files}] relationships bulk_add: {bulk_s:.2}s ({rels} rels)");
+
+                // The phase-3 bulk read (current file/tag state), ONCE in a
+                // single 1000-param IN statement vs in 100-id chunks. This is
+                // the other place a big IN list may hit limbo's super-linear
+                // planner.
+                let fids: Vec<u64> = file_cache.values().copied().collect();
+                let mut read_conn = db.connect().unwrap();
+                let rtn = read_conn
+                    .transaction_with_behavior(turso::transaction::TransactionBehavior::Deferred)
+                    .await
+                    .expect("begin read");
+                let t = Instant::now();
+                let current1 = db.file_id_get_tag_ids_bulk(&rtn, &fids).await.expect("read big");
+                let read_big_s = t.elapsed().as_secs_f64();
+                let mut current2 = HashMap::new();
+                let t = Instant::now();
+                for part in fids.chunks(100) {
+                    let part_rels = db.file_id_get_tag_ids_bulk(&rtn, part).await.expect("read small");
+                    for (file_id, tag_ids) in part_rels {
+                        current2.insert(file_id, tag_ids);
+                    }
+                }
+                let read_small_s = t.elapsed().as_secs_f64();
+                rtn.rollback().await.expect("rollback read tx");
+                eprintln!("PHASE[{files}] bulk read big IN: {read_big_s:.2}s ({} files -> {} rel sets)", fids.len(), current1.len());
+                eprintln!("PHASE[{files}] bulk read 100-chunks: {read_small_s:.2}s ({} files)", current2.len());
+
+                let t = Instant::now();
+                db.tag_counts_apply(&add_deltas, &HashMap::new())
+                    .await
+                    .expect("count apply");
+                let apply_s = t.elapsed().as_secs_f64();
+                eprintln!("PHASE[{files}] tag_counts_apply: {apply_s:.2}s ({} deltas)", add_deltas.len());
+                eprintln!("PHASE[{files}] summary: files {files_s:.2}s + tags {tags_s:.2}s + bulk_add {bulk_s:.2}s + read_big {read_big_s:.2}s + apply {apply_s:.2}s = {:.2}s", files_s + tags_s + bulk_s + read_big_s + apply_s);
+            }
+        });
+        drop(db_path);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

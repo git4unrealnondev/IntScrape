@@ -56,8 +56,8 @@ pub struct TursoDatabase {
     /// Serializes the tiny `Tags.count` maintenance writes that follow
     /// relationship inserts. Concurrent scrapers bump the same popular tag's
     /// count row, which is the hottest write-write conflict in the system;
-    /// count deltas are deferred out of the `BEGIN CONCURRENT` transactions
-    /// and folded in one short transaction at a time through this lock.
+    /// count deltas are deferred out of the phases' write transactions and
+    /// folded in one short transaction at a time through this lock.
     tag_count_lock: Arc<Mutex<()>>,
 }
 
@@ -105,6 +105,50 @@ impl TursoDatabase {
             || message.contains("conflict")
     }
 
+    /// Reads the database's current journal mode from the header ("wal",
+    /// "mvcc", "delete", ...). `None` when the mode cannot be read.
+    pub(in crate::db::turso) async fn journal_mode(&self) -> Option<String> {
+        let Ok(conn) = self.connect() else {
+            return None;
+        };
+        let mut actual = String::new();
+        if conn
+            .pragma_query("journal_mode", |row| {
+                actual = row.get::<String>(0).unwrap_or_default();
+                Ok(())
+            })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        Some(actual)
+    }
+
+    /// Sets the database's journal mode and confirms the resulting mode. The
+    /// pragma is database-wide, so a busy pool connection can reject the
+    /// change; returning false lets the caller keep running (under the
+    /// previous mode) rather than abort.
+    pub(in crate::db::turso) async fn try_set_journal_mode(&self, mode: &str) -> bool {
+        let Ok(conn) = self.connect() else {
+            return false;
+        };
+        match conn
+            .pragma_update("journal_mode", &format!("'{mode}'"))
+            .await
+        {
+            Ok(_) => {}
+            Err(error) => {
+                log::warn!("Turso journal_mode={mode} rejected: {error}");
+                return false;
+            }
+        }
+        match self.journal_mode().await {
+            Some(actual) => actual.eq_ignore_ascii_case(mode),
+            None => false,
+        }
+    }
+
     /// Opens a Turso connection without installing a busy handler. Transaction
     /// conflicts are handled by the operation that owns the transaction.
     pub(crate) fn connect(&self) -> Result<turso::Connection> {
@@ -132,14 +176,21 @@ impl TursoDatabase {
             .await
             .unwrap();
 
-        // MVCC allows BEGIN CONCURRENT transactions to overlap. The pragma is
-        // required for the database itself; the passive-checkpoint builder
-        // option alone does not enable MVCC.
+        // Serve the database in WAL journal mode. The scraper phases run plain
+        // BEGIN (not BEGIN CONCURRENT) transactions, so nothing requires MVCC;
+        // WAL commits flush dirty pages to the WAL file instead of
+        // copy-on-writing every existing b-tree page a write set touches (the
+        // MVCC commit tax: ~22s for a 24k-row relationship write that
+        // re-touches popular tags on upgraded files). WAL is persistent in the
+        // database header, so this one-time conversion serves every future
+        // connection. If WAL cannot be enabled, fall back to MVCC so the db
+        // still opens, and surface the failure.
         if let Ok(conn) = db.connect() {
-            match conn.pragma_update("journal_mode", "'mvcc'").await {
+            match conn.pragma_update("journal_mode", "'wal'").await {
                 Ok(_) => {}
                 Err(error) => {
-                    log::error!("Failed to enable Turso MVCC mode: {error}");
+                    log::error!("Failed to enable WAL journal mode; falling back to MVCC: {error}");
+                    let _ = conn.pragma_update("journal_mode", "'mvcc'").await;
                 }
             }
         }
@@ -236,7 +287,17 @@ impl TursoDatabase {
         // database so a crash never leaves a job stuck as "running".
         self.jobs_reset_isrunning_sql(&conn).await?;
 
-        conn.pragma_update("journal_mode", "'mvcc'").await?;
+        // Serve in WAL journal mode (see the boot pragma in new_with_exit).
+        // Re-applied every boot so a crash mid-slurp (which restores the
+        // pre-import serving mode) can never leave the db on the slow MVCC
+        // commit path.
+        match conn.pragma_update("journal_mode", "'wal'").await {
+            Ok(_) => {}
+            Err(error) => {
+                log::error!("Failed to enable WAL journal mode: {error}");
+                conn.pragma_update("journal_mode", "'mvcc'").await?;
+            }
+        }
 
         conn.commit().await?;
 

@@ -135,10 +135,11 @@ impl TursoDatabase {
     /// Ensures every namespace in `namespaces` has a row, a cached id, and its
     /// `Relationship_{id}` partition, using a short exclusive transaction when
     /// anything is missing. Namespace creation runs CREATE TABLE (DDL), which
-    /// turso forbids inside BEGIN CONCURRENT — so callers run this *before*
-    /// opening their concurrent transaction, after which the tag-add paths hit
-    /// the warm in-memory cache and never execute DDL. All-namespaces-cached
-    /// is the fast path (no transaction at all); returns the object -> id map.
+    /// must run outside the write transactions of the tag-add paths — so
+    /// callers run this *before* opening them, after which the tag-add paths
+    /// hit the warm in-memory cache and never execute DDL. All-namespaces-
+    /// cached is the fast path (no transaction at all); returns the object ->
+    /// id map.
     pub(in crate::db::turso) async fn namespace_ensure_set(
         &self,
         namespaces: &HashSet<GenericNamespaceObj>,

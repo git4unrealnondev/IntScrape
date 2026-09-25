@@ -17,7 +17,7 @@ use crate::db::turso::TursoDatabase;
 /// **Bump this constant whenever the turso/limbo FTS index format changes** —
 /// e.g. `"pre12-docid"` when the database is served by a core that writes the
 /// identity columns.
-pub(in crate::db::turso) const FTS_SHADOW_SCHEMA_GENERATION: &str = "pre11-v1";
+pub(in crate::db::turso) const FTS_SHADOW_SCHEMA_GENERATION: &str = "pre12-docid";
 const FTS_SHADOW_MARKER_NAME: &str = "fts_shadow_schema";
 
 impl TursoDatabase {

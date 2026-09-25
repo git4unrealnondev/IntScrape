@@ -221,21 +221,29 @@ impl TursoDatabase {
         // slurp never leaves the app paused behind it.
         self.set_slurping(true);
         self.ipc_pause().await;
-        // Run the whole import under the classic WAL journal, then flip back to
-        // MVCC when it finishes. A large autocommit (the post-copy index
-        // rebuild, the Tags_slurp swap) under MVCC materializes the entire
-        // delta in the in-memory commit log -- measured pinned RAM with zero
-        // WAL progress for a ~15M-tag import. WAL streams b-tree builds to
-        // temp files and checkpointed pages instead (~7x faster index builds,
-        // ~2x faster inserts on the slurp builder). check_db re-applies
-        // journal_mode=mvcc on the next boot, so a crash mid-import self-heals
-        // even if the restore below is skipped.
+        // Snapshot the mode the destination serves in before the import (WAL
+        // on a normal boot). The import streams into the same WAL journal; a
+        // destination that is somehow still in MVCC (opened by an older core
+        // before the WAL boot change) is flipped to WAL for the import and
+        // restored to its pre-import mode afterwards. WAL streams b-tree
+        // builds and large autocommits (the post-copy index rebuild, the
+        // Tags_slurp swap) to temp files and checkpointed pages instead of
+        // materializing the entire delta in the in-memory MVCC commit log
+        // (~7x faster index builds, ~2x faster inserts on the slurp builder).
+        // check_db re-applies the serving mode on the next boot, so a crash
+        // mid-import self-heals even if the restore below is skipped.
+        let serving_mode = self
+            .journal_mode()
+            .await
+            .unwrap_or_else(|| "wal".to_owned());
         let wal_fast_lane = self.try_set_journal_mode("wal").await;
         if wal_fast_lane {
-            log::info!("Turso slurp using WAL journal mode (MVCC commit-log fast lane).");
+            log::info!(
+                "Turso slurp using WAL journal mode (commit-log fast lane; restoring {serving_mode} after)."
+            );
         } else {
             log::warn!(
-                "Turso slurp could not switch off MVCC; falling back to the in-memory \
+                "Turso slurp could not switch to WAL; falling back to the in-memory \
                  commit-log path (slower index builds)."
             );
         }
@@ -260,11 +268,11 @@ impl TursoDatabase {
         };
         if wal_fast_lane {
             self.checkpoint_wal().await;
-            if self.try_set_journal_mode("mvcc").await {
-                log::info!("Turso slurp restored MVCC journal mode.");
+            if self.try_set_journal_mode(&serving_mode).await {
+                log::info!("Turso slurp restored {serving_mode} journal mode.");
             } else {
                 log::warn!(
-                    "Turso slurp could not restore MVCC; check_db re-applies it on the next boot."
+                    "Turso slurp could not restore {serving_mode}; check_db re-applies it on the next boot."
                 );
             }
         }
@@ -393,40 +401,9 @@ impl TursoDatabase {
         Ok(SlurpSourceTemp { path: copy })
     }
 
-    /// Sets the destination's journal mode and confirms the resulting mode.
-    /// The pragma is database-wide, so a busy pool connection can reject the
-    /// change; returning false lets the caller keep running (under mvcc) rather
-    /// than abort the import.
-    async fn try_set_journal_mode(&self, mode: &str) -> bool {
-        let Ok(conn) = self.connect() else {
-            return false;
-        };
-        match conn
-            .pragma_update("journal_mode", &format!("'{mode}'"))
-            .await
-        {
-            Ok(_) => {}
-            Err(error) => {
-                log::warn!("Turso journal_mode={mode} rejected: {error}");
-                return false;
-            }
-        }
-        let mut actual = String::new();
-        if conn
-            .pragma_query("journal_mode", |row| {
-                actual = row.get::<String>(0).unwrap_or_default();
-                Ok(())
-            })
-            .await
-            .is_err()
-        {
-            return false;
-        }
-        actual.eq_ignore_ascii_case(mode)
-    }
-
     /// Best-effort fold of the WAL back into the main file before restoring
-    /// MVCC, so the mvcc layer does not have to ingest a growing WAL.
+    /// the pre-import journal mode, so the restored mode does not have to
+    /// ingest a growing WAL.
     async fn checkpoint_wal(&self) {
         let Ok(conn) = self.connect() else {
             return;
@@ -531,12 +508,13 @@ impl TursoDatabase {
         }
 
         // Ensuring namespaces runs CREATE TABLE for their Relationship_N
-        // partitions — DDL, which turso forbids inside BEGIN CONCURRENT.
-        // `namespace_ensure_set` does it in a short exclusive transaction up
-        // front (also seeding the in-memory namespace cache) so the immediate
-        // copy below only ever executes DML, and so its snapshot sees the
-        // committed namespace rows. Now largely a no-op once namespaces are
-        // cached (the common warm-db case).
+        // partitions — DDL, which must run outside the write transactions of
+        // the scrape loop. `namespace_ensure_set` does it in a short
+        // exclusive transaction up front (also seeding the in-memory
+        // namespace cache) so the immediate copy below only ever executes
+        // DML, and so its snapshot sees the committed namespace rows. Now
+        // largely a no-op once namespaces are cached (the common warm-db
+        // case).
         let namespace_bulk = self.namespace_ensure_set(&namespace_set).await?;
         let namespace_count = namespace_bulk.len() as u64;
         log::info!(
@@ -3005,7 +2983,8 @@ mod tests {
             1
         );
 
-        // Journal mode was restored to MVCC by the import.
+        // Journal mode was restored to the pre-import serving mode (WAL under
+        // the boot journal-mode change).
         let mut mode = String::new();
         conn.pragma_query("journal_mode", |row| {
             mode = row.get::<String>(0).unwrap_or_default();
@@ -3013,7 +2992,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(mode, "mvcc");
+        assert_eq!(mode, "wal");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
