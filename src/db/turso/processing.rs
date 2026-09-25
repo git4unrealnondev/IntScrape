@@ -1009,17 +1009,22 @@ mod tests {
             let reap_s = t.elapsed().as_secs_f64();
             eprintln!("CHUNK re-persist {entries} files persisted={persisted} in {reap_s:.2}s");
 
-            // Contention: two identical chunks touching the same 10k popular
-            // tags in parallel. Phase 3 bumps shared Tags.count rows, so the
-            // write transactions collide and retry with jittered backoff.
+            // Contention: two fresh, disjoint chunks (files 200..399 and
+            // 400..599, so neither is persisted yet) over the same 10k
+            // popular tags, in parallel. WAL allows a single writer: the
+            // loser's first write busies and its phase rolls back, backs off
+            // with jitter, and retries. Wall time ~= twice the single-chunk
+            // cost (writes serialize); reads overlap but are a small share.
+            let (map_a, _, _) = bench_chunk_map(storage_id, popular_count, 200, 200, &ns);
+            let (map_b, _, _) = bench_chunk_map(storage_id, popular_count, 200, 400, &ns);
             let t = Instant::now();
-            let a = db.clone().process_scraper(map.clone(), Vec::new(), "a".into());
-            let b = db.clone().process_scraper(map.clone(), Vec::new(), "b".into());
-            let (ra, rb) = tokio::join!(a, b);
+            let pa = db.clone().process_scraper(map_a.clone(), Vec::new(), "a".into());
+            let pb = db.clone().process_scraper(map_b.clone(), Vec::new(), "b".into());
+            let (ra, rb) = tokio::join!(pa, pb);
             let both_s = t.elapsed().as_secs_f64();
             eprintln!(
-                "CHUNK concurrent x2 persisted=({ra},{rb}) in {both_s:.2}s (sequential would be {:.2}s)",
-                fresh_s + reap_s
+                "CHUNK concurrent x2 fresh-disjoint persisted=({ra},{rb}) in {both_s:.2}s (2x fresh = {:.2}s)",
+                fresh_s * 2.0
             );
 
             // Prod-scale: a 1000-file fresh chunk (24k relationship rows, 14k
