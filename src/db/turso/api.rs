@@ -253,46 +253,47 @@ impl TursoDatabase {
         }
 
         loop {
-            let conn = match self.connect() {
+            let mut conn = match self.connect() {
                 Ok(conn) => conn,
                 Err(error) => {
                     log::error!("Failed to connect while adding tag actions: {error}");
                     return false;
                 }
             };
-            loop {
-                match conn.execute("BEGIN IMMEDIATE", ()).await {
-                    Ok(_) => break,
-                    Err(error) if Self::is_concurrency_conflict(&error) => {
+            // CONCURRENT: tag writes arrive from the UI and the scrapers at the
+            // same time and touch the same popular-tag rows. CONCURRENT lets the
+            // transactions overlap instead of queueing for one writer lock.
+            // `tag_action_bulk_add` is idempotent (INSERT OR IGNORE), so the
+            // re-run-on-conflict CONCURRENT performs is safe.
+            let tx = match conn.transaction_with_behavior(Self::write_tx_behavior()).await {
+                Ok(tx) => tx,
+                Err(error) => {
+                    if Self::is_concurrency_conflict(&error) {
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
                     }
-                    Err(error) => {
-                        log::error!("Failed to begin tag-actions transaction: {error}");
-                        return false;
-                    }
+                    log::error!("Failed to begin tag-actions transaction: {error}");
+                    return false;
                 }
-            }
-            match self.tag_action_bulk_add(&conn, tag_actions).await {
+            };
+            match self.tag_action_bulk_add(&tx, tag_actions).await {
                 Ok(_) => {}
                 Err(error) if Self::is_concurrency_conflict(&error) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
+                    // `tx` drops and rolls back.
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     continue;
                 }
                 Err(error) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
                     log::error!("Failed to add tag actions: {error}");
                     return false;
                 }
             }
-            match conn.execute("COMMIT", ()).await {
+            match tx.commit().await {
                 Ok(_) => return true,
                 Err(error) if Self::is_concurrency_conflict(&error) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
                 Err(error) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
                     log::error!("Failed to commit tag actions: {error}");
                     return false;
                 }

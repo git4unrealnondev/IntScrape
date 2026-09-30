@@ -501,11 +501,16 @@ impl TursoDatabase {
     /// two chunks touching the same popular tag guarantee a write-write
     /// conflict there. So the deltas returned by
     /// `relationships_bulk_add` / `relationship_bulk_delete` are folded in
-    /// here — one short `BEGIN IMMEDIATE` transaction at a time, serialized
-    /// behind `tag_count_lock` — after the relationship inserts have already
+    /// here — one short serialized transaction at a time, held behind
+    /// `tag_count_lock` — after the relationship inserts have already
     /// committed. The heavy relationship inserts stay out of this writer;
     /// only the tiny count bookkeeping serializes, which is the point: the
     /// count row is never written by two transactions at once anymore.
+    ///
+    /// Deliberately NOT CONCURRENT (`serialized_tx_behavior`): the mutex
+    /// already admits one writer at a time, so CONCURRENT would only add
+    /// commit-time conflict retries here without any parallelism to trade
+    /// them for. This is also the hottest `Tags.count` write in the system.
     pub(crate) async fn tag_counts_apply(
         &self,
         add_deltas: &HashMap<u64, u64>,
@@ -521,46 +526,38 @@ impl TursoDatabase {
         let add_deltas = add_deltas.clone();
         let del_deltas = del_deltas.clone();
         self.retry_mvcc(|| async {
-            let conn = self.connect()?;
-            conn.execute("BEGIN IMMEDIATE", ()).await?;
+            let mut conn = self.connect()?;
+            // `tx` rolls back on drop, so a mid-loop failure below unwinds
+            // cleanly and `retry_mvcc` re-runs the whole fold-in.
+            let tx = conn
+                .transaction_with_behavior(Self::serialized_tx_behavior())
+                .await?;
             // Fold the deltas in POPULARITY_FOLD_CHUNK pieces inside this one
             // transaction: one count UPDATE plus its matching shadow sync per
             // piece. The whole apply still commits atomically (a failed piece
             // rolls everything back and `retry_mvcc` re-runs it), and a single
             // commit keeps the FTS writer from producing one tiny segment per
             // piece. Chunking exists because limbo's planner is ~quadratic in
-            // one statement's expression size: a single unbounded UPDATE with
-            // a multi-thousand-term CASE/IN tree cost seconds for 5k deltas
-            // and *minutes* for 50k, holding `tag_count_lock` — and every
-            // other job's fold-in — hostage the whole time.
+            // one statement's expression size: a single unbounded UPDATE with a
+            // multi-thousand-term CASE/IN tree cost seconds for 5k deltas and
+            // *minutes* for 50k, holding `tag_count_lock` — and every other
+            // job's fold-in — hostage the whole time.
             for (deltas, decrement) in [(&add_deltas, false), (&del_deltas, true)] {
                 let entries: Vec<(u64, u64)> = deltas.iter().map(|(&k, &v)| (k, v)).collect();
                 for piece in entries.chunks(POPULARITY_FOLD_CHUNK) {
                     let piece_map: HashMap<u64, u64> = piece.iter().copied().collect();
                     let (sql, params) = tag_count_update_sql(&piece_map, decrement);
-                    if let Err(error) = conn.execute(sql, params_from_iter(params)).await {
-                        let _ = conn.execute("ROLLBACK", ()).await;
-                        return Err(error);
-                    }
+                    tx.execute(sql, params_from_iter(params)).await?;
                     // Mirrors popularity into the FTS shadow in the same
                     // transaction, so a count that crossed the threshold
                     // becomes (or stops being) searchable atomically with the
                     // count itself. Idempotent, so piece-wise is equivalent
                     // to the old single unioned call.
                     let ids: Vec<u64> = piece_map.keys().copied().collect();
-                    if let Err(error) = self.sync_tags_popular(&conn, &ids).await {
-                        let _ = conn.execute("ROLLBACK", ()).await;
-                        return Err(error);
-                    }
+                    self.sync_tags_popular(&tx, &ids).await?;
                 }
             }
-            match conn.execute("COMMIT", ()).await {
-                Ok(_) => Ok(()),
-                Err(error) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    Err(error)
-                }
-            }
+            tx.commit().await
         })
         .await
     }

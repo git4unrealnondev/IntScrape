@@ -522,6 +522,13 @@ impl TursoDatabase {
 
         // Storage locations: re-use whatever rows exist, creating the rest.
         // Keep each batch short so scraper writes can commit between batches.
+        //
+        // NOTE: the import's BEGIN IMMEDIATE transactions are deliberately NOT
+        // CONCURRENT. The bulk import is one writer walking a source db, so
+        // there is nothing to overlap; and it is saturated with DDL (CREATE /
+        // DROP / ALTER TABLE and INDEX, see namespace partitioning and the
+        // Tags_slurp swap), which CONCURRENT rejects outright. The scraper
+        // write paths use `TursoDatabase::write_tx_behavior()` instead.
         let mut source_storage_ids = HashMap::new();
         conn.execute("BEGIN IMMEDIATE", ()).await?;
         let mut locations = source
@@ -2965,8 +2972,8 @@ mod tests {
             1
         );
 
-        // Journal mode was restored to the pre-import serving mode (WAL under
-        // the boot journal-mode change).
+        // Journal mode was restored to the pre-import serving mode (whatever
+        // the boot pragma in new_with_exit chose, not a hardcoded journal).
         let mut mode = String::new();
         conn.pragma_query("journal_mode", |row| {
             mode = row.get::<String>(0).unwrap_or_default();
@@ -2974,7 +2981,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(mode, "wal");
+        assert_eq!(mode, TursoDatabase::serving_journal_mode());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

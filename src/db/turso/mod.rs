@@ -4,7 +4,10 @@ use log::info;
 use shared_types::DbSettingsObj;
 use smol_str::SmolStr;
 use tokio::sync::{Mutex, RwLock};
-use turso::{Builder, Database, Result, transaction::Transaction};
+use turso::{
+    Builder, Database, Result,
+    transaction::{Transaction, TransactionBehavior},
+};
 
 use crate::DB_VERSION;
 use crate::plugins::PluginManager;
@@ -107,6 +110,56 @@ impl TursoDatabase {
             || message.contains("conflict")
     }
 
+    /// The journal mode the database is served in. Defaults to `mvcc` so
+    /// `TransactionBehavior::Concurrent` is available; WAL allowed only one
+    /// writer, which made CONCURRENT a no-op even where it was correct.
+    /// `INTSCRAPE_JOURNAL_MODE` overrides it (set `wal` for A/B and rollback).
+    /// Read at both boot sites because `check_db` re-applies the mode after
+    /// `create_db`, and the two must agree or the db lands on whichever ran last.
+    pub(in crate::db::turso) fn serving_journal_mode() -> String {
+        std::env::var("INTSCRAPE_JOURNAL_MODE")
+            .ok()
+            .map(|mode| mode.trim().to_ascii_lowercase())
+            .filter(|mode| !mode.is_empty())
+            .unwrap_or_else(|| "mvcc".to_string())
+    }
+
+    /// Behavior for the contended DML-only write paths (scraper phases, job
+    /// claim, tag writes). These run from many tasks at once and touch rows
+    /// other writers also touch, so CONCURRENT lets them proceed in parallel
+    /// and resolve write-write conflicts at commit instead of queueing for the
+    /// single writer lock.
+    ///
+    /// Every statement in these transactions must be idempotent: CONCURRENT
+    /// re-runs the whole transaction body when the commit loses a conflict.
+    /// `INTSCRAPE_WRITE_TX` overrides this for rollback/benchmarks.
+    pub(in crate::db::turso) fn write_tx_behavior() -> TransactionBehavior {
+        Self::behavior_from_env("INTSCRAPE_WRITE_TX")
+            .unwrap_or(TransactionBehavior::Concurrent)
+    }
+
+    /// Behavior for write paths that must not run concurrently: DDL (banned in
+    /// CONCURRENT), the slurp's bulk import, and `tag_counts_apply`, which is
+    /// already serialized behind `tag_count_lock` on purpose — CONCURRENT
+    /// would give it conflict-retry latency with no parallelism to trade for.
+    pub(in crate::db::turso) fn serialized_tx_behavior() -> TransactionBehavior {
+        Self::behavior_from_env("INTSCRAPE_SERIALIZED_TX")
+            .unwrap_or(TransactionBehavior::Immediate)
+    }
+
+    fn behavior_from_env(var: &str) -> Option<TransactionBehavior> {
+        match std::env::var(var).ok()?.trim().to_ascii_uppercase().as_str() {
+            "CONCURRENT" => Some(TransactionBehavior::Concurrent),
+            "IMMEDIATE" => Some(TransactionBehavior::Immediate),
+            "DEFERRED" => Some(TransactionBehavior::Deferred),
+            "EXCLUSIVE" => Some(TransactionBehavior::Exclusive),
+            other => {
+                log::warn!("Ignoring unknown {var}={other}");
+                None
+            }
+        }
+    }
+
     /// Reads the database's current journal mode from the header ("wal",
     /// "mvcc", "delete", ...). `None` when the mode cannot be read.
     pub(in crate::db::turso) async fn journal_mode(&self) -> Option<String> {
@@ -178,20 +231,32 @@ impl TursoDatabase {
             .await
             .unwrap();
 
-        // Serve the database in WAL journal mode. The scraper phases run plain
-        // BEGIN (not BEGIN CONCURRENT) transactions, so nothing requires MVCC;
-        // WAL commits flush dirty pages to the WAL file instead of
-        // copy-on-writing every existing b-tree page a write set touches (the
-        // MVCC commit tax: ~22s for a 24k-row relationship write that
-        // re-touches popular tags on upgraded files). WAL is persistent in the
-        // database header, so this one-time conversion serves every future
-        // connection. If WAL cannot be enabled, fall back to MVCC so the db
-        // still opens, and surface the failure.
+        // Serve the database in MVCC journal mode. The scraper phases and the
+        // other contended write paths run TransactionBehavior::Concurrent, and
+        // CONCURRENT requires MVCC (`only supported when MVCC is enabled`).
+        // MVCC also lets several writers be open at once instead of queueing
+        // behind one writer lock, which is the point of the change.
+        //
+        // This replaced the WAL journal (commit 178aba4), which was chosen
+        // when a 24k-row relationship write cost ~22s to commit under MVCC.
+        // Measured on turso 0.8.1 that same write commits in ~0.8s under MVCC
+        // (vs ~0.03s under WAL): group commit and batched logical-log commits
+        // closed most of the gap, and MVCC executes the bulk insert itself
+        // faster. `INTSCRAPE_JOURNAL_MODE=wal` restores the old mode.
+        //
+        // The mode has to be picked here, before create_db, because schema
+        // creation runs under the serving journal and the modes are not freely
+        // interconvertible afterwards. If the mode cannot be enabled, fall back
+        // to MVCC so the db still opens, and surface the failure.
+        let journal_mode = Self::serving_journal_mode();
         if let Ok(conn) = db.connect() {
-            match conn.pragma_update("journal_mode", "'wal'").await {
+            match conn
+                .pragma_update("journal_mode", &format!("'{journal_mode}'"))
+                .await
+            {
                 Ok(_) => {}
                 Err(error) => {
-                    log::error!("Failed to enable WAL journal mode; falling back to MVCC: {error}");
+                    log::error!("Failed to enable journal_mode={journal_mode}; falling back to MVCC: {error}");
                     let _ = conn.pragma_update("journal_mode", "'mvcc'").await;
                 }
             }
@@ -289,14 +354,18 @@ impl TursoDatabase {
         // database so a crash never leaves a job stuck as "running".
         self.jobs_reset_isrunning_sql(&conn).await?;
 
-        // Serve in WAL journal mode (see the boot pragma in new_with_exit).
-        // Re-applied every boot so a crash mid-slurp (which restores the
-        // pre-import serving mode) can never leave the db on the slow MVCC
-        // commit path.
-        match conn.pragma_update("journal_mode", "'wal'").await {
+        // Serve in the resolved journal mode (see the boot pragma in
+        // new_with_exit and `serving_journal_mode`). Re-applied every boot so a
+        // crash mid-slurp (which restores the pre-import serving mode) can
+        // never leave the db on an unintended journal.
+        let journal_mode = Self::serving_journal_mode();
+        match conn
+            .pragma_update("journal_mode", &format!("'{journal_mode}'"))
+            .await
+        {
             Ok(_) => {}
             Err(error) => {
-                log::error!("Failed to enable WAL journal mode: {error}");
+                log::error!("Failed to enable journal_mode={journal_mode}: {error}");
                 conn.pragma_update("journal_mode", "'mvcc'").await?;
             }
         }

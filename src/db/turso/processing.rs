@@ -36,40 +36,49 @@ impl TursoDatabase {
         if !jobs.is_empty() {
             let mut attempts = 0u32;
             loop {
-                let conn = match database.connect() {
+                let mut conn = match database.connect() {
                     Ok(conn) => conn,
                     Err(error) => {
                         log::error!("Failed to connect while adding pending scrape jobs: {error}");
                         return false;
                     }
                 };
-                if let Err(error) = conn.execute("BEGIN IMMEDIATE", ()).await {
-                    log::error!("Failed to begin scrape-job transaction: {error}");
-                    return false;
-                }
+                // CONCURRENT: these inserts run alongside the other scrapers'
+                // phases and contend on shared rows. The body is DML-only and
+                // idempotent (`INSERT OR IGNORE` + read-only skip checks), so
+                // re-running it on a commit conflict is safe.
+                let tx = match conn
+                    .transaction_with_behavior(Self::write_tx_behavior())
+                    .await
+                {
+                    Ok(tx) => tx,
+                    Err(error) => {
+                        log::error!("Failed to begin scrape-job transaction: {error}");
+                        return false;
+                    }
+                };
 
                 let mut failed = false;
                 'ScraperLoop: for scraperdatareturn in &jobs {
                     for skip_conditions in &scraperdatareturn.skip_conditions {
                         if database
-                            .should_skip_item(&conn, skip_conditions.clone())
+                            .should_skip_item(&tx, skip_conditions.clone())
                             .await
                         {
                             continue 'ScraperLoop;
                         }
                     }
-                    if let Err(error) = database.job_add_sql(&conn, &scraperdatareturn.job).await {
+                    if let Err(error) = database.job_add_sql(&tx, &scraperdatareturn.job).await {
                         log::error!("Failed to add scrape job: {error}");
                         failed = true;
                         break;
                     }
                 }
                 if failed {
-                    let _ = conn.execute("ROLLBACK", ()).await;
                     return false;
                 }
 
-                match conn.execute("COMMIT", ()).await {
+                match tx.commit().await {
                     Ok(_) => break,
                     Err(error)
                         if matches!(
@@ -78,7 +87,6 @@ impl TursoDatabase {
                         ) =>
                     {
                         log::warn!("Scrape-job commit conflicted; retrying: {error}");
-                        let _ = conn.execute("ROLLBACK", ()).await;
                         if scraper_backoff(&mut attempts).await {
                             log::error!(
                                 "Scrape-job commit still conflicted after \
@@ -121,14 +129,23 @@ impl TursoDatabase {
         }
 
         // The scraper result is persisted through three small, idempotent
-        // (`INSERT OR IGNORE`) plain-BEGIN transactions — files, tags, then
-        // relationships. Each phase begins Deferred, so its reads run without
-        // a write lock; the first write upgrades the transaction to the
-        // single writer, and a conflict at that upgrade point (or at commit)
-        // is retried by that phase alone. Each phase retries its own
-        // write-write conflicts with jittered backoff, so a contention spike
-        // on a shared popular tag only restarts the relationship phase
-        // instead of the whole chunk.
+        // (`INSERT OR IGNORE`) CONCURRENT transactions — files, tags, then
+        // relationships. CONCURRENT lets concurrent scraper chunks keep their
+        // write transactions open at the same time and resolve write-write
+        // conflicts at commit, instead of queueing for a single writer lock.
+        // Splitting still matters because the relationship phase is where
+        // contention concentrates: every new relationship also bumps the shared
+        // `Tags.count` row, so two scraper chunks that both touch a popular tag
+        // collide exactly there. With one giant transaction that collision
+        // rolled back the file and tag inserts too; now only the conflicted
+        // phase retries, and each phase's smaller write set overlaps other
+        // writers far less. Retries use jittered exponential backoff (see
+        // `scraper_backoff`) and are capped so a pathological contention storm
+        // cannot spin on the shared tokio runtime forever.
+        //
+        // CONCURRENT re-runs a transaction body whose commit loses a conflict,
+        // so every phase must stay idempotent: no side effects outside the
+        // database and no non-idempotent statements in the body.
         if !database
             .process_scraper_chunk_human(map)
             .await
@@ -202,7 +219,7 @@ impl TursoDatabase {
             let mut conn = self.connect()?;
             let tn = loop {
                 match conn
-                    .transaction_with_behavior(turso::transaction::TransactionBehavior::Deferred)
+                    .transaction_with_behavior(Self::write_tx_behavior())
                     .await
                 {
                     Ok(tn) => break tn,
@@ -284,7 +301,7 @@ impl TursoDatabase {
             let mut conn = self.connect()?;
             let tn = loop {
                 match conn
-                    .transaction_with_behavior(turso::transaction::TransactionBehavior::Deferred)
+                    .transaction_with_behavior(Self::write_tx_behavior())
                     .await
                 {
                     Ok(tn) => break tn,
@@ -343,7 +360,7 @@ impl TursoDatabase {
             let mut conn = self.connect()?;
             let tn = loop {
                 match conn
-                    .transaction_with_behavior(turso::transaction::TransactionBehavior::Deferred)
+                    .transaction_with_behavior(Self::write_tx_behavior())
                     .await
                 {
                     Ok(tn) => break tn,
@@ -1319,9 +1336,9 @@ mod tests {
              );
              INSERT INTO Tags_Popular(tag_id, name)
                  SELECT id, name FROM Tags WHERE count >= 5;
-             CREATE INDEX idx_tags_fts ON Tags_Popular USING fts
+             CREATE INDEX idx_tags_popular_fts ON Tags_Popular USING fts
                  (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);
-             OPTIMIZE INDEX idx_tags_fts;",
+             OPTIMIZE INDEX idx_tags_popular_fts;",
         )
         .await
         .unwrap();
@@ -1464,7 +1481,7 @@ mod tests {
             // 1) Bulk relationship insert inside a concurrent tx + commit.
             let mut bulk_conn = db.connect().unwrap();
             let tn = bulk_conn
-                .transaction_with_behavior(turso::transaction::TransactionBehavior::Deferred)
+                .transaction_with_behavior(TursoDatabase::write_tx_behavior())
                 .await
                 .unwrap();
             let t = Instant::now();
@@ -1473,9 +1490,12 @@ mod tests {
                 .await
                 .unwrap();
             let bulk_s = t.elapsed().as_secs_f64();
+            // Timed separately so the commit cost is visible on its own.
+            let t = Instant::now();
             tn.commit().await.unwrap();
+            let commit_s = t.elapsed().as_secs_f64();
             eprintln!(
-                "MICRO relationships_bulk_add: {bulk_s:.3}s ({} deltas)",
+                "MICRO relationships_bulk_add: {bulk_s:.3}s + commit {commit_s:.3}s ({} deltas)",
                 add_deltas.len()
             );
 
@@ -1610,6 +1630,7 @@ mod tests {
         rt.block_on(async {
             let should_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+            eprintln!("BENCH journal_mode={:?}", db.journal_mode().await);
             let popular_count = 10_000u64;
             let (_, _) = bench_seed_db(&db, popular_count).await;
 
@@ -1673,7 +1694,7 @@ mod tests {
 
                 let mut bulk_conn = db.connect().unwrap();
                 let tn = bulk_conn
-                    .transaction_with_behavior(turso::transaction::TransactionBehavior::Deferred)
+                    .transaction_with_behavior(TursoDatabase::write_tx_behavior())
                     .await
                     .expect("begin");
                 let t = Instant::now();
@@ -1682,8 +1703,15 @@ mod tests {
                     .await
                     .expect("bulk add");
                 let bulk_s = t.elapsed().as_secs_f64();
+                // Timed separately: the MVCC-vs-WAL question is entirely about
+                // commit cost, and the statement timer above stops before the
+                // commit so bulk_s is pure statement execution.
+                let t = Instant::now();
                 tn.commit().await.expect("commit");
-                eprintln!("PHASE[{files}] relationships bulk_add: {bulk_s:.2}s ({rels} rels)");
+                let commit_s = t.elapsed().as_secs_f64();
+                eprintln!(
+                    "PHASE[{files}] relationships bulk_add: {bulk_s:.2}s + commit {commit_s:.2}s ({rels} rels)"
+                );
 
                 // The phase-3 bulk read (current file/tag state), ONCE in a
                 // single 1000-param IN statement vs in 100-id chunks. This is
@@ -1692,7 +1720,7 @@ mod tests {
                 let fids: Vec<u64> = file_cache.values().copied().collect();
                 let mut read_conn = db.connect().unwrap();
                 let rtn = read_conn
-                    .transaction_with_behavior(turso::transaction::TransactionBehavior::Deferred)
+                    .transaction_with_behavior(TursoDatabase::write_tx_behavior())
                     .await
                     .expect("begin read");
                 let t = Instant::now();
@@ -1717,7 +1745,7 @@ mod tests {
                     .expect("count apply");
                 let apply_s = t.elapsed().as_secs_f64();
                 eprintln!("PHASE[{files}] tag_counts_apply: {apply_s:.2}s ({} deltas)", add_deltas.len());
-                eprintln!("PHASE[{files}] summary: files {files_s:.2}s + tags {tags_s:.2}s + bulk_add {bulk_s:.2}s + read_big {read_big_s:.2}s + apply {apply_s:.2}s = {:.2}s", files_s + tags_s + bulk_s + read_big_s + apply_s);
+                eprintln!("PHASE[{files}] summary: files {files_s:.2}s + tags {tags_s:.2}s + bulk_add {bulk_s:.2}s + commit {commit_s:.2}s + read_big {read_big_s:.2}s + apply {apply_s:.2}s = {:.2}s", files_s + tags_s + bulk_s + commit_s + read_big_s + apply_s);
             }
         });
         drop(db_path);

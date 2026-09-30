@@ -204,32 +204,44 @@ impl TursoDatabase {
         }
 
         loop {
-            let Ok(conn) = self.db.connect() else {
-                return false;
-            };
-            loop {
-                match conn.execute("BEGIN IMMEDIATE", ()).await {
-                    Ok(_) => break,
-                    Err(error) if TursoDatabase::is_concurrency_conflict(&error) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                    Err(error) => {
-                        log::error!("Failed to begin tag transaction for file {file_id}: {error}");
-                        return false;
-                    }
+            let mut conn = match self.db.connect() {
+                Ok(conn) => conn,
+                Err(error) => {
+                    log::error!("Failed to connect while tagging file {file_id}: {error}");
+                    return false;
                 }
-            }
+            };
+            // CONCURRENT: this runs per UI tag request, many at once, against
+            // the same popular-tag rows the scrapers write. CONCURRENT lets the
+            // transactions overlap and settle write-write conflicts at commit.
+            // The body is idempotent (tag_action_bulk_add + relationships_bulk_add
+            // are INSERT OR IGNORE), so CONCURRENT's re-run-on-conflict is safe.
+            // Count deltas are deliberately NOT applied here: they are folded in
+            // after the commit through the serialized writer.
+            let tx = match conn
+                .transaction_with_behavior(TursoDatabase::write_tx_behavior())
+                .await
+            {
+                Ok(tx) => tx,
+                Err(error) => {
+                    if TursoDatabase::is_concurrency_conflict(&error) {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    log::error!("Failed to begin tag transaction for file {file_id}: {error}");
+                    return false;
+                }
+            };
 
-            let tag_map = match self.tag_action_bulk_add(&conn, tag).await {
+            let tag_map = match self.tag_action_bulk_add(&tx, tag).await {
                 Ok(tag_map) => tag_map,
                 Err(error) if TursoDatabase::is_concurrency_conflict(&error) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
+                    // `tx` drops and rolls back.
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     continue;
                 }
                 Err(error) => {
                     log::error!("Failed to add tags for file {file_id}: {error}");
-                    let _ = conn.execute("ROLLBACK", ()).await;
                     return false;
                 }
             };
@@ -238,21 +250,19 @@ impl TursoDatabase {
                 .map(|tag_id| (*file_id, *tag_id as u64))
                 .collect();
 
-            let add_deltas = match self.relationships_bulk_add(&conn, &relationships).await {
+            let add_deltas = match self.relationships_bulk_add(&tx, &relationships).await {
                 Ok(deltas) => deltas,
                 Err(error) if TursoDatabase::is_concurrency_conflict(&error) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     continue;
                 }
                 Err(error) => {
                     log::error!("Failed to add relationships for file {file_id}: {error}");
-                    let _ = conn.execute("ROLLBACK", ()).await;
                     return false;
                 }
             };
 
-            match conn.execute("COMMIT", ()).await {
+            match tx.commit().await {
                 Ok(_) => {
                     // Relationship rows committed; fold the deferred count
                     // deltas in through the serialized writer. Failure only
@@ -268,12 +278,10 @@ impl TursoDatabase {
                     log::warn!(
                         "Tag transaction for file {file_id} conflicted; retrying in 50ms: {error}"
                     );
-                    let _ = conn.execute("ROLLBACK", ()).await;
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
                 Err(error) => {
                     log::error!("Failed to commit tags for file {file_id}: {error}");
-                    let _ = conn.execute("ROLLBACK", ()).await;
                     return false;
                 }
             }
@@ -321,45 +329,54 @@ impl TursoDatabase {
         }
 
         loop {
-            let Ok(conn) = self.db.connect() else {
-                return false;
-            };
-            loop {
-                match conn.execute("BEGIN IMMEDIATE", ()).await {
-                    Ok(_) => break,
-                    Err(error) if TursoDatabase::is_concurrency_conflict(&error) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                    Err(error) => {
-                        log::error!("Failed to begin bulk tag transaction: {error}");
-                        return false;
-                    }
+            let mut conn = match self.db.connect() {
+                Ok(conn) => conn,
+                Err(error) => {
+                    log::error!("Failed to connect while bulk tagging: {error}");
+                    return false;
                 }
-            }
+            };
+            // CONCURRENT, same reasoning as the per-file tag transaction: the
+            // body is idempotent (INSERT OR IGNORE throughout) so re-running it
+            // on a commit conflict is safe, and overlapping beats queueing for
+            // the single writer lock on shared popular-tag rows.
+            let tx = match conn
+                .transaction_with_behavior(TursoDatabase::write_tx_behavior())
+                .await
+            {
+                Ok(tx) => tx,
+                Err(error) => {
+                    if TursoDatabase::is_concurrency_conflict(&error) {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    log::error!("Failed to begin bulk tag transaction: {error}");
+                    return false;
+                }
+            };
 
             let mut relationships: HashSet<(u64, u64)> = HashSet::new();
-            let mut failed = false;
+            let mut conflicted = false;
             for (file_id, tag_actions) in tags_by_file {
                 if tag_actions.is_empty() {
                     continue;
                 }
-                match self.tag_action_bulk_add(&conn, tag_actions).await {
+                match self.tag_action_bulk_add(&tx, tag_actions).await {
                     Ok(tag_map) => relationships
                         .extend(tag_map.values().map(|tag_id| (*file_id, *tag_id as u64))),
                     Err(error) if TursoDatabase::is_concurrency_conflict(&error) => {
                         log::warn!("Bulk tag transaction conflicted; retrying in 50ms: {error}");
-                        let _ = conn.execute("ROLLBACK", ()).await;
-                        failed = true;
+                        conflicted = true;
                         break;
                     }
                     Err(error) => {
                         log::error!("Failed to add bulk tags for file {file_id}: {error}");
-                        let _ = conn.execute("ROLLBACK", ()).await;
                         return false;
                     }
                 }
             }
-            if failed {
+            if conflicted {
+                // `tx` drops and rolls back.
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 continue;
             }
@@ -367,10 +384,9 @@ impl TursoDatabase {
             let add_deltas = if relationships.is_empty() {
                 HashMap::new()
             } else {
-                match self.relationships_bulk_add(&conn, &relationships).await {
+                match self.relationships_bulk_add(&tx, &relationships).await {
                     Ok(deltas) => deltas,
                     Err(error) => {
-                        let _ = conn.execute("ROLLBACK", ()).await;
                         if TursoDatabase::is_concurrency_conflict(&error) {
                             log::warn!(
                                 "Bulk relationship transaction conflicted; retrying in 50ms: {error}"
@@ -384,7 +400,7 @@ impl TursoDatabase {
                 }
             };
 
-            match conn.execute("COMMIT", ()).await {
+            match tx.commit().await {
                 Ok(_) => {
                     // Fold the deferred count deltas in via the serialized
                     // writer; a failure only leaves a stale count.
@@ -397,11 +413,9 @@ impl TursoDatabase {
                     log::warn!(
                         "Bulk tag transaction conflicted at commit; retrying in 50ms: {error}"
                     );
-                    let _ = conn.execute("ROLLBACK", ()).await;
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
                 Err(error) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
                     log::error!("Failed to commit bulk tag transaction: {error}");
                     return false;
                 }

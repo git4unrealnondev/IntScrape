@@ -321,9 +321,15 @@ impl TursoDatabase {
     }
 
     /// Marks a job as running, returning whether the claim succeeded.
+    ///
+    /// Runs CONCURRENT: every scraper task claims jobs at the same time and
+    /// they contend on the same `Jobs` rows, so letting the transactions
+    /// overlap and resolve at commit beats queueing on one writer lock. The
+    /// body is a single idempotent `UPDATE ... WHERE is_running = 0`, which is
+    /// what makes CONCURRENT's re-run-on-conflict safe.
     pub async fn job_set_is_running(&self, job: &DbJobsObj) -> bool {
         loop {
-            let conn = match self.connect() {
+            let mut conn = match self.connect() {
                 Ok(conn) => conn,
                 Err(error) => {
                     log::error!("Failed to connect while claiming job {}: {error}", job.id);
@@ -331,20 +337,23 @@ impl TursoDatabase {
                 }
             };
 
-            if let Err(error) = conn.execute("BEGIN IMMEDIATE", ()).await {
-                if Self::is_concurrency_conflict(&error) {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    continue;
+            let tx = match conn.transaction_with_behavior(Self::write_tx_behavior()).await {
+                Ok(tx) => tx,
+                Err(error) => {
+                    if Self::is_concurrency_conflict(&error) {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    log::error!(
+                        "Failed to begin claim transaction for job {}: {error}",
+                        job.id
+                    );
+                    return false;
                 }
-                log::error!(
-                    "Failed to begin claim transaction for job {}: {error}",
-                    job.id
-                );
-                return false;
-            }
+            };
 
-            if let Err(error) = self.job_set_isrunning_sql(&conn, job.id).await {
-                let _ = conn.execute("ROLLBACK", ()).await;
+            if let Err(error) = self.job_set_isrunning_sql(&tx, job.id).await {
+                // `tx` drops here and rolls back.
                 if Self::is_concurrency_conflict(&error) {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     continue;
@@ -353,14 +362,12 @@ impl TursoDatabase {
                 return false;
             }
 
-            match conn.execute("COMMIT", ()).await {
+            match tx.commit().await {
                 Ok(_) => return true,
                 Err(error) if Self::is_concurrency_conflict(&error) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
                 Err(error) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
                     log::error!("Failed to commit job {} claim: {error}", job.id);
                     return false;
                 }
