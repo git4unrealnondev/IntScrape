@@ -25,7 +25,7 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
     vec![shared_types::Plugin {
         name: "Pawchive".into(),
         properties: vec![
-            PluginProperties::ThreadNum(5),
+            PluginProperties::ThreadNum(1),
             PluginProperties::Ratelimit(1, std::time::Duration::from_secs(1)),
             PluginProperties::Sites(vec!["pawchive".into(), "pawchive.pw".into()]),
             PluginProperties::Modifier(TargetModifier {

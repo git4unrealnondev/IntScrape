@@ -11,8 +11,16 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let plugins_dir = Path::new("plugins");
 
-    // Tell Cargo to watch the build script and the plugins directory
+    // Tell Cargo to watch the build script and the plugins directory.
+    //
+    // The plugins directory has to be declared explicitly. Cargo's default is to
+    // rerun a build script when any file in the package changes, but naming
+    // `build.rs` here opts out of that default, so without this line editing a
+    // plugin never reruns the script and `compiled_plugins/` keeps serving the
+    // previously built shared object. That failure is silent: the build reports
+    // success and the stale plugin is what gets loaded at runtime.
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed={}", plugins_dir.display());
 
     if !plugins_dir.exists() {
         println!(

@@ -81,10 +81,7 @@ fn keyset_bound(first_pass: bool, last: u64) -> i64 {
 /// it is the measured ~9.5 h bottleneck in the relationship copy, so the
 /// operator needs to know. Pure diagnostics: any introspection failure returns
 /// None and is silently skipped, never aborting the slurp.
-async fn slurp_source_keyset_indexed(
-    source: &Connection,
-    table: &str,
-) -> Option<bool> {
+async fn slurp_source_keyset_indexed(source: &Connection, table: &str) -> Option<bool> {
     // Composite PRIMARY KEY (file_id, tag_id) — clustered (WITHOUT ROWID) or
     // autoindexed (rowid table) — already serves the keyset. `PRAGMA table_info`
     // reports pk positions 1..n in key order.
@@ -1290,9 +1287,7 @@ impl TursoDatabase {
                         );
                     }
 
-                    if cold_import
-                        || added_here > 0
-                        || pending_recount.contains(&target_namespace)
+                    if cold_import || added_here > 0 || pending_recount.contains(&target_namespace)
                     {
                         // Tags.count churns idx_tags_count_covering (ordered by
                         // count) on every recount UPDATE: each reordering
@@ -1350,9 +1345,7 @@ impl TursoDatabase {
             if !legacy_namespaces.is_empty() {
                 let target_by_source_namespace: HashMap<u64, u64> =
                     legacy_namespaces.iter().copied().collect();
-                if let Some(indexed) =
-                    slurp_source_keyset_indexed(&source, "Relationship").await
-                {
+                if let Some(indexed) = slurp_source_keyset_indexed(&source, "Relationship").await {
                     if !indexed {
                         log::warn!(
                             "Slurp: source table Relationship has no (file_id, tag_id) \
@@ -1458,11 +1451,7 @@ impl TursoDatabase {
                             for sub in relationships.chunks(SLURP_RELATIONSHIP_WRITE_BATCH) {
                                 let tn = conn.transaction().await?;
                                 let added = self
-                                    .slurp_relationships_bulk_add(
-                                        &tn,
-                                        *target_namespace,
-                                        sub,
-                                    )
+                                    .slurp_relationships_bulk_add(&tn, *target_namespace, sub)
                                     .await?;
                                 *added_by_namespace.entry(*target_namespace).or_default() += added;
                                 if added > 0 {
@@ -1508,11 +1497,8 @@ impl TursoDatabase {
                             || pending_recount.contains(&target_namespace)
                         {
                             if !covering_dropped {
-                                conn.execute(
-                                    "DROP INDEX IF EXISTS idx_tags_count_covering",
-                                    (),
-                                )
-                                .await?;
+                                conn.execute("DROP INDEX IF EXISTS idx_tags_count_covering", ())
+                                    .await?;
                                 covering_dropped = true;
                             }
                             slurp_recount_namespace(&conn, target_namespace).await?;
@@ -1728,11 +1714,8 @@ impl TursoDatabase {
         // next scheduled slurp starts clean: a warm destination re-imports
         // cheaply because every stage dedupes with INSERT OR IGNORE and
         // skips recounts, exactly like the pre-existing warm re-slurp path.
-        conn.execute(
-            format!("DROP TABLE IF EXISTS {SLURP_CHECKPOINT_TABLE}"),
-            (),
-        )
-        .await?;
+        conn.execute(format!("DROP TABLE IF EXISTS {SLURP_CHECKPOINT_TABLE}"), ())
+            .await?;
 
         Ok((namespace_count, tag_count, file_count))
     }
@@ -2051,9 +2034,7 @@ struct SlurpStageCheckpoint {
 
 /// Loads every slurp cursor left by a previous (interrupted) run. A fresh
 /// destination, or one whose last slurp fully completed, has none.
-async fn slurp_checkpoint_load(
-    conn: &Connection,
-) -> Result<HashMap<String, SlurpStageCheckpoint>> {
+async fn slurp_checkpoint_load(conn: &Connection) -> Result<HashMap<String, SlurpStageCheckpoint>> {
     let mut out = HashMap::new();
     let mut stmt = conn
         .prepare(&format!(
@@ -2549,10 +2530,7 @@ mod tests {
             .unwrap();
         let mut tag_counts = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
-            tag_counts.push((
-                row.get::<String>(0).unwrap(),
-                row.get::<u64>(1).unwrap(),
-            ));
+            tag_counts.push((row.get::<String>(0).unwrap(), row.get::<u64>(1).unwrap()));
         }
         assert_eq!(
             tag_counts,
@@ -3452,10 +3430,7 @@ mod tests {
             .unwrap();
         let mut tag_counts = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
-            tag_counts.push((
-                row.get::<String>(0).unwrap(),
-                row.get::<u64>(1).unwrap(),
-            ));
+            tag_counts.push((row.get::<String>(0).unwrap(), row.get::<u64>(1).unwrap()));
         }
         assert_eq!(
             tag_counts,
@@ -3527,13 +3502,13 @@ mod tests {
 
         // The tail of the scan was re-read and deduplicated, and the pending
         // recounts fired: counts are authoritative again.
-        let mut rows = conn.query("SELECT name, count FROM Tags ORDER BY name;", ()).await.unwrap();
+        let mut rows = conn
+            .query("SELECT name, count FROM Tags ORDER BY name;", ())
+            .await
+            .unwrap();
         let mut tag_counts = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
-            tag_counts.push((
-                row.get::<String>(0).unwrap(),
-                row.get::<u64>(1).unwrap(),
-            ));
+            tag_counts.push((row.get::<String>(0).unwrap(), row.get::<u64>(1).unwrap()));
         }
         assert_eq!(
             tag_counts,
@@ -3571,8 +3546,16 @@ mod tests {
              INSERT INTO Relationship (file_id, tag_id) VALUES (1, 1);
              CREATE TABLE Parents (id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
                                    relate_tag_id INTEGER NOT NULL, limit_to INTEGER);";
-        write_source(&source_a, &script.replace("{tags}", "(1, 'one', 1), (2, 'two', 1)")).await;
-        write_source(&source_b, &script.replace("{tags}", "(1, 'three', 1), (2, 'four', 1)")).await;
+        write_source(
+            &source_a,
+            &script.replace("{tags}", "(1, 'one', 1), (2, 'two', 1)"),
+        )
+        .await;
+        write_source(
+            &source_b,
+            &script.replace("{tags}", "(1, 'three', 1), (2, 'four', 1)"),
+        )
+        .await;
 
         assert_eq!(db.db_slurp(&source_a).await.unwrap(), (1, 2, 1));
 
@@ -3662,8 +3645,14 @@ mod tests {
 
         assert_eq!(db.db_slurp(&source_path).await.unwrap(), (1, 2, 2));
         let conn = db.connect().unwrap();
-        let mut rows = conn.query("SELECT COUNT(*) FROM FileHashes;", ()).await.unwrap();
-        assert_eq!(rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(), 4);
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM FileHashes;", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+            4
+        );
 
         // Simulate a crash after file 1's hashes committed: the resume must
         // jump past file 1's batch and still import file 2's tail.
@@ -3706,16 +3695,16 @@ mod tests {
         );
 
         assert_eq!(db.db_slurp(&source_path).await.unwrap(), (1, 2, 2));
-        let mut rows = conn.query("SELECT COUNT(*) FROM FileHashes;", ()).await.unwrap();
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM FileHashes;", ())
+            .await
+            .unwrap();
         assert_eq!(
             rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
             4,
             "resumed hash stage must keep every row"
         );
     }
-
-
-
 
     async fn slurp_assert_no_progress_tables(db: &TursoDatabase) {
         let conn = db.connect().unwrap();

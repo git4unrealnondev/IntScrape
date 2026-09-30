@@ -1,5 +1,6 @@
 use std::{collections::HashMap, future::Future, path::Path, sync::Arc};
 
+use log::info;
 use shared_types::DbSettingsObj;
 use smol_str::SmolStr;
 use tokio::sync::{Mutex, RwLock};
@@ -25,6 +26,7 @@ mod tag;
 
 mod api;
 mod ipc;
+mod migrations;
 
 const TAG_CACHE_LIMIT: usize = 100_000;
 
@@ -168,9 +170,9 @@ impl TursoDatabase {
         let create_db = !db_path.exists();
 
         let db = Builder::new_local(&db_path.to_string_lossy())
-            //.experimental_vacuum(true)
+            .experimental_vacuum(true)
             //.experimental_without_rowid(true)
-            //.experimental_materialized_views(true)
+            .experimental_materialized_views(true)
             .experimental_index_method(true)
             .build()
             .await
@@ -214,7 +216,7 @@ impl TursoDatabase {
             let _ = out.create_db().await;
         }
 
-        let _ = out.check_db().await;
+        out.check_db().await.unwrap();
 
         Arc::new(out)
     }
@@ -299,55 +301,41 @@ impl TursoDatabase {
             }
         }
 
-        // Parents write-path migration (see table_create_parents): legacy
-        // schemas maintained two redundant indexes per insert — the inline
-        // UNIQUE(tag_id, relate_tag_id, limit_to) autoindex (fully covered by
-        // idx_unique_parents_null_safe, which additionally dedupes NULL
-        // limit_to rows the plain UNIQUE cannot) and idx_parents_lim (no query
-        // filters limit_to alone). Both tax every cold parent insert (~7s and
-        // ~14s per 50k rows on the bench). idx_parents_lim drops in place;
-        // the inline UNIQUE needs a table rebuild, so it lingers until the
-        // next parents import (db-slurp) rebuilds Parents from the lean
-        // table_create_parents. Failures surface instead of silently shipping
-        // a slower write path.
-        if let Err(error) = conn
-            .execute("DROP INDEX IF EXISTS idx_parents_lim;", ())
-            .await
-        {
-            log::error!("Failed to migrate Parents index set (idx_parents_lim): {error}");
-        }
-        {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM sqlite_master
-                         WHERE type = 'index' AND LOWER(name) = 'sqlite_autoindex_parents_1'
-                     )",
-                )
-                .await?;
-            let legacy_unique: i64 = stmt.query_row(()).await?.get(0)?;
-            if legacy_unique != 0 {
-                log::info!(
-                    "Legacy Parents inline UNIQUE index detected; the next parents import (db-slurp) rebuilds Parents lean and drops it."
+        self.load_cache().await?;
+
+        loop {
+            if let Some(setting) = self.setting_get_cache(&"SYSTEM_VERSION".to_string()).await
+                && let Some(version_num) = setting.num
+            {
+                if version_num == DB_VERSION {
+                    break;
+                }
+
+                info!(
+                    "Starting upgrade from version: {} to: {}",
+                    version_num,
+                    version_num + 1
                 );
+
+                match version_num {
+                    0..=5 => {
+                        info!(
+                            "Could not upgrade from version: {} not yet implimented.",
+                            version_num
+                        );
+                        return Err(turso::Error::Error(
+                            "Cannot upgrade from legacy db. check logs".to_string(),
+                        ));
+                    }
+                    6 => {
+                        self.update_db_6_to_7(&conn).await?;
+                    }
+                    _ => {}
+                }
             }
         }
 
         conn.commit().await?;
-
-        // Popular-tag FTS shadow: create/index on first boot or upgrade,
-        // verify-only on steady boots. Runs here (every boot) because
-        // `create_db` only fires for a brand-new file. Failures are surfaced
-        // so a broken search index is never invisible.
-        {
-            let connection = self.connect()?;
-            if let Err(error) = self.table_ensure_tags_popular(&connection).await {
-                log::error!("Failed to ensure popular-tag FTS shadow: {error}");
-            }
-        }
-
-        self.load_cache().await?;
-
         Ok(())
     }
 

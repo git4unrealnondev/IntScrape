@@ -77,9 +77,7 @@ impl TursoDatabase {
                             turso::Error::Busy(_) | turso::Error::BusySnapshot(_)
                         ) =>
                     {
-                        log::warn!(
-                            "Scrape-job commit conflicted; retrying: {error}"
-                        );
+                        log::warn!("Scrape-job commit conflicted; retrying: {error}");
                         let _ = conn.execute("ROLLBACK", ()).await;
                         if scraper_backoff(&mut attempts).await {
                             log::error!(
@@ -279,10 +277,7 @@ impl TursoDatabase {
     /// Phase 2 of a scraper chunk: persists tags (and their parent
     /// relations) in one small plain-BEGIN transaction, returning the
     /// `Tag -> id` mapping the relationship phase resolves against.
-    async fn scraper_phase_tags(
-        &self,
-        all_tags: &[FileTagAction],
-    ) -> Result<HashMap<Tag, i64>> {
+    async fn scraper_phase_tags(&self, all_tags: &[FileTagAction]) -> Result<HashMap<Tag, i64>> {
         let mut attempts = 0u32;
         loop {
             // Cant connect to db?
@@ -408,15 +403,12 @@ impl TursoDatabase {
                     "SELECT t.id, n.name FROM Tags t JOIN Namespace n ON n.id = t.namespace \
                      WHERE t.id IN ({placeholders});"
                 );
-                let params: Vec<Value> =
-                    missing.iter().map(|id| Value::from(*id as i64)).collect();
+                let params: Vec<Value> = missing.iter().map(|id| Value::from(*id as i64)).collect();
                 let mut rows = match tn.query(&sql, params_from_iter(params)).await {
                     Ok(rows) => rows,
                     Err(error) if Self::is_concurrency_conflict(&error) => {
                         let _ = tn.rollback().await;
-                        log::warn!(
-                            "Scraper tag namespace read conflicted; retrying: {error}"
-                        );
+                        log::warn!("Scraper tag namespace read conflicted; retrying: {error}");
                         if scraper_backoff(&mut attempts).await {
                             return Err(scraper_give_up("tag namespace read"));
                         }
@@ -572,9 +564,7 @@ impl TursoDatabase {
                     return Ok(());
                 }
                 Err(error) if Self::is_concurrency_conflict(&error) => {
-                    log::warn!(
-                        "Scraper relationship phase commit conflicted; retrying: {error}"
-                    );
+                    log::warn!("Scraper relationship phase commit conflicted; retrying: {error}");
                     if scraper_backoff(&mut attempts).await {
                         return Err(scraper_give_up("relationship phase commit"));
                     }
@@ -891,7 +881,6 @@ mod tests {
         db.shutdown().await;
     }
 
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn steady_state_boot_rebuilds_missing_fts_index() {
         // The state a torn/crashed index rebuild leaves behind: the shadow
@@ -1078,7 +1067,10 @@ mod tests {
                 .unwrap();
             stmt.query_row(()).await.unwrap().get(0).unwrap()
         };
-        assert_eq!(uidx_present, 1, "null-safe unique index must survive the migration");
+        assert_eq!(
+            uidx_present, 1,
+            "null-safe unique index must survive the migration"
+        );
 
         // Dedupe still works after the migration: the OR IGNORE probes the
         // null-safe index, not the dropped inline UNIQUE.
@@ -1127,10 +1119,8 @@ mod tests {
         use std::time::Instant;
 
         let db_path = if std::path::Path::new("/dev/shm").exists() {
-            std::path::PathBuf::from("/dev/shm").join(format!(
-                "intscrape-fts-bench-{}.db",
-                std::process::id()
-            ))
+            std::path::PathBuf::from("/dev/shm")
+                .join(format!("intscrape-fts-bench-{}.db", std::process::id()))
         } else {
             std::env::temp_dir().join(format!("intscrape-fts-bench-{}.db", std::process::id()))
         };
@@ -1191,10 +1181,8 @@ mod tests {
         use shared_types::{PluginTag, TagType};
 
         let db_path = if std::path::Path::new("/dev/shm").exists() {
-            std::path::PathBuf::from("/dev/shm").join(format!(
-                "intscrape-chunk-bench-{}.db",
-                std::process::id()
-            ))
+            std::path::PathBuf::from("/dev/shm")
+                .join(format!("intscrape-chunk-bench-{}.db", std::process::id()))
         } else {
             std::env::temp_dir().join(format!("intscrape-chunk-bench-{}.db", std::process::id()))
         };
@@ -1304,7 +1292,8 @@ mod tests {
         let conn = db.connect().unwrap();
         let seed_start = Instant::now();
         for chunk in (1u64..=popular).collect::<Vec<_>>().chunks(256) {
-            let mut sql = String::from("INSERT OR REPLACE INTO Tags (name, namespace, count) VALUES ");
+            let mut sql =
+                String::from("INSERT OR REPLACE INTO Tags (name, namespace, count) VALUES ");
             let mut params: Vec<Value> = Vec::with_capacity(chunk.len() * 3);
             for (i, id) in chunk.iter().enumerate() {
                 if i > 0 {
@@ -1423,10 +1412,8 @@ mod tests {
     #[ignore = "manual benchmark: split phase-3 cost into bulk-add vs count-apply vs shadow"]
     fn scraper_write_path_micro_dissection_bench() {
         let db_path = if std::path::Path::new("/dev/shm").exists() {
-            std::path::PathBuf::from("/dev/shm").join(format!(
-                "intscrape-micro-bench-{}.db",
-                std::process::id()
-            ))
+            std::path::PathBuf::from("/dev/shm")
+                .join(format!("intscrape-micro-bench-{}.db", std::process::id()))
         } else {
             std::env::temp_dir().join(format!("intscrape-micro-bench-{}.db", std::process::id()))
         };
@@ -1612,10 +1599,8 @@ mod tests {
     #[ignore = "manual benchmark: per-phase cost of a fresh scraper chunk"]
     fn scraper_chunk_phase_dissection_bench() {
         let db_path = if std::path::Path::new("/dev/shm").exists() {
-            std::path::PathBuf::from("/dev/shm").join(format!(
-                "intscrape-phase-bench-{}.db",
-                std::process::id()
-            ))
+            std::path::PathBuf::from("/dev/shm")
+                .join(format!("intscrape-phase-bench-{}.db", std::process::id()))
         } else {
             std::env::temp_dir().join(format!("intscrape-phase-bench-{}.db", std::process::id()))
         };

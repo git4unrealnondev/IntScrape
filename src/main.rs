@@ -44,7 +44,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 const TURSO_DB_PATH: &str = "turso.db";
 const LOG_PATH: &str = "log.txt";
 pub const PLUGINS_PATH: &str = "compiled_plugins";
-const DB_VERSION: u64 = 6;
+const DB_VERSION: u64 = 7;
 const JOB_PROCESSING_CHUNK_SIZE: usize = 256;
 
 ///

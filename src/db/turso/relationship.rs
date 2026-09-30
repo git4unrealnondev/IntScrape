@@ -534,8 +534,7 @@ impl TursoDatabase {
             // and *minutes* for 50k, holding `tag_count_lock` — and every
             // other job's fold-in — hostage the whole time.
             for (deltas, decrement) in [(&add_deltas, false), (&del_deltas, true)] {
-                let entries: Vec<(u64, u64)> =
-                    deltas.iter().map(|(&k, &v)| (k, v)).collect();
+                let entries: Vec<(u64, u64)> = deltas.iter().map(|(&k, &v)| (k, v)).collect();
                 for piece in entries.chunks(POPULARITY_FOLD_CHUNK) {
                     let piece_map: HashMap<u64, u64> = piece.iter().copied().collect();
                     let (sql, params) = tag_count_update_sql(&piece_map, decrement);

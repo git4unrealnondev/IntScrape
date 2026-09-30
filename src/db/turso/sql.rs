@@ -143,18 +143,18 @@ impl TursoDatabase {
             return Ok(out);
         }
         let conn = self.db.connect()?;
-        let fts_query = search_string.trim().to_owned();
+        let fts_query = format!("{}", search_string.trim().to_owned());
         // The FTS index only covers popular tags (`Tags_Popular.count >= 5`),
         // so search joins back to Tags for the authoritative count used to
         // rank and return. Unpopular tags are intentionally not searchable.
         let mut rows = conn
             .query(
-                "SELECT t.id, t.count, fts_score(p.name, ?1) AS score \
-                 FROM Tags t \
-                 JOIN Tags_Popular p ON p.tag_id = t.id \
-                 WHERE fts_match(p.name, ?1) \
-                 ORDER BY t.count DESC, score DESC, t.id ASC \
-                 LIMIT ?2;",
+                "SELECT t.id, t.count, fts_score(p.name, ?1) AS score
+FROM Tags_Popular p
+JOIN Tags t ON t.id = p.tag_id
+WHERE fts_match(p.name, ?1)
+ORDER BY t.count DESC, score DESC, t.id ASC
+LIMIT ?2;",
                 (fts_query, limit as i64),
             )
             .await?;

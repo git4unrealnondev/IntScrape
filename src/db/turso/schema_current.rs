@@ -104,9 +104,16 @@ CREATE INDEX idx_namespace ON Namespace (name);
         .await;
     }
     pub(in crate::db::turso) async fn table_create_parents(&self, conn: &Connection) -> Result<()> {
+        self.table_create_parents_v1(conn).await
+    }
+
+    pub(in crate::db::turso) async fn table_create_parents_v1(
+        &self,
+        conn: &Connection,
+    ) -> Result<()> {
         conn.execute_batch("
 CREATE TABLE Parents (
-id INTEGER PRIMARY KEY AUTOINCREMENT,
+id INTEGER PRIMARY KEY,
     tag_id INTEGER NOT NULL,
     relate_tag_id INTEGER NOT NULL,
     limit_to INTEGER,
@@ -122,6 +129,7 @@ CREATE INDEX idx_parents_rel ON Parents (relate_tag_id);
 CREATE UNIQUE INDEX idx_unique_parents_null_safe ON Parents (tag_id, relate_tag_id, IFNULL(limit_to, -1));
 ").await
     }
+
     pub(in crate::db::turso) async fn table_create_tags(&self, conn: &Connection) {
         conn.execute_batch(
             "
@@ -139,6 +147,32 @@ CREATE INDEX IF NOT EXISTS idx_tags_count_covering ON Tags(count DESC, name, nam
 ",
         )
         .await;
+        self.table_create_tags_popular(conn).await;
+    }
+
+    /// Creates the most current tags popular table
+    pub(in crate::db::turso) async fn table_create_tags_popular(&self, conn: &Connection) {
+        self.table_create_tags_popular_v1(conn).await;
+    }
+
+    pub(in crate::db::turso) async fn table_create_tags_popular_v1(
+        &self,
+        conn: &Connection,
+    ) -> Result<()> {
+        conn.execute_batch(
+            "
+CREATE TABLE IF NOT EXISTS Tags_Popular (
+    tag_id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tags_popular_fts ON Tags_Popular USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);
+CREATE INDEX IF NOT EXISTS idx_tags_fts ON Tags USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);
+
+",
+        )
+        .await?;
+        Ok(())
     }
 
     /// Ensures the popular-tag FTS shadow exists and is indexed. Runs on every
@@ -305,7 +339,10 @@ CREATE TABLE IF NOT EXISTS Tags_Popular (
         conn.execute(
             "INSERT OR REPLACE INTO Settings (name, description, num, param)
              VALUES (?1, NULL, NULL, ?2);",
-            (FTS_SHADOW_MARKER_NAME, FTS_SHADOW_SCHEMA_GENERATION.to_string()),
+            (
+                FTS_SHADOW_MARKER_NAME,
+                FTS_SHADOW_SCHEMA_GENERATION.to_string(),
+            ),
         )
         .await?;
         Ok(())

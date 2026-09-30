@@ -214,9 +214,7 @@ impl TursoDatabase {
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                     Err(error) => {
-                        log::error!(
-                            "Failed to begin tag transaction for file {file_id}: {error}"
-                        );
+                        log::error!("Failed to begin tag transaction for file {file_id}: {error}");
                         return false;
                     }
                 }

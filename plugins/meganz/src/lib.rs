@@ -7,7 +7,7 @@
 //! Slop coded by GPT5.6-Luna with himan supervision
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     error::Error,
 };
 
@@ -16,9 +16,10 @@ use futures::{StreamExt, stream};
 use mega::{Client, ErrorCode, Node, Nodes};
 use regex::Regex;
 use shared_types::{
-    CallbackReturn, DbSettingsObj, FileObject, FileSource, FileTagAction, GenericNamespaceObj,
-    GlobalCallbacks, PluginJob, PluginProperties, PluginTag, RelationContext, ScraperDataReturn,
-    ScraperParam, ScraperReturn, SearchType, SkipIf, Tag, TagOperation, Url,
+    CallbackCustomDataReturning, CallbackInfoInput, CallbackReturn, DbSettingsObj, FileObject,
+    FileSource, FileTagAction, GenericNamespaceObj, GlobalCallbacks, PluginJob, PluginProperties,
+    PluginTag, RelationContext, ScraperDataReturn, ScraperParam, ScraperReturn, SearchType, SkipIf,
+    Tag, TagOperation, Url,
 };
 
 const SITE: &str = "meganz";
@@ -470,6 +471,12 @@ pub fn parser_call(_text: &str, source_url: &str, data: &ScraperDataReturn) -> V
         return vec![ScraperReturn::Nothing];
     };
 
+    // Asked for outside the runtime below on purpose: the IPC client drives its
+    // own blocking call into the host, and nesting that inside the `block_on`
+    // here would mean a runtime inside a runtime. Having no proxy is the normal
+    // case, not an error.
+    let route = working_proxy();
+
     let result =
         (|| -> Result<(Vec<FileObject>, Vec<String>, bool), Box<dyn std::error::Error>> {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -477,12 +484,13 @@ pub fn parser_call(_text: &str, source_url: &str, data: &ScraperDataReturn) -> V
                 .build()?;
 
             runtime.block_on(async {
-                let http = reqwest::Client::builder()
-                    .use_rustls_tls()
-                    .user_agent(
-                        "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0",
-                    )
-                    .build()?;
+                let mut builder = reqwest::Client::builder().use_rustls_tls().user_agent(
+                    "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0",
+                );
+                if let Some(route) = &route {
+                    builder = builder.proxy(route.proxy.clone());
+                }
+                let http = builder.build()?;
 
                 let mega = Client::builder().build(http)?;
 
@@ -518,6 +526,16 @@ pub fn parser_call(_text: &str, source_url: &str, data: &ScraperDataReturn) -> V
                 Ok((files, errors, bandwidth_error))
             })
         })();
+
+    // Feed the result back so the proxy ranking reflects what MEGA actually
+    // did, rather than what a bare reachability check would have said.
+    if let Some(route) = &route {
+        let success = match &result {
+            Ok(_) => true,
+            Err(error) => !is_transport_error(error.as_ref()),
+        };
+        report_proxy(route, success);
+    }
 
     match result {
         Err(error) => {
@@ -613,4 +631,177 @@ fn is_bandwidth_error_message(error: &str) -> bool {
     error.contains("over quota")
         || error.contains("509 bandwidth limit exceeded")
         || error.contains("bandwidth limit exceeded")
+}
+
+// ---------------------------------------------------------------------------
+// proxy routing
+//
+// MEGA sits behind Cloudflare and rate-limits aggressively, so routing these
+// scrapes through a proxy the user already has on file is worth doing. The
+// `proxy` plugin owns the list and the ranking; this side only asks it for a
+// route, uses it, and reports what happened.
+// ---------------------------------------------------------------------------
+
+/// A proxy route handed over by the `proxy` plugin.
+struct ProxyRoute {
+    /// The URL to send the report back under. The plugin matches on this, so it
+    /// has to be the value it gave us rather than a re-encoding.
+    url: String,
+    /// Ready-to-use reqwest proxy.
+    proxy: reqwest::Proxy,
+}
+
+/// Calls a callback on the `proxy` plugin.
+///
+/// Returns `None` when the IPC round trip fails. The host answers an
+/// unregistered or unknown callback with an empty map rather than an error, so
+/// an empty map is a valid answer meaning "no route", not a failure.
+fn proxy_plugin_call(
+    func: &str,
+    args: Vec<(&str, CallbackCustomDataReturning)>,
+) -> Option<HashMap<String, CallbackCustomDataReturning>> {
+    let info = CallbackInfoInput {
+        vers: 0,
+        data_name: args.iter().map(|(name, _)| (*name).to_string()).collect(),
+        data: args.into_iter().map(|(_, value)| value).collect(),
+    };
+    client::external_plugin_call(func.to_string(), info).ok()
+}
+
+/// Asks the `proxy` plugin for a proxy that should be working right now.
+///
+/// `None` means "connect directly": either the plugin has nothing to offer, the
+/// plugin is not loaded, the entry it handed over is SOCKS, or its stored URL is
+/// not a URL reqwest accepts.
+fn working_proxy() -> Option<ProxyRoute> {
+    let out = proxy_plugin_call(
+        "proxy_get_proxy",
+        vec![(
+            "site",
+            CallbackCustomDataReturning::String(SITE.to_string()),
+        )],
+    )?;
+
+    let url = match out.get("proxy_url") {
+        Some(CallbackCustomDataReturning::String(text)) => text.trim().to_string(),
+        _ => String::new(),
+    };
+    if url.is_empty() {
+        return None;
+    }
+
+    let kind = match out.get("proxy_type") {
+        Some(CallbackCustomDataReturning::String(text)) => text.trim().to_ascii_lowercase(),
+        _ => String::new(),
+    };
+
+    // `proxy_type` only matters when the stored URL has no scheme, which is the
+    // usual shape for a scraped proxy list. With no scheme and no recognised
+    // type, assume plain HTTP rather than dropping the route.
+    let candidate = if url.contains("://") {
+        url.clone()
+    } else {
+        let scheme = match kind.as_str() {
+            "https" | "socks4" | "socks4a" | "socks5" | "socks5h" => kind,
+            _ => "http".to_string(),
+        };
+        format!("{scheme}://{url}")
+    };
+
+    // SOCKS entries are skipped rather than attempted. This crate's reqwest is
+    // built without the `socks` feature, so `Proxy::all` below would reject the
+    // scheme anyway and land in the same direct connection — checking here makes
+    // that an explicit decision and keeps the reason in the log. Reported back as
+    // "no route", so the plugin is free to rank a non-SOCKS entry first next time.
+    if is_socks(&candidate) {
+        let _ = client::log_silent(format!(
+            "MEGA: proxy plugin offered SOCKS proxy `{candidate}`, ignoring it \
+             because this plugin has no SOCKS support; connecting directly"
+        ));
+        return None;
+    }
+
+    let proxy = reqwest::Proxy::all(&candidate).ok()?;
+    Some(ProxyRoute { url, proxy })
+}
+
+/// Whether a proxy URL uses a SOCKS scheme.
+///
+/// The scheme is read off the URL rather than off `proxy_type`, because a fully
+/// qualified URL carries its own scheme and the stored type is then only
+/// advisory — a list can disagree with itself, and it is the URL reqwest will act
+/// on that decides the question.
+fn is_socks(candidate: &str) -> bool {
+    let Some((scheme, _)) = candidate.split_once("://") else {
+        return false;
+    };
+    matches!(
+        scheme.trim().to_ascii_lowercase().as_str(),
+        "socks4" | "socks4a" | "socks5" | "socks5h"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_socks;
+
+    #[test]
+    fn socks_schemes_are_skipped() {
+        for scheme in ["socks4", "socks4a", "socks5", "socks5h"] {
+            assert!(is_socks(&format!("{scheme}://1.2.3.4:1080")), "{scheme}");
+        }
+    }
+
+    #[test]
+    fn scheme_match_ignores_case_and_surrounding_space() {
+        assert!(is_socks("SOCKS5://1.2.3.4:1080"));
+        assert!(is_socks("socks5h://1.2.3.4:1080"));
+    }
+
+    #[test]
+    fn non_socks_routes_are_kept() {
+        for candidate in [
+            "http://1.2.3.4:8080",
+            "https://1.2.3.4:8080",
+            // A host that merely looks like it carries a scheme is not one, and
+            // `working_proxy` has already prefixed a default by this point.
+            "1.2.3.4:8080",
+        ] {
+            assert!(!is_socks(candidate), "{candidate}");
+        }
+    }
+}
+
+/// Tells the `proxy` plugin how the request went so the ranking learns from it.
+fn report_proxy(route: &ProxyRoute, success: bool) {
+    let _ = proxy_plugin_call(
+        "proxy_report",
+        vec![
+            (
+                "proxy_url",
+                CallbackCustomDataReturning::String(route.url.clone()),
+            ),
+            (
+                "site",
+                CallbackCustomDataReturning::String(SITE.to_string()),
+            ),
+            (
+                "success",
+                CallbackCustomDataReturning::U64(u64::from(success)),
+            ),
+        ],
+    );
+}
+
+/// Whether a failure is the proxy's fault rather than MEGA's.
+///
+/// Only transport-level trouble counts against a proxy. A blocked folder, an
+/// exceeded quota or a malformed link all mean the request arrived and got an
+/// answer back, so the proxy did its job and reporting a failure there would
+/// retire a good proxy over something MEGA decided.
+fn is_transport_error(error: &(dyn Error + 'static)) -> bool {
+    matches!(
+        error.downcast_ref::<mega::Error>(),
+        Some(mega::Error::ReqwestError { .. } | mega::Error::MaxRetriesReached)
+    )
 }
