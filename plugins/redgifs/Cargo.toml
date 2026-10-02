@@ -1,0 +1,17 @@
+[package]
+name = "redgifs"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+json = "0.12.4"
+log = "0.4.33"
+shared_types = { workspace = true }
+client = { workspace = true }
+# `blocking` because the plugin ABI runs `parser_call` on the host's blocking
+# pool, where a sync client is correct; `rustls-tls` to match the proxy plugin
+# and avoid pulling an openssl system dependency.
+reqwest = { version = "0.12.22", default-features = false, features = ["blocking", "rustls-tls", "gzip", "deflate"] }

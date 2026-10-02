@@ -13,12 +13,21 @@ client = { workspace = true }
 tokio = { workspace = true }
 json = "0.12.4"
 rtipc = "0.7.0"
-vetis = "0.1.7-beta.3"
+# Pinned exactly, not with a caret. Caret on a pre-release admits any later
+# `-beta`, and vetis has been shipping breaking changes between betas: in
+# `0.1.7-beta.4` `ListenerConfigBuilder::protos` moved to `HostConfigBuilder`
+# and `VetisBuilder::add_listeners` was removed outright (its own rustdoc still
+# calls `.protos()` on the listener builder, so that release does not even
+# compile its examples). `0.1.2-beta.5` of vetis-tokio similarly dropped
+# `build_listeners`. Pinning keeps `cargo update` from silently breaking this
+# plugin again.
+vetis = "=0.1.7-beta.3"
 smol-macros = "0.1.1"
 macro_rules_attribute = "0.2.3"
 http = "1.5.0"
 smol = "2.0.2"
-vetis-tokio = {version="0.1.2-beta.4", default-features=false, features=["rust-tls"]}
+# Pinned exactly for the same reason as `vetis` above.
+vetis-tokio = {version="=0.1.2-beta.4", default-features=false, features=["rust-tls"]}
 # `blocking` because the host runs plugin callbacks via `tokio::task::spawn_blocking`
 # (src/ipc.rs), so a blocking client is safe there and avoids nesting a runtime.
 # `socks` is required for `reqwest::Proxy::socks5`.

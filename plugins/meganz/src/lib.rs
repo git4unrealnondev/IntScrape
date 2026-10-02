@@ -770,6 +770,69 @@ mod tests {
             assert!(!is_socks(candidate), "{candidate}");
         }
     }
+
+    /// A public link's key fragment is user-pasted text, so its decoded length is
+    /// not to be trusted. `fetch_public_nodes` used to feed it straight to the
+    /// fixed-size AES-128 helpers, which panic on a short key rather than returning
+    /// an error -- a 3-character fragment decodes to 2 bytes and aborted the scraper
+    /// with `assertion left == right failed / left: 2, right: 16` inside
+    /// `generic-array`, taking the whole blocking task with it.
+    ///
+    /// Every case here is rejected before the HTTP client is touched, which is what
+    /// keeps this test hermetic: a regression that let one through would try to reach
+    /// the network and fail loudly instead (this runtime deliberately has no timer
+    /// driver). That means it exercises the real code path rather than re-deriving
+    /// the check it is asserting.
+    #[test]
+    fn public_link_with_wrong_sized_key_is_rejected_before_any_request() {
+        use mega::{Client, Error};
+
+        /// A base64url-no-pad fragment that decodes to exactly `bytes` bytes.
+        /// `"A"` is zero, so the trailing bits of the final group are always valid.
+        fn fragment(bytes: usize) -> String {
+            "A".repeat((4 * bytes).div_ceil(3))
+        }
+
+        // A folder key is 16 bytes and a file key is 32 bytes; anything else is not a
+        // key at all. Note that a 16-byte fragment on a folder link is the *correct*
+        // size and so must not appear here.
+        let cases = [
+            ("folder", 1, "1-byte key"),
+            ("folder", 2, "2-byte key"),
+            ("folder", 15, "15-byte key"),
+            ("folder", 17, "17-byte key"),
+            ("folder", 24, "24-byte key"),
+            ("folder", 32, "file-sized key on a folder link"),
+            ("file", 2, "2-byte key"),
+            ("file", 16, "folder-sized key on a file link"),
+            ("file", 31, "31-byte key"),
+            ("file", 33, "33-byte key"),
+        ];
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+
+        let client = Client::builder()
+            .build(reqwest::Client::new())
+            .expect("client");
+
+        for (kind, bytes, label) in cases {
+            // `fetch_public_nodes` also accepts `<key>/<path>`, so cover that too.
+            for suffix in ["", "/extra"] {
+                let url = format!("https://mega.nz/{kind}/AbCdEf#{}{suffix}", fragment(bytes));
+
+                let Err(err) = runtime.block_on(client.fetch_public_nodes(&url)) else {
+                    panic!("{label} ({url}) should have been rejected as a malformed link");
+                };
+
+                assert!(
+                    matches!(err, Error::InvalidPublicUrlFormat),
+                    "{label} ({url}) should be rejected as a malformed link, got {err:?}"
+                );
+            }
+        }
+    }
 }
 
 /// Tells the `proxy` plugin how the request went so the ranking learns from it.

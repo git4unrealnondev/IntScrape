@@ -159,6 +159,16 @@ CREATE INDEX IF NOT EXISTS idx_tags_count_covering ON Tags(count DESC, name, nam
         &self,
         conn: &Connection,
     ) -> Result<()> {
+        // NOTE: deliberately does NOT create an FTS index on the full `Tags`
+        // table. Search is served entirely by the `Tags_Popular` shadow (see
+        // `tags_search_fts`, which queries `fts_match(p.name, ...)` against
+        // `Tags_Popular`), so an FTS index on `Tags` is dead weight that every
+        // tag insert pays for: turso's FTS index method buffers each affected
+        // document and builds a whole immutable Tantivy segment per statement
+        // flush, which is what emits the `save metas` line from inside tantivy
+        // and roughly triples the per-tag insert cost (measured 19.2 -> 7.3
+        // us/row over 20k tags). It also breaks the ensure below, which reuses
+        // the `idx_tags_fts` name for the shadow index.
         conn.execute_batch(
             "
 CREATE TABLE IF NOT EXISTS Tags_Popular (
@@ -166,8 +176,7 @@ CREATE TABLE IF NOT EXISTS Tags_Popular (
     name TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_tags_popular_fts ON Tags_Popular USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);
-CREATE INDEX IF NOT EXISTS idx_tags_fts ON Tags USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);
+CREATE INDEX IF NOT EXISTS idx_tags_fts ON Tags_Popular USING fts (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);
 
 ",
         )
@@ -210,6 +219,47 @@ CREATE INDEX IF NOT EXISTS idx_tags_fts ON Tags USING fts (name) WITH (tokenizer
         &self,
         conn: &Connection,
     ) -> Result<()> {
+        // Heal a stray `idx_tags_fts` left on the FULL `Tags` table by older
+        // schema code. Every branch below reuses that name for the shadow
+        // index, so the stray has to go first or the rebuild fails outright
+        // with "index idx_tags_fts already exists" — and in the steady-state
+        // branch `CREATE INDEX IF NOT EXISTS` would silently match the stray
+        // name and leave the shadow with no FTS index at all (dead search).
+        let stray_fts_table: Option<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT LOWER(tbl_name) FROM sqlite_master
+                     WHERE type = 'index' AND LOWER(name) = 'idx_tags_fts';",
+                )
+                .await
+                .expect("table_ensure_tags_popular fts name probe");
+            let mut rows = stmt
+                .query(())
+                .await
+                .expect("table_ensure_tags_popular fts name row");
+            rows.next()
+                .await
+                .expect("table_ensure_tags_popular fts name value")
+                .map(|row| row.get::<String>(0))
+                .transpose()
+                .expect("table_ensure_tags_popular fts name string")
+        };
+        if stray_fts_table.as_deref() == Some("tags") {
+            log::warn!(
+                "Dropping stray full-table FTS index idx_tags_fts on Tags; tag search is served by the Tags_Popular shadow."
+            );
+            conn.execute_batch("DROP INDEX idx_tags_fts;").await?;
+        }
+        // The shadow's FTS index is canonically named `idx_tags_fts`; a database
+        // created before that rename carries a second FTS index over the SAME
+        // shadow rows under the old `idx_tags_popular_fts` name. Two FTS
+        // indexes over one small table double every shadow write (segment
+        // build included) for no read benefit, so retire the old name. Safe to
+        // drop unconditionally: the branches below re-create the canonical
+        // index, and the shadow table is never dropped without a rebuild.
+        conn.execute_batch("DROP INDEX IF EXISTS idx_tags_popular_fts;")
+            .await?;
+
         let shadow_existed: i64 = {
             let mut stmt = conn
                 .prepare(

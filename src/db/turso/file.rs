@@ -93,13 +93,14 @@ impl TursoDatabase {
         conn: &Connection,
         namespace_id: u64,
     ) -> Result<HashSet<u64>> {
-        let relationship_source = self.relationship_union_source(conn, "Relationship").await?;
-        let sql = format!(
-            "SELECT DISTINCT file_id FROM {relationship_source}
-             WHERE tag_id IN (
-                 SELECT id FROM Tags WHERE namespace = ?1
-             );"
-        );
+        let relationship_source = self
+            .relationship_union_source(
+                conn,
+                "Relationship",
+                Some("tag_id IN (SELECT id FROM Tags WHERE namespace = ?1)"),
+            )
+            .await?;
+        let sql = format!("SELECT DISTINCT file_id FROM {relationship_source}");
 
         let mut out = HashSet::new();
         let mut rows = conn.query(&sql, (namespace_id as i64,)).await?;

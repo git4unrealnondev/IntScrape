@@ -1124,6 +1124,305 @@ mod tests {
         db.shutdown().await;
     }
 
+    /// Reproduces the exact production state that made the scraper tags phase
+    /// slow: an FTS index left on the FULL `Tags` table under the name
+    /// `idx_tags_fts`, alongside the shadow's index, and no
+    /// `fts_shadow_schema` marker (nothing had ever run the shadow ensure).
+    ///
+    /// That stray index is pure write tax — search only ever queries
+    /// `Tags_Popular` — and it is what made turso build a Tantivy segment per
+    /// tag-insert statement (the `save metas` line in the log). The boot-time
+    /// ensure must drop it and leave exactly one FTS index, on the shadow,
+    /// with search still working.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn boot_drops_stray_full_table_fts_index() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("stray_fts.db");
+        let should_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "INSERT INTO Namespace (name, description) VALUES ('subject', NULL);",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO Tags (name, namespace, count) VALUES ('straymark', 1, 12);",
+                (),
+            )
+            .await
+            .unwrap();
+            // Bake the production shape: the shadow's index under the legacy
+            // `idx_tags_popular_fts` name, a stray full-table FTS index squatting
+            // on the canonical `idx_tags_fts` name, and no schema marker.
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS idx_tags_fts;
+                 DELETE FROM Settings WHERE name = 'fts_shadow_schema';",
+            )
+            .await
+            .unwrap();
+            conn.execute_batch(
+                "CREATE INDEX idx_tags_fts ON Tags USING fts (name)
+                     WITH (tokenizer='ngram', min_gram=2, max_gram=3);",
+            )
+            .await
+            .unwrap();
+            conn.execute_batch(
+                "CREATE INDEX idx_tags_popular_fts ON Tags_Popular USING fts (name)
+                     WITH (tokenizer='ngram', min_gram=2, max_gram=3);",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO Tags_Popular(tag_id, name)
+                 SELECT id, name FROM Tags WHERE count >= 5;",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        db.shutdown().await;
+        drop(db);
+
+        // Reboot: the ensure must heal the index layout.
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit).await;
+        let conn = db.connect().unwrap();
+
+        let fts_index_tables: Vec<String> = {
+            let mut rows = conn
+                .query(
+                    "SELECT LOWER(tbl_name) FROM sqlite_master
+                     WHERE type = 'index' AND sql LIKE '%USING fts%'
+                     ORDER BY LOWER(tbl_name);",
+                    (),
+                )
+                .await
+                .unwrap();
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await.unwrap() {
+                out.push(row.get::<String>(0).unwrap());
+            }
+            out
+        };
+        assert_eq!(
+            fts_index_tables,
+            vec!["tags_popular".to_string()],
+            "exactly one FTS index must remain, and it must be on the Tags_Popular shadow \
+             (a full-table FTS index on Tags taxes every tag insert)"
+        );
+
+        // The rebuild must not have cost us searchability.
+        let found = db.tags_search_fts("straymark", 10).await.unwrap();
+        assert_eq!(found.len(), 1, "shadow search must still resolve");
+
+        // And the marker must be recorded, so the next boot is verify-only.
+        let mut marker_rows = conn
+            .query(
+                "SELECT param FROM Settings WHERE name = 'fts_shadow_schema';",
+                (),
+            )
+            .await
+            .unwrap();
+        let marker: String = marker_rows
+            .next()
+            .await
+            .unwrap()
+            .expect("marker must be written after a generation rebuild")
+            .get(0)
+            .unwrap();
+        assert_eq!(
+            marker,
+            super::super::schema_current::FTS_SHADOW_SCHEMA_GENERATION,
+            "boot must record the current shadow generation"
+        );
+
+        drop(conn);
+        db.shutdown().await;
+    }
+
+    /// Migration 7 -> 8: a v7 database carrying the stray full-table FTS index
+    /// must have it removed by the versioned upgrade, with the shadow's own
+    /// index and rows left intact.
+    ///
+    /// Distinct from `boot_drops_stray_full_table_fts_index`, which covers the
+    /// idempotent ensure. This pins the versioned path, and in particular that
+    /// the migration does not touch `idx_tags_fts` when it is legitimately
+    /// attached to the shadow — that index is the live search index, and
+    /// dropping it would silently kill autocomplete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn migration_7_to_8_drops_stray_index_and_keeps_shadow_index() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("v7.db");
+        let should_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Build a v7-shaped database: shadow index present under its own name,
+        // stray full-table index squatting on `idx_tags_fts`, version pinned to
+        // 7 so the upgrade loop runs the 7 -> 8 step.
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+        {
+            let conn = db.connect().unwrap();
+            conn.execute_batch(
+                "INSERT INTO Namespace (name, description) VALUES ('subject', NULL);
+                 INSERT INTO Tags (name, namespace, count) VALUES ('migmark', 1, 12);
+                 DROP INDEX IF EXISTS idx_tags_fts;
+                 DELETE FROM Settings WHERE name = 'fts_shadow_schema';",
+            )
+            .await
+            .unwrap();
+            conn.execute_batch(
+                "CREATE INDEX idx_tags_fts ON Tags USING fts (name)
+                     WITH (tokenizer='ngram', min_gram=2, max_gram=3);",
+            )
+            .await
+            .unwrap();
+            conn.execute_batch(
+                "CREATE INDEX idx_tags_popular_fts ON Tags_Popular USING fts (name)
+                     WITH (tokenizer='ngram', min_gram=2, max_gram=3);",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO Tags_Popular(tag_id, name)
+                 SELECT id, name FROM Tags WHERE count >= 5;",
+                (),
+            )
+            .await
+            .unwrap();
+            // Pin the pre-migration version.
+            conn.execute(
+                "UPDATE Settings SET num = 7 WHERE name = 'SYSTEM_VERSION';",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        db.shutdown().await;
+        drop(db);
+
+        // Reboot: the 7 -> 8 upgrade must run and heal the layout.
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit).await;
+        let conn = db.connect().unwrap();
+
+        let fts_index_tables: Vec<String> = {
+            let mut rows = conn
+                .query(
+                    "SELECT LOWER(tbl_name) FROM sqlite_master
+                     WHERE type = 'index' AND sql LIKE '%USING fts%'
+                     ORDER BY LOWER(tbl_name);",
+                    (),
+                )
+                .await
+                .unwrap();
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await.unwrap() {
+                out.push(row.get::<String>(0).unwrap());
+            }
+            out
+        };
+        assert_eq!(
+            fts_index_tables,
+            vec!["tags_popular".to_string()],
+            "exactly one FTS index must survive, on the shadow"
+        );
+
+        // The shadow's rows and searchability must be untouched by the migration.
+        let mut rows = conn
+            .query("SELECT name FROM Tags_Popular ORDER BY name;", ())
+            .await
+            .unwrap();
+        let mut shadow_names = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            shadow_names.push(row.get::<String>(0).unwrap());
+        }
+        assert_eq!(
+            shadow_names,
+            vec!["migmark".to_string()],
+            "migration must not disturb the shadow's rows"
+        );
+        assert_eq!(
+            db.tags_search_fts("migmark", 10).await.unwrap().len(),
+            1,
+            "shadow search must still work after the migration"
+        );
+
+        // And the version must now be current, so the loop terminates.
+        let version: i64 = {
+            let mut stmt = conn
+                .prepare("SELECT num FROM Settings WHERE name = 'SYSTEM_VERSION';")
+                .await
+                .unwrap();
+            stmt.query_row(()).await.unwrap().get(0).unwrap()
+        };
+        assert_eq!(version, 8, "migration must record the new schema version");
+
+        drop(conn);
+        db.shutdown().await;
+    }
+
+    /// A healthy database (one FTS index, on the shadow) must survive a reboot
+    /// unchanged, and must not have its live shadow index dropped by the
+    /// cleanup paths. Guards the migration/ensure from getting over-eager.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn healthy_db_keeps_its_shadow_fts_index_across_boots() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("healthy.db");
+        let should_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+        {
+            let conn = db.connect().unwrap();
+            conn.execute_batch(
+                "INSERT INTO Namespace (name, description) VALUES ('subject', NULL);
+                 INSERT INTO Tags (name, namespace, count) VALUES ('keepsafe', 1, 12);",
+            )
+            .await
+            .unwrap();
+            // Drive one crossing so the shadow gets a real row to protect.
+            db.tag_counts_apply(
+                &std::collections::HashMap::from([(1u64, 6u64)]),
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        }
+        db.shutdown().await;
+        drop(db);
+
+        for _ in 0..2 {
+            let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+            let conn = db.connect().unwrap();
+            let shadow_index_present: i64 = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM sqlite_master
+                             WHERE type = 'index'
+                               AND LOWER(name) = 'idx_tags_fts'
+                               AND LOWER(tbl_name) = 'tags_popular'
+                         )",
+                    )
+                    .await
+                    .unwrap();
+                stmt.query_row(()).await.unwrap().get(0).unwrap()
+            };
+            assert_eq!(
+                shadow_index_present, 1,
+                "the shadow's FTS index is the live search index and must never be dropped"
+            );
+            assert_eq!(
+                db.tags_search_fts("keepsafe", 10).await.unwrap().len(),
+                1,
+                "search must keep working across repeated boots"
+            );
+            drop(conn);
+            db.shutdown().await;
+            drop(db);
+        }
+    }
+
     #[test]
     #[ignore = "manual benchmark: FTS shadow write-path throughput on RAM-backed storage"]
     fn fts_shadow_write_path_throughput_bench() {
@@ -1336,9 +1635,9 @@ mod tests {
              );
              INSERT INTO Tags_Popular(tag_id, name)
                  SELECT id, name FROM Tags WHERE count >= 5;
-             CREATE INDEX idx_tags_popular_fts ON Tags_Popular USING fts
+             CREATE INDEX idx_tags_fts ON Tags_Popular USING fts
                  (name) WITH (tokenizer='ngram', min_gram=2, max_gram=3);
-             OPTIMIZE INDEX idx_tags_popular_fts;",
+             OPTIMIZE INDEX idx_tags_fts;",
         )
         .await
         .unwrap();
@@ -1751,6 +2050,140 @@ mod tests {
         drop(db_path);
     }
 
+    /// Multi-writer contention bench: N scraper chunks persist concurrently,
+    /// each over a DISJOINT file range but the SAME pool of popular tags.
+    ///
+    /// That overlap is the point. Every new relationship bumps the shared
+    /// `Tags.count` row, so chunks that share popular tags collide on exactly
+    /// the hottest write-write row in the system. This is the only workload in
+    /// the suite that can show what CONCURRENT actually buys — every other
+    /// bench here is single-writer, where a one-writer-at-a-time journal makes
+    /// CONCURRENT indistinguishable from IMMEDIATE.
+    ///
+    /// Env: CONC_WRITERS (default 4), CONC_FILES (per-writer file count,
+    /// default 200). A/B the transaction behavior with INTSCRAPE_WRITE_TX; the
+    /// journal is held fixed (default mvcc) so only the behavior varies.
+    #[test]
+    #[ignore = "manual benchmark: N concurrent scraper chunks over shared popular tags"]
+    fn scraper_concurrent_writer_bench() {
+        let writers: u64 = std::env::var("CONC_WRITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let files_per_writer: u64 = std::env::var("CONC_FILES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+
+        let db_path = if Path::new("/dev/shm").exists() {
+            std::path::PathBuf::from("/dev/shm")
+                .join(format!("intscrape-conc-bench-{}.db", std::process::id()))
+        } else {
+            std::env::temp_dir().join(format!("intscrape-conc-bench-{}.db", std::process::id()))
+        };
+        let _ = std::fs::remove_file(&db_path);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let should_exit = std::sync::Arc::new(AtomicBool::new(false));
+            let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+            let popular_count = 10_000u64;
+            let _ = bench_seed_db(&db, popular_count).await;
+            let behavior = match TursoDatabase::write_tx_behavior() {
+                turso::transaction::TransactionBehavior::Concurrent => "CONCURRENT",
+                turso::transaction::TransactionBehavior::Immediate => "IMMEDIATE",
+                turso::transaction::TransactionBehavior::Deferred => "DEFERRED",
+                turso::transaction::TransactionBehavior::Exclusive => "EXCLUSIVE",
+                _ => "other",
+            };
+            eprintln!(
+                "CONC config: journal_mode={:?} write_tx={behavior} writers={writers} files/writer={files_per_writer}",
+                db.journal_mode().await,
+            );
+
+            let conn = db.connect().unwrap();
+            let storage_id = db
+                .file_storage_location_get_or_create(&conn, "bench_storage")
+                .await
+                .unwrap();
+            drop(conn);
+
+            let ns = GenericNamespaceObj {
+                name: "bench".into(),
+                description: None,
+            };
+            let mut ns_set = HashSet::new();
+            ns_set.insert(ns.clone());
+            db.namespace_ensure_set(&ns_set).await.expect("pre-ensure ns");
+
+            // Disjoint file ranges (so no chunk depends on another's rows),
+            // shared popular tags (so every chunk fights for the same counts).
+            let maps: Vec<_> = (0..writers)
+                .map(|w| {
+                    bench_chunk_map(
+                        storage_id,
+                        popular_count,
+                        files_per_writer,
+                        w * files_per_writer,
+                        &ns,
+                    )
+                    .0
+                })
+                .collect();
+
+            let start = Instant::now();
+            let handles: Vec<_> = maps
+                .into_iter()
+                .map(|map| {
+                    let db = db.clone();
+                    tokio::spawn(async move { db.process_scraper_chunk_human(map).await })
+                })
+                .collect();
+
+            let mut ok = 0usize;
+            let mut failed = 0usize;
+            for handle in handles {
+                match handle.await {
+                    Ok(Ok(true)) => ok += 1,
+                    Ok(Ok(false)) => failed += 1,
+                    Ok(Err(error)) => {
+                        eprintln!("CONC writer error: {error}");
+                        failed += 1;
+                    }
+                    Err(error) => {
+                        eprintln!("CONC join error: {error}");
+                        failed += 1;
+                    }
+                }
+            }
+            let wall = start.elapsed().as_secs_f64();
+
+            // Prove real work landed rather than a fast no-op.
+            let files = db
+                .connect()
+                .unwrap()
+                .query("SELECT COUNT(*) FROM File;", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .expect("file count")
+                .get::<u64>(0)
+                .unwrap();
+
+            let total_files = writers * files_per_writer;
+            eprintln!(
+                "CONC summary: {ok}/{writers} chunks ok ({failed} failed) in {wall:.2}s | \
+                 files persisted {files}/{total_files} | {:.0} files/s",
+                total_files as f64 / wall
+            );
+            assert_eq!(files, total_files, "every chunk must persist its files");
+            assert_eq!(failed, 0, "no chunk may fail");
+        });
+        drop(db_path);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn process_scraper_creates_namespace_partition_without_ddl_error() {
         use shared_types::{
@@ -1847,6 +2280,265 @@ mod tests {
             .unwrap();
         let rel_count: u64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
         assert!(rel_count > 0, "expected a file/tag relationship row");
+    }
+
+    /// The redgifs plugin models uploader and gallery purely with
+    /// `relates_to`/`limit_to` on `PluginTag`, so this pins the exact tag shape
+    /// it emits to the rows that must appear. If the plugin changes how it
+    /// relates a gif to its uploader, this fails instead of the graph silently
+    /// losing an edge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redgifs_shaped_tags_persist_the_uploader_and_gallery_graph() {
+        use shared_types::{FileManager, GenericNamespaceObj, PluginTag, ScraperDataReturn};
+
+        fn ns(name: &str) -> GenericNamespaceObj {
+            GenericNamespaceObj {
+                name: name.to_string(),
+                description: None,
+            }
+        }
+
+        fn tag(name: &str, namespace: &str) -> shared_types::Tag {
+            shared_types::Tag {
+                name: name.to_string(),
+                namespace: ns(namespace),
+            }
+        }
+
+        fn related(
+            child_name: &str,
+            child_ns: &str,
+            parent: shared_types::Tag,
+            limit_to: Option<shared_types::Tag>,
+        ) -> PluginTag {
+            PluginTag {
+                tag: tag(child_name, child_ns),
+                tag_type: shared_types::TagType::default(),
+                relates_to: Some(shared_types::RelationContext {
+                    tag: parent,
+                    tag_type: shared_types::TagType::default(),
+                    limit_to,
+                }),
+            }
+        }
+
+        let db = new_test_db().await;
+
+        let conn = db.connect().unwrap();
+        let storage_id = db
+            .file_storage_location_get_or_create(&conn, "test_storage")
+            .await
+            .unwrap();
+        drop(conn);
+
+        let gif = tag("shrillcourageouscomet", "RedgifsGif");
+        let uploader = tag("someUploader", "RedgifsUser");
+        let gallery = tag("1a0f5dccfaf-0257", "RedgifsGallery");
+
+        let structural = vec![
+            // gif -> uploader, and the mirror so the name is a file tag
+            related(
+                "shrillcourageouscomet",
+                "RedgifsGif",
+                uploader.clone(),
+                None,
+            ),
+            related("someUploader", "RedgifsUser", gif.clone(), None),
+            // gif -> gallery, and the mirror
+            related("shrillcourageouscomet", "RedgifsGif", gallery.clone(), None),
+            related("1a0f5dccfaf-0257", "RedgifsGallery", gif.clone(), None),
+            // A value tag scoped to its gif. This is the case that keeps a tag
+            // shared by thousands of gifs from collapsing into one row.
+            related("Anal", "RedgifsTag", gif.clone(), Some(gif.clone())),
+            related(
+                "1080x1920",
+                "RedgifsDimensions",
+                gif.clone(),
+                Some(gif.clone()),
+            ),
+        ];
+
+        // Structural tags go in on their own, exactly as the scraper does:
+        // `tag_actions_add` records the tag and its `Parents` rows but no file
+        // relationship.
+        let structural_action = FileTagAction {
+            operation: TagOperation::Add,
+            tags: structural.clone(),
+        };
+        assert!(db.tag_actions_add(&[structural_action.clone()]).await);
+
+        // Files carry the identity tags so a download stays searchable through
+        // its uploader and gallery.
+        let file = FileManager {
+            internal: FileInternal {
+                id: None,
+                hash: "redgifs_hash_1".into(),
+                extension: "mp4".into(),
+                storage_id,
+                size_bytes: Some(4096),
+            },
+            identifying_hashes: vec![],
+        };
+        let file_tags = vec![FileTagAction {
+            operation: TagOperation::Add,
+            tags: vec![
+                related(
+                    "shrillcourageouscomet",
+                    "RedgifsGif",
+                    uploader.clone(),
+                    None,
+                ),
+                related("someUploader", "RedgifsUser", gif.clone(), None),
+                related("Anal", "RedgifsTag", gif.clone(), Some(gif.clone())),
+            ],
+        }];
+
+        let mut map: HashMap<FileManager, Vec<FileTagAction>> = HashMap::new();
+        map.insert(file, file_tags);
+        assert!(
+            db.clone()
+                .process_scraper(map, Vec::<ScraperDataReturn>::new(), "redgifs".into())
+                .await
+        );
+
+        /// Counts `Parents` rows for child -> parent, optionally requiring a
+        /// specific `limit_to` (namespace then name).
+        async fn parent_rows(
+            db: &TursoDatabase,
+            child_ns: &str,
+            child_name: &str,
+            parent_ns: &str,
+            parent_name: &str,
+            limit_to: Option<(&str, &str)>,
+        ) -> i64 {
+            let conn = db.connect().unwrap();
+            let limit_clause = match limit_to {
+                Some(_) => "AND l2.name = ?5 AND l.name = ?6",
+                None => "AND p.limit_to IS NULL",
+            };
+            let sql = format!(
+                "SELECT COUNT(*)
+                 FROM Parents p
+                 JOIN Tags c ON c.id = p.tag_id
+                 JOIN Namespace cn ON cn.id = c.namespace
+                 JOIN Tags r ON r.id = p.relate_tag_id
+                 JOIN Namespace rn ON rn.id = r.namespace
+                 LEFT JOIN Tags l ON l.id = p.limit_to
+                 LEFT JOIN Namespace l2 ON l2.id = l.namespace
+                 WHERE cn.name = ?1 AND c.name = ?2 AND rn.name = ?3 AND r.name = ?4
+                   {limit_clause};"
+            );
+            let params = [
+                child_ns.into(),
+                child_name.into(),
+                parent_ns.into(),
+                parent_name.into(),
+            ]
+            .into_iter()
+            .chain(
+                limit_to
+                    .map(|(ns, name)| vec![ns.into(), name.into()])
+                    .unwrap_or_default(),
+            )
+            .collect::<Vec<turso::Value>>();
+            let mut rows = conn
+                .query(&sql, turso::params_from_iter(params))
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        }
+
+        assert_eq!(
+            parent_rows(
+                &db,
+                "RedgifsGif",
+                "shrillcourageouscomet",
+                "RedgifsUser",
+                "someUploader",
+                None
+            )
+            .await,
+            1,
+            "gif must relate to its uploader"
+        );
+        assert_eq!(
+            parent_rows(
+                &db,
+                "RedgifsUser",
+                "someUploader",
+                "RedgifsGif",
+                "shrillcourageouscomet",
+                None
+            )
+            .await,
+            1,
+            "uploader must relate back to the gif"
+        );
+        assert_eq!(
+            parent_rows(
+                &db,
+                "RedgifsGif",
+                "shrillcourageouscomet",
+                "RedgifsGallery",
+                "1a0f5dccfaf-0257",
+                None
+            )
+            .await,
+            1,
+            "gif must relate to its gallery"
+        );
+        assert_eq!(
+            parent_rows(
+                &db,
+                "RedgifsTag",
+                "Anal",
+                "RedgifsGif",
+                "shrillcourageouscomet",
+                Some(("RedgifsGif", "shrillcourageouscomet"))
+            )
+            .await,
+            1,
+            "a shared tag must record which gif it belongs to"
+        );
+
+        // The file is reachable from the uploader tag, which is what makes
+        // "everything this person uploaded" answerable.
+        let conn = db.connect().unwrap();
+        let user_ns_id = db
+            .namespace_get(&conn, "RedgifsUser")
+            .await
+            .unwrap()
+            .unwrap();
+        let user_tag_id = db
+            .tag_get_id(&conn, "someUploader", user_ns_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let files = db
+            .relationship_get_parent_file_id(&conn, user_tag_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "file must be reachable through the uploader tag"
+        );
+
+        // Re-running a scrape must not duplicate edges.
+        assert!(db.tag_actions_add(&[structural_action]).await);
+        assert_eq!(
+            parent_rows(
+                &db,
+                "RedgifsGif",
+                "shrillcourageouscomet",
+                "RedgifsUser",
+                "someUploader",
+                None
+            )
+            .await,
+            1,
+            "re-running a scrape must not duplicate Parents rows"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

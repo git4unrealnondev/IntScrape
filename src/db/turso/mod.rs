@@ -134,8 +134,7 @@ impl TursoDatabase {
     /// re-runs the whole transaction body when the commit loses a conflict.
     /// `INTSCRAPE_WRITE_TX` overrides this for rollback/benchmarks.
     pub(in crate::db::turso) fn write_tx_behavior() -> TransactionBehavior {
-        Self::behavior_from_env("INTSCRAPE_WRITE_TX")
-            .unwrap_or(TransactionBehavior::Concurrent)
+        Self::behavior_from_env("INTSCRAPE_WRITE_TX").unwrap_or(TransactionBehavior::Concurrent)
     }
 
     /// Behavior for write paths that must not run concurrently: DDL (banned in
@@ -143,12 +142,16 @@ impl TursoDatabase {
     /// already serialized behind `tag_count_lock` on purpose — CONCURRENT
     /// would give it conflict-retry latency with no parallelism to trade for.
     pub(in crate::db::turso) fn serialized_tx_behavior() -> TransactionBehavior {
-        Self::behavior_from_env("INTSCRAPE_SERIALIZED_TX")
-            .unwrap_or(TransactionBehavior::Immediate)
+        Self::behavior_from_env("INTSCRAPE_SERIALIZED_TX").unwrap_or(TransactionBehavior::Immediate)
     }
 
     fn behavior_from_env(var: &str) -> Option<TransactionBehavior> {
-        match std::env::var(var).ok()?.trim().to_ascii_uppercase().as_str() {
+        match std::env::var(var)
+            .ok()?
+            .trim()
+            .to_ascii_uppercase()
+            .as_str()
+        {
             "CONCURRENT" => Some(TransactionBehavior::Concurrent),
             "IMMEDIATE" => Some(TransactionBehavior::Immediate),
             "DEFERRED" => Some(TransactionBehavior::Deferred),
@@ -256,7 +259,9 @@ impl TursoDatabase {
             {
                 Ok(_) => {}
                 Err(error) => {
-                    log::error!("Failed to enable journal_mode={journal_mode}; falling back to MVCC: {error}");
+                    log::error!(
+                        "Failed to enable journal_mode={journal_mode}; falling back to MVCC: {error}"
+                    );
                     let _ = conn.pragma_update("journal_mode", "'mvcc'").await;
                 }
             }
@@ -373,38 +378,85 @@ impl TursoDatabase {
         self.load_cache().await?;
 
         loop {
-            if let Some(setting) = self.setting_get_cache(&"SYSTEM_VERSION".to_string()).await
-                && let Some(version_num) = setting.num
-            {
-                if version_num == DB_VERSION {
-                    break;
+            // Every arm must either advance the stored version or return:
+            // a `loop` that simply falls through (missing setting, missing
+            // `num`, or an unhandled version) re-reads the same value forever
+            // and pins a core at 100% for the life of the process.
+            let Some(setting) = self.setting_get_cache(&"SYSTEM_VERSION".to_string()).await else {
+                return Err(turso::Error::Error(
+                    "SYSTEM_VERSION is missing; cannot verify db schema version".to_string(),
+                ));
+            };
+            let Some(version_num) = setting.num else {
+                return Err(turso::Error::Error(format!(
+                    "SYSTEM_VERSION has no numeric value; cannot verify db schema version (db reports {:?})",
+                    setting.param
+                )));
+            };
+            if version_num == DB_VERSION {
+                break;
+            }
+            if version_num > DB_VERSION {
+                return Err(turso::Error::Error(format!(
+                    "Db schema version {version_num} is newer than this binary's {DB_VERSION}; \
+                     upgrade IntScrape or restore a matching database"
+                )));
+            }
+
+            info!(
+                "Starting upgrade from version: {} to: {}",
+                version_num,
+                version_num + 1
+            );
+
+            match version_num {
+                0..=5 => {
+                    info!(
+                        "Could not upgrade from version: {} not yet implimented.",
+                        version_num
+                    );
+                    return Err(turso::Error::Error(
+                        "Cannot upgrade from legacy db. check logs".to_string(),
+                    ));
                 }
-
-                info!(
-                    "Starting upgrade from version: {} to: {}",
-                    version_num,
-                    version_num + 1
-                );
-
-                match version_num {
-                    0..=5 => {
-                        info!(
-                            "Could not upgrade from version: {} not yet implimented.",
-                            version_num
-                        );
-                        return Err(turso::Error::Error(
-                            "Cannot upgrade from legacy db. check logs".to_string(),
-                        ));
-                    }
-                    6 => {
-                        self.update_db_6_to_7(&conn).await?;
-                    }
-                    _ => {}
+                6 => {
+                    self.update_db_6_to_7(&conn).await?;
+                }
+                7 => {
+                    self.update_db_7_to_8(&conn).await?;
+                }
+                _ => {
+                    return Err(turso::Error::Error(format!(
+                        "No upgrade path from db schema version {version_num} to {DB_VERSION}"
+                    )));
                 }
             }
         }
 
         conn.commit().await?;
+
+        // Popular-tag FTS shadow: create/index on first boot or upgrade,
+        // verify-only on steady boots. Runs here (every boot, after the boot
+        // transaction commits) because `create_db` only fires for a brand-new
+        // file. Failures are surfaced so a broken search index is never
+        // invisible.
+        //
+        // This call is load-bearing, not just a repair path. It is what drops
+        // a stray full-table FTS index on `Tags`: without it, every tag insert
+        // pays a Tantivy segment build (the `save metas` line in the log) and
+        // runs ~2.6x slower. It needs its own connection because turso only
+        // permits the DDL it issues inside an exclusive transaction.
+        match self.connect() {
+            Ok(connection) => {
+                if let Err(error) = self.table_ensure_tags_popular(&connection).await {
+                    log::error!("Failed to ensure popular-tag FTS shadow: {error}");
+                }
+            }
+            Err(error) => {
+                log::error!("Failed to connect while ensuring popular-tag FTS shadow: {error}");
+            }
+        }
+
         Ok(())
     }
 

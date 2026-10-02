@@ -810,6 +810,23 @@ impl Client {
             BASE64_URL_SAFE_NO_PAD.decode(key)?
         };
 
+        // The fragment comes straight from user-supplied link text, so its decoded
+        // length is only as trustworthy as the paste. Every consumer below assumes a
+        // fixed-size key and panics otherwise (`decrypt_ebc_in_place` asserts a 16-byte
+        // key, `unmerge_key_mac` and `split_at(16)` panic on a short slice), so reject
+        // a wrong-sized fragment here and report it as a bad link instead. The
+        // password-protected path already guards its key the same way, via
+        // `Error::UrlTooShort`.
+        let expected_key_size = if node_kind.is_file() {
+            FILE_KEY_SIZE
+        } else {
+            FOLDER_KEY_SIZE
+        };
+
+        if node_key.len() != expected_key_size {
+            return Err(Error::InvalidPublicUrlFormat);
+        }
+
         let mut nodes = HashMap::<String, Node>::default();
 
         match node_kind {

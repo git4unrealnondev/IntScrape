@@ -226,18 +226,26 @@ impl TursoDatabase {
             return Ok(out);
         }
 
-        let relationship_source = self.relationship_union_source(conn, "r").await?;
+        // A HashSet has no order, so collect once to get a stable, sliceable
+        // sequence; the ids themselves are what matters, not their order.
         let file_id_vec: Vec<u64> = file_ids.iter().copied().collect();
-        for chunk in file_id_vec.chunks(SQL_CHUNK_SIZE) {
-            let placeholders = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
+        // Pushed into each namespace arm so the partitions are index-probed
+        // rather than scanned; numbered placeholders keep it one binding, and
+        // the namespace list is read once for both the arm count and the text.
+        let tables = super::relationship::relationship_union_tables(conn).await;
+        let batch = super::relationship::pushed_union_batch_size(tables.len());
+        for chunk in file_id_vec.chunks(batch) {
+            let predicate = format!(
+                "file_id IN ({})",
+                super::relationship::numbered_placeholders(chunk.len())
+            );
+            let relationship_source =
+                super::relationship::union_source_from_tables(&tables, "r", Some(&predicate));
             let sql = format!(
                 "SELECT r.file_id, t.name, n.name, n.description
                  FROM {relationship_source}
                  JOIN Tags t ON r.tag_id = t.id
-                 JOIN Namespace n ON t.namespace = n.id
-                 WHERE r.file_id IN ({placeholders});"
+                 JOIN Namespace n ON t.namespace = n.id"
             );
             let params: Vec<Value> = chunk.iter().map(|id| Value::from(*id as i64)).collect();
 
