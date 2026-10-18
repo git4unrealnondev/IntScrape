@@ -974,12 +974,20 @@ fn text_response(status: StatusCode, body: &str) -> vetis::VetisResult<vetis::Re
     Ok(vetis::Response::builder().status(status).text(body))
 }
 
-async fn health_handler(_request: vetis::Request) -> vetis::VetisResult<vetis::Response> {
+// `handler_fn` takes `(Request, HostContext)` as of vetis-tokio 0.1.2-beta.5;
+// the trailing context is unused here, so every handler ignores it.
+async fn health_handler(
+    _request: vetis::Request,
+    _ctx: HostContext,
+) -> vetis::VetisResult<vetis::Response> {
     text_response(StatusCode::OK, "Health check")
 }
 
 /// Reports the current ranking as JSON.
-async fn proxies_handler(_request: vetis::Request) -> vetis::VetisResult<vetis::Response> {
+async fn proxies_handler(
+    _request: vetis::Request,
+    _ctx: HostContext,
+) -> vetis::VetisResult<vetis::Response> {
     let body = with_registry(false, |reg| {
         let list: Vec<JsonValue> = reg.proxies.iter().map(proxy_to_json).collect();
         let sites: Vec<JsonValue> = reg.sites.iter().map(site_to_json).collect();
@@ -994,7 +1002,10 @@ async fn proxies_handler(_request: vetis::Request) -> vetis::VetisResult<vetis::
 ///
 /// `?site=` scopes the answer the same way the callbacks are scoped, and an
 /// empty 503 means "nothing in the list has passed a check yet".
-async fn best_proxy_handler(request: vetis::Request) -> vetis::VetisResult<vetis::Response> {
+async fn best_proxy_handler(
+    request: vetis::Request,
+    _ctx: HostContext,
+) -> vetis::VetisResult<vetis::Response> {
     let site = request
         .uri()
         .query()
@@ -1020,35 +1031,48 @@ async fn best_proxy_handler(request: vetis::Request) -> vetis::VetisResult<vetis
 async fn spool_server() -> Result<(), Box<dyn std::error::Error>> {
     let port = 8080;
 
-    let https = ListenerConfig::builder()
-        .port(port)
-        .protos(vec![Version::HTTP_11])
-        .interface("0.0.0.0".parse().unwrap())
-        // Required on the beta line. Without it the TCP worker accepts a
-        // connection, peeks to decide TLS vs plaintext, and on a plaintext
-        // request returns `Ok(())` without writing a response — the client sees
-        // "connection reset by peer" and curl reports HTTP 000. 0.1.6 allowed
-        // plaintext implicitly, so this opt-in did not exist before.
-        .allow_unsafe_connections(true)
-        .build()
-        .unwrap();
-
+    // `build_listeners` and `VetisBuilder::add_listeners` are both gone as of
+    // vetis-tokio 0.1.2-beta.5, and `listener::tcp` is `pub(crate)`, so there is
+    // no longer a public way to build a listener by hand. `VetisBuilder::add_host`
+    // now derives them from each host's `bind_addresses` instead: it groups hosts
+    // by `(interface, port)` and creates one `Listener` per distinct pair, so the
+    // whole `ListenerConfig` that used to live here now hangs off the host config
+    // below. Listeners are deduplicated by port+interface, so all three virtual
+    // hosts below share the single 0.0.0.0:8080 listener.
+    //
     // vetis keys virtual hosts by `hostname:port`, so register every name a local
     // probe can legitimately arrive under. Without this a probe to
     // `http://127.0.0.1:8080/health` is answered with 502 even though
     // `http://localhost:8080/health` works.
-    let mut builder = Vetis::builder().add_listeners(build_listeners(https))?;
+    let mut builder = Vetis::builder();
 
     for hostname in ["localhost", "127.0.0.1", "[::1]"] {
-        // The beta line attaches a host to each listener whose interface and
-        // port match an entry in the host's `bind_addresses`. A host with no bind
-        // addresses is silently never registered, and the listener then accepts
-        // connections and resets them, so this must mirror the listener config.
         let host_config = HostConfig::builder()
             .hostname(hostname)
-            .bind_addresses(vec![("0.0.0.0".parse()?, port)])
+            // A host is only attached to a listener when one of its protos is
+            // HTTP/1.1 or HTTP/2; HTTP/3 alone would build a UDP listener, and this
+            // spool is plaintext TCP only.
+            .protos(&[Version::HTTP_11])
+            // Explicit plaintext opt-in, carried over from when this was set on the
+            // listener builder. On the betas up to 0.1.2-beta.4 it was mandatory:
+            // without it the TCP worker accepted a connection, peeked to decide TLS
+            // vs plaintext, and on a plaintext request returned `Ok(())` without
+            // writing a response, so the client saw "connection reset by peer" and
+            // curl reported HTTP 000. As of beta.8 the worker routes normally and
+            // this flag only gates the HSTS-redirect branch in `service/http.rs`,
+            // which a host with no TLS never reaches -- so it is now a no-op here.
+            // Kept because it still states the intent, and because it costs nothing
+            // if a future beta reinstates the strict behaviour.
+            .allow_unsafe_connections(true)
+            // `add_host` builds a listener per distinct `(interface, port)` pair it
+            // finds here, so this is now also the listener configuration. A host
+            // with no bind addresses is silently never registered, and a listener
+            // with no hosts accepts connections and resets them.
+            .bind_addresses(&[("0.0.0.0".parse()?, port)])
             .build()?;
-        let mut host = Host::new(host_config);
+        // `Host::new` is async as of beta.5 because it reads the TLS cert/key from
+        // disk when one is configured.
+        let mut host = Host::new(host_config).await?;
         // `HandlerPath` boxes the handler and is not `Clone`, so every virtual
         // host needs its own instance of each route.
         host.add_path(
@@ -1069,7 +1093,7 @@ async fn spool_server() -> Result<(), Box<dyn std::error::Error>> {
                 .handler(handler_fn(best_proxy_handler))
                 .build()?,
         );
-        builder = builder.add_host(host)?;
+        builder = builder.add_host(host).await?;
     }
 
     let mut server = builder.build();
@@ -1099,13 +1123,8 @@ async fn spool_server() -> Result<(), Box<dyn std::error::Error>> {
 
 use http::{StatusCode, Version};
 use smol::Timer;
-use vetis::{
-    VetisServer as _,
-    host::{HostConfig, handler_fn},
-    listener::ListenerConfig,
-};
+use vetis::{VetisServer as _, host::HostConfig, host::HostContext};
 use vetis_tokio::{
     Vetis,
-    host::{Host, path::HandlerPath},
-    listener::build_listeners,
+    host::{Host, path::{HandlerPath, handler_fn}},
 };

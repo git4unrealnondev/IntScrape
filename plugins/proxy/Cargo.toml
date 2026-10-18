@@ -14,20 +14,32 @@ tokio = { workspace = true }
 json = "0.12.4"
 rtipc = "0.9.0"
 # Pinned exactly, not with a caret. Caret on a pre-release admits any later
-# `-beta`, and vetis has been shipping breaking changes between betas: in
-# `0.1.7-beta.4` `ListenerConfigBuilder::protos` moved to `HostConfigBuilder`
-# and `VetisBuilder::add_listeners` was removed outright (its own rustdoc still
-# calls `.protos()` on the listener builder, so that release does not even
-# compile its examples). `0.1.2-beta.5` of vetis-tokio similarly dropped
-# `build_listeners`. Pinning keeps `cargo update` from silently breaking this
-# plugin again.
-vetis = "=0.1.7-beta.3"
+# `-beta`, and vetis has been shipping breaking changes between betas. Pinning
+# keeps `cargo update` from silently breaking this plugin again.
+#
+# The exact versions matter more than usual here: every 0.1.2 pre-release of
+# vetis-tokio up to and including `beta.5` has been yanked from crates.io, and a
+# yanked version cannot be selected by a fresh resolve. This repo gitignores
+# Cargo.lock, so every container build resolves from scratch and went red the
+# moment upstream yanked beta.4, even though local builds kept working off a
+# lockfile that still named it. Only `beta.6` through `beta.8` are selectable.
+#
+# `vetis-tokio 0.1.2-beta.8` requires `vetis >= 0.1.7-beta.5`, so these two
+# pins have to move together. `0.1.7-beta.4` is deliberately skipped: in that
+# release `ListenerConfigBuilder::protos` moved to `HostConfigBuilder` while its
+# own rustdoc still called `.protos()` on the listener builder, so it does not
+# even compile its examples.
+vetis = "=0.1.7-beta.6"
 smol-macros = "0.1.1"
 macro_rules_attribute = "0.2.3"
 http = "1.5.0"
 smol = "2.0.2"
-# Pinned exactly for the same reason as `vetis` above.
-vetis-tokio = {version="=0.1.2-beta.4", default-features=false, features=["rust-tls"]}
+# Pinned exactly for the same reason as `vetis` above. `default-features=false`
+# keeps `http3` out (it needs `h3`/`quinn`, which this plaintext-only spool does
+# not use) and `rust-tls` is kept on deliberately: `rust-tls` is the feature that
+# enables the `HostConfig::tls()` path, and `vetis-tokio` refuses to compile
+# `http3` without it.
+vetis-tokio = {version="=0.1.2-beta.8", default-features=false, features=["rust-tls"]}
 # `blocking` because the host runs plugin callbacks via `tokio::task::spawn_blocking`
 # (src/ipc.rs), so a blocking client is safe there and avoids nesting a runtime.
 # `socks` is required for `reqwest::Proxy::socks5`.
