@@ -38,9 +38,33 @@ CREATE TABLE File
 
             FOREIGN KEY (storage_id) REFERENCES FileStorageLocations(id) ON DELETE CASCADE ON UPDATE CASCADE
             );
-CREATE INDEX idx_file_hash ON File (hash);
 
 ").await;
+    }
+
+    /// Retires indexes that duplicate one the schema already creates.
+    ///
+    /// `File.hash` and `Namespace.name` are both declared `UNIQUE`, so SQLite
+    /// already builds a unique index for each. The `CREATE INDEX idx_file_hash
+    /// ON File (hash)` / `CREATE INDEX idx_namespace ON Namespace (name)`
+    /// statements that used to sit alongside them added a second, byte-identical
+    /// b-tree that the planner never selects — `EXPLAIN QUERY PLAN` resolves both
+    /// lookups to `sqlite_autoindex_File_1` / `sqlite_autoindex_Namespace_1` —
+    /// while every `File` insert and every hash `UPDATE` paid to maintain it.
+    ///
+    /// Dropped by `update_db_8_to_9` rather than from the create path, so a
+    /// database that already carried them gets them retired on upgrade instead
+    /// of silently keeping the write tax. `IF EXISTS` keeps it a no-op on a
+    /// database created after the removal.
+    pub(in crate::db::turso) async fn drop_redundant_indexes(
+        &self,
+        conn: &Connection,
+    ) -> Result<()> {
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_file_hash;
+             DROP INDEX IF EXISTS idx_namespace;",
+        )
+        .await
     }
 
     pub(in crate::db::turso) async fn table_create_filestoragelocations(&self, conn: &Connection) {
@@ -98,7 +122,6 @@ CREATE TABLE Namespace (
     name TEXT NOT NULL UNIQUE, 
     description TEXT
 );
-CREATE INDEX idx_namespace ON Namespace (name);
 ",
         )
         .await;

@@ -14,7 +14,7 @@ repository = "https://github.com/Trivernis/thumbnailer"
 webp = "*"
 #rayon = "*"
 tempfile = "*"
-image = { version = "*", default-features = false, features=["jpeg", "png", "gif"]}
+image = { version = "0.25.10", default-features = false, features=["jpeg", "png", "gif"]}
 lazy_static = "*"
 file-format = { workspace = true }
 #video-rs = { version = "0.11.0", features = ["ndarray"] }

@@ -220,7 +220,7 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex, OnceLock};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
     static SOCKET_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -252,6 +252,15 @@ mod tests {
 
     /// Fresh server + DB with exactly `channels` IPC sockets.
     async fn test_environment_with(channels: usize) -> (Arc<IpcServer>, tempfile::TempDir) {
+        let (server, _db, dir) = test_environment_with_db(channels).await;
+        (server, dir)
+    }
+
+    /// As `test_environment_with`, but also hands back the database so a
+    /// benchmark can seed rows the plugin path would have written.
+    async fn test_environment_with_db(
+        channels: usize,
+    ) -> (Arc<IpcServer>, Arc<TursoDatabase>, tempfile::TempDir) {
         client::set_ipc_channel_count(channels);
         clean_sockets();
         let temp_dir = tempdir().unwrap();
@@ -261,9 +270,9 @@ mod tests {
         let plugins_path = temp_dir.path().join("plugins");
         std::fs::create_dir(&plugins_path).unwrap();
         let plugin_manager = PluginManager::new(&plugins_path, db.clone(), should_exit.clone());
-        let server = IpcServer::new(db, should_exit, plugin_manager, channels);
+        let server = IpcServer::new(db.clone(), should_exit, plugin_manager, channels);
         wait_for_sockets().await;
-        (server, temp_dir)
+        (server, db, temp_dir)
     }
 
     /// One request over the given explicit channel, wrapped in a timeout.
@@ -480,6 +489,445 @@ mod tests {
 
         drop(server);
         clean_sockets();
+    }
+
+    /// The per-request cost of the IPC layer, which is what a plugin pays once per
+    /// file when it walks a scraped account one file at a time.
+    ///
+    /// Every request opens a fresh `LocalSocketStream` connection
+    /// (`init_data_request_async_on_channel`), so the cost being measured here is
+    /// connect + send + receive + close, not any database work. That is the whole
+    /// point: a meganz-style scrape issues `get_tag_file` and `put_tags_to_file`
+    /// per file, and if the round trip dominates, no amount of batching *inside*
+    /// the database will matter.
+    ///
+    /// Compares three shapes at the same request count:
+    /// - one request at a time (what a sequential plugin loop does)
+    /// - the same requests pipelined concurrently
+    /// - the same total work issued as a single bulk request
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual benchmark: IPC round-trip cost per request"]
+    async fn ipc_round_trip_bench() {
+        let _socket_lock = SOCKET_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let (server, _temp_dir) = test_environment().await;
+        assert!(all_sockets_ready(), "IPC sockets were not created");
+        let iters: usize = std::env::var("BENCH_IPC_ITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+
+        // Warmup, so socket creation and page-cache effects are not in the number.
+        for i in 0..10 {
+            auto_settings_request()
+                .await
+                .unwrap_or_else(|e| panic!("warmup request {i} failed: {e}"));
+        }
+
+        let started = Instant::now();
+        for i in 0..iters {
+            let _ = settings_request(i % 4).await.unwrap();
+        }
+        let sequential = started.elapsed();
+        println!(
+            "\nIPC: {iters} sequential requests: {:.2} ms total, {:.3} ms/request",
+            sequential.as_secs_f64() * 1000.0,
+            sequential.as_secs_f64() * 1000.0 / iters as f64
+        );
+
+        // Same number of requests, all in flight at once. If this is much
+        // faster, the cost is per-request latency that batching would hide; if it
+        // is the same, something is serializing the server side.
+        let started = Instant::now();
+        let handles: Vec<_> = (0..iters)
+            .map(|i| tokio::spawn(async move { settings_request(i % 4).await }))
+            .collect();
+        for handle in handles {
+            let _ = handle.await.unwrap().unwrap();
+        }
+        let concurrent = started.elapsed();
+        println!(
+            "IPC: {iters} concurrent requests: {:.2} ms total, {:.3} ms/request",
+            concurrent.as_secs_f64() * 1000.0,
+            concurrent.as_secs_f64() * 1000.0 / iters as f64
+        );
+        println!(
+            "    sequential/concurrent = {:.2}x",
+            sequential.as_secs_f64() / concurrent.as_secs_f64().max(f64::MIN_POSITIVE)
+        );
+
+        drop(server);
+        clean_sockets();
+    }
+
+    /// Why every statement that materializes a row out of `Tags` is slow, and
+    /// whether the declared foreign keys are the cause.
+    ///
+    /// `tag_counts_apply` costs ~2.2 s per call at 20k tags, and every
+    /// relationship write funnels into it behind one lock, so this is what makes
+    /// a meganz scrape spend ~2 s per file. Isolating it gave numbers that do
+    /// not fit a query-shape explanation:
+    ///
+    /// | statement on `Tags`                        | cost    |
+    /// |--------------------------------------------|---------|
+    /// | `SELECT id FROM Tags WHERE id = ?` (hit)   | ~116 ms |
+    /// | `SELECT id FROM Tags WHERE id = ?` (miss)  | 0.34 ms |
+    /// | `SELECT 1 FROM Tags WHERE id = ?` (hit)    | ~116 ms |
+    /// | `UPDATE` over 9 `Tags` rows                | ~1076 ms|
+    /// | the same lookup on a control table         | 0.076 ms|
+    ///
+    /// A miss is cheap and a hit is not, and the projection does not matter, so
+    /// the cost is in materializing the row rather than finding it — and it
+    /// applies to writes, so it is per row touched rather than per statement.
+    /// The control table rules out row width, the two indexes, MVCC history, and
+    /// a stale snapshot: it was copied from `Tags`, so it has the same long tag
+    /// names and the same indexes, filled the same way.
+    ///
+    /// One structural difference is left: `Tags` declares three foreign keys and
+    /// the control declares none. That accounts for the whole table above — a
+    /// miss touches no row so no parent key is resolved, a hit resolves the
+    /// parent even for `SELECT 1`, and a control with no key is fast.
+    ///
+    /// So this compares a control against the same table with keys added, then
+    /// rebuilds `Tags` itself without them to check the conclusion end to end
+    /// instead of by inference.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual benchmark: is the Tags foreign key the slow part"]
+    async fn tags_row_touch_cost_bench() {
+        let _socket_lock = SOCKET_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let (server, db, _temp_dir) = test_environment_with_db(4).await;
+        assert!(all_sockets_ready(), "IPC sockets were not created");
+        let tag_count: u64 = std::env::var("BENCH_TAGS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20_000);
+        let reps: usize = std::env::var("BENCH_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+
+        let ns = shared_types::GenericNamespaceObj {
+            name: "probe_ns".to_string(),
+            description: None,
+        };
+        let storage_id = 1u64;
+        let map: std::collections::HashMap<
+            shared_types::FileManager,
+            Vec<shared_types::FileTagAction>,
+        > = (0..tag_count)
+            .map(|i| {
+                (
+                    shared_types::FileManager {
+                        internal: shared_types::FileInternal {
+                            id: None,
+                            hash: format!("probe{i:056x}"),
+                            extension: "bin".into(),
+                            storage_id,
+                            size_bytes: Some(1),
+                        },
+                        identifying_hashes: vec![],
+                    },
+                    vec![shared_types::FileTagAction {
+                        operation: shared_types::TagOperation::Add,
+                        tags: vec![shared_types::PluginTag {
+                            tag: shared_types::Tag {
+                                // Long names on purpose: `Tags` stores real
+                                // metadata values (paths, MIME types) here, so
+                                // the rows are wide and row width is the obvious
+                                // first suspect for a per-row cost.
+                                name: format!("a-plausibly-long-tag-name-{i:08}"),
+                                namespace: ns.clone(),
+                            },
+                            ..Default::default()
+                        }],
+                    }],
+                )
+            })
+            .collect();
+        assert!(
+            db.clone()
+                .process_scraper(map, Vec::new(), "probe".into())
+                .await,
+            "failed to seed tags"
+        );
+
+        let probe_id = {
+            let conn = db.connect().unwrap();
+            let mut rows = conn.query("SELECT id FROM Tags LIMIT 1;", ()).await.unwrap();
+            rows.next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap()
+        };
+
+        // Controls, each copied from `Tags` so they hold the same rows at the
+        // same width with the same indexes. The only thing that varies is
+        // whether they declare the foreign key.
+        let variants: [(&str, &str, &str); 3] = [
+            ("control: no foreign key", "probe_plain", ""),
+            (
+                "control: + FOREIGN KEY",
+                "probe_fk",
+                "FOREIGN KEY (namespace) REFERENCES Namespace(id)",
+            ),
+            (
+                "control: + FK ON DELETE/UPDATE CASCADE",
+                "probe_fk_cascade",
+                "FOREIGN KEY (namespace) REFERENCES Namespace(id) ON DELETE CASCADE ON UPDATE CASCADE",
+            ),
+        ];
+        for (label, name, fk) in variants {
+            let conn = db.connect().unwrap();
+            // The FK clause goes last and is omitted entirely when empty, since
+            // a dangling comma is a syntax error.
+            let fk_clause = if fk.is_empty() {
+                String::new()
+            } else {
+                format!(",\n                     {fk}")
+            };
+            conn.execute_batch(&format!(
+                "DROP TABLE IF EXISTS {name};
+                 CREATE TABLE {name} (
+                     id INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     namespace INTEGER NOT NULL,
+                     count INTEGER NOT NULL DEFAULT 0,
+                     UNIQUE(name, namespace){fk_clause}
+                 );
+                 CREATE INDEX idx_{name}_covering ON {name}(count DESC, name, namespace);
+                 INSERT INTO {name} (id, name, namespace, count)
+                     SELECT id, name, namespace, count FROM Tags;"
+            ))
+            .await
+            .unwrap();
+            println!(
+                "  {label:<42} {:>9.3} ms",
+                pk_read_ms(&db, name, probe_id, reps).await
+            );
+        }
+
+        println!(
+            "  {:<42} {:>9.3} ms",
+            "Tags, as shipped",
+            pk_read_ms(&db, "Tags", probe_id, reps).await
+        );
+
+        // The earlier fixture that measured 116 ms per lookup had a *second*
+        // namespace in it (the noise files used their own), so `Tags` had a
+        // foreign key pointing at more than one parent row, and the table held
+        // ids interleaved across both. Re-measure with that shape before
+        // concluding anything from the numbers above.
+        {
+            let ns2 = shared_types::GenericNamespaceObj {
+                name: "probe_ns_two".to_string(),
+                description: None,
+            };
+            let extra: std::collections::HashMap<
+                shared_types::FileManager,
+                Vec<shared_types::FileTagAction>,
+            > = (0..tag_count)
+                .map(|i| {
+                    (
+                        shared_types::FileManager {
+                            internal: shared_types::FileInternal {
+                                id: None,
+                                hash: format!("probe2{i:056x}"),
+                                extension: "bin".into(),
+                                storage_id,
+                                size_bytes: Some(1),
+                            },
+                            identifying_hashes: vec![],
+                        },
+                        vec![shared_types::FileTagAction {
+                            operation: shared_types::TagOperation::Add,
+                            tags: vec![shared_types::PluginTag {
+                                tag: shared_types::Tag {
+                                    name: format!("a-plausibly-long-tag-name-{i:08}"),
+                                    namespace: ns2.clone(),
+                                },
+                                ..Default::default()
+                            }],
+                        }],
+                    )
+                })
+                .collect();
+            assert!(
+                db.clone()
+                    .process_scraper(extra, Vec::new(), "probe2".into())
+                    .await,
+                "failed to seed the second namespace"
+            );
+            println!(
+                "  {:<42} {:>9.3} ms",
+                "Tags, after a 2nd namespace was added",
+                pk_read_ms(&db, "Tags", probe_id, reps).await
+            );
+        }
+
+        // Namespace count. Every `Tags` row carries a foreign key to `Namespace`, and
+        // the earlier slow fixture created a namespace *per tag batch*, so the
+        // parent table had tens of thousands of rows. If resolving that key
+        // costs per parent row, this is the trigger — and it would also explain
+        // why a control table with the same `Tags` rows was fast when it pointed
+        // at a 3-row `Namespace`.
+        {
+            let conn = db.connect().unwrap();
+            let mut rows = conn.query("SELECT COUNT(*) FROM Namespace;", ()).await.unwrap();
+            let n: i64 = rows
+                .next()
+                .await
+                .unwrap()
+                .map(|r| r.get(0).unwrap())
+                .unwrap_or(0);
+            println!("  Namespace rows: {n}");
+        }
+        // Add a namespace per tag and watch the lookup.
+        {
+            let batch = 2_000usize;
+            for b in 0..batch {
+                let ns = shared_types::GenericNamespaceObj {
+                    name: format!("ns_{b:05}"),
+                    description: None,
+                };
+                let one: std::collections::HashMap<
+                    shared_types::FileManager,
+                    Vec<shared_types::FileTagAction>,
+                > = (0..10)
+                    .map(|i| {
+                        (
+                            shared_types::FileManager {
+                                internal: shared_types::FileInternal {
+                                    id: None,
+                                    hash: format!("nss{b:05}_{i:03}{:0>51}", ""),
+                                    extension: "bin".into(),
+                                    storage_id,
+                                    size_bytes: Some(1),
+                                },
+                                identifying_hashes: vec![],
+                            },
+                            vec![shared_types::FileTagAction {
+                                operation: shared_types::TagOperation::Add,
+                                tags: vec![shared_types::PluginTag {
+                                    tag: shared_types::Tag {
+                                        name: format!("nss-tag-{b:05}-{i:03}"),
+                                        namespace: ns.clone(),
+                                    },
+                                    ..Default::default()
+                                }],
+                            }],
+                        )
+                    })
+                    .collect();
+                if !db
+                    .clone()
+                    .process_scraper(one, Vec::new(), "ns".into())
+                    .await
+                {
+                    panic!("seeding namespace batch {b} failed");
+                }
+            }
+            let conn = db.connect().unwrap();
+            let mut rows = conn.query("SELECT COUNT(*) FROM Namespace;", ()).await.unwrap();
+            let n: i64 = rows
+                .next()
+                .await
+                .unwrap()
+                .map(|r| r.get(0).unwrap())
+                .unwrap_or(0);
+            println!("  Namespace rows: {n}");
+            println!(
+                "  {:<42} {:>9.3} ms",
+                "Tags, after 2000 namespaces",
+                pk_read_ms(&db, "Tags", probe_id, reps).await
+            );
+        }
+
+// Write traffic. The fixture that measured 116 ms per `Tags` lookup had
+        // already been through `tag_counts_apply` and a bulk tag write; this one
+        // has only been seeded. If the lookup degrades after writes, the cost
+        // is not the table's shape but something the writes leave behind.
+        {
+            let mut deltas = std::collections::HashMap::new();
+            for i in 0..9u64 {
+                deltas.insert(1 + i, 1u64);
+            }
+            for round in 0..20 {
+                let _ = db.tag_counts_apply(&deltas, &Default::default()).await;
+                if round == 0 {
+                    println!(
+                        "  {:<42} {:>9.3} ms",
+                        "Tags, after 1 tag_counts_apply",
+                        pk_read_ms(&db, "Tags", probe_id, reps).await
+                    );
+                }
+            }
+            println!(
+                "  {:<42} {:>9.3} ms",
+                "Tags, after 20 tag_counts_apply",
+                pk_read_ms(&db, "Tags", probe_id, reps).await
+            );
+        }
+
+        // The fix, checked rather than inferred: rebuild `Tags` without its
+        // foreign keys and read it again under identical conditions.
+        {
+            let conn = db.connect().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE Tags_nofk (
+                     id INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     namespace INTEGER NOT NULL,
+                     count INTEGER NOT NULL DEFAULT 0,
+                     UNIQUE(name, namespace)
+                 );
+                 INSERT INTO Tags_nofk (id, name, namespace, count)
+                     SELECT id, name, namespace, count FROM Tags;
+                 DROP TABLE Tags;
+                 ALTER TABLE Tags_nofk RENAME TO Tags;
+                 CREATE INDEX idx_tags_count_covering ON Tags(count DESC, name, namespace);",
+            )
+            .await
+            .unwrap();
+            println!(
+                "  {:<42} {:>9.3} ms",
+                "Tags, foreign keys dropped",
+                pk_read_ms(&db, "Tags", probe_id, reps).await
+            );
+        }
+
+        drop(server);
+        clean_sockets();
+    }
+
+    /// Milliseconds per primary-key hit on `table`, prepared once and repeated.
+    async fn pk_read_ms(db: &Arc<TursoDatabase>, table: &str, id: i64, reps: usize) -> f64 {
+        let conn = db.connect().unwrap();
+        let mut stmt = conn
+            .prepare(&format!("SELECT id FROM {table} WHERE id = ?1"))
+            .await
+            .unwrap();
+        // Warm, so the number is execution and not first-touch page faults.
+        {
+            let mut rows = stmt
+                .query(turso::params_from_iter([turso::Value::from(id)]))
+                .await
+                .unwrap();
+            while let Ok(Some(_)) = rows.next().await {}
+        }
+        let started = Instant::now();
+        let mut found = 0;
+        for _ in 0..reps {
+            let mut rows = stmt
+                .query(turso::params_from_iter([turso::Value::from(id)]))
+                .await
+                .unwrap();
+            while let Ok(Some(_)) = rows.next().await {
+                found += 1;
+            }
+        }
+        assert!(found > 0, "{table} must contain the probe id");
+        started.elapsed().as_secs_f64() * 1000.0 / reps as f64
     }
 
     /// `set_ipc_channel_count` clamps to the valid range; the default is the

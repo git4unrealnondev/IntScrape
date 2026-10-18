@@ -1,8 +1,4 @@
-use std::{
-    str::FromStr,
-    sync::{Arc, atomic::AtomicBool},
-    time::Duration,
-};
+use std::{str::FromStr, time::Duration};
 
 use log::info;
 use reqwest::{
@@ -12,9 +8,32 @@ use reqwest::{
 use shared_types::{DownloadModifiers, ModifierTarget, ScraperParam, TargetModifier};
 use url::Url;
 
-use crate::web::manager::Scraper;
+use crate::web::manager::{Scraper, is_retryable_status};
 
-const MAX_URL_RETRY: u8 = 3;
+pub(in crate::web) const MAX_URL_RETRY: u8 = 3;
+
+/// Result of downloading one url's text.
+///
+/// `dltext` retries a url up to [`MAX_URL_RETRY`] times. Once those attempts
+/// are spent the caller has to decide what happens to the *whole* job, which a
+/// bare `Option` cannot express: "this url is a dead end" and "this site is
+/// broken" need different handling from "there is nothing to download here".
+pub(in crate::web) enum TextDownload {
+    /// The param was not a url at all (`ScraperParam::Normal` and friends), so
+    /// there is nothing to download for it and the job carries on to the next
+    /// param. This is not a failure.
+    Skipped,
+    /// The text was retrieved, along with the url it came from.
+    Success(String, String),
+    /// Every attempt returned 404. On a paginated listing this is the site
+    /// saying "nothing past this offset", so the job is finished rather than
+    /// broken and does not need another pass on the next boot.
+    NotFound,
+    /// Some other error outlived `MAX_URL_RETRY` attempts, or the url could
+    /// never be parsed. Treated as a transient site problem, so the job is
+    /// kept and retried on the next boot.
+    Failed,
+}
 
 impl Scraper {
     fn process_modifiers(
@@ -142,9 +161,8 @@ impl Scraper {
     pub(in crate::web) async fn dltext(
         &self,
         input_url: ScraperParam,
-        should_remove_job: Arc<AtomicBool>,
         priority: u64,
-    ) -> Option<(String, String)> {
+    ) -> TextDownload {
         let url;
         let post_data;
         let mut cnt = 0;
@@ -165,7 +183,7 @@ impl Scraper {
                 method = reqwest::Method::POST;
             }
             _ => {
-                return None;
+                return TextDownload::Skipped;
             }
         }
 
@@ -173,7 +191,7 @@ impl Scraper {
             Ok(out) => out,
             Err(_e) => {
                 log::error!("ScraperDownloading: {} is not a valid URL.", url.url);
-                return None;
+                return TextDownload::Failed;
             }
         };
 
@@ -197,56 +215,66 @@ impl Scraper {
             }
             .await;
 
+            let mut dead_url = false;
+
             match futureresult {
                 Ok(res) => {
                     if let Err(err) = res.error_for_status_ref() {
-                        let time_secs = 5;
-                        if let Some(status) = err.status()
-                            && status == StatusCode::NOT_FOUND
-                        {
-                            // IE on 2nd go through this is definitely a deadurl and we shouldnt
-                            // download it
-                            if cnt >= MAX_URL_RETRY - 1 {
-                                log::warn!(
-                                    "Worker: {} JobId: {} -- While processing job {:?} was unable to download text. Had a 404 error. Telling db to kill job.",
-                                    self.plugin.name,
-                                    self.job.id,
-                                    url_parsed,
-                                );
-                                should_remove_job.store(true, std::sync::atomic::Ordering::Relaxed);
-                                break;
-                            } else {
-                                log::warn!(
-                                    "Worker: {} JobId: {} -- While processing job {:?} was unable to download text. Had a 404 error. Retrying in {} seconds.",
-                                    self.plugin.name,
-                                    self.job.id,
-                                    url_parsed,
-                                    time_secs
-                                );
-                            }
+                        let status = err.status();
 
-                            tokio::time::sleep(std::time::Duration::from_secs(time_secs)).await;
-                            cnt += 1;
-                            continue;
-                        }
-                        if err.is_timeout() {
-                            log::error!(
-                                "Worker: {} JobId: {} -- While processing job {:?} was unable to download text. Had err {:?} sleeping for {} seconds.",
+                        if status == Some(StatusCode::NOT_FOUND) {
+                            // On a paginated listing a 404 means "there is nothing
+                            // past this offset", not "try again". It still gets a
+                            // couple of attempts in case the site is flapping, but
+                            // once they are spent the job is over.
+                            dead_url = true;
+                            log::warn!(
+                                "Worker: {} JobId: {} -- While processing job {:?} was unable to download text. Had a 404 error. (attempt {}/{})",
                                 self.plugin.name,
                                 self.job.id,
                                 url_parsed,
-                                err,
-                                time_secs
+                                cnt + 1,
+                                MAX_URL_RETRY
                             );
-                            tokio::time::sleep(std::time::Duration::from_secs(time_secs)).await;
-
-                            cnt += 1;
-                            continue;
+                        } else if err.is_timeout() {
+                            log::warn!(
+                                "Worker: {} JobId: {} -- While processing job {:?} timed out. (attempt {}/{})",
+                                self.plugin.name,
+                                self.job.id,
+                                url_parsed,
+                                cnt + 1,
+                                MAX_URL_RETRY
+                            );
+                        } else if let Some(status) = status
+                            && is_retryable_status(status)
+                        {
+                            log::warn!(
+                                "Worker: {} JobId: {} -- While processing job {:?} had retryable status {}. (attempt {}/{})",
+                                self.plugin.name,
+                                self.job.id,
+                                url_parsed,
+                                status,
+                                cnt + 1,
+                                MAX_URL_RETRY
+                            );
+                        } else {
+                            // Not something a retry can fix (403/401/410...).
+                            log::error!(
+                                "Worker: {} JobId: {} -- While processing job {:?} had a permanent error {:?}",
+                                self.plugin.name,
+                                self.job.id,
+                                url_parsed,
+                                err
+                            );
+                            return TextDownload::Failed;
                         }
                     } else {
                         match res.text().await {
                             Ok(text) => {
-                                return Some((text, url_parsed.as_str().to_string()));
+                                return TextDownload::Success(
+                                    text,
+                                    url_parsed.as_str().to_string(),
+                                );
                             }
                             Err(err) => {
                                 log::error!(
@@ -256,28 +284,11 @@ impl Scraper {
                                     url_parsed,
                                     err
                                 );
-                                cnt += 1;
-                                continue;
                             }
                         }
                     }
                 }
                 Err(err) => {
-                    if err.is_timeout() {
-                        let time_secs = 5;
-                        tokio::time::sleep(std::time::Duration::from_secs(time_secs)).await;
-                        log::error!(
-                            "Worker: {} JobId: {} -- While processing job {:?} was unable to download text. Had err {:?} sleeping for {} seconds.",
-                            self.plugin.name,
-                            self.job.id,
-                            url_parsed,
-                            err,
-                            time_secs
-                        );
-
-                        cnt += 1;
-                        continue;
-                    }
                     log::error!(
                         "Worker: {} JobId: {} -- While processing job {:?} was unable to download text. Had err {:?} ",
                         self.plugin.name,
@@ -285,23 +296,27 @@ impl Scraper {
                         url_parsed,
                         err,
                     );
-                    // Non-timeout errors (TLS resets, truncated streams, etc.) almost
-                    // always mean the endpoint is degraded or throttling us. Back off
-                    // before retrying instead of hammering it with immediate reconnects,
-                    // which can extend the outage window.
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             }
 
-            if cnt >= MAX_URL_RETRY {
-                // If we have an error downloading text and its something goofy then we should
-                // NOT remove the job
-                should_remove_job.store(false, std::sync::atomic::Ordering::Relaxed);
-                break;
+            // Attempts are spent. Hand the decision back to the caller instead of
+            // silently moving on to the job's next url: a url that dies this many
+            // times in a row is the end of the listing, and every url after it in
+            // the job would be the same dead end.
+            if cnt + 1 >= MAX_URL_RETRY {
+                return if dead_url {
+                    TextDownload::NotFound
+                } else {
+                    TextDownload::Failed
+                };
             }
 
             cnt += 1;
+
+            // Back off before retrying. Every failure path funnels through here,
+            // so a throttling or degraded site is never hit with back-to-back
+            // requests.
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
-        None
     }
 }

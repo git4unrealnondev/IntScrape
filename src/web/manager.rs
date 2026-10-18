@@ -21,6 +21,7 @@ use url::Url;
 use bytes::Bytes;
 use governor::{DefaultDirectRateLimiter, Quota};
 use log::info;
+use priority_semaphore::{Permit, Priority, PrioritySemaphore};
 use reqwest::{Client, StatusCode};
 use sha2::{Sha256, Sha512};
 use shared_types::{
@@ -57,7 +58,7 @@ fn retry_delay(attempt: u8) -> Duration {
     Duration::from_secs(backoff_seconds) + Duration::from_millis(rand::random::<u64>() % 500)
 }
 
-fn is_retryable_status(status: StatusCode) -> bool {
+pub(in crate::web) fn is_retryable_status(status: StatusCode) -> bool {
     matches!(
         status,
         StatusCode::REQUEST_TIMEOUT
@@ -74,7 +75,10 @@ use crate::{
     db::turso::TursoDatabase,
     helper_functions::{self, get_sys_time_in_secs, memory_manage},
     plugins::PluginManager,
-    web::FileReturn,
+    web::{
+        FileReturn,
+        downloading::{MAX_URL_RETRY, TextDownload},
+    },
 };
 use crate::{
     db::{SourceUrlFileStatus, hashessupportedtokey},
@@ -267,7 +271,7 @@ struct InternalStorage {
     job_storage: Vec<DbJobsObj>,
     completed_job_storage: Vec<DbJobsObj>,
     ratelimiter: Arc<RatelimitManager>,
-    job_limiter: Arc<Semaphore>,
+    job_limiter: Arc<PrioritySemaphore>,
     //Stores file urls that we're downloading
     file_urls: HashSet<String>,
 }
@@ -295,6 +299,43 @@ struct FileProcessingGuard {
 impl Drop for FileProcessingGuard {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Converts a job's `u64` priority into the semaphore's signed priority.
+///
+/// Ordering is preserved (higher job priority is still granted first), with
+/// anything past `i32::MAX` — far beyond any real job priority — clamped to the
+/// top rather than wrapping to the bottom, which would invert it.
+pub(crate) fn semaphore_priority(job_priority: u64) -> Priority {
+    i32::try_from(job_priority).unwrap_or(Priority::MAX)
+}
+
+/// Takes one download slot, or gives up if shutdown is requested first.
+///
+/// Bounds concurrent network transfers and nothing else. Waiters are granted in
+/// descending job priority (FIFO within a priority), so a high-priority job's
+/// transfers are not stuck behind a low-priority job's.
+///
+/// A task can wait here for a long time when transfers are backed up, so
+/// shutdown is raced against the acquisition rather than checked only before
+/// it — a task parked here forever would keep `active_file_processing`
+/// non-zero and make `downloads_complete()` never return.
+///
+/// Free-standing because it needs no scraper state, which also lets the test
+/// drive the real acquisition rather than a copy of it.
+pub(crate) async fn acquire_transfer_permit(
+    semaphore: &Arc<PrioritySemaphore>,
+    should_exit: &std::sync::atomic::AtomicBool,
+    priority: Priority,
+) -> Option<Permit> {
+    tokio::select! {
+        permit = semaphore.acquire(priority) => permit.ok(),
+        _ = async {
+            while !should_exit.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        } => None,
     }
 }
 
@@ -385,7 +426,9 @@ impl Scraper {
             }
         }
 
-        let semaphore = Arc::new(Semaphore::new(max_concurrent_downloads));
+        // Priority-ordered so a high-priority job's transfers are not stuck
+        // behind a low-priority job's when both are queued for a slot.
+        let semaphore = Arc::new(PrioritySemaphore::new(max_concurrent_downloads));
         let plugin_handles_text = self
             .plugin
             .properties
@@ -438,254 +481,320 @@ impl Scraper {
 
                 let text_result = if is_redownload {
                     scrap_data.job.param.iter().find_map(|param| match param {
-                        ScraperParam::Url(url) => Some((String::new(), url.url.clone())),
+                        ScraperParam::Url(url) => {
+                            Some(TextDownload::Success(String::new(), url.url.clone()))
+                        }
                         _ => None,
                     })
                 } else if plugin_handles_text {
                     match param {
-                        ScraperParam::Url(url) => Some((String::new(), url.url.clone())),
-                        ScraperParam::UrlPost(url) => Some((String::new(), url.url.clone())),
+                        ScraperParam::Url(url) => {
+                            Some(TextDownload::Success(String::new(), url.url.clone()))
+                        }
+                        ScraperParam::UrlPost(url) => {
+                            Some(TextDownload::Success(String::new(), url.url.clone()))
+                        }
                         _ => None,
                     }
                 } else {
                     let scraper = self.clone();
                     let param_clone = param.clone();
-                    let should_remove_job_clone = should_remove_job.clone();
                     let priority = self.job.config.priority;
-                    tokio::spawn(async move {
-                        scraper
-                            .dltext(param_clone, should_remove_job_clone.clone(), priority)
-                            .await
-                    })
-                    .await
-                    .ok()
-                    .flatten()
+                    tokio::spawn(async move { scraper.dltext(param_clone, priority).await })
+                        .await
+                        .ok()
                 };
 
-                if let Some((text, source_url)) = text_result {
-                    let local_scrap_data = scrap_data.clone();
-                    let scraper = self.clone();
-                    let mut data_all = tokio::task::spawn_blocking(move || {
-                        scraper.plugin_manager.parser_call(
-                            &text,
-                            &source_url,
-                            &local_scrap_data,
-                            &scraper.plugin,
-                        )
-                    })
-                    .await
-                    .unwrap();
+                /*
+                 * A url that outlives its retries ends the whole job rather than
+                 * just that url. Paginated plugins emit a url per page, so once
+                 * one page is a confirmed dead end every remaining page in the
+                 * job is the same dead end; walking them one at a time is what
+                 * turned a single exhausted listing into thousands of requests.
+                 */
+                let text_result = match text_result {
+                    Some(result) => result,
+                    None => {
+                        // The spawned download task panicked, so the url's fate
+                        // is unknown. Keep the job for the next boot.
+                        log::error!(
+                            "Worker: {} JobId: {} -- STOPPING JOB because its text download task did not complete.",
+                            plugin_name,
+                            job_id,
+                        );
+                        should_remove_job.store(false, std::sync::atomic::Ordering::Relaxed);
+                        break 'scraperloop;
+                    }
+                };
 
-                    // Catch to prevent bad data from entering loop
-                    if data_all.is_empty() {
-                        data_all.push(ScraperReturn::Nothing);
+                let (text, source_url) = match text_result {
+                    // A param that was never a url. Move on without ending the
+                    // job, exactly as before.
+                    TextDownload::Skipped => continue,
+                    TextDownload::Success(text, source_url) => (text, source_url),
+                    TextDownload::NotFound => {
+                        log::warn!(
+                            "Worker: {} JobId: {} -- STOPPING JOB because a url returned 404 on all {} attempts.",
+                            plugin_name,
+                            job_id,
+                            MAX_URL_RETRY,
+                        );
+                        // A 404 means the listing is exhausted, not that anything
+                        // is broken, so the job is done and should not be retried.
+                        should_remove_job.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break 'scraperloop;
+                    }
+                    TextDownload::Failed => {
+                        log::error!(
+                            "Worker: {} JobId: {} -- STOPPING JOB because a url outlived its retries. It will retry next boot.",
+                            plugin_name,
+                            job_id,
+                        );
+                        should_remove_job.store(false, std::sync::atomic::Ordering::Relaxed);
+                        break 'scraperloop;
+                    }
+                };
+
+                let local_scrap_data = scrap_data.clone();
+                let scraper = self.clone();
+                let mut data_all = tokio::task::spawn_blocking(move || {
+                    scraper.plugin_manager.parser_call(
+                        &text,
+                        &source_url,
+                        &local_scrap_data,
+                        &scraper.plugin,
+                    )
+                })
+                .await
+                .unwrap();
+
+                // Catch to prevent bad data from entering loop
+                if data_all.is_empty() {
+                    data_all.push(ScraperReturn::Nothing);
+                }
+
+                for data in data_all {
+                    if self
+                        .download_manager
+                        .should_exit
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        log::error!(
+                            "Worker: {} JobId: {} -- STOPPING JOB {} will retry next boot.",
+                            plugin_name,
+                            job_id,
+                            "due to CTRL-C handler"
+                        );
+                        should_remove_job.store(false, std::sync::atomic::Ordering::Relaxed);
+                        break 'scraperloop;
                     }
 
-                    for data in data_all {
-                        if self
-                            .download_manager
-                            .should_exit
-                            .load(std::sync::atomic::Ordering::SeqCst)
-                        {
+                    match data {
+                        // File data thats actionable
+                        ScraperReturn::Data(scraper_object) => {
+                            if scraper_object.files.is_empty()
+                                && scraper_object.tags.is_empty()
+                                && scraper_object.jobs.is_empty()
+                            {
+                                log::info!(
+                                    "Worker: {} JobId: {} -- STOPPING JOB due to files, tags & jobs being empty inside of a valid scraperreturn data object.",
+                                    plugin_name,
+                                    job_id,
+                                );
+
+                                break 'scraperloop;
+                            }
+
+                            // Adds jobs from scraper into the list to process
+                            job_list.lock().await.extend(scraper_object.jobs);
+                            tag_list.lock().await.extend(scraper_object.tags);
+
+                            let existing_source_files = Arc::new(
+                                self.download_manager
+                                    .db
+                                    .clone()
+                                    .source_url_files_get(
+                                        scraper_object
+                                            .files
+                                            .iter()
+                                            .filter_map(|file| match &file.source {
+                                                Some(FileSource::Url(url)) => Some(url.clone()),
+                                                _ => None,
+                                            })
+                                            .collect::<HashSet<_>>(),
+                                    )
+                                    .await,
+                            );
+
+                            // Resolve hash dedup once per chunk instead of one
+                            // DB round trip per hash per file.
+                            let db = self.download_manager.db.clone();
+                            let chunk_hashes = scraper_object
+                                .files
+                                .iter()
+                                .flat_map(|file| file.hash.iter())
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+                            self.download_manager.heavy_processing_pool.spawn(move || {
+                                let _ = result_sender
+                                    .send(db.hashes_files_get_sync_blocking(&chunk_hashes));
+                            });
+                            let existing_hash_files =
+                                Arc::new(result_receiver.await.map_err(|_| {
+                                    std::io::Error::other("hash lookup task failed")
+                                })?);
+
+                            let mut set = JoinSet::new();
+                            for mut file in scraper_object.files {
+                                let scraper = self.clone();
+                                let existing_source_files = existing_source_files.clone();
+                                let existing_hash_files = existing_hash_files.clone();
+                                let file_id_tag_map_clone = file_id_tag_map.clone();
+                                let should_remove_job_clone = should_remove_job.clone();
+                                let job_list_clone = job_list.clone();
+                                let semaphore_clone = semaphore.clone();
+                                let plugin_name = plugin_name.clone();
+                                scraper
+                                    .download_manager
+                                    .active_file_processing
+                                    .fetch_add(1, Ordering::SeqCst);
+                                set.spawn(async move {
+                                    let _processing_guard = FileProcessingGuard {
+                                        active: scraper
+                                            .download_manager
+                                            .active_file_processing
+                                            .clone(),
+                                    };
+                                    let mut download_issue = false;
+                                    let mut jobs = Vec::new();
+
+                                    // The download semaphore is handed to
+                                    // `file_download_logic`, which takes it
+                                    // only around the network transfer.
+                                    //
+                                    // It used to be acquired here, before
+                                    // the spawn, and held for the whole
+                                    // task. That conflated "how many
+                                    // transfers may be open" with "how much
+                                    // per-file work is in flight": a permit
+                                    // was held across the plugin skip-If
+                                    // lookups and across the whole
+                                    // post-download Rayon stage, so slow
+                                    // non-network work throttled the
+                                    // connection count and vice versa.
+                                    //
+                                    // Dispatch is no longer gated here
+                                    // either. Per-task state is a
+                                    // `FileObject` (a url plus its tag
+                                    // list), and the two stages that
+                                    // actually allocate — the transfer's
+                                    // chunk buffer and the post-download
+                                    // whole-file buffer — stay bounded by
+                                    // this semaphore and by
+                                    // `processing_limiter` respectively.
+                                    let file_result = scraper
+                                         .file_download_logic(
+                                             &mut file,
+                                             &mut jobs,
+                                             &mut download_issue,
+                                             &existing_source_files,
+                                             &existing_hash_files,
+                                             semaphore_clone,
+                                         )
+                                        .await.map_err(|err| err.to_string());
+                                    match file_result
+                                    {
+                                        Ok(Some(filereturn)) => {
+                                            // Adds jobs from the on_download callback
+                                            job_list_clone.lock().await.extend(jobs);
+
+                                            match filereturn {
+                                                FileReturn::File(fileinternal) => {
+                                            // Adds tag data from the file
+                                            file_id_tag_map_clone
+                                                .lock()
+                                                .await
+                                                .insert(fileinternal, file.tag_list);
+                                                },
+                                                FileReturn::InDownloadQueue => {
+
+                                                }
+                                            }
+
+                                        }
+                                        Ok(None) => {
+                                            log::error!(
+                                                "Worker: {} JobId: {} -- File download did not complete: {}",
+                                                plugin_name,
+                                                job_id,
+                                                file.source.as_ref().map_or("missing source", |source| match source {
+                                                    FileSource::Url(url) => url.as_str(),
+                                                    FileSource::Bytes(_) => "in-memory bytes",
+                                                }),
+                                            );
+                                        }
+                                        Err(err) => {
+                                            log::error!(
+                                                "Worker: {} JobId: {} -- File: {:?} had err {}",
+                                                plugin_name,
+                                                job_id,
+                                                file,
+                                                err
+                                            );
+                                        }
+                                    }
+
+                                    if download_issue {
+                                        should_remove_job_clone
+                                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                });
+
+                                while matches!(set.try_join_next(), Some(Ok(()))) {
+                                    // Explicitly drains finished tasks to release internal tracking heap allocations
+                                }
+                            }
+                            //set.join_all().await;
+                            while set.join_next().await.is_some() {}
+                        }
+                        // No objects were returned. IE no files
+                        ScraperReturn::Nothing => {
+                            log::info!(
+                                "Worker: {} JobId: {} -- STOPPING JOB due to getting NOTHNG",
+                                plugin_name,
+                                job_id,
+                            );
+                            break 'scraperloop;
+                        }
+                        // Some sort of site issue. Will retry on next db boot
+                        ScraperReturn::Stop(stop_reason) => {
                             log::error!(
                                 "Worker: {} JobId: {} -- STOPPING JOB {} will retry next boot.",
                                 plugin_name,
                                 job_id,
-                                "due to CTRL-C handler"
+                                stop_reason
                             );
                             should_remove_job.store(false, std::sync::atomic::Ordering::Relaxed);
                             break 'scraperloop;
                         }
-
-                        match data {
-                            // File data thats actionable
-                            ScraperReturn::Data(scraper_object) => {
-                                if scraper_object.files.is_empty()
-                                    && scraper_object.tags.is_empty()
-                                    && scraper_object.jobs.is_empty()
-                                {
-                                    log::info!(
-                                        "Worker: {} JobId: {} -- STOPPING JOB due to files, tags & jobs being empty inside of a valid scraperreturn data object.",
-                                        plugin_name,
-                                        job_id,
-                                    );
-
-                                    break 'scraperloop;
-                                }
-
-                                // Adds jobs from scraper into the list to process
-                                job_list.lock().await.extend(scraper_object.jobs);
-                                tag_list.lock().await.extend(scraper_object.tags);
-
-                                let existing_source_files = Arc::new(
-                                    self.download_manager
-                                        .db
-                                        .clone()
-                                        .source_url_files_get(
-                                            scraper_object
-                                                .files
-                                                .iter()
-                                                .filter_map(|file| match &file.source {
-                                                    Some(FileSource::Url(url)) => Some(url.clone()),
-                                                    _ => None,
-                                                })
-                                                .collect::<HashSet<_>>(),
-                                        )
-                                        .await,
-                                );
-
-                                // Resolve hash dedup once per chunk instead of one
-                                // DB round trip per hash per file.
-                                let db = self.download_manager.db.clone();
-                                let chunk_hashes = scraper_object
-                                    .files
-                                    .iter()
-                                    .flat_map(|file| file.hash.iter())
-                                    .cloned()
-                                    .collect::<Vec<_>>();
-                                let (result_sender, result_receiver) =
-                                    tokio::sync::oneshot::channel();
-                                self.download_manager.heavy_processing_pool.spawn(move || {
-                                    let _ = result_sender
-                                        .send(db.hashes_files_get_sync_blocking(&chunk_hashes));
-                                });
-                                let existing_hash_files =
-                                    Arc::new(result_receiver.await.map_err(|_| {
-                                        std::io::Error::other("hash lookup task failed")
-                                    })?);
-
-                                let mut set = JoinSet::new();
-                                for mut file in scraper_object.files {
-                                    let scraper = self.clone();
-                                    let existing_source_files = existing_source_files.clone();
-                                    let existing_hash_files = existing_hash_files.clone();
-                                    let file_id_tag_map_clone = file_id_tag_map.clone();
-                                    let should_remove_job_clone = should_remove_job.clone();
-                                    let job_list_clone = job_list.clone();
-                                    let semaphore_clone = semaphore.clone();
-                                    let plugin_name = plugin_name.clone();
-                                    let permit = semaphore_clone.acquire_owned().await?;
-                                    scraper
-                                        .download_manager
-                                        .active_file_processing
-                                        .fetch_add(1, Ordering::SeqCst);
-                                    set.spawn(async move {
-                                        let _processing_guard = FileProcessingGuard {
-                                            active: scraper
-                                                .download_manager
-                                                .active_file_processing
-                                                .clone(),
-                                        };
-                                        let mut download_issue = false;
-                                        let mut jobs = Vec::new();
-
-                                        // Implements concurent ratelimit protection
-                                        let _permit = permit;
-
-                                        let file_result = scraper
-                                             .file_download_logic(
-                                                 &mut file,
-                                                 &mut jobs,
-                                                 &mut download_issue,
-                                                 &existing_source_files,
-                                                 &existing_hash_files,
-                                             )
-                                            .await.map_err(|err| err.to_string());
-                                        match file_result
-                                        {
-                                            Ok(Some(filereturn)) => {
-                                                // Adds jobs from the on_download callback
-                                                job_list_clone.lock().await.extend(jobs);
-
-                                                match filereturn {
-                                                    FileReturn::File(fileinternal) => {
-                                                // Adds tag data from the file
-                                                file_id_tag_map_clone
-                                                    .lock()
-                                                    .await
-                                                    .insert(fileinternal, file.tag_list);
-                                                    },
-                                                    FileReturn::InDownloadQueue => {
-
-                                                    }
-                                                }
-
-                                            }
-                                            Ok(None) => {
-                                                log::error!(
-                                                    "Worker: {} JobId: {} -- File download did not complete: {}",
-                                                    plugin_name,
-                                                    job_id,
-                                                    file.source.as_ref().map_or("missing source", |source| match source {
-                                                        FileSource::Url(url) => url.as_str(),
-                                                        FileSource::Bytes(_) => "in-memory bytes",
-                                                    }),
-                                                );
-                                            }
-                                            Err(err) => {
-                                                log::error!(
-                                                    "Worker: {} JobId: {} -- File: {:?} had err {}",
-                                                    plugin_name,
-                                                    job_id,
-                                                    file,
-                                                    err
-                                                );
-                                            }
-                                        }
-
-                                        if download_issue {
-                                            should_remove_job_clone
-                                                .store(false, std::sync::atomic::Ordering::Relaxed);
-                                        }
-                                    });
-
-                                    while matches!(set.try_join_next(), Some(Ok(()))) {
-                                        // Explicitly drains finished tasks to release internal tracking heap allocations
-                                    }
-                                }
-                                //set.join_all().await;
-                                while set.join_next().await.is_some() {}
-                            }
-                            // No objects were returned. IE no files
-                            ScraperReturn::Nothing => {
-                                log::info!(
-                                    "Worker: {} JobId: {} -- STOPPING JOB due to getting NOTHNG",
-                                    plugin_name,
-                                    job_id,
-                                );
-                                break 'scraperloop;
-                            }
-                            // Some sort of site issue. Will retry on next db boot
-                            ScraperReturn::Stop(stop_reason) => {
-                                log::error!(
-                                    "Worker: {} JobId: {} -- STOPPING JOB {} will retry next boot.",
-                                    plugin_name,
-                                    job_id,
-                                    stop_reason
-                                );
-                                should_remove_job
-                                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                                break 'scraperloop;
-                            }
-                            ScraperReturn::Fatal(fatal_error) => {
-                                log::error!(
-                                    "Worker: {} JobId: {} -- Encountered fatal error: {}",
-                                    plugin_name,
-                                    job_id,
-                                    fatal_error
-                                );
-                                todo!("Need to implement check logs for data");
-                            }
-                            ScraperReturn::RetryLater(later_duration) => {
-                                let mut job = self.job.clone();
-                                job.isrunning = false;
-                                job.config.time = helper_functions::get_sys_time_in_secs();
-                                job.config.reptime = later_duration;
-                                self.download_manager.db.jobs_update(&job).await;
-                                should_remove_job
-                                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                                break 'scraperloop;
-                            }
+                        ScraperReturn::Fatal(fatal_error) => {
+                            log::error!(
+                                "Worker: {} JobId: {} -- Encountered fatal error: {}",
+                                plugin_name,
+                                job_id,
+                                fatal_error
+                            );
+                            todo!("Need to implement check logs for data");
+                        }
+                        ScraperReturn::RetryLater(later_duration) => {
+                            let mut job = self.job.clone();
+                            job.isrunning = false;
+                            job.config.time = helper_functions::get_sys_time_in_secs();
+                            job.config.reptime = later_duration;
+                            self.download_manager.db.jobs_update(&job).await;
+                            should_remove_job.store(false, std::sync::atomic::Ordering::Relaxed);
+                            break 'scraperloop;
                         }
                     }
                 }
@@ -1131,6 +1240,7 @@ impl Scraper {
         download_issue: &mut bool,
         existing_source_files: &HashMap<String, SourceUrlFileStatus>,
         existing_hash_files: &HashMap<(String, String), FileInternal>,
+        download_semaphore: Arc<PrioritySemaphore>,
     ) -> Result<Option<FileReturn>, Box<dyn Error>> {
         let plugin_manager = self.download_manager.plugin_manager.clone();
         let self_clone = self.clone();
@@ -1250,10 +1360,36 @@ impl Scraper {
                 match url_source {
                     FileSource::Url(file_url) => {
                         if self.should_download_file(file_url).await {
+                            // The download semaphore is held for the transfer
+                            // and nothing else. Acquiring it here rather than
+                            // at dispatch keeps a slow skip-If lookup or a slow
+                            // post-download processing stage from consuming a
+                            // connection slot.
+                            let Some(transfer_permit) = acquire_transfer_permit(
+                                &download_semaphore,
+                                &should_exit,
+                                semaphore_priority(self.job.config.priority),
+                            )
+                            .await
+                            else {
+                                info!(
+                                    "Scraper: {} JobId: {} -- Skipping file because shutdown was requested while waiting for a download slot.",
+                                    self.plugin.name, self.job.id
+                                );
+                                self.release_download_file(file_url).await;
+                                return Ok(None);
+                            };
+
                             // Calls disk streaming download helper
                             let downloaded = self_clone
                                 .download_file(file_url, &file.hash, temp_dir().as_path())
                                 .await;
+
+                            // Released before any post-download work: from here
+                            // on the file is on disk and the next transfer may
+                            // start. `processing_limiter` bounds the stage that
+                            // follows.
+                            drop(transfer_permit);
                             self.release_download_file(file_url).await;
                             if let Some(downloaded) = downloaded {
                                 let computed = downloaded.core_hashes;
@@ -1785,7 +1921,10 @@ impl DownloadsManager {
                         plugin: plugin.clone(),
                         job_storage: job_storage.clone(),
                         ratelimiter: Arc::new(ratelimit.unwrap()),
-                        job_limiter: Arc::new(Semaphore::new(max_concurrent_jobs)),
+                        // Same priority ordering as the download gate: a
+                        // high-priority job must be able to start even
+                        // when the slots are taken by low-priority work.
+                        job_limiter: Arc::new(PrioritySemaphore::new(max_concurrent_jobs)),
                         completed_job_storage: vec![],
                         file_urls: HashSet::new(),
                     },
@@ -1988,7 +2127,16 @@ impl DownloadsManager {
                     };
                     internal_storage.job_limiter.clone()
                 };
-                let job_permit = job_limiter.acquire_owned().await;
+                // Priority is read before the permit is taken because the job
+                // is moved into `Scraper::new` further down.
+                let job_priority = semaphore_priority(job.config.priority);
+                let job_permit = match job_limiter.acquire(job_priority).await {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        log::error!("Job limiter closed; dropping job {}: {error}", job.id);
+                        break;
+                    }
+                };
 
                 info!("DownloadManager: Setting job {} to running status.", job.id);
                 if !self.db.job_set_is_running(&job).await {
@@ -2055,6 +2203,291 @@ pub fn expected_hash(hash: &HashesSupported) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Measures the three post-download suspects named during the redgifs
+    /// slow-crawl investigation, at the real per-file cost the run saw
+    /// (multi-MB media).
+    ///
+    /// Ignored by default because it is a manual benchmark: run with
+    /// `cargo test --bin intscrape web::manager::tests::suspect_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual benchmark: per-file cost of the post-download suspects"]
+    fn suspect_bench() {
+        use std::time::Instant;
+
+        // A 12.7 MB file, the mean size the redgifs run downloaded.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.bin");
+        std::fs::write(&path, vec![7u8; 12_700_000]).unwrap();
+
+        // --- Suspect 2: whole-file re-read for on_download callbacks ---
+        let t = Instant::now();
+        let bytes = bytes::Bytes::from(std::fs::read(&path).unwrap());
+        println!(
+            "SUSPECT 2  std::fs::read of 12.7MB: {:>8.2?}  ({} MiB resident)",
+            t.elapsed(),
+            bytes.len() / 1048576
+        );
+
+        // --- Suspect 2b: is the buffering path even active? ---
+        let _ = bytes;
+
+        // --- Suspect 3: per-chunk shutdown-poll select! overhead ---
+        // Mirrors manager.rs's streaming loop: a fresh 100ms sleep future is
+        // constructed and polled for every network chunk.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for chunk_size in [8 * 1024usize, 64 * 1024] {
+            let chunks = 12_700_000 / chunk_size;
+            let t = Instant::now();
+            rt.block_on(async {
+                let should_exit = std::sync::atomic::AtomicBool::new(false);
+                for _ in 0..chunks {
+                    let _fut = async {
+                        while !should_exit.load(std::sync::atomic::Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    };
+                    // Same select! shape as the streaming loop.
+                    tokio::select! {
+                        biased;
+                        _ = std::future::ready(()) => {}
+                        _ = _fut => {}
+                    }
+                }
+            });
+            println!(
+                "SUSPECT 3  select! with per-chunk sleep, {chunks} chunks @{chunk_size}B: {:>8.2?}",
+                t.elapsed()
+            );
+        }
+    }
+
+    /// Suspect 1 needs a real database, so it is measured separately from the
+    /// pure in-process costs above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "manual benchmark: per-file blocking connection cost"]
+    async fn suspect_connection_bench() {
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let should_exit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let db = crate::db::turso::TursoDatabase::new_with_exit(
+            &dir.path().join("bench.db"),
+            should_exit.clone(),
+        )
+        .await;
+        let conn = db.connect().unwrap();
+        let storage = dir.path().join("files");
+        std::fs::create_dir_all(&storage).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO FileStorageLocations (location) VALUES (?1);",
+            (storage.to_string_lossy().as_ref(),),
+        )
+        .await
+        .unwrap();
+
+        const N: usize = 50;
+        let hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+        let t = Instant::now();
+        for _ in 0..N {
+            let _ = db.connect().unwrap();
+        }
+        println!(
+            "SUSPECT 1a db.connect() alone:                {:>8.2?}/call",
+            t.elapsed() / N as u32
+        );
+
+        let t = Instant::now();
+        for _ in 0..N {
+            let _ = db.file_download_location_get_sync_blocking(hash, "mp4");
+        }
+        println!(
+            "SUSPECT 1b file_download_location_get_sync_blocking: {:>8.2?}/call",
+            t.elapsed() / N as u32
+        );
+
+        // The async equivalent, for comparison: what the call costs without
+        // the block_on + fresh-runtime handoff.
+        let t = Instant::now();
+        for _ in 0..N {
+            let _ = db.file_download_location_get_sync(hash, "mp4").await;
+        }
+        println!(
+            "  (same work, awaited instead of block_on):   {:>8.2?}/call",
+            t.elapsed() / N as u32
+        );
+    }
+
+    /// The download slot bounds transfers only, so it must be obtainable while
+    /// other work is in flight, and must be abandonable on shutdown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transfer_permit_bounds_transfers_and_abandons_on_shutdown() {
+        let semaphore = Arc::new(PrioritySemaphore::new(1));
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // A free slot is granted immediately.
+        let held = acquire_transfer_permit(&semaphore, &flag, 10).await;
+        assert!(held.is_some(), "a free slot must be granted");
+
+        // A saturated semaphore must block rather than exceed the bound.
+        let waiter = tokio::time::timeout(
+            Duration::from_millis(150),
+            acquire_transfer_permit(&semaphore, &flag, 10),
+        )
+        .await;
+        assert!(
+            waiter.is_err(),
+            "a second transfer must not start while the only slot is held"
+        );
+
+        // Releasing the permit lets the next transfer straight through. This is
+        // the property that lets post-download work run outside the slot.
+        drop(held);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                acquire_transfer_permit(&semaphore, &flag, 10)
+            )
+            .await
+            .expect("slot must be reusable once released")
+            .is_some()
+        );
+
+        // With the slot saturated and shutdown requested, the waiter gives up
+        // instead of parking forever.
+        let _busy = acquire_transfer_permit(&semaphore, &flag, 10).await;
+        flag.store(true, Ordering::SeqCst);
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(500),
+            acquire_transfer_permit(&semaphore, &flag, 10),
+        )
+        .await
+        .expect("shutdown must not hang");
+        assert!(abandoned.is_none(), "shutdown must abandon the slot wait");
+    }
+
+    /// The whole point of the priority semaphore: a high-priority job's
+    /// transfer must not sit behind a low-priority job's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn download_slots_are_granted_by_priority_then_fifo() {
+        let semaphore = Arc::new(PrioritySemaphore::new(1));
+
+        // Grant order is observed through a channel rather than by polling task
+        // completion: a waiter that is granted immediately drops its permit and
+        // lets the next one through, so `is_finished` says nothing about
+        // ordering by the time it is checked.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+
+        // Occupy the only slot.
+        let held = semaphore.acquire(0).await.unwrap();
+
+        // A low-priority waiter queues first, so it is genuinely older.
+        let low_sem = semaphore.clone();
+        let low_tx = tx.clone();
+        let low = tokio::spawn(async move {
+            let permit = low_sem.acquire(1).await.unwrap();
+            let _ = low_tx.send("low");
+            drop(permit);
+        });
+        wait_for_queued(&semaphore, 1).await;
+
+        // A high-priority waiter queues behind it.
+        let high_sem = semaphore.clone();
+        let high = tokio::spawn(async move {
+            let permit = high_sem.acquire(99).await.unwrap();
+            let _ = tx.send("high");
+            drop(permit);
+        });
+        wait_for_queued(&semaphore, 2).await;
+
+        // Freeing the slot must serve the higher priority first, even though
+        // the low-priority waiter has been waiting longer.
+        drop(held);
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a waiter must be granted")
+            .expect("channel must stay open");
+        let second = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the second waiter must be granted")
+            .expect("channel must stay open");
+        assert_eq!(
+            [first, second],
+            ["high", "low"],
+            "higher priority must be granted first regardless of arrival order"
+        );
+        low.await.unwrap();
+        high.await.unwrap();
+
+        // Equal priority must stay FIFO, so priority ordering cannot starve an
+        // equal-priority job either.
+        let held = semaphore.acquire(0).await.unwrap();
+        let (fifo_tx, mut fifo_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        let mut handles = Vec::new();
+        for index in 0..3 {
+            let sem = semaphore.clone();
+            let tx = fifo_tx.clone();
+            handles.push(tokio::spawn(async move {
+                let permit = sem.acquire(7).await.unwrap();
+                let _ = tx.send(index);
+                drop(permit);
+            }));
+        }
+        wait_for_queued(&semaphore, 3).await;
+        drop(held);
+        let mut order = Vec::new();
+        for _ in 0..3 {
+            order.push(
+                tokio::time::timeout(Duration::from_secs(5), fifo_rx.recv())
+                    .await
+                    .expect("every equal-priority waiter must be granted")
+                    .expect("channel must stay open"),
+            );
+        }
+        assert_eq!(
+            order,
+            vec![0, 1, 2],
+            "equal priority must be served in arrival order"
+        );
+        for handle in handles {
+            handle.await.unwrap();
+        }
+    }
+
+    /// Waits until `expected` waiters are queued, so the ordering assertions
+    /// cannot race the spawn.
+    async fn wait_for_queued(semaphore: &Arc<PrioritySemaphore>, expected: usize) {
+        for _ in 0..200 {
+            if semaphore.queued() >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "expected {expected} queued waiters, saw {}",
+            semaphore.queued()
+        );
+    }
+
+    #[test]
+    fn semaphore_priority_preserves_order_and_clamps_instead_of_wrapping() {
+        assert_eq!(semaphore_priority(0), 0);
+        assert_eq!(semaphore_priority(10), 10);
+        assert_eq!(semaphore_priority(i32::MAX as u64), i32::MAX);
+        // Past i32::MAX a plain cast would wrap negative and invert the
+        // ordering, putting the "highest" priority job last.
+        assert_eq!(semaphore_priority(i32::MAX as u64 + 1), Priority::MAX);
+        assert_eq!(semaphore_priority(1 << 63), Priority::MAX);
+        assert_eq!(semaphore_priority(u64::MAX), Priority::MAX);
+        assert!(
+            semaphore_priority(u64::MAX) > semaphore_priority(10),
+            "ordering must survive saturation"
+        );
+    }
 
     #[test]
     fn source_url_tag_is_added_once() {

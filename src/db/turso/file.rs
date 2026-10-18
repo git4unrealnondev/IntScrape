@@ -6,6 +6,55 @@ use turso::{Connection, Result, Value, params_from_iter};
 
 use crate::db::{SQL_CHUNK_SIZE, turso::TursoDatabase};
 
+/// Builds a batched `SET` clause of the form
+/// `col = CASE id WHEN ?k THEN ?v ... ELSE col END, ...`.
+///
+/// Limbo accepts a flat `CASE` arm list at the full `SQL_CHUNK_SIZE` (verified
+/// against a real database in `batched_update_matches_per_row_semantics`), so
+/// this collapses one statement per row into one statement per chunk. Its
+/// correlated-subquery alternative (`UPDATE ... SET x = (SELECT ...)`) does not
+/// parse in limbo at all — `Parse error: no such table: file` — so the CASE
+/// form is the only batched option available.
+///
+/// Assumes the caller bound each row as `(id, col0, col1, ...)` — the id gets
+/// its own slot so it cannot collide with a single-column row's value, which is
+/// what made an earlier version of this write the size into the `WHEN` arm.
+fn case_set_clause(columns: &[&str], rows: usize) -> String {
+    let per_row = columns.len() + 1;
+    let mut out = String::new();
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(column);
+        out.push_str(" = CASE id");
+        for row in 0..rows {
+            let base = row * per_row + 1;
+            out.push_str(&format!(" WHEN ?{base} THEN ?{}", base + 1 + index));
+        }
+        // The `WHERE ... id IN (...)` guard already restricts the statement to
+        // the rows being addressed, so `ELSE` never fires for a matched id. It
+        // exists only so the expression has a value for any row that slips
+        // through.
+        out.push_str(&format!(" ELSE {column} END"));
+    }
+    out
+}
+
+/// Builds an `id IN (...)` list of `rows` placeholders, numbered from
+/// `first_bind`.
+///
+/// The ids are bound a second time rather than reusing the `CASE` arms'
+/// placeholders: turso binds parameters positionally instead of resolving `?N`
+/// references, so a placeholder used twice raises
+/// `Misuse("bind index N is out of bounds")`.
+fn id_in_clause(first_bind: usize, rows: usize) -> String {
+    (first_bind..first_bind + rows)
+        .map(|bind| format!("?{bind}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl TursoDatabase {
     /// Gets a file row by id.
     pub(in crate::db::turso) async fn file_get(
@@ -32,6 +81,94 @@ impl TursoDatabase {
             storage_id: row.get(3)?,
             size_bytes: row.get(4)?,
         })
+    }
+
+    /// Gets many file rows by id with batched `IN` lookups.
+    ///
+    /// Callers that already know the full set of ids they care about (bulk hash
+    /// resolution, dedupe passes) use this instead of looping `file_get`, which
+    /// costs one statement per id. Ids are deduped so a repeated id costs one
+    /// `IN` slot, and missing ids are simply absent from the result.
+    pub(in crate::db::turso) async fn file_get_bulk(
+        &self,
+        conn: &Connection,
+        file_ids: &[u64],
+    ) -> Result<HashMap<u64, FileInternal>> {
+        let mut out = HashMap::with_capacity(file_ids.len());
+
+        let mut ids: Vec<u64> = file_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+
+        for chunk in ids.chunks(SQL_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut params: Vec<Value> = Vec::with_capacity(chunk.len());
+            for id in chunk {
+                params.push(Value::from(*id as i64));
+            }
+            let mut rows = conn
+                .query(
+                    format!(
+                        "SELECT id, hash, extension, storage_id, size_bytes
+                         FROM File WHERE id IN ({placeholders});"
+                    ),
+                    params_from_iter(params),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                out.insert(
+                    row.get::<u64>(0)?,
+                    FileInternal {
+                        id: Some(row.get(0)?),
+                        hash: row.get(1)?,
+                        extension: row.get(2)?,
+                        storage_id: row.get(3)?,
+                        size_bytes: row.get(4)?,
+                    },
+                );
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Gets up to `limit` file rows with `id` strictly greater than `after_id`,
+    /// in ascending id order.
+    ///
+    /// Keyset pagination rather than `LIMIT`/`OFFSET`: a deep walk stays an
+    /// indexed range scan at any depth, and the caller can bound its own memory
+    /// by holding one page at a time instead of the whole table. Returns fewer
+    /// than `limit` rows only at the end of the table.
+    pub(in crate::db::turso) async fn file_get_page(
+        &self,
+        conn: &Connection,
+        after_id: u64,
+        limit: usize,
+    ) -> Result<Vec<FileInternal>> {
+        let mut out = Vec::new();
+        if limit == 0 {
+            return Ok(out);
+        }
+        let mut rows = conn
+            .query(
+                "SELECT id, hash, extension, storage_id, size_bytes
+                 FROM File WHERE id > ?1 ORDER BY id LIMIT ?2;",
+                (after_id as i64, limit as i64),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            out.push(FileInternal {
+                id: Some(row.get(0)?),
+                hash: row.get(1)?,
+                extension: row.get(2)?,
+                storage_id: row.get(3)?,
+                size_bytes: row.get(4)?,
+            });
+        }
+
+        Ok(out)
     }
 
     /// Gets all recorded file storage locations: id -> base path.
@@ -231,22 +368,32 @@ impl TursoDatabase {
     }
 
     /// Updates the hash, extension, and storage id of a batch of files.
+    ///
+    /// One statement per `SQL_CHUNK_SIZE` rows instead of one per file. As
+    /// before, a file whose `id` is unset binds NULL and matches nothing.
     pub(in crate::db::turso) async fn file_update_batch(
         &self,
         conn: &Connection,
         files: &[FileInternal],
     ) -> Result<()> {
-        for file in files {
+        const COLUMNS: [&str; 3] = ["hash", "extension", "storage_id"];
+
+        for chunk in files.chunks(SQL_CHUNK_SIZE) {
+            let mut params: Vec<Value> = Vec::with_capacity(chunk.len() * 4);
+            for file in chunk {
+                params.push(Value::from(file.id.map(|id| id as i64)));
+                params.push(Value::from(file.hash.as_str()));
+                params.push(Value::from(file.extension.as_str()));
+                params.push(Value::from(file.storage_id as i64));
+            }
+            let set = case_set_clause(&COLUMNS, chunk.len());
+            let in_list = id_in_clause(params.len() + 1, chunk.len());
+            for file in chunk {
+                params.push(Value::from(file.id.map(|id| id as i64)));
+            }
             conn.execute(
-                "UPDATE File
-                 SET hash = ?1, extension = ?2, storage_id = ?3
-                 WHERE id = ?4;",
-                (
-                    file.hash.as_str(),
-                    file.extension.as_str(),
-                    file.storage_id as i64,
-                    file.id.map(|id| id as i64),
-                ),
+                format!("UPDATE File SET {set} WHERE id IN ({in_list});"),
+                params_from_iter(params),
             )
             .await?;
         }
@@ -307,13 +454,32 @@ impl TursoDatabase {
                 params.push(Value::from(digest.as_str()));
             }
 
-            let mut rows = conn.query(sql, params_from_iter(params)).await?;
+            // Drain the chunk's matches first, then fetch every matched file in
+            // one batched pass. The old loop called `file_get` per matched row,
+            // so a chunk resolving 4.6k hashes issued 4.6k extra point queries
+            // against `File` on top of the batched `FileHashes` lookup — and
+            // `hashes_files_get_sync` is the per-job dedupe lookup, so that
+            // landed on the scrape hot path.
+            let mut rows = conn.query(&sql, params_from_iter(params)).await?;
+            let mut matched: Vec<(String, String, u64)> = Vec::with_capacity(chunk.len());
             while let Some(row) = rows.next().await? {
                 let file_id: u64 = row.get(0)?;
                 let algorithm: String = row.get(1)?;
                 let digest: String = row.get(2)?;
-                if let Ok(file) = self.file_get(conn, &file_id).await {
-                    out.insert((algorithm, digest), file);
+                matched.push((algorithm, digest, file_id));
+            }
+
+            if matched.is_empty() {
+                continue;
+            }
+
+            let ids: Vec<u64> = matched.iter().map(|(_, _, file_id)| *file_id).collect();
+            let files = self.file_get_bulk(conn, &ids).await?;
+            for (algorithm, digest, file_id) in matched {
+                // A match row whose file has since been deleted resolves to
+                // nothing, exactly as the previous `if let Ok(file)` did.
+                if let Some(file) = files.get(&file_id) {
+                    out.insert((algorithm, digest), file.clone());
                 }
             }
         }
@@ -339,15 +505,33 @@ impl TursoDatabase {
     }
 
     /// Sets `size_bytes` for a batch of file ids, only filling null values.
+    ///
+    /// One statement per `SQL_CHUNK_SIZE` rows instead of one per file.
+    /// `update_missing_file_sizes` feeds this up to a full chunk per batch, so
+    /// the previous per-row form meant 4600 individual autocommitted
+    /// statements per batch — and it ran with no enclosing transaction, so
+    /// every one of those was its own commit under MVCC.
     pub(in crate::db::turso) async fn file_sizes_update(
         &self,
         conn: &Connection,
         updates: &[(u64, u64)],
     ) -> Result<()> {
-        for (file_id, size) in updates {
+        const COLUMNS: [&str; 1] = ["size_bytes"];
+
+        for chunk in updates.chunks(SQL_CHUNK_SIZE) {
+            let mut params: Vec<Value> = Vec::with_capacity(chunk.len() * 2);
+            for (file_id, size) in chunk {
+                params.push(Value::from(*file_id as i64));
+                params.push(Value::from(*size as i64));
+            }
+            let set = case_set_clause(&COLUMNS, chunk.len());
+            let in_list = id_in_clause(params.len() + 1, chunk.len());
+            for (file_id, _) in chunk {
+                params.push(Value::from(*file_id as i64));
+            }
             conn.execute(
-                "UPDATE File SET size_bytes = ?1 WHERE id = ?2 AND size_bytes IS NULL;",
-                (*size as i64, *file_id as i64),
+                format!("UPDATE File SET {set} WHERE size_bytes IS NULL AND id IN ({in_list});"),
+                params_from_iter(params),
             )
             .await?;
         }
@@ -561,6 +745,117 @@ mod tests {
             .get(0)
             .unwrap();
         assert_eq!(count, 1, "duplicate hashes must insert one row");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batched_update_matches_per_row_semantics() {
+        // Pins the two things that made the batched CASE form viable: limbo
+        // accepts a flat arm list at the full SQL_CHUNK_SIZE, and a chunked
+        // statement updates exactly the rows the old per-row loop did. If a
+        // future turso release reintroduces an expression-depth cap (the one
+        // that killed the old OR-term delete in `relationship_bulk_delete`) or
+        // changes NULL/bound-id handling, this fails loudly instead of silently
+        // updating zero rows in the background size-backfill job.
+        let (db, _temp_dir) = new_test_db_owned().await;
+        let conn = db.connect().unwrap();
+
+        let files: Vec<FileInternal> = (0..SQL_CHUNK_SIZE)
+            .map(|i| test_file(&format!("h{i}"), None))
+            .collect();
+        let inserted = db.file_add_bulk(&conn, &files).await.unwrap();
+        let mut ids: Vec<u64> = inserted.iter().filter_map(|f| f.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids.len(), SQL_CHUNK_SIZE);
+
+        let updates: Vec<(u64, u64)> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, (i + 1) as u64))
+            .collect();
+        db.file_sizes_update(&conn, &updates).await.unwrap();
+
+        let mut filled: Vec<(u64, Option<u64>)> = Vec::with_capacity(ids.len());
+        let mut rows = conn
+            .query("SELECT id, size_bytes FROM File ORDER BY id;", ())
+            .await
+            .unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            filled.push((row.get(0).unwrap(), row.get(1).unwrap()));
+        }
+        assert_eq!(filled.len(), SQL_CHUNK_SIZE, "every row must be updated");
+        for ((expected_id, expected_size), (id, size)) in updates.iter().zip(&filled) {
+            assert_eq!(id, expected_id, "ids must line up");
+            assert_eq!(
+                *size,
+                Some(*expected_size),
+                "a full chunk must update in one statement"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_sizes_update_leaves_existing_sizes_alone() {
+        let (db, _temp_dir) = new_test_db_owned().await;
+        let conn = db.connect().unwrap();
+
+        let inserted = db
+            .file_add_bulk(&conn, &[test_file("aaa", Some(100))])
+            .await
+            .unwrap();
+        let id = inserted.iter().next().unwrap().id.unwrap();
+
+        // The guard is `size_bytes IS NULL`, so a second pass over a file that
+        // already has a size must not overwrite it.
+        db.file_sizes_update(&conn, &[(id, 999)]).await.unwrap();
+        assert_eq!(db.file_get(&conn, &id).await.unwrap().size_bytes, Some(100));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_update_batch_writes_every_column() {
+        let (db, _temp_dir) = new_test_db_owned().await;
+        let conn = db.connect().unwrap();
+
+        let inserted = db
+            .file_add_bulk(&conn, &[test_file("aaa", None), test_file("bbb", None)])
+            .await
+            .unwrap();
+        let mut ids: Vec<u64> = inserted.iter().filter_map(|f| f.id).collect();
+        ids.sort_unstable();
+
+        let mut updates = Vec::new();
+        for (index, id) in ids.iter().enumerate() {
+            let mut file = test_file(&format!("renamed{index}"), None);
+            file.id = Some(*id);
+            file.extension = format!("png{index}");
+            file.storage_id = 7;
+            updates.push(file);
+        }
+        db.file_update_batch(&conn, &updates).await.unwrap();
+
+        for (index, id) in ids.iter().enumerate() {
+            let stored = db.file_get(&conn, id).await.unwrap();
+            assert_eq!(stored.hash, format!("renamed{index}"));
+            assert_eq!(stored.extension, format!("png{index}"));
+            assert_eq!(stored.storage_id, 7);
+        }
+
+        // A file with no id binds NULL and must match nothing.
+        let mut unset = test_file("ignored", None);
+        unset.id = None;
+        db.file_update_batch(&conn, &[unset]).await.unwrap();
+        assert_eq!(
+            conn.query("SELECT COUNT(*) FROM File WHERE hash = 'ignored';", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            0,
+            "an unset id must not match a row"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

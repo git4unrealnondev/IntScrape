@@ -7,7 +7,7 @@ edition = "2024"
 crate-type = ["cdylib"] 
 
 [dependencies]
-base64 = "0.22.1"
+base64 = "0.23.1"
 #chrono = "0.4.45"
 hex = "0.4.3"
 html2text = "0.17.1"

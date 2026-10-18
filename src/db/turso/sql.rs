@@ -9,6 +9,58 @@ use crate::db::{
     turso::{TagDb, TursoDatabase},
 };
 
+/// Resolves `Tags` ids for `(name, namespace)` keys with one indexed lookup per
+/// namespace instead of one point query per key.
+///
+/// `Tags` carries `UNIQUE(name, namespace)`, whose index leads on `name`, so
+/// `name IN (...) AND namespace = ?` is a set of index seeks rather than a scan.
+/// Names are sorted and deduped per namespace so the rendered statement text is
+/// stable across chunks (and therefore reusable), and so the `IN` list stays
+/// as short as the chunk's distinct keys rather than one slot per relationship.
+///
+/// Only keys that already exist appear in the result; the caller treats
+/// everything else as novel and inserts it.
+async fn tags_resolve_existing<'a>(
+    conn: &Connection,
+    keys: impl IntoIterator<Item = (&'a str, i64)>,
+) -> Result<HashMap<(String, i64), i64>> {
+    let mut out = HashMap::new();
+
+    let mut names_by_namespace: HashMap<i64, Vec<&str>> = HashMap::new();
+    for (name, namespace_id) in keys {
+        names_by_namespace
+            .entry(namespace_id)
+            .or_default()
+            .push(name);
+    }
+
+    for (namespace_id, mut names) in names_by_namespace {
+        names.sort_unstable();
+        names.dedup();
+        let placeholders = std::iter::repeat_n("?", names.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let params: Vec<Value> = std::iter::once(Value::from(namespace_id))
+            .chain(names.iter().map(|name| Value::from(*name)))
+            .collect();
+        let mut rows = conn
+            .query(
+                format!(
+                    "SELECT id, name FROM Tags WHERE namespace = ?1 AND name IN ({placeholders});"
+                ),
+                params_from_iter(params),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            let name: String = row.get(1)?;
+            out.insert((name, namespace_id), id);
+        }
+    }
+
+    Ok(out)
+}
+
 fn job_to_params(job: &DbJobsObj) -> Vec<Value> {
     vec![
         Value::from(job.id as i64),
@@ -267,12 +319,27 @@ LIMIT ?2;",
         // IFNULL(limit_to, -1))` so that index is extended at its right edge
         // instead of being punched all over the b-tree: every insert has to
         // probe that index for the `OR IGNORE` dedupe, and a sorted feed turns
-        // those probes into a sequential scan. Measured on the serving MVCC
-        // journal, 60k parents in one transaction: 29.6 -> 20.4 us/row, with
-        // every sorted sample beating every unsorted one. This mirrors what
+        // those probes into near-sequential seeks. This mirrors what
         // `relationships_bulk_add` already does for the relationship tables.
         // `-1` matches the `IFNULL(limit_to, -1)` sentinel in the index so the
         // NULL rows group together exactly as they are stored.
+        //
+        // The sort's benefit is much smaller than an earlier comment here
+        // claimed, and on turso 0.8.1 it is not reliably measurable at all:
+        // `db_bench_parents` recorded a novel insert of 20k rows at 519 us/row
+        // in index order versus 537 us/row reversed (a 3% win) on one run, and
+        // 387 versus 363 us/row (a 6% *loss*) on another. The ratio flips sign
+        // between runs on the same fixture.
+        //
+        // The sort is kept because it costs 0.79 us/row and cannot plausibly
+        // cost more than that, while the upside on a large fresh import is real
+        // even if unmeasurable here. But do not quote the old 29.6 -> 20.4
+        // us/row figure as a current measurement, and do not read the existing
+        // benchmark as confirming it.
+        //
+        // On a re-add the ordering is provably irrelevant: every row conflicts,
+        // so `OR IGNORE` probes and skips without inserting (measured 96.08 vs
+        // 96.19 us/row). Only the novel-insert case can benefit.
         let mut ordered: Vec<&TagParents> = parents.iter().collect();
         ordered.sort_unstable_by_key(|parent| {
             (
@@ -406,22 +473,26 @@ LIMIT ?2;",
         // document and rewrote the covering index for the whole chunk. At
         // millions of tags that rewrite dominated ingest; a re-scraped tag now
         // costs a unique-index seek and nothing is written.
-        let mut resolve_existing = conn
-            .prepare("SELECT id FROM Tags WHERE name = ?1 AND namespace = ?2")
+        for chunk in pending_tags.chunks(SQL_CHUNK_SIZE) {
+            // Existing tags are resolved read-only through the UNIQUE(name,
+            // namespace) index, one indexed lookup per namespace for the whole
+            // chunk. This used to be one point query per tag, so a 4.6k-tag
+            // chunk issued 4.6k statements — inside the scraper's write
+            // transaction (`scraper_phase_tags`), which widened the MVCC
+            // conflict window for every concurrent writer for no benefit: each
+            // individual probe is an index seek either way.
+            let existing = tags_resolve_existing(
+                conn,
+                chunk
+                    .iter()
+                    .map(|(tag, ns_id)| (tag.name.as_str(), *ns_id as i64)),
+            )
             .await?;
 
-        for chunk in pending_tags.chunks(SQL_CHUNK_SIZE) {
-            let mut existing = HashMap::with_capacity(chunk.len());
             let mut novel: Vec<(&Tag, u64)> = Vec::with_capacity(chunk.len());
             for (tag, ns_id) in chunk {
-                let params = vec![Value::from(tag.name.as_str()), Value::from(*ns_id as i64)];
-                let mut rows = resolve_existing.query(params_from_iter(params)).await?;
-                match rows.next().await? {
-                    Some(row) => {
-                        let id: i64 = row.get(0)?;
-                        existing.insert((tag.name.clone(), *ns_id), id);
-                    }
-                    None => novel.push((tag, *ns_id)),
+                if !existing.contains_key(&(tag.name.clone(), *ns_id as i64)) {
+                    novel.push((tag, *ns_id));
                 }
             }
 
@@ -472,23 +543,25 @@ LIMIT ?2;",
                 // A novel tag can still lose the insert race with another
                 // connection; OR IGNORE then skips it and RETURNING omits it.
                 // Resolve any such straggler so no tag is ever dropped from
-                // the caller's id mapping.
+                // the caller's id mapping. Batched for the same reason as the
+                // pre-insert resolution above.
                 if inserted_new.len() < novel.len() {
-                    for (tag, ns_id) in &novel {
-                        if inserted_new.contains(&(tag.name.clone(), *ns_id as i64)) {
-                            continue;
-                        }
-                        let params =
-                            vec![Value::from(tag.name.as_str()), Value::from(*ns_id as i64)];
-                        let mut rows = resolve_existing.query(params_from_iter(params)).await?;
-                        if let Some(row) = rows.next().await? {
-                            let id: i64 = row.get(0)?;
-                            out.insert(TagDb {
-                                id,
-                                name: tag.name.clone().into(),
-                                namespace_id: *ns_id as i64,
-                            });
-                        }
+                    let stragglers: Vec<(String, i64)> = novel
+                        .iter()
+                        .map(|(tag, ns_id)| (tag.name.clone(), *ns_id as i64))
+                        .filter(|key| !inserted_new.contains(key))
+                        .collect();
+                    for ((name, ns_id), id) in tags_resolve_existing(
+                        conn,
+                        stragglers.iter().map(|(n, ns)| (n.as_str(), *ns)),
+                    )
+                    .await?
+                    {
+                        out.insert(TagDb {
+                            id,
+                            name: name.into(),
+                            namespace_id: ns_id,
+                        });
                     }
                 }
             }
@@ -497,7 +570,7 @@ LIMIT ?2;",
                 out.insert(TagDb {
                     id,
                     name: name.into(),
-                    namespace_id: ns_id as i64,
+                    namespace_id: ns_id,
                 });
             }
         }
@@ -549,8 +622,6 @@ LIMIT ?2;",
             return Ok(out);
         }
 
-        let mut resolve_existing = conn.prepare("SELECT id FROM File WHERE hash = ?1").await?;
-
         for chunk in file_list.chunks(SQL_CHUNK_SIZE) {
             // Map hash -> file (last entry wins for duplicate hashes), so the
             // resolved output shape matches the previous single-entry-per-hash
@@ -560,23 +631,49 @@ LIMIT ?2;",
                 file_map.insert(file.hash.as_str(), file);
             }
 
+            // Resolve the chunk's whole hash set with batched indexed lookups
+            // instead of one point query per hash. `File.hash` is UNIQUE, so
+            // `hash IN (...)` is a set of unique-index seeks. This used to issue
+            // one statement per file inside the scraper's write transaction
+            // (`scraper_phase_files`), so a 4.6k-file chunk issued 4.6k
+            // statements and held the MVCC conflict window open for all of them.
+            //
+            // Sorted + deduped so the rendered statement text is stable across
+            // chunks and the `IN` list carries only the chunk's distinct hashes.
+            let mut hashes: Vec<&str> = file_map.keys().copied().collect();
+            hashes.sort_unstable();
+            hashes.dedup();
+
             // Split the chunk into already-known hashes (resolved id) and
             // genuinely new ones. Only the novel hashes are written.
-            let mut existing: HashMap<&str, i64> = HashMap::with_capacity(chunk.len());
-            let mut novel: HashMap<&str, &FileInternal> = HashMap::new();
-            for file in chunk {
-                let params = vec![Value::from(file.hash.as_str())];
-                let mut rows = resolve_existing.query(params_from_iter(params)).await?;
-                match rows.next().await? {
-                    Some(row) => {
-                        let id: i64 = row.get(0)?;
-                        existing.insert(file.hash.as_str(), id);
-                    }
-                    None => {
-                        novel.insert(file.hash.as_str(), file);
+            let mut existing: HashMap<&str, i64> = HashMap::with_capacity(hashes.len());
+            for key_chunk in hashes.chunks(SQL_CHUNK_SIZE) {
+                let placeholders = std::iter::repeat_n("?", key_chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let params: Vec<Value> = key_chunk.iter().map(|hash| Value::from(*hash)).collect();
+                let mut rows = conn
+                    .query(
+                        format!("SELECT id, hash FROM File WHERE hash IN ({placeholders});"),
+                        params_from_iter(params),
+                    )
+                    .await?;
+                while let Some(row) = rows.next().await? {
+                    let id: i64 = row.get(0)?;
+                    let hash: String = row.get(1)?;
+                    // Re-key through `file_map` so the stored key borrows from
+                    // the caller's chunk rather than the row-local String.
+                    if let Some((key, _)) = file_map.get_key_value(hash.as_str()) {
+                        existing.insert(*key, id);
                     }
                 }
             }
+
+            let novel: HashMap<&str, &FileInternal> = file_map
+                .iter()
+                .filter(|(hash, _)| !existing.contains_key(*hash))
+                .map(|(hash, file)| (*hash, *file))
+                .collect();
 
             if novel.is_empty() {
                 for (hash, id) in existing {
@@ -625,17 +722,32 @@ LIMIT ?2;",
             // Resolve any such straggler so no file is ever dropped from the
             // caller's id mapping.
             if inserted_new.len() < novel.len() {
-                for (hash, file) in &novel {
-                    if inserted_new.contains(*hash) {
-                        continue;
-                    }
-                    let params = vec![Value::from(*hash)];
-                    let mut rows = resolve_existing.query(params_from_iter(params)).await?;
-                    if let Some(row) = rows.next().await? {
+                let mut missing: Vec<&str> = novel
+                    .keys()
+                    .copied()
+                    .filter(|hash| !inserted_new.contains(*hash))
+                    .collect();
+                missing.sort_unstable();
+                for key_chunk in missing.chunks(SQL_CHUNK_SIZE) {
+                    let placeholders = std::iter::repeat_n("?", key_chunk.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let params: Vec<Value> =
+                        key_chunk.iter().map(|hash| Value::from(*hash)).collect();
+                    let mut rows = conn
+                        .query(
+                            format!("SELECT id, hash FROM File WHERE hash IN ({placeholders});"),
+                            params_from_iter(params),
+                        )
+                        .await?;
+                    while let Some(row) = rows.next().await? {
                         let id: i64 = row.get(0)?;
-                        let mut file = (*file).clone().clone();
-                        file.id = Some(id as u64);
-                        out.insert(file);
+                        let hash: String = row.get(1)?;
+                        if let Some(file) = file_map.get(hash.as_str()) {
+                            let mut file = (*file).clone().clone();
+                            file.id = Some(id as u64);
+                            out.insert(file);
+                        }
                     }
                 }
             }
@@ -670,7 +782,17 @@ LIMIT ?2;",
 
 /// Builds a multi-row `INSERT OR IGNORE INTO Parents` statement with one
 /// `(?, ?, ?)` tuple per parent row.
-fn parents_insert_sql(parent_count: usize) -> String {
+pub(in crate::db::turso) fn parents_insert_sql(parent_count: usize) -> String {
+    // The per-row `format!` below allocates a throwaway `String`, and the final
+    // `format!` copies the whole placeholder list into a second `String`. Both
+    // look like obvious waste, and were "fixed" to a preallocated buffer plus
+    // `write!` -- which measured *58% slower* (1.93 ms vs 1.22 ms for a
+    // 4600-row chunk over 20 rounds). `format!` with inline captured identifiers
+    // compiles to tighter code than `write!` with mixed inline and positional
+    // arguments. Reverted, and left as written so it is not "fixed" again. See
+    // `db_bench_parents`.
+    //
+    // Either shape is ~0.3% of the call, so this is not worth revisiting.
     let mut placeholders = String::new();
     for row in 0..parent_count {
         if row > 0 {
@@ -690,7 +812,7 @@ fn parents_insert_sql(parent_count: usize) -> String {
 
 /// Binds each parent row to its three `VALUES` placeholders, mapping an absent
 /// `limit_to` to SQL `NULL`.
-fn parents_params(parents: &[&TagParents]) -> Vec<Value> {
+pub(in crate::db::turso) fn parents_params(parents: &[&TagParents]) -> Vec<Value> {
     parents
         .iter()
         .flat_map(|parent| {

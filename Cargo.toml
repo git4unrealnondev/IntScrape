@@ -1,18 +1,16 @@
 [package]
 name = "intscrape"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
 default-run = "intscrape"
 
 [dependencies]
 fast_log = "1.7.8"
 log = "0.4.33"
-#r2d2 = { version = "0.8.10", optional = true }
-#r2d2_sqlite = { version = "*", default-features=false, features = [] }
-reqwest = {version = "0.12.22", default-features=false, features=["blocking", "cookies", "gzip", "deflate", "charset", "http2", "rustls-tls"]}
-#serde_rusqlite = { version = "*", optional = true }
-tokio = { version = "1.52.3", default-features=false, features = ["rt-multi-thread", "macros", "fs", "time", "io-util", "signal"] }
-shared_types = {path = "./libs/shared_types", features=["strum"]}
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "cookies", "gzip", "deflate", "charset", "http2", "rustls"] }
+tokio = { workspace = true, features = ["macros", "fs", "signal"] }
+shared_types = { workspace = true, features = ["strum"] }
 libloading = "0.9.0"
 parking_lot = "0.12.5"
 serde_json = "1.0.150"
@@ -20,46 +18,49 @@ url = "2.5.8"
 clap = { version = "4.6.1", features = ["derive"] }
 governor = "0.10.4"
 bytes = "1.12.0"
-file-format = {version="0.29.0", features=["reader"]}
+file-format = { workspace = true }
 sha2 = "0.11.0"
 sha1 = "0.11.0"
 md5 = "0.8.0"
 hex = "0.4.3"
 rayon = "1.12.0"
-#rusqlite = { version = "0.39.0", default-features=false, features = ["trace", "fallible_uint"] }
-#serde = { version = "1.0.228", features = ["derive"] }
-interprocess = { version = "2.4.2", features = ["tokio"] }
-#bitcode = { version = "0.6.9", features = ["serde"] }
-client = { path = "./generated/client" }
+interprocess = { workspace = true }
+client = { workspace = true }
 ipc_macro = { path = "./libs/ipc_macro" }
-roaring = { version = "0.11.4", optional = true }
-intmap = { version = "3.1.3", optional = true }
 rand = "0.10.1"
 cfg-if = "1.0.4"
 libc = "0.2.186"
 dhat = "0.3.3"
 tempfile = "3.27.0"
 walkdir = "2.5.0"
-jwalk = "0.8.1"
+jwalk = "0.9.0"
 memmap2 = "0.9.11"
-#zip = "8.6.0"
 ctrlc = "3.5.2"
 regex = "1.13.1"
-strsim = { version = "0.11.1", optional = true }
 strum = "0.28.0"
-#ipfs-cid = {git="https://github.com/git4unrealnondev/ipfs-cid"}
 image_hasher = "3.1.1"
 image = "0.25.10"
-nohash-hasher = { version = "0.2.0", optional = true }
-turso = { version = "=0.8.1", default-features = false, features = ["fts"] }
+# Priority-ordered async semaphore for the download and job concurrency
+# gates. Higher job priority is granted first, equal priority is FIFO.
+# Runtime-agnostic, so it works on tokio without pinning a runtime.
+priority-semaphore = "0.2.0"
+turso = { version = "=0.8.2", default-features = false, features = ["fts"] }
 smol_str = "0.3.6"
-multi-cid = "0.2.0"
+
+# Reserved for the rusqlite-backed legacy backend in src/db/old_code, which is
+# gated behind `#[cfg(feature = "legacy")]`. That feature is currently
+# undefined, so none of these are ever compiled; they stay here so the legacy
+# backend can be revived without re-deriving its dependency set.
+roaring = { version = "0.11.4", optional = true }
+intmap = { version = "3.1.3", optional = true }
+strsim = { version = "0.11.1", optional = true }
+nohash-hasher = { version = "0.2.0", optional = true }
 
 [workspace.dependencies]
 shared_types = { path = "./libs/shared_types" }
 client = { path = "./generated/client" }
-file-format = {version="0.29.0", features=["reader"]}
-serde={version="1.0.228", features=["derive"]}
+file-format = { version = "0.29.0", features = ["reader"] }
+serde = { version = "1.0.228", features = ["derive"] }
 interprocess = { version = "2.4.2", features = ["tokio"] }
 bitcode = "0.6.9"
 tokio = { version = "1.52.3", default-features = false, features = ["io-util", "rt", "rt-multi-thread", "time"] }
@@ -69,19 +70,20 @@ strum = "0.28.0"
 [workspace]
 members = [
     "plugins/*",
-    "libs/shared_types"
-, "generated/client"
-, "libs/ipc_macro"]
+    "libs/shared_types",
+    "libs/ipc_macro",
+    "generated/client",
+]
 
 [workspace.package]
 edition = "2024"
 rust-version = "1.85"
 
 [profile.release]
-opt-level = "z"     
-lto = true          
-codegen-units = 1   
-panic = "abort"     
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
 strip = true
 
 [profile.release-with-debug]
@@ -92,28 +94,7 @@ strip = false
 [features]
 dhat-heap = []    # if you are doing heap profiling
 dhat-ad-hoc = []  # if you are doing ad hoc profiling
-#legacy = ["dep:r2d2", "dep:serde_rusqlite", "dep:roaring", "dep:intmap", "dep:strsim", "dep:nohash-hasher"]
 
 [dev-dependencies]
-criterion = "0.5"
-
-## Source: https://www.namtao.com/rust/
-#[lints.clippy]
-## UM, ACTUALLY
-#pedantic = { level = "deny", priority = -1 }
-## DEVELOPING LINTS
-#nursery = { level = "deny", priority = -1 }
-## DENY PANICS
-#unwrap_used = "deny"
-#expect_used = "deny"
-#indexing_slicing = "deny"
-#arithmetic_side_effects = "deny"
-#unreachable = "deny"
-#unimplemented = "deny"
-#unchecked_time_subtraction = "deny"
-#todo = "deny"
-#string_slice = "deny"
-#panic_in_result_fn = "deny"
-#panic = "deny"
-#exit = "deny"
-#as_conversions = "deny"
+# Used by src/db/turso/bench.rs and any future `[[bench]]` targets.
+criterion = "0.8.2"

@@ -103,4 +103,39 @@ DROP TABLE Parents_old;
 
         Ok(())
     }
+
+    /// Updates the db from version 8 to 9.
+    ///
+    /// An v8 database carries `idx_file_hash` and `idx_namespace`, which
+    /// duplicate the unique indexes SQLite already builds for the `UNIQUE`
+    /// `File.hash` and `Namespace.name` columns. The planner never selects
+    /// them — `EXPLAIN QUERY PLAN` resolves both lookups to
+    /// `sqlite_autoindex_File_1` / `sqlite_autoindex_Namespace_1` — so they
+    /// were pure write tax: every `File` insert and every hash `UPDATE`
+    /// maintained a second byte-identical b-tree for no read benefit.
+    ///
+    /// Set-based and restart-safe (`DROP INDEX IF EXISTS`), and a no-op on a
+    /// database already created without them. The indexes are not the only
+    /// path to those columns' uniqueness, so dropping them cannot relax the
+    /// `UNIQUE` constraints.
+    pub(in crate::db) async fn update_db_8_to_9(&self, conn: &Connection) -> Result<()> {
+        log::info!(
+            "Migration 8->9: dropping idx_file_hash and idx_namespace \
+             (both duplicate an index the UNIQUE constraints already create)."
+        );
+        self.drop_redundant_indexes(conn).await?;
+
+        self.setting_set(
+            conn,
+            shared_types::DbSettingsObj {
+                name: "SYSTEM_VERSION".to_string(),
+                description: None,
+                num: Some(9),
+                param: None,
+            },
+        )
+        .await?;
+
+        Ok(())
+    }
 }

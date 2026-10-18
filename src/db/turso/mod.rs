@@ -28,6 +28,8 @@ pub(crate) mod system_jobs;
 mod tag;
 
 mod api;
+#[cfg(test)]
+mod bench;
 mod ipc;
 mod migrations;
 
@@ -424,6 +426,9 @@ impl TursoDatabase {
                 }
                 7 => {
                     self.update_db_7_to_8(&conn).await?;
+                }
+                8 => {
+                    self.update_db_8_to_9(&conn).await?;
                 }
                 _ => {
                     return Err(turso::Error::Error(format!(

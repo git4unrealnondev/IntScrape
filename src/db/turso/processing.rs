@@ -1134,6 +1134,124 @@ mod tests {
     /// tag-insert statement (the `save metas` line in the log). The boot-time
     /// ensure must drop it and leave exactly one FTS index, on the shadow,
     /// with search still working.
+    /// The 8 -> 9 migration must retire `idx_file_hash` / `idx_namespace`, which
+    /// duplicated the indexes the `UNIQUE` constraints already create, and must
+    /// leave lookups and the uniqueness enforcement intact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn migration_8_to_9_drops_indexes_that_duplicate_unique_columns() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("redundant_indexes.db");
+        let should_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Build a v8-shaped database: both redundant indexes present, version
+        // pinned to 8 so the upgrade loop runs the 8 -> 9 step.
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+        {
+            let conn = db.connect().unwrap();
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_file_hash ON File (hash);
+                 CREATE INDEX IF NOT EXISTS idx_namespace ON Namespace (name);
+                 UPDATE Settings SET num = 8 WHERE name = 'SYSTEM_VERSION';",
+            )
+            .await
+            .unwrap();
+        }
+        db.shutdown().await;
+        drop(db);
+
+        // Reboot: the 8 -> 9 upgrade must run and drop them.
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit).await;
+        let conn = db.connect().unwrap();
+
+        for name in ["idx_file_hash", "idx_namespace"] {
+            let present: i64 = conn
+                .query(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                     WHERE type = 'index' AND LOWER(name) = LOWER(?1));",
+                    (name,),
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            assert_eq!(present, 0, "migration 8->9 must drop {name}");
+        }
+
+        // The migration must have advanced the recorded version.
+        let version: i64 = conn
+            .query(
+                "SELECT num FROM Settings WHERE name = 'SYSTEM_VERSION';",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(
+            version as u64,
+            crate::DB_VERSION,
+            "migration must record the new schema version"
+        );
+
+        // Dropping them must not cost the lookups they were shadowing.
+        conn.execute(
+            "INSERT INTO Namespace (name, description) VALUES ('subject', NULL);",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO File (hash, extension, storage_id) VALUES ('abc123', 'jpg', NULL);",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let by_hash: i64 = conn
+            .query("SELECT COUNT(*) FROM File WHERE hash = 'abc123';", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(by_hash, 1, "hash lookup must still resolve");
+
+        let by_ns: i64 = conn
+            .query("SELECT COUNT(*) FROM Namespace WHERE name = 'subject';", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(by_ns, 1, "namespace lookup must still resolve");
+
+        // The UNIQUE constraints must still be enforced, which is what proves
+        // the surviving index is the real one.
+        assert!(
+            conn.execute(
+                "INSERT INTO File (hash, extension, storage_id) VALUES ('abc123', 'png', NULL);",
+                (),
+            )
+            .await
+            .is_err(),
+            "the UNIQUE constraint must still reject a duplicate hash"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn boot_drops_stray_full_table_fts_index() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1348,7 +1466,10 @@ mod tests {
             "shadow search must still work after the migration"
         );
 
-        // And the version must now be current, so the loop terminates.
+        // And the version must now be current, so the loop terminates. Asserted
+        // against `DB_VERSION` rather than a literal: the 7 -> 8 step is not the
+        // last one, so this boots a v7 database all the way forward through
+        // every later step.
         let version: i64 = {
             let mut stmt = conn
                 .prepare("SELECT num FROM Settings WHERE name = 'SYSTEM_VERSION';")
@@ -1356,7 +1477,11 @@ mod tests {
                 .unwrap();
             stmt.query_row(()).await.unwrap().get(0).unwrap()
         };
-        assert_eq!(version, 8, "migration must record the new schema version");
+        assert_eq!(
+            version as u64,
+            crate::DB_VERSION,
+            "migration must record the new schema version"
+        );
 
         drop(conn);
         db.shutdown().await;
