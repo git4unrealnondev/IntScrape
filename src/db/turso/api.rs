@@ -265,7 +265,10 @@ impl TursoDatabase {
             // transactions overlap instead of queueing for one writer lock.
             // `tag_action_bulk_add` is idempotent (INSERT OR IGNORE), so the
             // re-run-on-conflict CONCURRENT performs is safe.
-            let tx = match conn.transaction_with_behavior(Self::write_tx_behavior()).await {
+            let tx = match conn
+                .transaction_with_behavior(Self::write_tx_behavior())
+                .await
+            {
                 Ok(tx) => tx,
                 Err(error) => {
                     if Self::is_concurrency_conflict(&error) {

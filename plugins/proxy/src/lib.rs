@@ -1126,5 +1126,8 @@ use smol::Timer;
 use vetis::{VetisServer as _, host::HostConfig, host::HostContext};
 use vetis_tokio::{
     Vetis,
-    host::{Host, path::{HandlerPath, handler_fn}},
+    host::{
+        Host,
+        path::{HandlerPath, handler_fn},
+    },
 };

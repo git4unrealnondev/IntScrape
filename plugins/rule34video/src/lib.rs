@@ -4,8 +4,8 @@ use json::JsonValue;
 use scraper::{Html, Selector};
 use shared_types::{
     FileObject, FileSource, FileTagAction, GenericNamespaceObj, PluginJob, PluginProperties,
-    PluginTag, ScraperDataReturn, ScraperParam, ScraperReturn, Tag, TagOperation, TargetModifier,
-    Url,
+    PluginTag, ScraperDataReturn, ScraperParam, ScraperReturn, SkipIf, Tag, TagOperation,
+    TargetModifier, Url,
 };
 pub enum Site {
     Rule34Video,
@@ -213,6 +213,8 @@ fn add_video_jobs(
             continue;
         }
 
+        let skip_conditions = skip_conditions_for(&video_url);
+
         jobs.insert(ScraperDataReturn {
             job: PluginJob {
                 site: scraperdata.job.site.clone(),
@@ -224,10 +226,32 @@ fn add_video_jobs(
                 user_data: scraperdata.job.user_data.clone(),
                 ..Default::default()
             },
-            ..Default::default()
+            skip_conditions,
         });
     }
 }
+
+/// Skips the job when the database already holds this video.
+///
+/// `parse_video_page` tags every file it yields with its id and the page it came
+/// from, so a hit here means the page was already parsed and the media URL was
+/// already handed to the downloader. The id is preferred because it survives
+/// trailing-slash and host spelling drift that the raw page url does not.
+fn skip_conditions_for(video_url: &str) -> Vec<SkipIf> {
+    let tag = match extract_video_id(video_url) {
+        Some(id) => Tag {
+            name: id,
+            namespace: namespace("Id"),
+        },
+        None => Tag {
+            name: video_url.to_owned(),
+            namespace: namespace("Source"),
+        },
+    };
+
+    vec![SkipIf::FileTagRelationship(tag)]
+}
+
 fn duration_to_seconds(value: &str) -> Option<u64> {
     let value = value.strip_prefix("PT")?;
 

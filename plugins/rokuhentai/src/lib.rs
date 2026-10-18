@@ -111,17 +111,35 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
             PluginProperties::Modifier(TargetModifier {
                 target: ModifierTarget::Media,
                 modifier: DownloadModifiers::Header(("Referer".into(), format!("{SITE_URL}/"))),
-            }),PluginProperties::Modifier(TargetModifier {
-                target: ModifierTarget::Media,
-                modifier: DownloadModifiers::Header(("Accept".into(), "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".into())),
-            }),PluginProperties::Modifier(TargetModifier {
-                target: ModifierTarget::Media,
-                modifier: DownloadModifiers::Header(("Accept-Language".into(), "en-US,en;q=0.9".into())),
-            }),PluginProperties::Modifier(TargetModifier {
-                target: ModifierTarget::Media,
-                modifier: DownloadModifiers::Header(("Accept-Encoding".into(), "gzip, deflate, br, zstd".into())),
             }),
-            PluginProperties::Modifier(TargetModifier { target: ModifierTarget::Media, modifier: DownloadModifiers::Useragent("Mozilla/5.0 (X11; Linux x86_64; rv:156.0) Gecko/20100101 Firefox/156.0".to_string()) })
+            PluginProperties::Modifier(TargetModifier {
+                target: ModifierTarget::Media,
+                modifier: DownloadModifiers::Header((
+                    "Accept".into(),
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".into(),
+                )),
+            }),
+            PluginProperties::Modifier(TargetModifier {
+                target: ModifierTarget::Media,
+                modifier: DownloadModifiers::Header((
+                    "Accept-Language".into(),
+                    "en-US,en;q=0.9".into(),
+                )),
+            }),
+            PluginProperties::Modifier(TargetModifier {
+                target: ModifierTarget::Media,
+                modifier: DownloadModifiers::Header((
+                    "Accept-Encoding".into(),
+                    "gzip, deflate, br, zstd".into(),
+                )),
+            }),
+            PluginProperties::Modifier(TargetModifier {
+                target: ModifierTarget::Media,
+                modifier: DownloadModifiers::Useragent(
+                    "Mozilla/5.0 (X11; Linux x86_64; rv:156.0) Gecko/20100101 Firefox/156.0"
+                        .to_string(),
+                ),
+            }),
         ],
         ..Default::default()
     }]

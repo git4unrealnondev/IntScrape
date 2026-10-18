@@ -337,7 +337,10 @@ impl TursoDatabase {
                 }
             };
 
-            let tx = match conn.transaction_with_behavior(Self::write_tx_behavior()).await {
+            let tx = match conn
+                .transaction_with_behavior(Self::write_tx_behavior())
+                .await
+            {
                 Ok(tx) => tx,
                 Err(error) => {
                     if Self::is_concurrency_conflict(&error) {

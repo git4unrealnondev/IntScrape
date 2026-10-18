@@ -2108,19 +2108,28 @@ mod tests {
         assert_eq!(
             batch.len() as u64,
             edges,
-            "generator must produce {} distinct edges", edges
+            "generator must produce {} distinct edges",
+            edges
         );
 
         // Probe keys drawn from the batch itself, so every read hits rows that
         // exist. `tag_id` repeats every `tags` edges, so the forward probes are
         // real multi-row lookups rather than single-row point hits.
-        let probe_tags: Vec<u64> = batch.iter().map(|p| p.tag_id).take(probes as usize).collect();
+        let probe_tags: Vec<u64> = batch
+            .iter()
+            .map(|p| p.tag_id)
+            .take(probes as usize)
+            .collect();
         let probe_relate: Vec<u64> = batch
             .iter()
             .map(|p| p.relate_tag_id)
             .take(probes as usize)
             .collect();
-        let probe_pairs: Vec<(u64, u64)> = batch.iter().map(|p| (p.tag_id, p.relate_tag_id)).take(probes as usize).collect();
+        let probe_pairs: Vec<(u64, u64)> = batch
+            .iter()
+            .map(|p| (p.tag_id, p.relate_tag_id))
+            .take(probes as usize)
+            .collect();
 
         println!(
             "\nBENCH Parents layouts: {} edges, {} tags, {} probes/round, {} re-add rounds",
@@ -2133,8 +2142,13 @@ mod tests {
         let layouts = [
             ParentLayout::Current,
             ParentLayout::Sentinel,
+            ParentLayout::CurrentCover,
+            ParentLayout::SentinelCover,
             ParentLayout::WithoutRowid,
             ParentLayout::SplitSeq,
+            ParentLayout::FloorNoIndex,
+            ParentLayout::SwapUnique,
+            ParentLayout::SwapUniqueOnly,
         ];
 
         rt.block_on(async {
@@ -2155,16 +2169,34 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                conn.execute_batch(layout.ddl()).await.unwrap();
+                if let Err(error) = conn.execute_batch(layout.ddl()).await {
+                    // `db_bench_parents_schema_probe` records that turso rejects
+                    // `WITHOUT ROWID` without `--experimental-without-rowid`.
+                    // That is a capability limit, not a measurement, so the
+                    // layout is reported and skipped rather than failing the run.
+                    println!(
+                        "\n  == {} ==\n  SKIPPED: turso rejects this layout -> {error}",
+                        layout.label()
+                    );
+                    db.shutdown().await;
+                    drop(db);
+                    bench_remove(&path);
+                    continue;
+                }
 
                 println!("\n  == {} ==", layout.label());
                 for sql in layout.plans() {
                     explain(&conn, sql).await;
                 }
 
+                // The split's per-statement cost, collected separately so its re-add blowup can
+                // be attributed to one of the four statements rather than guessed
+                // at. Empty for every single-table layout.
+                let mut split_detail: Vec<Duration> = Vec::new();
+
                 let (novel_ms, novel_stmts) = {
                     let t = Instant::now();
-                    let stmts = layout_insert(&conn, layout, &batch).await;
+                    let stmts = layout_insert(&conn, layout, &batch, &mut split_detail).await;
                     (t.elapsed().as_secs_f64() * 1_000.0, stmts)
                 };
                 report(
@@ -2178,15 +2210,44 @@ mod tests {
                     novel_stmts,
                     batch.len() as f64 / novel_stmts.max(1) as f64
                 );
+                report_split_detail(&split_detail);
 
                 let readd = {
                     let t = Instant::now();
                     for _ in 0..rounds {
-                        layout_insert(&conn, layout, &batch).await;
+                        layout_insert(&conn, layout, &batch, &mut split_detail).await;
                     }
                     t.elapsed()
                 };
                 report("re-add", batch.len() as u64, rounds, readd);
+                report_split_detail(&split_detail);
+
+                if matches!(
+                    layout,
+                    ParentLayout::FloorNoIndex | ParentLayout::SwapUniqueOnly
+                ) {
+                    // Without a unique key on `(tag_id, ...)` a re-add appends
+                    // duplicate rows, and `SwapUniqueOnly` has no forward index,
+                    // so neither measures anything the others can be compared
+                    // against.
+                    println!("      (re-add and reads skipped: no unique index to re-add against)");
+                    let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    db.shutdown().await;
+                    drop(db);
+                    bench_remove(&path);
+                    results.push((
+                        layout,
+                        LayoutResult {
+                            novel_ms,
+                            readd_ms: f64::NAN,
+                            forward_us: f64::NAN,
+                            reverse_us: f64::NAN,
+                            pair_us: f64::NAN,
+                            bytes,
+                        },
+                    ));
+                    continue;
+                }
 
                 // Reads are per-probe-key, so the row count is the probe count.
                 let forward = {
@@ -2211,7 +2272,12 @@ mod tests {
                     }
                     t.elapsed()
                 };
-                report("reverse read (WHERE relate_tag_id)", probes, rounds, reverse);
+                report(
+                    "reverse read (WHERE relate_tag_id)",
+                    probes,
+                    rounds,
+                    reverse,
+                );
 
                 let pair = {
                     let t = Instant::now();
@@ -2255,13 +2321,29 @@ mod tests {
             let base_readd = results[0].1.readd_ms;
             for (layout, result) in &results {
                 println!(
-                    "  {:<26} {:>9.2}x {:>9.2}x {:>10} {:>10} {:>10} {:>7}M",
+                    "  {:<26} {:>9.2}x {:>9} {:>10} {:>10} {:>10} {:>7}M",
                     layout.label(),
                     result.novel_ms / base,
-                    result.readd_ms / base_readd,
-                    format!("{:.1}", result.forward_us),
-                    format!("{:.1}", result.reverse_us),
-                    format!("{:.1}", result.pair_us),
+                    if result.readd_ms.is_nan() {
+                        "n/a".to_string()
+                    } else {
+                        format!("{:.2}x", result.readd_ms / base_readd)
+                    },
+                    if result.forward_us.is_nan() {
+                        "n/a".to_string()
+                    } else {
+                        format!("{:.1}", result.forward_us)
+                    },
+                    if result.reverse_us.is_nan() {
+                        "n/a".to_string()
+                    } else {
+                        format!("{:.1}", result.reverse_us)
+                    },
+                    if result.pair_us.is_nan() {
+                        "n/a".to_string()
+                    } else {
+                        format!("{:.1}", result.pair_us)
+                    },
                     result.bytes / (1024 * 1024),
                 );
             }
@@ -2276,6 +2358,37 @@ mod tests {
                 results[0].1.bytes / (1024 * 1024),
             );
         });
+    }
+
+    /// Prints where a split layout's time went, statement by statement. The four
+    /// steps are, in order: clear the staging table, fill it, insert the edges,
+    /// and attach the limits (the join). Only the split layout records these;
+    /// for every other layout this prints nothing.
+    fn report_split_detail(detail: &[Duration]) {
+        if detail.is_empty() {
+            return;
+        }
+        let names = [
+            "1 clear staging",
+            "2 fill staging",
+            "3 insert edges",
+            "4 attach limits (join)",
+        ];
+        println!("      where it went:");
+        for (index, label) in names.iter().enumerate() {
+            // Each chunk pushes the four steps in order, so slice by position.
+            let step: Duration = detail.iter().skip(index).step_by(names.len()).sum();
+            println!(
+                "        {label:<26} {:>9.1} ms  ({:>5.1}% of the timed path)",
+                step.as_secs_f64() * 1_000.0,
+                100.0 * step.as_secs_f64()
+                    / detail
+                        .iter()
+                        .map(|d| d.as_secs_f64())
+                        .sum::<f64>()
+                        .max(f64::MIN_POSITIVE)
+            );
+        }
     }
 
     struct LayoutResult {
@@ -2297,10 +2410,32 @@ mod tests {
         /// `limit_to` stored as `-1` instead of `NULL`, so the unique index is a
         /// plain composite instead of an `IFNULL` expression.
         Sentinel,
+        /// Production, but the reverse index carries the rest of the row so
+        /// `child_relationships_get` can be answered from the index alone.
+        CurrentCover,
+        /// Both of the above: sentinel storage plus a covering reverse index.
+        SentinelCover,
         /// The whole edge is the primary key, so there is no rowid table at all.
         WithoutRowid,
         /// `(seq, tag_id, relate_tag_id)` in one table, `limit_to` in another.
         SplitSeq,
+        /// Same columns, zero indexes. Not a candidate — it has no uniqueness and
+        /// no read path — but it is the floor that says how much of the per-row
+        /// cost is index maintenance at all. If this is close to the real
+        /// layouts, no amount of index reshaping can pay for itself, which is the
+        /// whole question a split-table proposal turns on.
+        FloorNoIndex,
+        /// Two b-trees instead of three: the unique index is keyed
+        /// `(relate_tag_id, tag_id, limit_to)` so its prefix serves the reverse
+        /// lookup as a covering scan, and a plain `(tag_id)` index serves the
+        /// forward one. Uniqueness covers the same set of columns as before, so
+        /// only the *order* of the key changes — the one degree of freedom the
+        /// production schema has not spent.
+        SwapUnique,
+        /// The swap with no forward index at all. Not usable (forward reads
+        /// would scan), but it prices the second b-tree directly: what it saves
+        /// over `SwapUnique` is what the second index costs to maintain.
+        SwapUniqueOnly,
     }
 
     impl ParentLayout {
@@ -2309,8 +2444,13 @@ mod tests {
             match self {
                 ParentLayout::Current => 'a',
                 ParentLayout::Sentinel => 'b',
+                ParentLayout::CurrentCover => 'e',
+                ParentLayout::SentinelCover => 'f',
                 ParentLayout::WithoutRowid => 'c',
                 ParentLayout::SplitSeq => 'd',
+                ParentLayout::FloorNoIndex => 'g',
+                ParentLayout::SwapUnique => 'h',
+                ParentLayout::SwapUniqueOnly => 'i',
             }
         }
 
@@ -2319,7 +2459,12 @@ mod tests {
                 ParentLayout::Current => "A current: rowid + expr-unique + rel".to_string(),
                 ParentLayout::Sentinel => "B sentinel -1 + plain unique".to_string(),
                 ParentLayout::WithoutRowid => "C WITHOUT ROWID pk(edge)".to_string(),
+                ParentLayout::CurrentCover => "E current + covering reverse index".to_string(),
+                ParentLayout::SentinelCover => "F sentinel + covering reverse index".to_string(),
                 ParentLayout::SplitSeq => "D split: seq edge + limit_to side".to_string(),
+                ParentLayout::FloorNoIndex => "G floor: no indexes at all".to_string(),
+                ParentLayout::SwapUnique => "H swap: unique(rel,tag,lim) + idx(tag)".to_string(),
+                ParentLayout::SwapUniqueOnly => "I swap: unique(rel,tag,lim) only".to_string(),
             }
         }
 
@@ -2348,6 +2493,30 @@ mod tests {
                          ON Parents (tag_id, relate_tag_id, limit_to);
                      CREATE INDEX idx_parents_rel ON Parents (relate_tag_id);"
                 }
+                ParentLayout::CurrentCover => {
+                    // Only the reverse index changes: it carries the whole row,
+                    // so `WHERE relate_tag_id = ?` answers without a table visit.
+                    "CREATE TABLE Parents (
+                         id INTEGER PRIMARY KEY,
+                         tag_id INTEGER NOT NULL,
+                         relate_tag_id INTEGER NOT NULL,
+                         limit_to INTEGER,
+                         CHECK (tag_id != relate_tag_id));
+                     CREATE UNIQUE INDEX idx_unique_parents_null_safe
+                         ON Parents (tag_id, relate_tag_id, IFNULL(limit_to, -1));
+                     CREATE INDEX idx_parents_rel ON Parents (relate_tag_id, tag_id, limit_to);"
+                }
+                ParentLayout::SentinelCover => {
+                    "CREATE TABLE Parents (
+                         id INTEGER PRIMARY KEY,
+                         tag_id INTEGER NOT NULL,
+                         relate_tag_id INTEGER NOT NULL,
+                         limit_to INTEGER NOT NULL DEFAULT -1,
+                         CHECK (tag_id != relate_tag_id));
+                     CREATE UNIQUE INDEX idx_parents_unique
+                         ON Parents (tag_id, relate_tag_id, limit_to);
+                     CREATE INDEX idx_parents_rel ON Parents (relate_tag_id, tag_id, limit_to);"
+                }
                 ParentLayout::WithoutRowid => {
                     "CREATE TABLE Parents (
                          tag_id INTEGER NOT NULL,
@@ -2356,6 +2525,34 @@ mod tests {
                          PRIMARY KEY (tag_id, relate_tag_id, limit_to),
                          CHECK (tag_id != relate_tag_id)) WITHOUT ROWID;
                      CREATE INDEX idx_parents_rel ON Parents (relate_tag_id);"
+                }
+                ParentLayout::SwapUnique => {
+                    "CREATE TABLE Parents (
+                         id INTEGER PRIMARY KEY,
+                         tag_id INTEGER NOT NULL,
+                         relate_tag_id INTEGER NOT NULL,
+                         limit_to INTEGER NOT NULL DEFAULT -1,
+                         CHECK (tag_id != relate_tag_id));
+                     CREATE UNIQUE INDEX idx_parents_unique
+                         ON Parents (relate_tag_id, tag_id, limit_to);
+                     CREATE INDEX idx_parents_tag ON Parents (tag_id);"
+                }
+                ParentLayout::SwapUniqueOnly => {
+                    "CREATE TABLE Parents (
+                         id INTEGER PRIMARY KEY,
+                         tag_id INTEGER NOT NULL,
+                         relate_tag_id INTEGER NOT NULL,
+                         limit_to INTEGER NOT NULL DEFAULT -1,
+                         CHECK (tag_id != relate_tag_id));
+                     CREATE UNIQUE INDEX idx_parents_unique
+                         ON Parents (relate_tag_id, tag_id, limit_to);"
+                }
+                ParentLayout::FloorNoIndex => {
+                    "CREATE TABLE Parents (
+                         id INTEGER PRIMARY KEY,
+                         tag_id INTEGER NOT NULL,
+                         relate_tag_id INTEGER NOT NULL,
+                         limit_to INTEGER);"
                 }
                 ParentLayout::SplitSeq => {
                     // NOTE: uniqueness here is on the edge alone, so this layout
@@ -2397,12 +2594,17 @@ mod tests {
 
     /// Inserts the whole batch through whichever statements the layout needs,
     /// and returns how many statements that took.
-    async fn layout_insert(conn: &Connection, layout: ParentLayout, rows: &[TagParents]) -> u64 {
+    async fn layout_insert(
+        conn: &Connection,
+        layout: ParentLayout,
+        rows: &[TagParents],
+        split_detail: &mut Vec<Duration>,
+    ) -> u64 {
         let mut statements = 0u64;
         for chunk in rows.chunks(SQL_CHUNK_SIZE) {
             match layout {
                 ParentLayout::SplitSeq => {
-                    statements += layout_insert_split(conn, chunk).await;
+                    statements += layout_insert_split(conn, chunk, split_detail).await;
                 }
                 _ => {
                     conn.execute(
@@ -2418,10 +2620,18 @@ mod tests {
         statements
     }
 
-    async fn layout_insert_split(conn: &Connection, rows: &[TagParents]) -> u64 {
+    async fn layout_insert_split(
+        conn: &Connection,
+        rows: &[TagParents],
+        detail: &mut Vec<Duration>,
+    ) -> u64 {
         // 1. Park the chunk, keyed by a synthetic sequence number the caller
         //    controls, so the staging table never has to be read back.
-        conn.execute_batch("DELETE FROM Parents_stage;").await.unwrap();
+        let t = Instant::now();
+        conn.execute_batch("DELETE FROM Parents_stage;")
+            .await
+            .unwrap();
+        detail.push(t.elapsed());
         let mut placeholders = String::new();
         let mut params: Vec<turso::Value> = Vec::with_capacity(rows.len() * 4);
         for (row, parent) in rows.iter().enumerate() {
@@ -2429,7 +2639,13 @@ mod tests {
                 placeholders.push_str(", ");
             }
             let offset = row * 4;
-            placeholders.push_str(&format!("(?{}, ?{}, ?{}, ?{})", offset + 1, offset + 2, offset + 3, offset + 4));
+            placeholders.push_str(&format!(
+                "(?{}, ?{}, ?{}, ?{})",
+                offset + 1,
+                offset + 2,
+                offset + 3,
+                offset + 4
+            ));
             params.push(turso::Value::from(row as i64 + 1));
             params.push(turso::Value::from(parent.tag_id as i64));
             params.push(turso::Value::from(parent.relate_tag_id as i64));
@@ -2438,14 +2654,17 @@ mod tests {
                 None => params.push(turso::Value::Null),
             }
         }
+        let t = Instant::now();
         conn.execute(
             &format!("INSERT INTO Parents_stage (seq, tag_id, relate_tag_id, limit_to) VALUES {placeholders}"),
             turso::params_from_iter(params),
         )
         .await
         .unwrap();
+        detail.push(t.elapsed());
 
         // 2. The edges themselves, deduped by the edge unique index.
+        let t = Instant::now();
         conn.execute(
             "INSERT OR IGNORE INTO Parents (tag_id, relate_tag_id)
              SELECT tag_id, relate_tag_id FROM Parents_stage ORDER BY tag_id, relate_tag_id;",
@@ -2453,11 +2672,13 @@ mod tests {
         )
         .await
         .unwrap();
+        detail.push(t.elapsed());
 
         // 3. The limits, which only exist once the edge's `seq` is known. This
         //    join is the split's structural cost: without it there is no way to
         //    attach a `limit_to` to a row whose surrogate key the client never
         //    saw.
+        let t = Instant::now();
         conn.execute(
             "INSERT OR REPLACE INTO Parents_limit (seq, limit_to)
              SELECT p.seq, s.limit_to
@@ -2468,6 +2689,7 @@ mod tests {
         )
         .await
         .unwrap();
+        detail.push(t.elapsed());
         4
     }
 
@@ -2478,9 +2700,16 @@ mod tests {
                 placeholders.push_str(", ");
             }
             let offset = row * 3;
-            placeholders.push_str(&format!("(?{}, ?{}, ?{})", offset + 1, offset + 2, offset + 3));
+            placeholders.push_str(&format!(
+                "(?{}, ?{}, ?{})",
+                offset + 1,
+                offset + 2,
+                offset + 3
+            ));
         }
-        format!("INSERT OR IGNORE INTO Parents (tag_id, relate_tag_id, limit_to) VALUES {placeholders}")
+        format!(
+            "INSERT OR IGNORE INTO Parents (tag_id, relate_tag_id, limit_to) VALUES {placeholders}"
+        )
     }
 
     /// Binds the three columns, with `limit_to` in whichever representation the
@@ -2489,7 +2718,10 @@ mod tests {
     /// binding `-1` there instead would be a different key and would let both
     /// forms of the same edge coexist.
     fn layout_params(layout: ParentLayout, rows: &[TagParents]) -> Vec<turso::Value> {
-        let sentinel = !matches!(layout, ParentLayout::Current);
+        let sentinel = !matches!(
+            layout,
+            ParentLayout::Current | ParentLayout::CurrentCover | ParentLayout::FloorNoIndex
+        );
         rows.iter()
             .flat_map(|parent| {
                 [
@@ -2631,7 +2863,12 @@ mod tests {
                     .unwrap();
             }
             let per_tag = t.elapsed();
-            report("per-tag loop (shipped)", asked.len() as u64, rounds, per_tag);
+            report(
+                "per-tag loop (shipped)",
+                asked.len() as u64,
+                rounds,
+                per_tag,
+            );
             assert_eq!(expected.len(), asked.len(), "every asked tag must resolve");
 
             // Batched `IN (...)`.
@@ -2672,7 +2909,11 @@ mod tests {
                 batched_span,
             );
 
-            println!("    IN/loop = {:.2}x   spans/loop = {:.2}x", batched_in.as_secs_f64() / per_tag.as_secs_f64().max(f64::MIN_POSITIVE), batched_span.as_secs_f64() / per_tag.as_secs_f64().max(f64::MIN_POSITIVE));
+            println!(
+                "    IN/loop = {:.2}x   spans/loop = {:.2}x",
+                batched_in.as_secs_f64() / per_tag.as_secs_f64().max(f64::MIN_POSITIVE),
+                batched_span.as_secs_f64() / per_tag.as_secs_f64().max(f64::MIN_POSITIVE)
+            );
 
             db.shutdown().await;
             drop(db);

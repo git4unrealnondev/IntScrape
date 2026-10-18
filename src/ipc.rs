@@ -652,13 +652,11 @@ mod tests {
 
         let probe_id = {
             let conn = db.connect().unwrap();
-            let mut rows = conn.query("SELECT id FROM Tags LIMIT 1;", ()).await.unwrap();
-            rows.next()
+            let mut rows = conn
+                .query("SELECT id FROM Tags LIMIT 1;", ())
                 .await
-                .unwrap()
-                .unwrap()
-                .get::<i64>(0)
-                .unwrap()
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
         };
 
         // Controls, each copied from `Tags` so they hold the same rows at the
@@ -773,7 +771,10 @@ mod tests {
         // at a 3-row `Namespace`.
         {
             let conn = db.connect().unwrap();
-            let mut rows = conn.query("SELECT COUNT(*) FROM Namespace;", ()).await.unwrap();
+            let mut rows = conn
+                .query("SELECT COUNT(*) FROM Namespace;", ())
+                .await
+                .unwrap();
             let n: i64 = rows
                 .next()
                 .await
@@ -828,7 +829,10 @@ mod tests {
                 }
             }
             let conn = db.connect().unwrap();
-            let mut rows = conn.query("SELECT COUNT(*) FROM Namespace;", ()).await.unwrap();
+            let mut rows = conn
+                .query("SELECT COUNT(*) FROM Namespace;", ())
+                .await
+                .unwrap();
             let n: i64 = rows
                 .next()
                 .await
@@ -843,7 +847,7 @@ mod tests {
             );
         }
 
-// Write traffic. The fixture that measured 116 ms per `Tags` lookup had
+        // Write traffic. The fixture that measured 116 ms per `Tags` lookup had
         // already been through `tag_counts_apply` and a bulk tag write; this one
         // has only been seeded. If the lookup degrades after writes, the cost
         // is not the table's shape but something the writes leave behind.
