@@ -45,10 +45,10 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
                 target: shared_types::ModifierTarget::Media,
                 modifier: shared_types::DownloadModifiers::Timeout(Some(Duration::from_mins(300))),
             }),
-            PluginProperties::Ratelimit(4, std::time::Duration::from_secs(1)),
-            PluginProperties::JobNum(20),
+            PluginProperties::Ratelimit(2, std::time::Duration::from_secs(1)),
+            PluginProperties::JobNum(5),
             PluginProperties::Sites(vec!["rule34video.com".into(), "rule34video".into()]),
-            PluginProperties::ThreadNum(10),
+            PluginProperties::ThreadNum(2),
         ],
         ..Default::default()
     }]

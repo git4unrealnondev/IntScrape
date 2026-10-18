@@ -2050,6 +2050,721 @@ mod tests {
         });
     }
 
+    /// Candidate physical layouts for `Parents`, measured as a batch at a
+    /// realistic scale (`BENCH_EDGES`, default 100k edges over `BENCH_TAGS`
+    /// tags) instead of one chunk at a time.
+    ///
+    /// The question this answers is whether moving `limit_to` out of the edge
+    /// row into its own table — so the main table holds nothing but
+    /// `(seq, tag_id, relate_tag_id)` and stays uniform — buys anything.
+    /// `db_bench_parents_schema_variants` answered the smaller version of this
+    /// at one chunk's worth of rows, and found index count irrelevant; at 100k
+    /// the picture can differ, because index depth and page count finally
+    /// matter and the split trades a third-column unique index for an extra
+    /// b-tree plus a join that has to resolve each edge's `seq`.
+    ///
+    /// Every layout is measured on the same four workloads:
+    ///
+    /// * **novel insert** — the cold import of a fresh database.
+    /// * **re-add** — `INSERT OR IGNORE` over rows that all already exist,
+    ///   which is what every re-scrape pays.
+    /// * **forward read** — `parent_relationships_get`'s `WHERE tag_id = ?`.
+    /// * **reverse read** — `child_relationships_get`'s `WHERE relate_tag_id = ?`.
+    /// * **pair read** — `parent_relationship_get`'s exact two-column probe.
+    ///
+    /// Statement count is reported alongside time, because the split cannot
+    /// insert an edge and its `limit_to` in one statement: the `seq` is only
+    /// known after the edge lands, so the limit rows need a join back. That
+    /// extra round trip per chunk is the split's structural cost, and it has to
+    /// be paid whether or not the b-trees are cheaper.
+    ///
+    /// Each layout gets its own database and its own process-wide budget, so a
+    /// layout is never measured against another's leftovers.
+    #[test]
+    #[ignore = "manual benchmark: Parents physical layouts at batch scale"]
+    fn db_bench_parents_layout() {
+        let tags = env_u64("BENCH_TAGS", DEFAULT_TAGS);
+        let edges = env_u64("BENCH_EDGES", 100_000);
+        let rounds = env_u64("BENCH_ITERS", 3).max(1);
+        let probes = env_u64("BENCH_PROBES", 200).max(1);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // The same generator every other parents benchmark uses, so the numbers
+        // are comparable with `db_bench_parents_schema_variants`: distinct
+        // triples over 1..tags, with `limit_to` set on one row in three.
+        let batch: Vec<TagParents> = dedupe_sorted(
+            (0..edges)
+                .map(|i| TagParents {
+                    tag_id: 1 + (i % tags),
+                    relate_tag_id: 1 + (i / 3 + 7) % tags,
+                    limit_to: if i % 3 == 0 {
+                        Some(1 + (i + 11) % tags)
+                    } else {
+                        None
+                    },
+                })
+                .collect(),
+        );
+        assert_eq!(
+            batch.len() as u64,
+            edges,
+            "generator must produce {} distinct edges", edges
+        );
+
+        // Probe keys drawn from the batch itself, so every read hits rows that
+        // exist. `tag_id` repeats every `tags` edges, so the forward probes are
+        // real multi-row lookups rather than single-row point hits.
+        let probe_tags: Vec<u64> = batch.iter().map(|p| p.tag_id).take(probes as usize).collect();
+        let probe_relate: Vec<u64> = batch
+            .iter()
+            .map(|p| p.relate_tag_id)
+            .take(probes as usize)
+            .collect();
+        let probe_pairs: Vec<(u64, u64)> = batch.iter().map(|p| (p.tag_id, p.relate_tag_id)).take(probes as usize).collect();
+
+        println!(
+            "\nBENCH Parents layouts: {} edges, {} tags, {} probes/round, {} re-add rounds",
+            batch.len(),
+            tags,
+            probes,
+            rounds
+        );
+
+        let layouts = [
+            ParentLayout::Current,
+            ParentLayout::Sentinel,
+            ParentLayout::WithoutRowid,
+            ParentLayout::SplitSeq,
+        ];
+
+        rt.block_on(async {
+            let mut results: Vec<(ParentLayout, LayoutResult)> = Vec::new();
+
+            for layout in layouts {
+                let path = bench_db_path(&format!("layout_{}", layout.key()));
+                bench_remove(&path);
+                let db =
+                    TursoDatabase::new_with_exit(&path, Arc::new(AtomicBool::new(false))).await;
+                let conn = db.connect().unwrap();
+                // Boot already built the production `Parents` table; each layout
+                // replaces it so the only difference measured is the layout.
+                conn.execute_batch(
+                    "DROP TABLE IF EXISTS Parents;
+                     DROP TABLE IF EXISTS Parents_limit;
+                     DROP TABLE IF EXISTS Parents_stage;",
+                )
+                .await
+                .unwrap();
+                conn.execute_batch(layout.ddl()).await.unwrap();
+
+                println!("\n  == {} ==", layout.label());
+                for sql in layout.plans() {
+                    explain(&conn, sql).await;
+                }
+
+                let (novel_ms, novel_stmts) = {
+                    let t = Instant::now();
+                    let stmts = layout_insert(&conn, layout, &batch).await;
+                    (t.elapsed().as_secs_f64() * 1_000.0, stmts)
+                };
+                report(
+                    "novel insert",
+                    batch.len() as u64,
+                    1,
+                    Duration::from_secs_f64(novel_ms / 1_000.0),
+                );
+                println!(
+                    "      {} statements ({:.0} rows/statement)",
+                    novel_stmts,
+                    batch.len() as f64 / novel_stmts.max(1) as f64
+                );
+
+                let readd = {
+                    let t = Instant::now();
+                    for _ in 0..rounds {
+                        layout_insert(&conn, layout, &batch).await;
+                    }
+                    t.elapsed()
+                };
+                report("re-add", batch.len() as u64, rounds, readd);
+
+                // Reads are per-probe-key, so the row count is the probe count.
+                let forward = {
+                    let t = Instant::now();
+                    let mut rows = 0u64;
+                    for _ in 0..rounds {
+                        for tag_id in &probe_tags {
+                            rows += layout_read_tag(&conn, layout, *tag_id).await;
+                        }
+                    }
+                    let _ = rows;
+                    t.elapsed()
+                };
+                report("forward read (WHERE tag_id)", probes, rounds, forward);
+
+                let reverse = {
+                    let t = Instant::now();
+                    for _ in 0..rounds {
+                        for relate in &probe_relate {
+                            layout_read_relate(&conn, layout, *relate).await;
+                        }
+                    }
+                    t.elapsed()
+                };
+                report("reverse read (WHERE relate_tag_id)", probes, rounds, reverse);
+
+                let pair = {
+                    let t = Instant::now();
+                    for _ in 0..rounds {
+                        for (tag_id, relate) in &probe_pairs {
+                            layout_read_pair(&conn, layout, *tag_id, *relate).await;
+                        }
+                    }
+                    t.elapsed()
+                };
+                report("pair read (tag + relate)", probes, rounds, pair);
+
+                // Size on disk after 100k edges: the split's whole argument is
+                // that the main table stays dense, so the file size is evidence
+                // either way.
+                let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+                db.shutdown().await;
+                drop(db);
+                bench_remove(&path);
+
+                results.push((
+                    layout,
+                    LayoutResult {
+                        novel_ms,
+                        readd_ms: readd.as_secs_f64() * 1_000.0,
+                        forward_us: forward.as_secs_f64() * 1_000_000.0 / (probes * rounds) as f64,
+                        reverse_us: reverse.as_secs_f64() * 1_000_000.0 / (probes * rounds) as f64,
+                        pair_us: pair.as_secs_f64() * 1_000_000.0 / (probes * rounds) as f64,
+                        bytes,
+                    },
+                ));
+            }
+
+            println!("\n  == summary, everything relative to the current schema ==");
+            println!(
+                "  {:<26} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8}",
+                "layout", "novel", "re-add", "fwd us", "rev us", "pair us", "size"
+            );
+            let base = results[0].1.novel_ms;
+            let base_readd = results[0].1.readd_ms;
+            for (layout, result) in &results {
+                println!(
+                    "  {:<26} {:>9.2}x {:>9.2}x {:>10} {:>10} {:>10} {:>7}M",
+                    layout.label(),
+                    result.novel_ms / base,
+                    result.readd_ms / base_readd,
+                    format!("{:.1}", result.forward_us),
+                    format!("{:.1}", result.reverse_us),
+                    format!("{:.1}", result.pair_us),
+                    result.bytes / (1024 * 1024),
+                );
+            }
+            println!(
+                "\n  Absolute, for the record: current schema novel {:.1} ms / re-add {:.1} ms,\n\
+                 fwd {:.1} us, rev {:.1} us, pair {:.1} us per probe, {} MiB on disk.",
+                base,
+                base_readd,
+                results[0].1.forward_us,
+                results[0].1.reverse_us,
+                results[0].1.pair_us,
+                results[0].1.bytes / (1024 * 1024),
+            );
+        });
+    }
+
+    struct LayoutResult {
+        novel_ms: f64,
+        readd_ms: f64,
+        forward_us: f64,
+        reverse_us: f64,
+        pair_us: f64,
+        bytes: u64,
+    }
+
+    /// The physical layouts under test. Each owns its own DDL and its own
+    /// insert/read statements, because the split genuinely cannot be expressed
+    /// through the single-table statements the others share.
+    #[derive(Clone, Copy)]
+    enum ParentLayout {
+        /// Production today.
+        Current,
+        /// `limit_to` stored as `-1` instead of `NULL`, so the unique index is a
+        /// plain composite instead of an `IFNULL` expression.
+        Sentinel,
+        /// The whole edge is the primary key, so there is no rowid table at all.
+        WithoutRowid,
+        /// `(seq, tag_id, relate_tag_id)` in one table, `limit_to` in another.
+        SplitSeq,
+    }
+
+    impl ParentLayout {
+        /// Short filename-safe tag, so each layout's database is identifiable.
+        fn key(&self) -> char {
+            match self {
+                ParentLayout::Current => 'a',
+                ParentLayout::Sentinel => 'b',
+                ParentLayout::WithoutRowid => 'c',
+                ParentLayout::SplitSeq => 'd',
+            }
+        }
+
+        fn label(&self) -> String {
+            match self {
+                ParentLayout::Current => "A current: rowid + expr-unique + rel".to_string(),
+                ParentLayout::Sentinel => "B sentinel -1 + plain unique".to_string(),
+                ParentLayout::WithoutRowid => "C WITHOUT ROWID pk(edge)".to_string(),
+                ParentLayout::SplitSeq => "D split: seq edge + limit_to side".to_string(),
+            }
+        }
+
+        fn ddl(&self) -> &'static str {
+            match self {
+                ParentLayout::Current => {
+                    "CREATE TABLE Parents (
+                         id INTEGER PRIMARY KEY,
+                         tag_id INTEGER NOT NULL,
+                         relate_tag_id INTEGER NOT NULL,
+                         limit_to INTEGER,
+                         CHECK (tag_id != relate_tag_id));
+                     CREATE UNIQUE INDEX idx_unique_parents_null_safe
+                         ON Parents (tag_id, relate_tag_id, IFNULL(limit_to, -1));
+                     CREATE INDEX idx_parents_rel ON Parents (relate_tag_id);"
+                }
+                ParentLayout::Sentinel => {
+                    // Tag ids are >= 1, so -1 cannot collide with a real tag.
+                    "CREATE TABLE Parents (
+                         id INTEGER PRIMARY KEY,
+                         tag_id INTEGER NOT NULL,
+                         relate_tag_id INTEGER NOT NULL,
+                         limit_to INTEGER NOT NULL DEFAULT -1,
+                         CHECK (tag_id != relate_tag_id));
+                     CREATE UNIQUE INDEX idx_parents_unique
+                         ON Parents (tag_id, relate_tag_id, limit_to);
+                     CREATE INDEX idx_parents_rel ON Parents (relate_tag_id);"
+                }
+                ParentLayout::WithoutRowid => {
+                    "CREATE TABLE Parents (
+                         tag_id INTEGER NOT NULL,
+                         relate_tag_id INTEGER NOT NULL,
+                         limit_to INTEGER NOT NULL DEFAULT -1,
+                         PRIMARY KEY (tag_id, relate_tag_id, limit_to),
+                         CHECK (tag_id != relate_tag_id)) WITHOUT ROWID;
+                     CREATE INDEX idx_parents_rel ON Parents (relate_tag_id);"
+                }
+                ParentLayout::SplitSeq => {
+                    // NOTE: uniqueness here is on the edge alone, so this layout
+                    // can hold exactly one limit per (tag, relate) pair. That is
+                    // a semantic narrowing, not just a physical one — see the
+                    // report. The staging table is what lets the insert avoid a
+                    // per-row `seq` lookup: the batch is parked there, the edges
+                    // are inserted from it, and the limit rows join back on the
+                    // edge key.
+                    "CREATE TABLE Parents (
+                         seq INTEGER PRIMARY KEY,
+                         tag_id INTEGER NOT NULL,
+                         relate_tag_id INTEGER NOT NULL,
+                         CHECK (tag_id != relate_tag_id));
+                     CREATE UNIQUE INDEX idx_parents_edge ON Parents (tag_id, relate_tag_id);
+                     CREATE INDEX idx_parents_rel ON Parents (relate_tag_id);
+                     CREATE TABLE Parents_limit (
+                         seq INTEGER PRIMARY KEY,
+                         limit_to INTEGER NOT NULL);
+                     CREATE TABLE Parents_stage (
+                         seq INTEGER PRIMARY KEY,
+                         tag_id INTEGER NOT NULL,
+                         relate_tag_id INTEGER NOT NULL,
+                         limit_to INTEGER);"
+                }
+            }
+        }
+
+        /// The statements whose query plans decide whether a layout's reads are
+        /// index lookups or scans.
+        fn plans(&self) -> Vec<&'static str> {
+            vec![
+                "SELECT relate_tag_id, limit_to FROM Parents WHERE tag_id = 7",
+                "SELECT tag_id, limit_to FROM Parents WHERE relate_tag_id = 7",
+                "SELECT limit_to FROM Parents WHERE tag_id = 7 AND relate_tag_id = 8",
+            ]
+        }
+    }
+
+    /// Inserts the whole batch through whichever statements the layout needs,
+    /// and returns how many statements that took.
+    async fn layout_insert(conn: &Connection, layout: ParentLayout, rows: &[TagParents]) -> u64 {
+        let mut statements = 0u64;
+        for chunk in rows.chunks(SQL_CHUNK_SIZE) {
+            match layout {
+                ParentLayout::SplitSeq => {
+                    statements += layout_insert_split(conn, chunk).await;
+                }
+                _ => {
+                    conn.execute(
+                        &single_table_insert_sql(chunk.len()),
+                        layout_params(layout, chunk),
+                    )
+                    .await
+                    .unwrap();
+                    statements += 1;
+                }
+            }
+        }
+        statements
+    }
+
+    async fn layout_insert_split(conn: &Connection, rows: &[TagParents]) -> u64 {
+        // 1. Park the chunk, keyed by a synthetic sequence number the caller
+        //    controls, so the staging table never has to be read back.
+        conn.execute_batch("DELETE FROM Parents_stage;").await.unwrap();
+        let mut placeholders = String::new();
+        let mut params: Vec<turso::Value> = Vec::with_capacity(rows.len() * 4);
+        for (row, parent) in rows.iter().enumerate() {
+            if row > 0 {
+                placeholders.push_str(", ");
+            }
+            let offset = row * 4;
+            placeholders.push_str(&format!("(?{}, ?{}, ?{}, ?{})", offset + 1, offset + 2, offset + 3, offset + 4));
+            params.push(turso::Value::from(row as i64 + 1));
+            params.push(turso::Value::from(parent.tag_id as i64));
+            params.push(turso::Value::from(parent.relate_tag_id as i64));
+            match parent.limit_to {
+                Some(limit_id) => params.push(turso::Value::from(limit_id as i64)),
+                None => params.push(turso::Value::Null),
+            }
+        }
+        conn.execute(
+            &format!("INSERT INTO Parents_stage (seq, tag_id, relate_tag_id, limit_to) VALUES {placeholders}"),
+            turso::params_from_iter(params),
+        )
+        .await
+        .unwrap();
+
+        // 2. The edges themselves, deduped by the edge unique index.
+        conn.execute(
+            "INSERT OR IGNORE INTO Parents (tag_id, relate_tag_id)
+             SELECT tag_id, relate_tag_id FROM Parents_stage ORDER BY tag_id, relate_tag_id;",
+            (),
+        )
+        .await
+        .unwrap();
+
+        // 3. The limits, which only exist once the edge's `seq` is known. This
+        //    join is the split's structural cost: without it there is no way to
+        //    attach a `limit_to` to a row whose surrogate key the client never
+        //    saw.
+        conn.execute(
+            "INSERT OR REPLACE INTO Parents_limit (seq, limit_to)
+             SELECT p.seq, s.limit_to
+             FROM Parents_stage s
+             JOIN Parents p ON p.tag_id = s.tag_id AND p.relate_tag_id = s.relate_tag_id
+             WHERE s.limit_to IS NOT NULL;",
+            (),
+        )
+        .await
+        .unwrap();
+        4
+    }
+
+    fn single_table_insert_sql(count: usize) -> String {
+        let mut placeholders = String::new();
+        for row in 0..count {
+            if row > 0 {
+                placeholders.push_str(", ");
+            }
+            let offset = row * 3;
+            placeholders.push_str(&format!("(?{}, ?{}, ?{})", offset + 1, offset + 2, offset + 3));
+        }
+        format!("INSERT OR IGNORE INTO Parents (tag_id, relate_tag_id, limit_to) VALUES {placeholders}")
+    }
+
+    /// Binds the three columns, with `limit_to` in whichever representation the
+    /// layout stores. `Current` keeps SQL `NULL`, which its `IFNULL(limit_to, -1)`
+    /// unique index folds into the same key the sentinel layouts store directly;
+    /// binding `-1` there instead would be a different key and would let both
+    /// forms of the same edge coexist.
+    fn layout_params(layout: ParentLayout, rows: &[TagParents]) -> Vec<turso::Value> {
+        let sentinel = !matches!(layout, ParentLayout::Current);
+        rows.iter()
+            .flat_map(|parent| {
+                [
+                    turso::Value::from(parent.tag_id as i64),
+                    turso::Value::from(parent.relate_tag_id as i64),
+                    match parent.limit_to {
+                        Some(limit_id) => turso::Value::from(limit_id as i64),
+                        None if sentinel => turso::Value::from(-1i64),
+                        None => turso::Value::Null,
+                    },
+                ]
+            })
+            .collect()
+    }
+
+    async fn layout_read_tag(conn: &Connection, layout: ParentLayout, tag_id: u64) -> u64 {
+        let sql = match layout {
+            ParentLayout::SplitSeq => {
+                "SELECT p.relate_tag_id, l.limit_to FROM Parents p
+                 LEFT JOIN Parents_limit l ON l.seq = p.seq
+                 WHERE p.tag_id = ?1"
+            }
+            _ => "SELECT relate_tag_id, limit_to FROM Parents WHERE tag_id = ?1",
+        };
+        count_rows(conn, sql, (tag_id as i64,)).await
+    }
+
+    async fn layout_read_relate(conn: &Connection, layout: ParentLayout, relate: u64) -> u64 {
+        let sql = match layout {
+            ParentLayout::SplitSeq => {
+                "SELECT p.tag_id, l.limit_to FROM Parents p
+                 LEFT JOIN Parents_limit l ON l.seq = p.seq
+                 WHERE p.relate_tag_id = ?1"
+            }
+            _ => "SELECT tag_id, limit_to FROM Parents WHERE relate_tag_id = ?1",
+        };
+        count_rows(conn, sql, (relate as i64,)).await
+    }
+
+    async fn layout_read_pair(
+        conn: &Connection,
+        layout: ParentLayout,
+        tag_id: u64,
+        relate: u64,
+    ) -> u64 {
+        let sql = match layout {
+            ParentLayout::SplitSeq => {
+                "SELECT l.limit_to FROM Parents p
+                 LEFT JOIN Parents_limit l ON l.seq = p.seq
+                 WHERE p.tag_id = ?1 AND p.relate_tag_id = ?2"
+            }
+            _ => "SELECT limit_to FROM Parents WHERE tag_id = ?1 AND relate_tag_id = ?2",
+        };
+        count_rows(conn, sql, (tag_id as i64, relate as i64)).await
+    }
+
+    async fn count_rows<P>(conn: &Connection, sql: &str, params: P) -> u64
+    where
+        P: turso::IntoParams,
+    {
+        let mut rows = conn.query(sql, params).await.unwrap();
+        let mut count = 0u64;
+        while rows.next().await.unwrap().is_some() {
+            count += 1;
+        }
+        count
+    }
+
+    /// `parent_relationships_get_many` / `child_relationships_get_many` against
+    /// a database that actually holds `BENCH_EDGES` edges, comparing the
+    /// per-tag statement loop that ships today against the two batched forms.
+    ///
+    /// The loop is the interesting part: a caller asking about *N* tags pays *N*
+    /// statements, so the cost of "get me the parents of these tags" scales with
+    /// the caller's set size rather than with the data. That is exactly the shape
+    /// `agents.md` rules out ("do not perform one SQL query per item"), and it is
+    /// invisible in the insert benchmarks. Two batched forms are measured:
+    ///
+    /// 1. `IN (...)` chunks — one statement per chunk of tag ids.
+    /// 2. Coalesced ranges — one statement per span of tag ids, which is
+    ///    cheaper in statements but returns rows for tags nobody asked about.
+    ///
+    /// The caller asks for the *same* tags either way, so correctness is
+    /// asserted by comparing each batched result against the loop's.
+    #[test]
+    #[ignore = "manual benchmark: Parents get_many, per-tag loop vs batched"]
+    fn db_bench_parents_read_many() {
+        let tags = env_u64("BENCH_TAGS", DEFAULT_TAGS);
+        let edges = env_u64("BENCH_EDGES", 100_000);
+        let rounds = env_u64("BENCH_ITERS", 3).max(1);
+        let wanted = env_u64("BENCH_WANTED", 500).max(1).min(tags);
+        let in_chunk = env_u64("BENCH_IN_CHUNK", SQL_CHUNK_SIZE as u64).max(1);
+        let span = env_u64("BENCH_SPAN_TAGS", 64).max(1);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let batch: Vec<TagParents> = dedupe_sorted(
+            (0..edges)
+                .map(|i| TagParents {
+                    tag_id: 1 + (i % tags),
+                    relate_tag_id: 1 + (i / 3 + 7) % tags,
+                    limit_to: if i % 3 == 0 {
+                        Some(1 + (i + 11) % tags)
+                    } else {
+                        None
+                    },
+                })
+                .collect(),
+        );
+        // The tags a caller would realistically ask about: the first `wanted`
+        // distinct tag ids in the batch.
+        let mut asked: Vec<u64> = batch.iter().map(|parent| parent.tag_id).collect();
+        asked.sort_unstable();
+        asked.dedup();
+        asked.truncate(wanted as usize);
+        let asked_set: HashSet<u64> = asked.iter().copied().collect();
+
+        println!(
+            "\nBENCH Parents get_many: {} edges, {} tags, asking about {} tags, {} rounds",
+            batch.len(),
+            tags,
+            asked.len(),
+            rounds
+        );
+
+        rt.block_on(async {
+            let path = bench_db_path("read_many");
+            bench_remove(&path);
+            let db = TursoDatabase::new_with_exit(&path, Arc::new(AtomicBool::new(false))).await;
+            let conn = db.connect().unwrap();
+            insert_slice(&conn, &batch.iter().collect::<Vec<_>>()).await;
+
+            // Ground truth, and the loop cost.
+            let t = Instant::now();
+            let mut expected: HashMap<u64, Vec<TagParents>> = HashMap::new();
+            for _ in 0..rounds {
+                expected = db
+                    .parent_relationships_get_many(&conn, &asked_set)
+                    .await
+                    .unwrap();
+            }
+            let per_tag = t.elapsed();
+            report("per-tag loop (shipped)", asked.len() as u64, rounds, per_tag);
+            assert_eq!(expected.len(), asked.len(), "every asked tag must resolve");
+
+            // Batched `IN (...)`.
+            let t = Instant::now();
+            for _ in 0..rounds {
+                let grouped = read_many_in(&conn, &asked, in_chunk as usize).await;
+                assert_eq!(
+                    grouped, expected,
+                    "the batched IN form must return exactly what the loop returns"
+                );
+            }
+            let batched_in = t.elapsed();
+            report(
+                &format!("batched IN (chunks of {in_chunk})"),
+                asked.len() as u64,
+                rounds,
+                batched_in,
+            );
+
+            // Coalesced tag-id ranges.
+            let t = Instant::now();
+            for _ in 0..rounds {
+                let grouped = read_many_spans(&conn, &asked, span as usize).await;
+                let only_asked: HashMap<u64, Vec<TagParents>> = grouped
+                    .into_iter()
+                    .filter(|(tag, _)| asked_set.contains(tag))
+                    .collect();
+                assert_eq!(
+                    only_asked, expected,
+                    "the span form must return exactly what the loop returns"
+                );
+            }
+            let batched_span = t.elapsed();
+            report(
+                &format!("coalesced ranges (span {span})"),
+                asked.len() as u64,
+                rounds,
+                batched_span,
+            );
+
+            println!("    IN/loop = {:.2}x   spans/loop = {:.2}x", batched_in.as_secs_f64() / per_tag.as_secs_f64().max(f64::MIN_POSITIVE), batched_span.as_secs_f64() / per_tag.as_secs_f64().max(f64::MIN_POSITIVE));
+
+            db.shutdown().await;
+            drop(db);
+            bench_remove(&path);
+        });
+    }
+
+    /// One `IN (...)` statement per chunk of tag ids, grouped back into the same
+    /// `HashMap<u64, Vec<TagParents>>` the per-tag loop returns so the two are
+    /// directly comparable.
+    async fn read_many_in(
+        conn: &Connection,
+        tag_ids: &[u64],
+        chunk: usize,
+    ) -> HashMap<u64, Vec<TagParents>> {
+        let mut out: HashMap<u64, Vec<TagParents>> = HashMap::new();
+        for window in tag_ids.chunks(chunk) {
+            let placeholders = std::iter::repeat_n("?", window.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let params: Vec<turso::Value> = window
+                .iter()
+                .map(|id| turso::Value::from(*id as i64))
+                .collect();
+            let mut rows = conn
+                .query(
+                    format!(
+                        "SELECT tag_id, relate_tag_id, limit_to FROM Parents \
+                         WHERE tag_id IN ({placeholders})"
+                    ),
+                    turso::params_from_iter(params),
+                )
+                .await
+                .unwrap();
+            while let Some(row) = rows.next().await.unwrap() {
+                let parent = TagParents {
+                    tag_id: row.get(0).unwrap(),
+                    relate_tag_id: row.get(1).unwrap(),
+                    limit_to: row.get(2).unwrap(),
+                };
+                out.entry(parent.tag_id).or_default().push(parent);
+            }
+        }
+        for rows in out.values_mut() {
+            rows.sort_unstable_by_key(parents_key);
+        }
+        out
+    }
+
+    /// One range statement per span of `span` tag ids. Cheaper in statements
+    /// than `IN (...)` when the asked-for tags are dense, at the cost of
+    /// returning rows for tags in the gaps.
+    async fn read_many_spans(
+        conn: &Connection,
+        tag_ids: &[u64],
+        span: usize,
+    ) -> HashMap<u64, Vec<TagParents>> {
+        let mut sorted = tag_ids.to_vec();
+        sorted.sort_unstable();
+        let mut out: HashMap<u64, Vec<TagParents>> = HashMap::new();
+        let mut start = 0;
+        while start < sorted.len() {
+            let first = sorted[start];
+            let mut end = start;
+            while end < sorted.len() && sorted[end] < first + span as u64 {
+                end += 1;
+            }
+            let last = sorted[end - 1];
+            let mut rows = conn
+                .query(
+                    "SELECT tag_id, relate_tag_id, limit_to FROM Parents \
+                     WHERE tag_id >= ?1 AND tag_id <= ?2",
+                    (first as i64, last as i64),
+                )
+                .await
+                .unwrap();
+            while let Some(row) = rows.next().await.unwrap() {
+                let parent = TagParents {
+                    tag_id: row.get(0).unwrap(),
+                    relate_tag_id: row.get(1).unwrap(),
+                    limit_to: row.get(2).unwrap(),
+                };
+                out.entry(parent.tag_id).or_default().push(parent);
+            }
+            start = end;
+        }
+        for rows in out.values_mut() {
+            rows.sort_unstable_by_key(parents_key);
+        }
+        out
+    }
+
     /// Job-queue write benchmark, since job scheduling is on the critical path
     /// for every crawl.
     #[test]
