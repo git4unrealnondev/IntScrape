@@ -442,6 +442,28 @@ pub fn limited_child_relationships_get_async(
         limit_tag_id,
     ))
 }
+/// Gets the child-parent relations qualified by any of the supplied
+/// limit tags in one IPC request. This is the bulk form of
+/// `limited_child_relationships_get`; results are grouped by limit tag.
+pub fn limited_child_relationships_get_many(
+    limit_tag_ids: HashSet<u64>,
+) -> Result<HashMap<u64, Vec<TagParents>>, Box<dyn std::error::Error>> {
+    crate::init_data_request(
+        crate::SupportedDBRequests::LimitedChildRelationshipsGetMany(limit_tag_ids),
+    )
+}
+/// Gets the child-parent relations qualified by any of the supplied
+/// limit tags in one IPC request. This is the bulk form of
+/// `limited_child_relationships_get`; results are grouped by limit tag.
+pub fn limited_child_relationships_get_many_async(
+    limit_tag_ids: HashSet<u64>,
+) -> impl std::future::Future<
+    Output = Result<HashMap<u64, Vec<TagParents>>, Box<dyn std::error::Error + Send + Sync>>,
+> {
+    crate::init_data_request_async(
+        crate::SupportedDBRequests::LimitedChildRelationshipsGetMany(limit_tag_ids),
+    )
+}
 /// Gets child relations for multiple parent tags in one IPC request.
 pub fn child_relationships_get_many(
     tag_ids: HashSet<u64>,

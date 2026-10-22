@@ -416,6 +416,46 @@ impl TursoDatabase {
         Ok(out)
     }
 
+    /// Gets the child-parent relations whose `limit_to` qualifier is any of
+    /// the supplied tags, in one pass over the `idx_parents_lim` index. This
+    /// is the bulk form of `limited_child_relationships_get`: a page of 50
+    /// threads is one chunked `IN (...)` read instead of one query per
+    /// thread. Results are not grouped; callers bucket rows by `limit_to`.
+    pub(in crate::db::turso) async fn limited_child_relationships_get_many(
+        &self,
+        conn: &Connection,
+        limit_tag_ids: &HashSet<u64>,
+    ) -> Result<HashMap<u64, Vec<TagParents>>> {
+        let mut out: HashMap<u64, Vec<TagParents>> = HashMap::new();
+        if limit_tag_ids.is_empty() {
+            return Ok(out);
+        }
+
+        let ids: Vec<i64> = limit_tag_ids.iter().map(|&id| id as i64).collect();
+        for chunk in ids.chunks(SQL_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT tag_id, relate_tag_id, limit_to
+                 FROM Parents
+                 WHERE limit_to IN ({placeholders});"
+            );
+
+            let mut rows = conn.query(&sql, params_from_iter(chunk.to_vec())).await?;
+            while let Some(row) = rows.next().await? {
+                let limit_tag_id: i64 = row.get(2)?;
+                out.entry(limit_tag_id as u64).or_default().push(TagParents {
+                    tag_id: row.get(0)?,
+                    relate_tag_id: row.get(1)?,
+                    limit_to: parents_limit_decode(Some(limit_tag_id)),
+                });
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Returns the subset of `piece` whose `Tags_Popular` membership will not
     /// match its `count >= 5` state *after* the pending delta is applied.
     ///

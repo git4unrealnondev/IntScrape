@@ -197,6 +197,7 @@ id INTEGER PRIMARY KEY,
 );
 
 CREATE INDEX idx_parents_rel ON Parents (relate_tag_id, tag_id, limit_to);
+CREATE INDEX idx_parents_lim ON Parents (limit_to, tag_id, relate_tag_id);
 CREATE UNIQUE INDEX idx_unique_parents ON Parents (tag_id, relate_tag_id, limit_to);
 ",
         )

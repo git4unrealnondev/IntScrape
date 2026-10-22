@@ -579,6 +579,25 @@ impl TursoDatabase {
             .unwrap_or_default()
     }
 
+    /// Gets the child-parent relations qualified by any of the supplied
+    /// limit tags in one IPC request. This is the bulk form of
+    /// `limited_child_relationships_get`; results are grouped by limit tag.
+    #[ipc(
+        name = "limited_child_relationships_get_many",
+        request = "LimitedChildRelationshipsGetMany"
+    )]
+    pub async fn ipc_limited_child_relationships_get_many(
+        &self,
+        limit_tag_ids: &HashSet<u64>,
+    ) -> HashMap<u64, Vec<TagParents>> {
+        let Ok(conn) = self.db.connect() else {
+            return HashMap::new();
+        };
+        self.limited_child_relationships_get_many(&conn, limit_tag_ids)
+            .await
+            .unwrap_or_default()
+    }
+
     /// Gets child relations for multiple parent tags in one IPC request.
     #[ipc(
         name = "child_relationships_get_many",

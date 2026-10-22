@@ -236,4 +236,38 @@ DROP TABLE Parents_old;
 
         Ok(())
     }
+
+    /// Updates the db from version 11 to 12.
+    ///
+    /// The v10 rebuild of `Parents` dropped `idx_parents_lim` when it
+    /// recreated the table's index set, leaving every `WHERE limit_to = ?`
+    /// read (the chan thread reverse index) with nothing but a full table
+    /// scan. This restores the index in the v10 covering style, so the
+    /// limited-relationship reads — including the bulk form — are index
+    /// seeks that return their rows without touching the table b-tree.
+    /// Set-based and restart-safe (`CREATE INDEX IF NOT EXISTS`).
+    pub(in crate::db) async fn update_db_11_to_12(&self, conn: &Connection) -> Result<()> {
+        log::info!(
+            "Migration 11->12: restoring idx_parents_lim on Parents \
+             (limit_to reads full-scanned after the v10 rebuild)."
+        );
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_parents_lim
+                 ON Parents (limit_to, tag_id, relate_tag_id);",
+        )
+        .await?;
+
+        self.setting_set(
+            conn,
+            shared_types::DbSettingsObj {
+                name: "SYSTEM_VERSION".to_string(),
+                description: None,
+                num: Some(12),
+                param: None,
+            },
+        )
+        .await?;
+
+        Ok(())
+    }
 }
