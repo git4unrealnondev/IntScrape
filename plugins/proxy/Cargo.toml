@@ -12,7 +12,6 @@ shared_types = { workspace = true }
 client = { workspace = true }
 tokio = { workspace = true }
 json = "0.12.4"
-rtipc = "0.9.0"
 # Pinned exactly, not with a caret. Caret on a pre-release admits any later
 # `-beta`, and vetis has been shipping breaking changes between betas. Pinning
 # keeps `cargo update` from silently breaking this plugin again.
@@ -30,8 +29,6 @@ rtipc = "0.9.0"
 # own rustdoc still called `.protos()` on the listener builder, so it does not
 # even compile its examples.
 vetis = "=0.1.7-beta.6"
-smol-macros = "0.1.1"
-macro_rules_attribute = "0.2.3"
 http = "1.5.0"
 smol = "2.0.2"
 # Pinned exactly for the same reason as `vetis` above. `default-features=false`

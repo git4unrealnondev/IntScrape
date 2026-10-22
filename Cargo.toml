@@ -8,7 +8,7 @@ default-run = "intscrape"
 [dependencies]
 fast_log = "1.7.8"
 log = "0.4.33"
-reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "cookies", "gzip", "deflate", "charset", "http2", "rustls"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["cookies", "gzip", "deflate", "charset", "http2", "rustls"] }
 tokio = { workspace = true, features = ["macros", "fs", "signal"] }
 shared_types = { workspace = true, features = ["strum"] }
 libloading = "0.9.0"
@@ -30,7 +30,7 @@ ipc_macro = { path = "./libs/ipc_macro" }
 rand = "0.10.1"
 cfg-if = "1.0.4"
 libc = "0.2.186"
-dhat = "0.3.3"
+dhat = { version = "0.3.3", optional = true }
 tempfile = "3.27.0"
 walkdir = "2.5.0"
 jwalk = "0.9.0"
@@ -39,7 +39,12 @@ ctrlc = "3.5.2"
 regex = "1.13.1"
 strum = "0.28.0"
 image_hasher = "3.1.1"
-image = "0.25.10"
+# Only the codecs that actually occur in scraped media. The defaults pull in
+# `ravif`/`rav1e` (an AV1 *encoder*; AVIF cannot be decoded without the
+# non-default `avif-native` anyway), OpenEXR (`exr`), and HDR/DDS/PNM/QOI/
+# farbfeld support. Undecodable formats already degrade gracefully in the
+# hashing paths (`.ok()?` / `if let Ok`).
+image = { version = "0.25.10", default-features = false, features = ["rayon", "jpeg", "png", "gif", "webp", "bmp", "ico", "tga", "tiff"] }
 # Priority-ordered async semaphore for the download and job concurrency
 # gates. Higher job priority is granted first, equal priority is FIFO.
 # Runtime-agnostic, so it works on tokio without pinning a runtime.
@@ -81,10 +86,23 @@ rust-version = "1.85"
 
 [profile.release]
 opt-level = 3
-lto = "fat"
-codegen-units = 1
+# `lto = "fat"` + `codegen-units = 1` serialized nearly the whole build: fat
+# LTO's optimization pass is single-threaded and runs once per linked artifact
+# (the main binary plus every plugin), and one codegen unit disables parallel
+# codegen inside each crate. Thin LTO keeps most of the cross-crate inlining
+# while parallelizing, and 16 codegen units restore intra-crate parallelism.
+lto = "thin"
+codegen-units = 16
 panic = "abort"
 strip = true
+
+# Opt-in maximum-performance profile for final production builds where the
+# last percent of runtime speed is worth a much longer compile time:
+# `cargo build --profile release-max -p intscrape`
+[profile.release-max]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
 
 [profile.release-with-debug]
 inherits = "release"
@@ -92,8 +110,8 @@ debug = true
 strip = false
 
 [features]
-dhat-heap = []    # if you are doing heap profiling
-dhat-ad-hoc = []  # if you are doing ad hoc profiling
+dhat-heap = ["dep:dhat"]   # if you are doing heap profiling
+dhat-ad-hoc = ["dep:dhat"] # if you are doing ad hoc profiling
 
 [dev-dependencies]
 # Used by src/db/turso/bench.rs and any future `[[bench]]` targets.

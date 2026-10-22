@@ -1,5 +1,10 @@
-compiled_plugins
 target
 .git
-*.db
-*.json
+.vscode
+compiled_plugins
+*.db*
+log.txt
+flamegraph.svg
+thumbnails
+files
+tor-serve

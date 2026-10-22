@@ -1,23 +1,32 @@
+# syntax=docker/dockerfile:1
 FROM archlinux:base AS chef
 
 WORKDIR /src
 
-# Install the Rust toolchain and native dependencies required by the workspace.
+# Pin the Rust toolchain so image builds are reproducible instead of floating
+# with the rolling `rust` pacman package. Bump this to track new releases.
+ARG RUST_VERSION=1.99.1
+
+# Install the native dependencies required by the workspace, then the pinned
+# Rust toolchain and cargo-chef.
 RUN pacman -Syu --noconfirm \
     base-devel \
     ca-certificates \
-    cargo \
     clang \
     cmake \
+    curl \
     ffmpeg \
     git \
     libbluray \
     openssl \
     pkgconf \
-    rust \
     sqlite \
     && pacman -Scc --noconfirm \
-    && cargo install cargo-chef --locked
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain "${RUST_VERSION}" \
+    && "$HOME/.cargo/bin/cargo" install cargo-chef --locked
+
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 FROM chef AS planner
 COPY . .
@@ -27,21 +36,39 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 COPY --from=planner /src/recipe.json recipe.json
 
+# Build dependencies only - this is the caching Docker layer! Source edits in
+# the COPY below do not recompile it as long as Cargo.lock/manifests are
+# unchanged.
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 ARG BUILD_REVISION=unknown
 
-# Add these mount flags to your cargo build step
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    echo "Building revision ${BUILD_REVISION}" \
-    && rm -rf compiled_plugins bin \
-    && cargo build --release --workspace \
-    && mkdir -p compiled_plugins bin \
-    && cp target/release/intscrape bin/intscrape \
-    && find target/release -maxdepth 1 -type f -name '*.so' -exec cp {} compiled_plugins/ \; \
-    && strip compiled_plugins/*.so \
-    && test -n "$(find compiled_plugins -maxdepth 1 -type f -name '*.so' -print -quit)"
+# Build the whole workspace: every dependency was already compiled by
+# cargo-chef into the shared target directory, so only workspace crates compile
+# here. INTSCRAPE_SKIP_PLUGIN_BUILD=1 makes build.rs a no-op (the workspace
+# build already emits the plugin .so files into target/release), which avoids a
+# second full dependency-graph build that a build-script-invoked cargo would
+# otherwise need in its separate target directory.
+RUN <<'EOF'
+set -eu
+
+echo "Building revision ${BUILD_REVISION}"
+rm -rf compiled_plugins bin
+
+INTSCRAPE_SKIP_PLUGIN_BUILD=1 cargo build --release --locked --workspace
+
+mkdir -p bin compiled_plugins
+cp target/release/intscrape bin/intscrape
+for plugin_dir in plugins/*/; do
+    crate_name="$(basename "$plugin_dir" | tr '-' '_')"
+    if [ -f "target/release/lib${crate_name}.so" ]; then
+        cp "target/release/lib${crate_name}.so" compiled_plugins/
+    else
+        echo "warning: expected target/release/lib${crate_name}.so" >&2
+    fi
+done
+test -n "$(find compiled_plugins -maxdepth 1 -type f -name '*.so' -print -quit)"
+EOF
 
 FROM archlinux:base
 WORKDIR /app
