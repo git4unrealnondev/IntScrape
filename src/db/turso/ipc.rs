@@ -117,6 +117,23 @@ impl TursoDatabase {
             .unwrap_or_default()
     }
 
+    /// Gets tag ids associated with a namespace id, newest-created first.
+    /// `limit` bounds how many ids are returned; `None` or a limit of zero
+    /// returns every id, matching the unlimited request.
+    #[ipc(name = "get_tag_ids_namespace_id_limited", request = "GetNamespaceTagIDsLimited")]
+    pub async fn ipc_tag_id_get_namespace_id_limited(
+        &self,
+        namespace_id: &u64,
+        limit: &Option<u64>,
+    ) -> Vec<u64> {
+        let Ok(conn) = self.db.connect() else {
+            return Vec::new();
+        };
+        self.tag_id_get_namespace_id_limited(&conn, *namespace_id, *limit)
+            .await
+            .unwrap_or_default()
+    }
+
     /// Gets every tag id in the database.
     #[ipc(name = "get_tag_ids_all", request = "GetTagIDsAll")]
     pub async fn ipc_tag_id_get_all(&self) -> HashSet<u64> {

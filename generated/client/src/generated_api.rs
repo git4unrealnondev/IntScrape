@@ -124,6 +124,30 @@ pub fn get_tag_ids_namespace_id_async(
 {
     crate::init_data_request_async(crate::SupportedDBRequests::GetNamespaceTagIDs(namespace_id))
 }
+/// Gets tag ids associated with a namespace id, newest-created first.
+/// `limit` bounds how many ids are returned; `None` or a limit of zero
+/// returns every id, matching the unlimited request.
+pub fn get_tag_ids_namespace_id_limited(
+    namespace_id: u64,
+    limit: Option<u64>,
+) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+    crate::init_data_request(crate::SupportedDBRequests::GetNamespaceTagIDsLimited(
+        namespace_id,
+        limit,
+    ))
+}
+/// Gets tag ids associated with a namespace id, newest-created first.
+/// `limit` bounds how many ids are returned; `None` or a limit of zero
+/// returns every id, matching the unlimited request.
+pub fn get_tag_ids_namespace_id_limited_async(
+    namespace_id: u64,
+    limit: Option<u64>,
+) -> impl std::future::Future<Output = Result<Vec<u64>, Box<dyn std::error::Error + Send + Sync>>> {
+    crate::init_data_request_async(crate::SupportedDBRequests::GetNamespaceTagIDsLimited(
+        namespace_id,
+        limit,
+    ))
+}
 /// Gets every tag id in the database.
 pub fn get_tag_ids_all() -> Result<HashSet<u64>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::GetTagIDsAll())

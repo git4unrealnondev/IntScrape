@@ -29,6 +29,37 @@ impl TursoDatabase {
         Ok(out)
     }
 
+    /// Gets tag ids associated with a namespace id, newest-created first.
+    /// `limit` bounds how many ids are returned; `None` (or zero) falls back
+    /// to the unlimited read. `id DESC` rides the primary key index, so a
+    /// limited read touches only the newest rows instead of scanning the
+    /// whole namespace.
+    pub(in crate::db::turso) async fn tag_id_get_namespace_id_limited(
+        &self,
+        conn: &Connection,
+        namespace_id: u64,
+        limit: Option<u64>,
+    ) -> Result<Vec<u64>> {
+        let Some(limit) = limit.filter(|&limit| limit > 0) else {
+            let unlimited = self.tag_id_get_namespace_id(conn, namespace_id).await?;
+            return Ok(unlimited.into_iter().collect());
+        };
+
+        let mut out = Vec::new();
+        let mut rows = conn
+            .query(
+                "SELECT id FROM Tags WHERE namespace = ?1 ORDER BY id DESC LIMIT ?2;",
+                (namespace_id as i64, limit as i64),
+            )
+            .await?;
+
+        while let Some(row) = rows.next().await? {
+            out.push(row.get(0)?);
+        }
+
+        Ok(out)
+    }
+
     /// Gets every tag id in the database.
     pub(in crate::db::turso) async fn tag_id_get_all(
         &self,

@@ -217,6 +217,7 @@ CREATE TABLE IF NOT EXISTS Tags (
     FOREIGN KEY (namespace) REFERENCES Namespace(id) ON DELETE CASCADE ON UPDATE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_tags_count_covering ON Tags(count DESC, name, namespace);
+CREATE INDEX IF NOT EXISTS idx_tags_namespace ON Tags (namespace);
 ",
         )
         .await;

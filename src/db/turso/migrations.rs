@@ -204,4 +204,36 @@ DROP TABLE Parents_old;
 
         Ok(())
     }
+
+    /// Updates the db from version 10 to 11.
+    ///
+    /// The `Tags` table had no index on `namespace` — the `UNIQUE(name,
+    /// namespace)` index cannot serve a `WHERE namespace = ?` probe because
+    /// namespace is its second column. Every namespace-scoped read (thread
+    /// listing, board totals, tag-id fetches) full-scanned the table, which
+    /// cost 30-90s on production archives with millions of tags. This adds a
+    /// plain b-tree on `namespace` so those reads become index lookups.
+    pub(in crate::db) async fn update_db_10_to_11(&self, conn: &Connection) -> Result<()> {
+        log::info!(
+            "Migration 10->11: adding idx_tags_namespace to Tags \
+             (namespace lookups previously full-scanned the table)."
+        );
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_tags_namespace ON Tags (namespace);",
+        )
+        .await?;
+
+        self.setting_set(
+            conn,
+            shared_types::DbSettingsObj {
+                name: "SYSTEM_VERSION".to_string(),
+                description: None,
+                num: Some(11),
+                param: None,
+            },
+        )
+        .await?;
+
+        Ok(())
+    }
 }
