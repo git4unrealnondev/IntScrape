@@ -62,13 +62,21 @@ ARG BUILD_REVISION=unknown
 # build already emits the plugin .so files into target/release), which avoids a
 # second full dependency-graph build that a build-script-invoked cargo would
 # otherwise need in its separate target directory.
+#
+# --locked pins the build to the committed Cargo.lock. If the build context
+# ships a stale or missing lock (e.g. a server checkout with local lock
+# changes), fall back to letting cargo resolve from the manifests so the image
+# can still be built, and say so loudly.
 RUN <<'EOF'
 set -eu
 
 echo "Building revision ${BUILD_REVISION}"
 rm -rf compiled_plugins bin
 
-INTSCRAPE_SKIP_PLUGIN_BUILD=1 cargo build --release --locked --workspace
+if ! INTSCRAPE_SKIP_PLUGIN_BUILD=1 cargo build --release --locked --workspace; then
+    echo "warning: Cargo.lock did not match the manifests in this build context; building without --locked" >&2
+    INTSCRAPE_SKIP_PLUGIN_BUILD=1 cargo build --release --workspace
+fi
 
 mkdir -p bin compiled_plugins
 cp target/release/intscrape bin/intscrape
