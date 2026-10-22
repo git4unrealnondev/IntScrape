@@ -12,6 +12,11 @@ WORKDIR /src
 # "cannot update the lock file ... because --locked was passed". When bumping,
 # regenerate the lock with the new toolchain (`cargo +<new> check`) in the same
 # change.
+#
+# The `minimal` profile skips optional components, but rustfmt must be pulled
+# in explicitly: the `export_ipc` proc macro shells out to `rustfmt` to format
+# the generated client code, so building without it fails with
+# "'rustfmt' is not installed for the toolchain ...".
 ARG RUST_VERSION=1.97.1
 
 # Install the native dependencies required by the workspace, then the pinned
@@ -31,6 +36,7 @@ RUN pacman -Syu --noconfirm \
     && pacman -Scc --noconfirm \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --profile minimal --default-toolchain "${RUST_VERSION}" \
+            --component rustfmt \
     && "$HOME/.cargo/bin/cargo" install cargo-chef --locked
 
 ENV PATH="/root/.cargo/bin:${PATH}"
