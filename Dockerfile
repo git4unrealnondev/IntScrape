@@ -5,7 +5,14 @@ WORKDIR /src
 
 # Pin the Rust toolchain so image builds are reproducible instead of floating
 # with the rolling `rust` pacman package. Bump this to track new releases.
-ARG RUST_VERSION=1.99.1
+#
+# IMPORTANT: this must stay in sync with the cargo version that generated the
+# committed Cargo.lock (locally: `cargo --version`). A newer cargo can resolve
+# dependencies differently and then refuses `--locked` builds with
+# "cannot update the lock file ... because --locked was passed". When bumping,
+# regenerate the lock with the new toolchain (`cargo +<new> check`) in the same
+# change.
+ARG RUST_VERSION=1.97.1
 
 # Install the native dependencies required by the workspace, then the pinned
 # Rust toolchain and cargo-chef.
