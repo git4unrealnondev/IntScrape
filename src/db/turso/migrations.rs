@@ -105,7 +105,6 @@ DROP TABLE Parents_old;
     }
 
     /// Updates the db from version 8 to 9.
-    ///
     /// An v8 database carries `idx_file_hash` and `idx_namespace`, which
     /// duplicate the unique indexes SQLite already builds for the `UNIQUE`
     /// `File.hash` and `Namespace.name` columns. The planner never selects
@@ -131,6 +130,73 @@ DROP TABLE Parents_old;
                 name: "SYSTEM_VERSION".to_string(),
                 description: None,
                 num: Some(9),
+                param: None,
+            },
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Updates the db from version 9 to 10.
+    ///
+    /// Re-stores `Parents` around what the probes and list reads actually
+    /// need. Measured in `db_bench_parents_store` (release, MVCC, fresh db per
+    /// variant, 100k edges):
+    ///
+    /// ```text
+    ///                       novel   re-add  fwd   rev    exact
+    /// A v9 (expr key + rel)  14.70    3.56  56.4  47.7    44.4
+    /// v10 (plain + covering) 13.17    3.33  43.4  43.7    23.1
+    /// ```
+    ///
+    /// - `limit_to` switches from nullable to `NOT NULL DEFAULT -1`. That
+    ///   replaces the `IFNULL(limit_to, -1)` *expression* dedupe index with a
+    ///   plain composite key, so inserts stop recomputing the expression
+    ///   (novel inserts ~10% faster, exact triple probes ~2x faster) and the
+    ///   forward list becomes an index-only read. Tag ids are rowids that
+    ///   start at 1, so `-1` is an unambiguous "no limit tag".
+    /// - `idx_parents_rel` grows to `(relate_tag_id, tag_id, limit_to)` so
+    ///   reverse reads (`child_relationships_get`,
+    ///   `parent_relate_limit_exists`) stop hopping through the rowid to the
+    ///   table b-tree.
+    ///
+    /// The copy is set-based and deduplicates on the same effective key the
+    /// v9 expression index used (`IFNULL(limit_to, -1)`), so a NULL-limit row
+    /// from any older generation and the sentinel encoding collapse to one
+    /// row. Without-rowid storage was evaluated and is not available: turso
+    /// 0.8.2 rejects `CREATE INDEX` on `WITHOUT ROWID` tables, and the reverse
+    /// direction needs a secondary index.
+    pub(in crate::db) async fn update_db_9_to_10(&self, conn: &Connection) -> Result<()> {
+        log::info!(
+            "Migration 9->10: rebuilding Parents with the sentinel limit_to and a covering reverse index."
+        );
+        conn.execute_batch(
+            "ALTER TABLE Parents RENAME TO Parents_old;
+             DROP INDEX IF EXISTS idx_parents_rel;
+             DROP INDEX IF EXISTS idx_unique_parents_null_safe;
+             DROP INDEX IF EXISTS idx_unique_parents;",
+        )
+        .await?;
+
+        self.table_create_parents_v2(conn).await?;
+
+        conn.execute_batch(
+            "INSERT INTO Parents (tag_id, relate_tag_id, limit_to)
+             SELECT tag_id, relate_tag_id, IFNULL(limit_to, -1)
+             FROM Parents_old
+             GROUP BY tag_id, relate_tag_id, IFNULL(limit_to, -1);
+
+             DROP TABLE Parents_old;",
+        )
+        .await?;
+
+        self.setting_set(
+            conn,
+            shared_types::DbSettingsObj {
+                name: "SYSTEM_VERSION".to_string(),
+                description: None,
+                num: Some(10),
                 param: None,
             },
         )

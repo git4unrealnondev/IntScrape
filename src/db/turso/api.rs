@@ -345,6 +345,33 @@ impl TursoDatabase {
     }
 
     ///
+    /// Batched skip-if lookup for a scraped page: for the whole page's
+    /// `(namespace, tag)` pair set, resolves which tags already belong to an
+    /// existing file. Keys that do not resolve are absent, which the caller
+    /// reads as "no skip" ("no dedup found"), never as "drop the file".
+    /// Errors log and return an empty map for the same reason.
+    ///
+    pub async fn tag_skip_files_get(
+        &self,
+        keys: &std::collections::HashSet<(String, String)>,
+    ) -> HashMap<(String, String), FileInternal> {
+        let conn = match self.db.connect() {
+            Ok(conn) => conn,
+            Err(error) => {
+                log::error!("Failed to connect while resolving skip tags: {error}");
+                return HashMap::new();
+            }
+        };
+        match self.tag_skip_files_sql(&conn, keys).await {
+            Ok(map) => map,
+            Err(error) => {
+                log::error!("Failed to resolve skip tags: {error}");
+                HashMap::new()
+            }
+        }
+    }
+
+    ///
     /// Adds a single job — sync wrapper for non-async contexts (plugins).
     ///
     pub fn jobs_add_single_sync(&self, job: PluginJob) -> u64 {

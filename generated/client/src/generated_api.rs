@@ -395,6 +395,29 @@ pub fn child_relationships_get_async(
         relate_tag_id,
     ))
 }
+/// Gets every child-parent relation whose `limit_to` qualifier equals the
+/// supplied tag — the reverse index of a qualified relationship. Rows are
+/// `(tag_id -> relate_tag_id)` pairs that are only meaningful in the
+/// context of that limit tag.
+pub fn limited_child_relationships_get(
+    limit_tag_id: u64,
+) -> Result<Vec<TagParents>, Box<dyn std::error::Error>> {
+    crate::init_data_request(crate::SupportedDBRequests::LimitedChildRelationshipsGet(
+        limit_tag_id,
+    ))
+}
+/// Gets every child-parent relation whose `limit_to` qualifier equals the
+/// supplied tag — the reverse index of a qualified relationship. Rows are
+/// `(tag_id -> relate_tag_id)` pairs that are only meaningful in the
+/// context of that limit tag.
+pub fn limited_child_relationships_get_async(
+    limit_tag_id: u64,
+) -> impl std::future::Future<Output = Result<Vec<TagParents>, Box<dyn std::error::Error + Send + Sync>>>
+{
+    crate::init_data_request_async(crate::SupportedDBRequests::LimitedChildRelationshipsGet(
+        limit_tag_id,
+    ))
+}
 /// Gets child relations for multiple parent tags in one IPC request.
 pub fn child_relationships_get_many(
     tag_ids: HashSet<u64>,
@@ -483,6 +506,26 @@ pub fn dead_url_get_async(
     Output = Result<HashMap<String, bool>, Box<dyn std::error::Error + Send + Sync>>,
 > {
     crate::init_data_request_async(crate::SupportedDBRequests::GetDeadUrl(dead_urls))
+}
+///
+/// Resolves downloaded source URLs to one representative file id each, so
+/// UIs can link URLs in text back to the actual files on disk.
+///
+pub fn source_url_file_ids_get(
+    urls: Vec<String>,
+) -> Result<Vec<(String, u64)>, Box<dyn std::error::Error>> {
+    crate::init_data_request(crate::SupportedDBRequests::SourceUrlFileIdsGet(urls))
+}
+///
+/// Resolves downloaded source URLs to one representative file id each, so
+/// UIs can link URLs in text back to the actual files on disk.
+///
+pub fn source_url_file_ids_get_async(
+    urls: Vec<String>,
+) -> impl std::future::Future<
+    Output = Result<Vec<(String, u64)>, Box<dyn std::error::Error + Send + Sync>>,
+> {
+    crate::init_data_request_async(crate::SupportedDBRequests::SourceUrlFileIdsGet(urls))
 }
 ///
 /// Adds a namespace into the db

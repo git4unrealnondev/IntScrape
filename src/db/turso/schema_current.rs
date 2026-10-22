@@ -127,7 +127,7 @@ CREATE TABLE Namespace (
         .await;
     }
     pub(in crate::db::turso) async fn table_create_parents(&self, conn: &Connection) -> Result<()> {
-        self.table_create_parents_v1(conn).await
+        self.table_create_parents_v2(conn).await
     }
 
     pub(in crate::db::turso) async fn table_create_parents_v1(
@@ -151,6 +151,56 @@ id INTEGER PRIMARY KEY,
 CREATE INDEX idx_parents_rel ON Parents (relate_tag_id);
 CREATE UNIQUE INDEX idx_unique_parents_null_safe ON Parents (tag_id, relate_tag_id, IFNULL(limit_to, -1));
 ").await
+    }
+
+    ///
+    /// The current `Parents` storage shape (db schema v10 onward).
+    ///
+    /// Two deliberate deviations from v1, both measured in
+    /// `db_bench_parents_store`:
+    ///
+    /// - `limit_to` is `NOT NULL DEFAULT -1` instead of nullable. The -1
+    ///   sentinel keeps the "no limit tag" case dedupeable by an ordinary
+    ///   composite index; v1 needed an `IFNULL(limit_to, -1)` *expression*
+    ///   index, which every insert and every probe re-evaluates. Tag ids start
+    ///   at 1 (they are rowids), so `-1` is unambiguous.
+    /// - `idx_parents_rel` carries all three columns
+    ///   `(relate_tag_id, tag_id, limit_to)` so the reverse direction
+    ///   (`child_relationships_get`, `parent_relate_limit_exists`) is served
+    ///   without a rowid hop back to the table b-tree.
+    ///
+    /// The dedupe index keeps the name `idx_unique_parents` (renamed from the
+    /// expression variant `idx_unique_parents_null_safe`, which no longer
+    /// describes the key).
+    ///
+    /// The `limit_to` foreign key is deliberately gone: under the sentinel the
+    /// stored value `-1` is not a `Tags.id`, so a declared reference would fail
+    /// the day `PRAGMA foreign_keys` was switched on. Enforcement of the
+    /// remaining two FKs is unchanged (the backend runs with the pragma off;
+    /// their cascade macros are inert today and stay inert).
+    pub(in crate::db::turso) async fn table_create_parents_v2(
+        &self,
+        conn: &Connection,
+    ) -> Result<()> {
+        conn.execute_batch(
+            "
+CREATE TABLE Parents (
+id INTEGER PRIMARY KEY,
+    tag_id INTEGER NOT NULL,
+    relate_tag_id INTEGER NOT NULL,
+    limit_to INTEGER NOT NULL DEFAULT -1,
+
+    FOREIGN KEY (tag_id) REFERENCES Tags(id) ON DELETE CASCADE ON UPDATE CASCADE,
+    FOREIGN KEY (relate_tag_id) REFERENCES Tags(id) ON DELETE CASCADE ON UPDATE CASCADE,
+
+    CHECK (tag_id != relate_tag_id)
+);
+
+CREATE INDEX idx_parents_rel ON Parents (relate_tag_id, tag_id, limit_to);
+CREATE UNIQUE INDEX idx_unique_parents ON Parents (tag_id, relate_tag_id, limit_to);
+",
+        )
+        .await
     }
 
     pub(in crate::db::turso) async fn table_create_tags(&self, conn: &Connection) {

@@ -545,6 +545,23 @@ impl TursoDatabase {
             .unwrap_or_default()
     }
 
+    /// Gets every child-parent relation whose `limit_to` qualifier equals the
+    /// supplied tag — the reverse index of a qualified relationship. Rows are
+    /// `(tag_id -> relate_tag_id)` pairs that are only meaningful in the
+    /// context of that limit tag.
+    #[ipc(
+        name = "limited_child_relationships_get",
+        request = "LimitedChildRelationshipsGet"
+    )]
+    pub async fn ipc_limited_child_relationships_get(&self, limit_tag_id: &u64) -> Vec<TagParents> {
+        let Ok(conn) = self.db.connect() else {
+            return Vec::new();
+        };
+        self.limited_child_relationships_get(&conn, *limit_tag_id)
+            .await
+            .unwrap_or_default()
+    }
+
     /// Gets child relations for multiple parent tags in one IPC request.
     #[ipc(
         name = "child_relationships_get_many",
@@ -605,6 +622,22 @@ impl TursoDatabase {
     #[ipc(name = "dead_url_get", request = "GetDeadUrl")]
     pub async fn ipc_dead_url_get(&self, dead_urls: &[String]) -> HashMap<String, bool> {
         self.dead_url_exist(dead_urls.to_vec()).await
+    }
+
+    ///
+    /// Resolves downloaded source URLs to one representative file id each, so
+    /// UIs can link URLs in text back to the actual files on disk.
+    ///
+    #[ipc(name = "source_url_file_ids_get", request = "SourceUrlFileIdsGet")]
+    pub async fn ipc_source_url_file_ids_get(&self, urls: &[String]) -> Vec<(String, u64)> {
+        let url_set: HashSet<String> = urls.iter().cloned().collect();
+        self.source_url_files_get(url_set)
+            .await
+            .into_iter()
+            .filter_map(|(url, status)| {
+                status.file.and_then(|file| file.id).map(|id| (url, id))
+            })
+            .collect()
     }
 
     ///

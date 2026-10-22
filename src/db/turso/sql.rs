@@ -315,14 +315,14 @@ LIMIT ?2;",
 
         // Callers hand this a `HashSet` iteration (see `tag_action_bulk_add`
         // and the slurp import), so rows arrive in hash order. Order the batch
-        // on the null-safe unique index key `(tag_id, relate_tag_id,
-        // IFNULL(limit_to, -1))` so that index is extended at its right edge
-        // instead of being punched all over the b-tree: every insert has to
-        // probe that index for the `OR IGNORE` dedupe, and a sorted feed turns
-        // those probes into near-sequential seeks. This mirrors what
-        // `relationships_bulk_add` already does for the relationship tables.
-        // `-1` matches the `IFNULL(limit_to, -1)` sentinel in the index so the
-        // NULL rows group together exactly as they are stored.
+        // on the unique index key `(tag_id, relate_tag_id, limit_to)` so that
+        // index is extended at its right edge instead of being punched all
+        // over the b-tree: every insert has to probe that index for the
+        // `OR IGNORE` dedupe, and a sorted feed turns those probes into
+        // near-sequential seeks. This mirrors what `relationships_bulk_add`
+        // already does for the relationship tables.
+        // `-1` binds the absent-`limit_to` rows exactly as the sentinel is
+        // stored, so NULL rows and sentinel rows group together identically.
         //
         // The sort's benefit is much smaller than an earlier comment here
         // claimed, and on turso 0.8.1 it is not reliably measurable at all:
@@ -810,8 +810,13 @@ pub(in crate::db::turso) fn parents_insert_sql(parent_count: usize) -> String {
     format!("INSERT OR IGNORE INTO Parents (tag_id, relate_tag_id, limit_to) VALUES {placeholders}")
 }
 
-/// Binds each parent row to its three `VALUES` placeholders, mapping an absent
-/// `limit_to` to SQL `NULL`.
+/// Binds each parent row to its three `VALUES` placeholders.
+///
+/// An absent `limit_to` binds the `-1` sentinel the current `Parents` schema
+/// stores instead of SQL `NULL`: tag ids are rowids that start at 1, so `-1`
+/// is unambiguous, and the dedupe index can then be a plain composite
+/// `(tag_id, relate_tag_id, limit_to)` key rather than an `IFNULL(limit_to,
+/// -1)` expression key that every insert and probe re-evaluates.
 pub(in crate::db::turso) fn parents_params(parents: &[&TagParents]) -> Vec<Value> {
     parents
         .iter()
@@ -821,7 +826,7 @@ pub(in crate::db::turso) fn parents_params(parents: &[&TagParents]) -> Vec<Value
                 Value::from(parent.relate_tag_id as i64),
                 match parent.limit_to {
                     Some(limit_id) => Value::from(limit_id as i64),
-                    None => Value::Null,
+                    None => Value::from(-1),
                 },
             ]
         })

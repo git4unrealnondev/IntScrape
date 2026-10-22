@@ -593,7 +593,7 @@ impl TursoDatabase {
 
     /// Gets existing files associated with source URLs plus dead-url state.
     pub async fn source_url_files_get(
-        self: std::sync::Arc<Self>,
+        &self,
         url_set: HashSet<String>,
     ) -> HashMap<String, SourceUrlFileStatus> {
         let mut out: HashMap<String, SourceUrlFileStatus> = HashMap::new();
@@ -1020,10 +1020,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn boot_migrates_legacy_parents_index_set() {
-        // A database created before the lean Parents schema still carries the
-        // redundant idx_parents_lim (and inline UNIQUE autoindex). The boot
-        // migration must drop idx_parents_lim in place while leaving dedupe
-        // and reads intact on the null-safe unique index.
+        // A database created before the lean Parents schema carries the legacy
+        // 4-index shape (inline UNIQUE autoindex, idx_parents_lim on
+        // limit_to alone, and the IFNULL expression unique). The boot
+        // migration chain must retire the redundant indexes and land on the
+        // current sentinel + covering-index shape with dedupe and reads
+        // intact. The version is pinned to 6, the generation the legacy shape
+        // dates from, so the whole 6 -> 7 -> ... -> 10 chain runs.
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("legacy_parents.db");
         let should_exit = Arc::new(AtomicBool::new(false));
@@ -1046,7 +1049,8 @@ mod tests {
              CREATE INDEX idx_parents_lim ON Parents (limit_to);
              CREATE INDEX idx_parents_rel ON Parents (relate_tag_id);
              CREATE UNIQUE INDEX idx_unique_parents_null_safe
-                 ON Parents (tag_id, relate_tag_id, IFNULL(limit_to, -1));",
+                 ON Parents (tag_id, relate_tag_id, IFNULL(limit_to, -1));
+             UPDATE Settings SET num = 6 WHERE name = 'SYSTEM_VERSION';",
         )
         .await
         .unwrap();
@@ -1054,43 +1058,53 @@ mod tests {
         db.shutdown().await;
         drop(db);
 
-        // Reboot: check_db's Parents migration must run.
+        // Reboot: the migration chain must run through 10.
         let db = TursoDatabase::new_with_exit(&db_path, should_exit).await;
         let conn = db.connect().unwrap();
 
-        let lim_present: i64 = {
+        let version: i64 = {
             let mut stmt = conn
-                .prepare(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM sqlite_master
-                         WHERE type = 'index' AND LOWER(name) = 'idx_parents_lim'
-                     )",
-                )
-                .await
-                .unwrap();
-            stmt.query_row(()).await.unwrap().get(0).unwrap()
-        };
-        assert_eq!(lim_present, 0, "boot must drop the legacy idx_parents_lim");
-
-        let uidx_present: i64 = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM sqlite_master
-                         WHERE type = 'index' AND LOWER(name) = 'idx_unique_parents_null_safe'
-                     )",
-                )
+                .prepare("SELECT num FROM Settings WHERE name = 'SYSTEM_VERSION'")
                 .await
                 .unwrap();
             stmt.query_row(()).await.unwrap().get(0).unwrap()
         };
         assert_eq!(
-            uidx_present, 1,
-            "null-safe unique index must survive the migration"
+            version, 10,
+            "the full migration chain must complete on boot"
+        );
+        let lim_present: i64 = {
+            let mut stmt = conn.prepare("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND LOWER(name) = 'idx_parents_lim')").await.unwrap();
+            stmt.query_row(()).await.unwrap().get(0).unwrap()
+        };
+        assert_eq!(lim_present, 0, "boot must drop the legacy idx_parents_lim");
+
+        let null_safe_present: i64 = {
+            let mut stmt = conn.prepare("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND LOWER(name) = 'idx_unique_parents_null_safe')").await.unwrap();
+            stmt.query_row(()).await.unwrap().get(0).unwrap()
+        };
+        assert_eq!(
+            null_safe_present, 0,
+            "the IFNULL expression index must be retired by 9 -> 10"
+        );
+
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index'
+                   AND LOWER(name) IN ('idx_parents_rel', 'idx_unique_parents');",
+                (),
+            )
+            .await
+            .unwrap();
+        let keep_count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            keep_count, 2,
+            "the sentinel unique index and the covering reverse index must replace the legacy set"
         );
 
         // Dedupe still works after the migration: the OR IGNORE probes the
-        // null-safe index, not the dropped inline UNIQUE.
+        // composite unique index, not the dropped expression index.
         let conn2 = db.connect().unwrap();
         let tags = vec![
             shared_types::TagParents {
@@ -1117,7 +1131,17 @@ mod tests {
         };
         assert_eq!(
             count2, 2,
-            "re-asserting the same parents must dedupe through the null-safe index"
+            "re-asserting the same parents must dedupe through the composite index"
+        );
+        // The migrated NULL-limit row is stored as the -1 sentinel.
+        let mut rows = conn2
+            .query("SELECT COUNT(*) FROM Parents WHERE limit_to = -1;", ())
+            .await
+            .unwrap();
+        let sentinel_rows: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            sentinel_rows, 1,
+            "the NULL-limit parent must be stored with the -1 sentinel"
         );
         drop(conn2);
         drop(conn);
@@ -1249,6 +1273,176 @@ mod tests {
             .await
             .is_err(),
             "the UNIQUE constraint must still reject a duplicate hash"
+        );
+    }
+
+    /// The 9 -> 10 migration re-stores `Parents` around the sentinel limit_to
+    /// and a covering reverse index. Data written before the migration must
+    /// survive: pre-v10 `NULL` limits become the `-1` sentinel, real limits
+    /// are preserved, the expression dedupe key must still reject re-adds
+    /// after the copy, and both read directions must decode through the new
+    /// storage.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn migration_9_to_10_preserves_parent_edges() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("parents_sentinel.db");
+        let should_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Build a v9-shaped database: nullable limit_to with the IFNULL
+        // expression unique index, version pinned to 9.
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+        {
+            let conn = db.connect().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE Parents_v9 (
+                     id INTEGER PRIMARY KEY,
+                     tag_id INTEGER NOT NULL,
+                     relate_tag_id INTEGER NOT NULL,
+                     limit_to INTEGER
+                 );
+                 INSERT INTO Parents (tag_id, relate_tag_id, limit_to)
+                     SELECT tag_id, relate_tag_id, limit_to FROM Parents;
+                 DROP TABLE Parents;
+                 ALTER TABLE Parents_v9 RENAME TO Parents;
+                 CREATE INDEX idx_parents_rel ON Parents (relate_tag_id);
+                 CREATE UNIQUE INDEX idx_unique_parents_null_safe
+                     ON Parents (tag_id, relate_tag_id, IFNULL(limit_to, -1));
+                 UPDATE Settings SET num = 9 WHERE name = 'SYSTEM_VERSION';",
+            )
+            .await
+            .unwrap();
+            // Three edges as the v9 generation would have written them: an
+            // unscoped edge (NULL limit), a scoped one, and a second unscoped.
+            conn.execute_batch(
+                "INSERT INTO Parents (tag_id, relate_tag_id, limit_to)
+                     VALUES (1, 2, NULL), (3, 4, 5), (6, 7, NULL);",
+            )
+            .await
+            .unwrap();
+        }
+        db.shutdown().await;
+        drop(db);
+
+        // Reboot: the 9 -> 10 upgrade must run and land on the sentinel shape.
+        let db = TursoDatabase::new_with_exit(&db_path, should_exit).await;
+        {
+            let conn = db.connect().unwrap();
+
+            let version: i64 = conn
+                .query(
+                    "SELECT num FROM Settings WHERE name = 'SYSTEM_VERSION';",
+                    (),
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            assert_eq!(
+                version as u64,
+                crate::DB_VERSION,
+                "migration must record the new schema version"
+            );
+
+            for (name, want) in [
+                ("idx_unique_parents_null_safe", 0i64),
+                ("idx_unique_parents", 1),
+                ("idx_parents_rel", 1),
+            ] {
+                let present: i64 = conn
+                    .query(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                         WHERE type = 'index' AND LOWER(name) = LOWER(?1));",
+                        (name,),
+                    )
+                    .await
+                    .unwrap()
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get(0)
+                    .unwrap();
+                assert_eq!(present, want, "index {name} after 9 -> 10");
+            }
+
+            // Every edge survived the copy.
+            let count: i64 = conn
+                .query("SELECT COUNT(*) FROM Parents;", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            assert_eq!(count, 3, "all three pre-migration edges must survive");
+
+            // Both unscoped edges must now be sentinel rows.
+            let sentinels: i64 = conn
+                .query("SELECT COUNT(*) FROM Parents WHERE limit_to = -1;", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            assert_eq!(
+                sentinels, 2,
+                "pre-migration NULL limits must be stored as the -1 sentinel"
+            );
+        }
+
+        // Re-adding the same edges must dedupe through the migrated rows.
+        let conn = db.connect().unwrap();
+        let edges = vec![
+            shared_types::TagParents {
+                tag_id: 1,
+                relate_tag_id: 2,
+                limit_to: None,
+            },
+            shared_types::TagParents {
+                tag_id: 3,
+                relate_tag_id: 4,
+                limit_to: Some(5),
+            },
+        ];
+        db.parents_bulk_add(&conn, &edges).await.unwrap();
+        let count: i64 = conn
+            .query("SELECT COUNT(*) FROM Parents;", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(
+            count, 3,
+            "re-adds of pre-migration edges must dedupe, not duplicate"
+        );
+
+        // Reads decode the sentinel back to None in both directions.
+        let children = db.parent_relationships_get(&conn, 1).await.unwrap();
+        assert!(
+            children
+                .iter()
+                .any(|edge| edge.relate_tag_id == 2 && edge.limit_to.is_none()),
+            "forward read must decode the sentinel: {children:?}"
+        );
+        let children_of_four = db.child_relationships_get(&conn, 4).await.unwrap();
+        assert!(
+            children_of_four
+                .iter()
+                .any(|edge| edge.tag_id == 3 && edge.limit_to == Some(5)),
+            "reverse read must serve the covering index: {children_of_four:?}"
         );
     }
 
@@ -2539,7 +2733,7 @@ mod tests {
             let conn = db.connect().unwrap();
             let limit_clause = match limit_to {
                 Some(_) => "AND l2.name = ?5 AND l.name = ?6",
-                None => "AND p.limit_to IS NULL",
+                None => "AND p.limit_to = -1",
             };
             let sql = format!(
                 "SELECT COUNT(*)
@@ -2663,6 +2857,186 @@ mod tests {
             .await,
             1,
             "re-running a scrape must not duplicate Parents rows"
+        );
+    }
+
+    /// The 4chan plugin models a thread the same way redgifs models a gif:
+    /// values (comments, attachment identity md5s) relate to a post tag and are
+    /// limited to the thread tag. `limited_child_relationships_get` is the read
+    /// side grouping those values back by their thread, so this pins the row
+    /// shape it must return.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chan_shaped_values_group_back_by_their_limit_tag() {
+        use shared_types::{FileManager, GenericNamespaceObj, PluginTag, ScraperDataReturn};
+
+        fn ns(name: &str) -> GenericNamespaceObj {
+            GenericNamespaceObj {
+                name: name.to_string(),
+                description: None,
+            }
+        }
+
+        fn tag(name: &str, namespace: &str) -> shared_types::Tag {
+            shared_types::Tag {
+                name: name.to_string(),
+                namespace: ns(namespace),
+            }
+        }
+
+        fn related(
+            child_name: &str,
+            child_ns: &str,
+            parent: shared_types::Tag,
+            limit_to: Option<shared_types::Tag>,
+        ) -> PluginTag {
+            PluginTag {
+                tag: tag(child_name, child_ns),
+                tag_type: shared_types::TagType::default(),
+                relates_to: Some(shared_types::RelationContext {
+                    tag: parent,
+                    tag_type: shared_types::TagType::default(),
+                    limit_to,
+                }),
+            }
+        }
+
+        let db = new_test_db().await;
+
+        let conn = db.connect().unwrap();
+        let storage_id = db
+            .file_storage_location_get_or_create(&conn, "test_storage")
+            .await
+            .unwrap();
+        drop(conn);
+
+        let thread = tag("998877_g_4chan", "Thread_ID_Unique");
+        let post = tag("998877_g_4chan", "Thread_Post_Id");
+
+        // Attachment identity + the post's comment, both relating to the post
+        // tag limited to the thread tag. The tag phase creates the post and
+        // thread tag rows itself as the relate/limit_to sides, exactly as the
+        // chan plugin feed does - no structural pre-pass needed.
+        let file_tags = vec![FileTagAction {
+            operation: TagOperation::Add,
+            tags: vec![
+                related(
+                    "400fe_localscream",
+                    "Thread_Post_Original_MD5",
+                    post.clone(),
+                    Some(thread.clone()),
+                ),
+                related(
+                    "good post, anon",
+                    "Thread_Comment_cleaned",
+                    post.clone(),
+                    Some(thread.clone()),
+                ),
+            ],
+        }];
+
+        let file = FileManager {
+            internal: FileInternal {
+                id: None,
+                hash: "chan_hash_1".into(),
+                extension: "png".into(),
+                storage_id,
+                size_bytes: Some(2048),
+            },
+            identifying_hashes: vec![],
+        };
+
+        let mut map: HashMap<FileManager, Vec<FileTagAction>> = HashMap::new();
+        map.insert(file, file_tags);
+        assert!(
+            db.clone()
+                .process_scraper(map, Vec::<ScraperDataReturn>::new(), "chan".into())
+                .await
+        );
+
+        // The reverse index by limit tag returns the exact edges that were
+        // qualified by this thread: attachment md5 and comment, both pointing
+        // at the post, both limited to the thread.
+        let conn = db.connect().unwrap();
+        let thread_ns_id = db
+            .namespace_get(&conn, "Thread_ID_Unique")
+            .await
+            .unwrap()
+            .unwrap();
+        let thread_tag_id = db
+            .tag_get_id(&conn, "998877_g_4chan", thread_ns_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let rows = db
+            .limited_child_relationships_get(&conn, thread_tag_id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "both qualified values must group back");
+
+        assert!(
+            rows.iter()
+                .all(|row| row.relate_tag_id == rows[0].relate_tag_id),
+            "both values must share the post tag"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.limit_to == Some(thread_tag_id)),
+            "both values must be limited to this thread only"
+        );
+
+        // The attachment md5 must lead back to the file. Resolve both value
+        // tags by name and check the grouped-back children match exactly.
+        let md5_ns_id = db
+            .namespace_get(&conn, "Thread_Post_Original_MD5")
+            .await
+            .unwrap()
+            .unwrap();
+        let comment_ns_id = db
+            .namespace_get(&conn, "Thread_Comment_cleaned")
+            .await
+            .unwrap()
+            .unwrap();
+        let post_ns_id = db
+            .namespace_get(&conn, "Thread_Post_Id")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let md5_id = db
+            .tag_get_id(&conn, "400fe_localscream", md5_ns_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let comment_id = db
+            .tag_get_id(&conn, "good post, anon", comment_ns_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let post_id = db
+            .tag_get_id(&conn, "998877_g_4chan", post_ns_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut children: Vec<u64> = rows.iter().map(|row| row.tag_id).collect();
+        children.sort_unstable();
+        let mut expected = vec![md5_id, comment_id];
+        expected.sort_unstable();
+        assert_eq!(children, expected, "both and only the two values group back");
+        assert!(
+            rows.iter().all(|row| row.relate_tag_id == post_id),
+            "both values must point at the post tag"
+        );
+
+        let files = db
+            .relationship_get_file_id(&conn, md5_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "the thread's attachment must be reachable through its md5 tag"
         );
     }
 

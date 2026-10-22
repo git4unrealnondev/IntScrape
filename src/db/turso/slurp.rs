@@ -1577,15 +1577,19 @@ impl TursoDatabase {
 
             let mut parent_set = HashSet::new();
             while let Some(row) = rows.next().await? {
-                let (tag_id, relate_tag_id, limit_to): (u64, u64, Option<u64>) =
+                let (tag_id, relate_tag_id, limit_to): (u64, u64, Option<i64>) =
                     (row.get(0)?, row.get(1)?, row.get(2)?);
+                // The source db can be any schema generation: pre-v10 sources
+                // store SQL `NULL`, v10+ sources store the `-1` sentinel. Both
+                // mean "no limit tag", and a real tag id is always > 0.
+                let limit_tag_id = limit_to.filter(|stored| *stored != -1).map(|id| id as u64);
                 if let (Some(&tag_id), Some(&relate_tag_id)) =
                     (slurp_tags.get(&tag_id), slurp_tags.get(&relate_tag_id))
                 {
                     parent_set.insert(TagParents {
                         tag_id,
                         relate_tag_id,
-                        limit_to: limit_to.and_then(|id| slurp_tags.get(&id).copied()),
+                        limit_to: limit_tag_id.and_then(|id| slurp_tags.get(&id).copied()),
                     });
                 }
             }
@@ -1595,9 +1599,16 @@ impl TursoDatabase {
             // If a previous run crashed between the rename and the drop,
             // Parents will be missing/incomplete, but Parents_old will hold the good data.
             {
+                // Name probing must fold case: turso canonicalizes schema
+                // names to lowercase on disk, so a case-sensitive
+                // `name = 'Parents'` matches nothing and the recovery branch
+                // would never fire.
                 let mut check = conn
                     .prepare(
-                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                        "SELECT EXISTS(
+                             SELECT 1 FROM sqlite_schema
+                             WHERE type = 'table' AND LOWER(name) = LOWER(?1)
+                         )",
                     )
                     .await?;
                 let has_parents: i64 = check.query_row(("Parents",)).await?.get(0)?;
@@ -1612,11 +1623,17 @@ impl TursoDatabase {
                     // The restored table may be missing the named indexes if the
                     // interrupted run had already dropped them from Parents_old,
                     // and may carry a stale idx_parents_lim if the run predates
-                    // the lean Parents schema (dropped here so a restored table
-                    // never pays its per-insert tax).
+                    // the lean Parents schema. Recreate both directions with the
+                    // definitions the current schema uses — the IFNULL unique
+                    // key is deliberately shape-agnostic here: it dedupes
+                    // correctly whether the restored table still stores NULL
+                    // (pre-v10) or the -1 sentinel (v10+). The rename dance
+                    // below rebuilds the table fresh either way, so these only
+                    // cover a run that dies again after this point.
                     conn.execute_batch(
                         "DROP INDEX IF EXISTS idx_parents_lim;
-                         CREATE INDEX IF NOT EXISTS idx_parents_rel ON Parents (relate_tag_id);
+                         CREATE INDEX IF NOT EXISTS idx_parents_rel
+                             ON Parents (relate_tag_id, tag_id, limit_to);
                          CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_parents_null_safe
                              ON Parents (tag_id, relate_tag_id, IFNULL(limit_to, -1));",
                     )
@@ -1631,33 +1648,35 @@ impl TursoDatabase {
             // The named indexes follow the renamed table, so their names would
             // collide with the fresh Parents table that table_create_parents
             // creates below. Drop them from Parents_old first so the new table
-            // gets its full index set, including the null-safe unique index
-            // that makes the bulk INSERT OR IGNORE dedupe warm re-slurps.
+            // gets its full index set, including the plain composite unique
+            // index that makes the bulk INSERT OR IGNORE dedupe warm re-slurps.
             conn.execute_batch("PRAGMA foreign_keys = OFF;").await?;
             conn.execute_batch(
                 "ALTER TABLE Parents RENAME TO Parents_old;
                  DROP INDEX IF EXISTS idx_parents_lim;
                  DROP INDEX IF EXISTS idx_parents_rel;
-                 DROP INDEX IF EXISTS idx_unique_parents_null_safe;",
+                 DROP INDEX IF EXISTS idx_unique_parents_null_safe;
+                 DROP INDEX IF EXISTS idx_unique_parents;",
             )
             .await?;
 
             self.table_create_parents(&conn).await?;
 
             // 2. Copy existing data from Parents_old into the freshly
-            // constrained Parents table, deduplicating with the same null-safe
-            // key the unique index uses.
+            // constrained Parents table, deduplicating on the shared
+            // "no limit tag" key: `IFNULL(limit_to, -1)` maps both the SQL
+            // NULL of pre-v10 rows and the v10+ sentinel to one group.
             log::info!("Copying and deduplicating existing parents data");
             conn.execute(
                 "INSERT INTO Parents (tag_id, relate_tag_id, limit_to)
-                 SELECT tag_id, relate_tag_id, limit_to
+                 SELECT tag_id, relate_tag_id, IFNULL(limit_to, -1)
                  FROM Parents_old
                  GROUP BY tag_id, relate_tag_id, IFNULL(limit_to, -1)",
                 (),
             )
             .await?;
 
-            // 3. Insert new parents in chunks; the null-safe unique index on
+            // 3. Insert new parents in chunks; the unique index on
             // the new Parents table makes INSERT OR IGNORE skip rows already
             // copied from Parents_old above.
             let parent_vec: Vec<_> = parent_set.into_iter().collect();
@@ -2355,10 +2374,10 @@ mod tests {
     async fn slurp_recomputes_counts_and_rebuilds_bulk_import_indexes() {
         let db = new_target().await;
 
-        // Warm destination: the namespace, tags and a NULL-limit parent all
-        // already exist here. The source duplicates that parent, so after the
-        // slurp it must be deduplicated rather than doubled while the null-safe
-        // unique index is dropped.
+        // Warm destination: the namespace, tags and a sentinel-limit parent
+        // (the "no limit tag" -1) all already exist here. The source
+        // duplicates that parent with a pre-v10 NULL, so after the slurp both
+        // generations must dedupe to one row.
         {
             let conn = db.connect().unwrap();
             conn.execute(
@@ -2374,7 +2393,7 @@ mod tests {
             .await
             .unwrap();
             conn.execute(
-                "INSERT INTO Parents (tag_id, relate_tag_id, limit_to) VALUES (1, 2, NULL);",
+                "INSERT INTO Parents (tag_id, relate_tag_id, limit_to) VALUES (1, 2, -1);",
                 (),
             )
             .await
@@ -2440,8 +2459,9 @@ mod tests {
             "canine count must be recomputed from the partition: {tag_counts:?}"
         );
 
-        // The pre-existing NULL-limit parent and the slurped one dedupe back to
-        // a single row, leaving the null-safe unique index rebuildable.
+        // The pre-existing sentinel-limit parent and the slurped NULL-limit
+        // one dedupe back to a single row stored as the -1 sentinel,
+        // leaving the composite unique index rebuildable.
         let mut rows = conn
             .query("SELECT tag_id, relate_tag_id, limit_to FROM Parents;", ())
             .await
@@ -2451,16 +2471,16 @@ mod tests {
             parents.push((
                 row.get::<u64>(0).unwrap(),
                 row.get::<u64>(1).unwrap(),
-                row.get::<Option<u64>>(2).unwrap(),
+                row.get::<Option<i64>>(2).unwrap(),
             ));
         }
-        assert_eq!(parents, vec![(1, 2, None)]);
+        assert_eq!(parents, vec![(1, 2, Some(-1))]);
 
         // Every index dropped for the bulk load must be back in place. Turso
         // canonicalizes identifiers to lowercase on disk, so the partition
         // index is queried in its lowercase form. The lean Parents schema
-        // carries two indexes (relate_tag_id + null-safe unique); the legacy
-        // idx_parents_lim is intentionally never recreated.
+        // carries two indexes (covering relate_tag_id + composite unique); the
+        // legacy idx_parents_lim is intentionally never recreated.
         let mut rows = conn
             .query(
                 "SELECT LOWER(name) FROM sqlite_schema
@@ -2468,7 +2488,7 @@ mod tests {
                 (
                     "idx_relationship_1_tag_file",
                     "idx_parents_rel",
-                    "idx_unique_parents_null_safe",
+                    "idx_unique_parents",
                 ),
             )
             .await
@@ -2482,6 +2502,125 @@ mod tests {
             3,
             "all bulk-import indexes recreated: {present:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slurp_recovers_interrupted_parents_rebuild() {
+        let db = new_target().await;
+
+        // Warm destination with one pre-existing edge, left in the crash
+        // state of an interrupted slurp rebuild: Parents was renamed aside to
+        // Parents_old and the fresh table never got created, so Parents is
+        // missing entirely. Parents_old here keeps a pre-v10 nullable
+        // limit_to to also cover the restore's shape-agnostic index work.
+        {
+            let conn = db.connect().unwrap();
+            conn.execute_batch(
+                "INSERT INTO Namespace (id, name, description) VALUES (1, 'species', 'pre');
+                 INSERT INTO Tags (id, name, namespace) VALUES (1, 'mammal', 1), (2, 'canine', 1);
+                 DROP TABLE Parents;
+                 CREATE TABLE Parents_old (
+                     id INTEGER PRIMARY KEY,
+                     tag_id INTEGER NOT NULL,
+                     relate_tag_id INTEGER NOT NULL,
+                     limit_to INTEGER);
+                 INSERT INTO Parents_old (tag_id, relate_tag_id, limit_to) VALUES (1, 2, NULL);",
+            )
+            .await
+            .unwrap();
+        }
+
+        // The source carries the same pre-existing edge (as a pre-v10 NULL)
+        // plus a novel one, so recovery must fold both into the fresh table.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source_path = temp_dir.path().join("source.db");
+        write_source(
+            &source_path,
+            "CREATE TABLE Namespace (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
+             INSERT INTO Namespace (name, description) VALUES ('species', 'test');
+
+             CREATE TABLE Tags (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
+                 count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
+             INSERT INTO Tags (name, namespace) VALUES ('mammal', 1), ('canine', 1);
+
+             CREATE TABLE FileStorageLocations (
+                 id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
+             INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
+
+             CREATE TABLE File (
+                 id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
+                 storage_id INTEGER, size_bytes INTEGER);
+             INSERT INTO File (hash, extension, storage_id, size_bytes)
+                 VALUES ('slurp-hash', 'jpg', 1, 42);
+
+             CREATE TABLE Relationship_1 (
+                 file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                 PRIMARY KEY (tag_id, file_id));
+             INSERT INTO Relationship_1 (file_id, tag_id) VALUES (1, 1), (1, 2);
+
+             CREATE TABLE Parents (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
+                 relate_tag_id INTEGER NOT NULL, limit_to INTEGER);
+             INSERT INTO Parents (tag_id, relate_tag_id, limit_to)
+                 VALUES (1, 2, NULL), (2, 1, NULL);",
+        )
+        .await;
+
+        let counts = db.db_slurp(&source_path).await.unwrap();
+        assert_eq!(counts, (1, 2, 1));
+
+        let conn = db.connect().unwrap();
+
+        // The restored edge dedupes with the slurped copy; the novel edge
+        // lands. Both unscoped, so both store as the -1 sentinel.
+        let mut rows = conn
+            .query(
+                "SELECT tag_id, relate_tag_id, limit_to FROM Parents ORDER BY tag_id, relate_tag_id;",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut parents = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            parents.push((
+                row.get::<u64>(0).unwrap(),
+                row.get::<u64>(1).unwrap(),
+                row.get::<Option<i64>>(2).unwrap(),
+            ));
+        }
+        assert_eq!(
+            parents,
+            vec![(1, 2, Some(-1)), (2, 1, Some(-1))],
+            "recovered Parents_old rows plus slurped rows must dedupe into fresh Parents"
+        );
+
+        // The scratch table is gone and the fresh Parents schema (sentinel
+        // unique + covering reverse) is what remains: the recovery-created
+        // shape-agnostic IFNULL unique index must not survive the rebuild.
+        for (name, want) in [
+            ("parents_old", 0i64),
+            ("idx_unique_parents_null_safe", 0),
+            ("idx_unique_parents", 1),
+            ("idx_parents_rel", 1),
+        ] {
+            let present: i64 = conn
+                .query(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                     WHERE LOWER(name) = LOWER(?1));",
+                    (name,),
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            assert_eq!(present, want, "{name} after interrupted-slurp recovery");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

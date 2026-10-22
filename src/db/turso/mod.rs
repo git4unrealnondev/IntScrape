@@ -430,6 +430,9 @@ impl TursoDatabase {
                 8 => {
                     self.update_db_8_to_9(&conn).await?;
                 }
+                9 => {
+                    self.update_db_9_to_10(&conn).await?;
+                }
                 _ => {
                     return Err(turso::Error::Error(format!(
                         "No upgrade path from db schema version {version_num} to {DB_VERSION}"

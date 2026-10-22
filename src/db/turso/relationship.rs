@@ -115,6 +115,20 @@ pub(in crate::db::turso) fn union_source_from_tables(
     format!("({source}) AS {alias}")
 }
 
+/// Decodes the stored `limit_to` value back into the API's `Option<u64>`.
+///
+/// The `Parents` schema stores "no limit tag" as the `-1` sentinel (tag ids
+/// are rowids and start at 1, so `-1` is unambiguous) rather than SQL `NULL`,
+/// which lets the dedupe index be a plain composite key. Every `Parents` read
+/// funnels through this one function, so the ABI-facing `Option` never leaks
+/// the storage encoding.
+fn parents_limit_decode(stored: Option<i64>) -> Option<u64> {
+    match stored {
+        None | Some(-1) => None,
+        Some(id) => Some(id as u64),
+    }
+}
+
 /// `?1, ?2, ... ?count` — numbered placeholders starting at 1.
 ///
 /// Numbered parameters are what let a predicate be repeated across the arms of
@@ -332,6 +346,23 @@ impl TursoDatabase {
         Ok(out)
     }
 
+    /// Gets every child-parent relation whose `limit_to` qualifier is
+    /// `limit_tag_id`.
+    ///
+    /// This is the reverse index of a qualified relationship: value-style tags
+    /// (a post comment relating to its post id) share one edge shape
+    /// `(child -> parent, limited to qualifier)`, so querying by the qualifier
+    /// groups those values back by their context — every post relationship
+    /// that belongs to one 4chan thread, for example.
+    pub(in crate::db::turso) async fn limited_child_relationships_get(
+        &self,
+        conn: &Connection,
+        limit_tag_id: u64,
+    ) -> Result<Vec<TagParents>> {
+        self.parents_by_column(conn, "limit_to", limit_tag_id)
+            .await
+    }
+
     /// Gets one exact child-parent relation, including its optional limit tag.
     pub(in crate::db::turso) async fn parent_relationship_get(
         &self,
@@ -353,7 +384,7 @@ impl TursoDatabase {
             Ok(Some(TagParents {
                 tag_id: row.get(0)?,
                 relate_tag_id: row.get(1)?,
-                limit_to: row.get(2)?,
+                limit_to: parents_limit_decode(row.get(2)?),
             }))
         } else {
             Ok(None)
@@ -361,7 +392,8 @@ impl TursoDatabase {
     }
 
     /// Shared `Parents` query filtered by either the child (`tag_id`) or
-    /// parent (`relate_tag_id`) column.
+    /// parent (`relate_tag_id`) column, decoded from the `-1` sentinel back
+    /// into the API's `Option<u64>`.
     async fn parents_by_column(
         &self,
         conn: &Connection,
@@ -377,7 +409,7 @@ impl TursoDatabase {
             out.push(TagParents {
                 tag_id: row.get(0)?,
                 relate_tag_id: row.get(1)?,
-                limit_to: row.get(2)?,
+                limit_to: parents_limit_decode(row.get(2)?),
             });
         }
 
@@ -953,10 +985,7 @@ impl TursoDatabase {
                  FROM Parents
                  WHERE tag_id = ?1
                    AND relate_tag_id = ?2
-                   AND (
-                     (?3 IS NULL AND limit_to IS NULL) OR
-                     (limit_to = ?3)
-                   )
+                   AND limit_to = IFNULL(?3, -1)
                  LIMIT 1;",
                 (
                     child_id as i64,

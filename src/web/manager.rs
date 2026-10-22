@@ -47,6 +47,11 @@ const MAX_CONCURRENT_JOBS: usize = 10;
 // Dunno what this does
 const MAX_CONCURRENT_PROCESSING: usize = 20;
 
+// How many per-page file tasks the JoinSet may hold at once. Bounds resident
+// task state when a single page returns thousands of files; the transfer
+// semaphore stays the actual concurrency gate.
+const MAX_PER_PAGE_TASKS: usize = 64;
+
 // How many times should we retry to download a file
 const MAX_DOWNLOAD_RETRIES: u8 = 3;
 
@@ -265,6 +270,16 @@ pub(in crate::web) struct Scraper {
     pub(in crate::web) file_client: Arc<Client>,
 }
 
+/// The page-level dedup lookups resolved in one batch each before the page's
+/// per-file tasks are spawned: source-URL status, known secondary hashes, and
+/// the tags a `skip_if` relationship currently belongs to. The per-file task
+/// answers all three "is this already in the database" questions from memory.
+struct PageDedup<'a> {
+    source_files: &'a HashMap<String, SourceUrlFileStatus>,
+    hash_files: &'a HashMap<(String, String), FileInternal>,
+    skip_files: &'a HashMap<(String, String), FileInternal>,
+}
+
 #[derive(Clone, Debug)]
 struct InternalStorage {
     plugin: Plugin,
@@ -436,9 +451,12 @@ impl Scraper {
             .any(|property| matches!(property, PluginProperties::NoTextDownload));
 
         'scraperloop: for scrap_data in scraper_data_return.iter() {
-            let file_id_tag_map = Arc::new(Mutex::new(HashMap::new()));
             let job_list = Arc::new(Mutex::new(Vec::new()));
             let tag_list = Arc::new(Mutex::new(Vec::new()));
+            // Serializes this page's per-file db flushes. Each flush is tiny;
+            // queueing waits on a local lock beats letting this page's files
+            // race each other for the same new tag rows.
+            let flush_guard = Arc::new(tokio::sync::Mutex::new(()));
 
             if self
                 .clone()
@@ -534,7 +552,7 @@ impl Scraper {
                     TextDownload::Success(text, source_url) => (text, source_url),
                     TextDownload::NotFound => {
                         log::warn!(
-                            "Worker: {} JobId: {} -- STOPPING JOB because a url returned 404 on all {} attempts.",
+                            "Worker: {} JobId: {} -- STOPPING JOB because the url {param:?} returned 404 on all {} attempts.",
                             plugin_name,
                             job_id,
                             MAX_URL_RETRY,
@@ -546,7 +564,7 @@ impl Scraper {
                     }
                     TextDownload::Failed => {
                         log::error!(
-                            "Worker: {} JobId: {} -- STOPPING JOB because a url outlived its retries. It will retry next boot.",
+                            "Worker: {} JobId: {} -- STOPPING JOB because the url {param:?} outlived its retries. It will retry next boot.",
                             plugin_name,
                             job_id,
                         );
@@ -557,6 +575,9 @@ impl Scraper {
 
                 let local_scrap_data = scrap_data.clone();
                 let scraper = self.clone();
+                // Keep the parsed url for the result handlers below; the parse
+                // itself moves the url into the blocking task.
+                let parsed_source_url = source_url.clone();
                 let mut data_all = tokio::task::spawn_blocking(move || {
                     scraper.plugin_manager.parser_call(
                         &text,
@@ -645,12 +666,36 @@ impl Scraper {
                                     std::io::Error::other("hash lookup task failed")
                                 })?);
 
+                            // Resolve the page's skip-if tags in one batched
+                            // lookup instead of two DB round trips plus a fresh
+                            // connection per tag per file. The per-file task
+                            // below answers its `FileTagRelationship` skips
+                            // from this map alone.
+                            let skip_keys = scraper_object
+                                .files
+                                .iter()
+                                .flat_map(|file| file.skip_if.iter())
+                                .filter_map(|skip| match skip {
+                                    SkipIf::FileTagRelationship(tag) => {
+                                        Some((tag.namespace.name.clone(), tag.name.clone()))
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<HashSet<_>>();
+                            let existing_skip_files = Arc::new(
+                                self.download_manager
+                                    .db
+                                    .tag_skip_files_get(&skip_keys)
+                                    .await,
+                            );
+
                             let mut set = JoinSet::new();
                             for mut file in scraper_object.files {
                                 let scraper = self.clone();
                                 let existing_source_files = existing_source_files.clone();
                                 let existing_hash_files = existing_hash_files.clone();
-                                let file_id_tag_map_clone = file_id_tag_map.clone();
+                                let existing_skip_files = existing_skip_files.clone();
+                                let flush_guard_clone = flush_guard.clone();
                                 let should_remove_job_clone = should_remove_job.clone();
                                 let job_list_clone = job_list.clone();
                                 let semaphore_clone = semaphore.clone();
@@ -666,6 +711,10 @@ impl Scraper {
                                             .active_file_processing
                                             .clone(),
                                     };
+                                    // Handle for this file's flush. Cloned up
+                                    // front because the download call below
+                                    // moves `scraper`.
+                                    let db = scraper.download_manager.db.clone();
                                     let mut download_issue = false;
                                     let mut jobs = Vec::new();
 
@@ -693,13 +742,17 @@ impl Scraper {
                                     // whole-file buffer — stay bounded by
                                     // this semaphore and by
                                     // `processing_limiter` respectively.
+                                    let dedup = PageDedup {
+                                        source_files: &existing_source_files,
+                                        hash_files: &existing_hash_files,
+                                        skip_files: &existing_skip_files,
+                                    };
                                     let file_result = scraper
                                          .file_download_logic(
                                              &mut file,
                                              &mut jobs,
                                              &mut download_issue,
-                                             &existing_source_files,
-                                             &existing_hash_files,
+                                             &dedup,
                                              semaphore_clone,
                                          )
                                         .await.map_err(|err| err.to_string());
@@ -711,11 +764,54 @@ impl Scraper {
 
                                             match filereturn {
                                                 FileReturn::File(fileinternal) => {
-                                            // Adds tag data from the file
-                                            file_id_tag_map_clone
-                                                .lock()
-                                                .await
-                                                .insert(fileinternal, file.tag_list);
+                                                    // Commits the file the moment it is
+                                                    // ready instead of holding it until
+                                                    // the page's last transfer finishes.
+                                                    //
+                                                    // This is the same chunk contract the
+                                                    // post-page commit used, called with a
+                                                    // one-file map: `process_scraper` is
+                                                    // idempotent and conflict-retrying by
+                                                    // design, so smaller chunks are only
+                                                    // more of the same. Tags and parent
+                                                    // edges of early files commit while
+                                                    // the page's remaining transfers are
+                                                    // still in flight, and a shutdown or
+                                                    // crash mid-page drops at most the
+                                                    // file it happened during.
+                                                    let mut flush = HashMap::new();
+                                                    flush.insert(
+                                                        fileinternal,
+                                                        std::mem::take(&mut file.tag_list),
+                                                    );
+                                                    let flushed = {
+                                                        // Wait for this page's previous
+                                                        // file to finish committing.
+                                                        let _guard =
+                                                            flush_guard_clone.lock().await;
+                                                        db.process_scraper(
+                                                            flush,
+                                                            Vec::new(),
+                                                            plugin_name.clone(),
+                                                        )
+                                                        .await
+                                                    };
+
+                                                    if !flushed {
+                                                        // Nothing about a lost flush is
+                                                        // destructive: the next boot
+                                                        // re-walks the page, and the file
+                                                        // dedupes against what did land.
+                                                        log::error!(
+                                                            "Worker: {} JobId: {} -- File flush failed; keeping job to retry on next boot.",
+                                                            plugin_name,
+                                                            job_id,
+                                                        );
+                                                        should_remove_job_clone.store(
+                                                            false,
+                                                            std::sync::atomic::Ordering::Relaxed,
+                                                        );
+                                                    }
                                                 },
                                                 FileReturn::InDownloadQueue => {
 
@@ -754,6 +850,23 @@ impl Scraper {
                                 while matches!(set.try_join_next(), Some(Ok(()))) {
                                     // Explicitly drains finished tasks to release internal tracking heap allocations
                                 }
+
+                                // Sliding window: a page can return thousands of
+                                // files, and spawning every task up front would
+                                // hold every FileObject, its tag list, and each
+                                // task's cloned state resident until the page's
+                                // last transfer even though only
+                                // `max_concurrent_downloads` of them may move at
+                                // once. Waiting for one completion keeps at most
+                                // MAX_PER_PAGE_TASKS spawned; the transfer
+                                // semaphore remains the only concurrency gate.
+                                //
+                                // An Err (a task panicked) is ignored here for
+                                // parity with the trailing drain below: per-file
+                                // failures are logged inside the task itself.
+                                if set.len() >= MAX_PER_PAGE_TASKS {
+                                    let _ = set.join_next().await;
+                                }
                             }
                             //set.join_all().await;
                             while set.join_next().await.is_some() {}
@@ -761,7 +874,7 @@ impl Scraper {
                         // No objects were returned. IE no files
                         ScraperReturn::Nothing => {
                             log::info!(
-                                "Worker: {} JobId: {} -- STOPPING JOB due to getting NOTHNG",
+                                "Worker: {} JobId: {} -- STOPPING JOB due to getting NOTHING from {parsed_source_url}",
                                 plugin_name,
                                 job_id,
                             );
@@ -779,13 +892,22 @@ impl Scraper {
                             break 'scraperloop;
                         }
                         ScraperReturn::Fatal(fatal_error) => {
+                            // A Fatal is the plugin saying the site's state is
+                            // unsalvageable for this run. The job must survive so
+                            // it can retry on the next boot: this used to panic
+                            // via todo!(), which unwound past the Err handler below,
+                            // left the job flagged isrunning in the database, and
+                            // blocked every other queued job for the plugin until
+                            // restart.
                             log::error!(
-                                "Worker: {} JobId: {} -- Encountered fatal error: {}",
+                                "Worker: {} JobId: {} -- FATAL from {}: {}. Keeping job to retry on next boot.",
                                 plugin_name,
                                 job_id,
+                                parsed_source_url,
                                 fatal_error
                             );
-                            todo!("Need to implement check logs for data");
+                            should_remove_job.store(false, std::sync::atomic::Ordering::Relaxed);
+                            break 'scraperloop;
                         }
                         ScraperReturn::RetryLater(later_duration) => {
                             let mut job = self.job.clone();
@@ -801,10 +923,10 @@ impl Scraper {
             }
 
             // Do all our happy db stuff down here :D
-            let file_id_tag_map = Arc::try_unwrap(file_id_tag_map)
-                .expect("Arc reference leak")
-                .into_inner();
-
+            //
+            // Files are flushed per file as they land (see the FileReturn
+            // handling in the transfer tasks), so what is left at page end is
+            // the page's own tag set and the next-round jobs.
             let job_list = Arc::try_unwrap(job_list)
                 .expect("Arc reference leak")
                 .into_inner();
@@ -827,7 +949,7 @@ impl Scraper {
                     .download_manager
                     .db
                     .clone()
-                    .process_scraper(file_id_tag_map, job_list, audit_reason)
+                    .process_scraper(HashMap::new(), job_list, audit_reason)
                     .await;
 
             if !db_process_ok {
@@ -1238,8 +1360,7 @@ impl Scraper {
         file: &mut FileObject,
         jobs: &mut Vec<ScraperDataReturn>,
         download_issue: &mut bool,
-        existing_source_files: &HashMap<String, SourceUrlFileStatus>,
-        existing_hash_files: &HashMap<(String, String), FileInternal>,
+        dedup: &PageDedup<'_>,
         download_semaphore: Arc<PrioritySemaphore>,
     ) -> Result<Option<FileReturn>, Box<dyn Error>> {
         let plugin_manager = self.download_manager.plugin_manager.clone();
@@ -1266,7 +1387,13 @@ impl Scraper {
             Self::add_source_url_tag(file, &file_url);
         }
 
-        // Skips downloading file IF we have tag x associated with file_id
+        // Skips downloading file IF we have tag x associated with file_id.
+        //
+        // The page's whole skip-tag set was resolved by one batched lookup
+        // before these tasks were spawned (`tag_skip_files_get`), so this is a
+        // map read; absence of the key means no matching file and the check
+        // falls through, exactly as the old sequential
+        // `tag_get_file_id` + `file_id_get` pair did.
         for skip in &file.skip_if {
             if should_exit.load(Ordering::SeqCst) {
                 info!(
@@ -1276,8 +1403,9 @@ impl Scraper {
                 return Ok(None);
             }
             if let SkipIf::FileTagRelationship(tag) = skip
-                && let Some(file_id) = self.download_manager.db.clone().tag_get_file_id(tag).await
-                && let Some(file_internal) = self.download_manager.db.file_id_get(file_id).await
+                && let Some(file_internal) = dedup
+                    .skip_files
+                    .get(&(tag.namespace.name.clone(), tag.name.clone()))
             {
                 info!(
                     "Scraper: {} JobId: {} Skipping file_id {} because TAG: {:?} already in db.",
@@ -1286,7 +1414,7 @@ impl Scraper {
                     file_internal.id.unwrap_or(0),
                     tag
                 );
-                return Ok(Some(FileReturn::File(file_internal.into())));
+                return Ok(Some(FileReturn::File(file_internal.clone().into())));
             }
         }
 
@@ -1297,7 +1425,7 @@ impl Scraper {
                 FileSource::Bytes(_) => None,
             })
         {
-            if let Some(source_status) = existing_source_files.get(file_url) {
+            if let Some(source_status) = dedup.source_files.get(file_url) {
                 if source_status.dead {
                     info!(
                         "Scraper: {} JobId: {} Skipping dead URL: {}",
@@ -1334,7 +1462,7 @@ impl Scraper {
                 return Ok(None);
             }
             let hash_key = hashessupportedtokey(hash);
-            if let Some(file_internal) = existing_hash_files.get(&hash_key) {
+            if let Some(file_internal) = dedup.hash_files.get(&hash_key) {
                 info!(
                     "Scraper: {} JobId: {} Skipping file_id {} because hash: {:?} already in db.",
                     self.plugin.name,

@@ -1,0 +1,12 @@
+[package]
+name = "directdownload"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+regex = "1.13.1"
+shared_types = { workspace = true }
+client = { workspace = true }

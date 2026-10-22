@@ -38,7 +38,7 @@ mod tests {
     use shared_types::{
         FileInternal, GenericNamespaceObj, PluginJob, ScraperParam, Tag, TagParents,
     };
-    use turso::Connection;
+    use turso::{Builder, Connection, Value};
 
     use crate::db::SQL_CHUNK_SIZE;
     use crate::db::turso::sql::{parents_insert_sql, parents_params};
@@ -1491,7 +1491,10 @@ mod tests {
                             (
                                 parent.tag_id as i64,
                                 parent.relate_tag_id as i64,
-                                parent.limit_to.unwrap_or(0) as i64,
+                                // `-1` is the sentinel the current Parents
+                                // schema stores for "no limit tag", matching
+                                // what `parents_params` binds.
+                                parent.limit_to.map(|id| id as i64).unwrap_or(-1),
                             ),
                         )
                         .await
@@ -3076,5 +3079,577 @@ mod tests {
         if std::env::var("BENCH_KEEP").is_err() && std::env::var("BENCH_PATH").is_err() {
             bench_remove(&path);
         }
+    }
+
+    /// Indexable sort key for an encoded row value; `NULL` limit_to and the
+    /// storage `-1` sentinel share one key so every variant sorts identically.
+    fn index_key(value: &Value) -> i64 {
+        match value {
+            Value::Integer(integer) => *integer,
+            Value::Null => -1,
+            _ => i64::MIN,
+        }
+    }
+
+    /// Prints `EXPLAIN QUERY PLAN` for every `Parents` statement the current
+    /// storage shape serves, on a real production-schema database.
+    ///
+    /// Run anytime a `Parents` index changes. The expected plans:
+    /// `SEARCH Parents USING COVERING INDEX idx_unique_parents` for forward
+    /// lists and exact probes, and `... COVERING INDEX idx_parents_rel` for
+    /// reverse reads. Any `SCAN Parents` on a hot path means an index stopped
+    /// covering.
+    #[test]
+    #[ignore = "manual: print EXPLAIN QUERY PLAN for the Parents statements"]
+    fn db_show_parents_query_plans() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = bench_db_path("parents_eqp");
+            bench_remove(&path);
+            let should_exit = Arc::new(AtomicBool::new(false));
+            let db = TursoDatabase::new_with_exit(&path, should_exit).await;
+            let conn = db.connect().unwrap();
+
+            let sqls: [(&str, &str); 7] = [
+                (
+                    "forward list (parent_relationships_get)",
+                    "SELECT relate_tag_id, limit_to FROM Parents WHERE tag_id = 1",
+                ),
+                (
+                    "reverse list (child_relationships_get)",
+                    "SELECT tag_id, limit_to FROM Parents WHERE relate_tag_id = 1",
+                ),
+                (
+                    "exact edge (parent_relationship_get)",
+                    "SELECT 1 FROM Parents WHERE tag_id = 1 AND relate_tag_id = 2 LIMIT 1",
+                ),
+                (
+                    "structure skip-check (parent_structure_exists)",
+                    "SELECT 1 FROM Parents WHERE tag_id = 1 AND relate_tag_id = 2 \
+                     AND limit_to = IFNULL(3, -1) LIMIT 1",
+                ),
+                (
+                    "relate+limit skip-check (parent_relate_limit_exists)",
+                    "SELECT 1 FROM Parents WHERE relate_tag_id = 1 AND limit_to = 2 LIMIT 1",
+                ),
+                (
+                    "slurp copy (dedupe + sentinel fold)",
+                    "INSERT INTO Parents (tag_id, relate_tag_id, limit_to) \
+                     SELECT tag_id, relate_tag_id, IFNULL(limit_to, -1) FROM Parents_old \
+                     GROUP BY tag_id, relate_tag_id, IFNULL(limit_to, -1)",
+                ),
+                (
+                    "slurp-source whole-table read",
+                    "SELECT tag_id, relate_tag_id, limit_to FROM Parents",
+                ),
+            ];
+
+            println!("\nEQP Parents statements (production schema)");
+            // The slurp-copy statement references Parents_old, which only
+            // exists mid-slurp; shape it as the migration leaves it (pre-v10,
+            // still nullable).
+            conn.execute_batch(
+                "CREATE TABLE Parents_old (
+                     id INTEGER PRIMARY KEY,
+                     tag_id INTEGER NOT NULL,
+                     relate_tag_id INTEGER NOT NULL,
+                     limit_to INTEGER);",
+            )
+            .await
+            .unwrap();
+            for (label, sql) in sqls {
+                let explain = format!("EXPLAIN QUERY PLAN {sql};");
+                let mut rows = conn.query(&explain, ()).await.unwrap();
+                println!("  [{label}]");
+                while let Some(row) = rows.next().await.unwrap() {
+                    let detail: String = row.get(3).unwrap();
+                    println!("    {}", detail.trim());
+                }
+            }
+
+            db.shutdown().await;
+        });
+    }
+
+    /// Measures the cost of the per-call `db.connect()` pattern: every
+    /// read-side DB helper opens a fresh connection (`file_id_get`,
+    /// `file_download_location_get_sync`, `dead_url_get`, ...), each of which
+    /// builds a fresh schema view, versus one reused connection for N probes.
+    ///
+    /// Run whenever connection churn comes into suspicion: if fresh-connect
+    /// dominates reused-probe cost by ~10x, the per-call pattern is a real
+    /// path cost; if it is near-parity, the churn is noise and the suspicion
+    /// can be dropped.
+    #[test]
+    #[ignore = "manual benchmark: per-call db.connect() vs reused connection"]
+    fn db_bench_connect_cost() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = bench_db_path("connect_cost");
+            bench_remove(&path);
+            let should_exit = Arc::new(AtomicBool::new(false));
+            let db = TursoDatabase::new_with_exit(&path, should_exit).await;
+            let conn_warm = db.connect().unwrap();
+            // Touch the schema once so the first-query cost is not baked into
+            // round one.
+            conn_warm
+                .query("SELECT COUNT(*) FROM sqlite_schema;", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap();
+            drop(conn_warm);
+
+            const PROBES: u64 = 500;
+            let rounds = std::env::var("BENCH_ITERS")
+                .ok()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .unwrap_or(3)
+                .max(1);
+
+            for round in 0..rounds {
+                // Pattern A: the per-call connect every read-side helper does.
+                let t = Instant::now();
+                for probe in 0..PROBES {
+                    std::hint::black_box(probe);
+                    let conn = db.connect().unwrap();
+                    let mut rows = conn.query("SELECT 1;", ()).await.unwrap();
+                    rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap();
+                }
+                let fresh = t.elapsed();
+                println!(
+                    "BENCH connect: fresh connect+select 1, {PROBES} per round: \
+                     {fresh:?} -> {} us each",
+                    fresh.as_micros() / PROBES as u128
+                );
+                std::hint::black_box(fresh);
+
+                // Pattern B: one reused connection, N parameterized probes.
+                let conn = db.connect().unwrap();
+                let t = Instant::now();
+                for probe in 0..PROBES {
+                    let mut rows = conn
+                        .query(
+                            "SELECT COUNT(*) FROM sqlite_schema WHERE name = ?1;",
+                            (format!("x{probe}"),),
+                        )
+                        .await
+                        .unwrap();
+                    rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap();
+                }
+                let reuse = t.elapsed();
+                println!(
+                    "BENCH reuse:   N probes on 1 connection, {PROBES} per round: \
+                     {reuse:?} -> {} us each",
+                    reuse.as_micros() / PROBES as u128
+                );
+                std::hint::black_box(reuse);
+            }
+
+            db.shutdown().await;
+            bench_remove(&path);
+        });
+    }
+
+    /// Compares full `Parents` storage designs on both the write and the read
+    /// paths, each in its own database.
+    ///
+    /// `db_bench_parents_schema_variants` showed the current *index set* is within
+    /// noise of the no-index floor on novel inserts in release mode, so any further
+    /// write win has to come from a different shape rather than from one less
+    /// index. Note the engine constraint this bench documents: turso 0.8.2 rejects
+    /// `CREATE INDEX` on `WITHOUT ROWID` tables, so a secondary index is only
+    /// available on a rowid table and every direction an index serves has to keep
+    /// the rowid table around.
+    /// Candidates:
+    ///
+    /// - `A` — current: rowid table served by `idx_unique_parents_null_safe`
+    ///   `(tag_id, relate_tag_id, IFNULL(limit_to, -1))` plus `idx_parents_rel`
+    ///   `(relate_tag_id)`. Three b-trees; the expression key costs an `IFNULL`
+    ///   evaluation per insert, and reverse reads resolve through the rowid.
+    /// - `R` — same rowid table, reorganized to serve reads from the indexes
+    ///   themselves: `limit_to` stored NOT NULL with a `-1` NULL sentinel so the
+    ///   dedupe key is a plain composite index, and the reverse index made fully
+    ///   covering `(relate_tag_id, tag_id, limit_to)` so reverse reads never touch
+    ///   the rowid. Same three b-trees — this is a coverage and expression-cost
+    ///   change, not an index-count change.
+    /// - `F` — rowid table with the plain composite unique index only. Not
+    ///   production material (reverse reads would be a full scan); it bounds what
+    ///   the reverse index buys, the same role `E` plays in the insert-side sweep.
+    ///
+    /// Measured per variant: novel insert, re-add (pure conflict), forward
+    /// listing for `BENCH_PARENT_PROBES` child ids one statement at a time, the
+    /// same ids gathered by one `IN (...)` statement, reverse listing for parent
+    /// ids, exact triple probes alternating present/absent keys, and a whole-table
+    /// streaming scan (the slurp importer runs one).
+    #[test]
+    #[ignore = "manual benchmark: Parents storage designs (write + read paths)"]
+    fn db_bench_parents_store() {
+        async fn insert_rows(
+            conn: &Connection,
+            rows: &[Vec<Value>],
+            insert_prefix: &str,
+            rounds: u64,
+        ) -> (Duration, u64) {
+            let mut written = 0u64;
+            let t = Instant::now();
+            for _ in 0..rounds {
+                for chunk in rows.chunks(SQL_CHUNK_SIZE) {
+                    let placeholders = std::iter::repeat_n("(?,?,?)", chunk.len())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let sql = format!("{insert_prefix} VALUES {placeholders}");
+                    let flat: Vec<Value> = chunk.iter().flatten().cloned().collect();
+                    conn.execute(&sql, turso::params_from_iter(flat))
+                        .await
+                        .unwrap();
+                    written += chunk.len() as u64;
+                }
+            }
+            (t.elapsed(), written)
+        }
+
+        async fn list_for_ids(
+            conn: &Connection,
+            sql: &str,
+            ids: &[u64],
+            rounds: u64,
+        ) -> (Duration, u64) {
+            let t = Instant::now();
+            let mut fetched = 0u64;
+            for _ in 0..rounds {
+                for id in ids {
+                    let mut rows = conn.query(sql, (Value::from(*id as i64),)).await.unwrap();
+                    while let Some(row) = rows.next().await.unwrap() {
+                        let _: i64 = row.get(0).unwrap();
+                        let _: Option<i64> = row.get(1).unwrap();
+                        fetched += 1;
+                    }
+                }
+            }
+            (t.elapsed(), fetched)
+        }
+
+        let tags = env_u64("BENCH_TAGS", DEFAULT_TAGS);
+        let edges = env_u64("BENCH_PARENT_EDGES", 20_000);
+        let probes = env_u64("BENCH_PARENT_PROBES", 200).max(1);
+        let rounds = env_u64("BENCH_ITERS", 3).max(1);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        println!("\nBENCH Parents store: {edges} edges, {probes} probe ids, fresh db per variant");
+
+        // Clustering on purpose: one edge in four extends the previous child, so
+        // probe lists have realistic fan-out and the b-trees get locality worth
+        // exploiting — the difference between "stored in child order" and random
+        // order is invisible otherwise.
+        let make_edges = || -> Vec<TagParents> {
+            (0..edges)
+                .map(|i| TagParents {
+                    tag_id: 1 + (i / 4 % tags),
+                    relate_tag_id: 1 + ((i / 3 + 11) % tags),
+                    limit_to: if i % 3 == 0 {
+                        Some(1 + ((i + 17) % tags))
+                    } else {
+                        None
+                    },
+                })
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect()
+        };
+
+        /// Physical encoding of one edge, plus every statement the read paths need.
+        struct Motor {
+            label: &'static str,
+            /// `INSERT OR IGNORE INTO pvar ...` including the column list.
+            insert_prefix: &'static str,
+            encode: fn(&TagParents) -> Vec<Value>,
+            forward_sql: &'static str,
+            reverse_sql: &'static str,
+            exact_sql: &'static str,
+            /// Aggregates enough columns that the scan cannot be optimized away.
+            sum_sql: &'static str,
+        }
+
+        let motors: Vec<Motor> = vec![
+            Motor {
+                label: "A current (rowid + expr unique + rel)",
+                insert_prefix: "INSERT OR IGNORE INTO pvar (tag_id, relate_tag_id, limit_to)",
+                encode: |edge| {
+                    vec![
+                        Value::from(edge.tag_id as i64),
+                        Value::from(edge.relate_tag_id as i64),
+                        edge.limit_to
+                            .map(|id| Value::from(id as i64))
+                            .unwrap_or(Value::Null),
+                    ]
+                },
+                forward_sql: "SELECT relate_tag_id, limit_to FROM pvar WHERE tag_id = ?1",
+                reverse_sql: "SELECT tag_id, limit_to FROM pvar WHERE relate_tag_id = ?1",
+                exact_sql: "SELECT 1 FROM pvar WHERE relate_tag_id = ?1 AND tag_id = ?2 \
+                            AND ((limit_to IS NULL AND ?3 IS NULL) OR limit_to = ?3) LIMIT 1",
+                sum_sql: "SELECT COUNT(tag_id), SUM(relate_tag_id), COUNT(limit_to) FROM pvar",
+            },
+            Motor {
+                label: "R rowid, plain unique + covering rel",
+                insert_prefix: "INSERT OR IGNORE INTO pvar (tag_id, relate_tag_id, limit_to)",
+                encode: |edge| {
+                    vec![
+                        Value::from(edge.tag_id as i64),
+                        Value::from(edge.relate_tag_id as i64),
+                        // NULL becomes the -1 sentinel; tag ids start at 1.
+                        Value::from(edge.limit_to.map(|id| id as i64).unwrap_or(-1)),
+                    ]
+                },
+                forward_sql: "SELECT relate_tag_id, limit_to FROM pvar WHERE tag_id = ?1",
+                reverse_sql: "SELECT tag_id, limit_to FROM pvar WHERE relate_tag_id = ?1",
+                exact_sql: "SELECT 1 FROM pvar WHERE relate_tag_id = ?1 AND tag_id = ?2 \
+                            AND limit_to = ?3 LIMIT 1",
+                sum_sql: "SELECT COUNT(tag_id), SUM(relate_tag_id), COUNT(limit_to) FROM pvar",
+            },
+            Motor {
+                label: "F plain unique only (floor)",
+                insert_prefix: "INSERT OR IGNORE INTO pvar (tag_id, relate_tag_id, limit_to)",
+                encode: |edge| {
+                    vec![
+                        Value::from(edge.tag_id as i64),
+                        Value::from(edge.relate_tag_id as i64),
+                        Value::from(edge.limit_to.map(|id| id as i64).unwrap_or(-1)),
+                    ]
+                },
+                forward_sql: "SELECT relate_tag_id, limit_to FROM pvar WHERE tag_id = ?1",
+                // No reverse index exists in the floor variant: this statement is
+                // a full scan, printed to bound what the other variants buy.
+                reverse_sql: "SELECT tag_id, limit_to FROM pvar WHERE relate_tag_id = ?1",
+                exact_sql: "SELECT 1 FROM pvar WHERE relate_tag_id = ?1 AND tag_id = ?2 \
+                            AND limit_to = ?3 LIMIT 1",
+                sum_sql: "SELECT COUNT(tag_id), SUM(relate_tag_id), COUNT(limit_to) FROM pvar",
+            },
+        ];
+
+        rt.block_on(async {
+            let batch: Vec<TagParents> = make_edges();
+            println!("  {} distinct edges from {} generated", batch.len(), edges);
+
+            let mut child_ids: Vec<u64> = batch.iter().map(|edge| edge.tag_id).collect();
+            child_ids.sort_unstable();
+            child_ids.dedup();
+            let mut parent_ids: Vec<u64> = batch.iter().map(|edge| edge.relate_tag_id).collect();
+            parent_ids.sort_unstable();
+            parent_ids.dedup();
+
+            struct Results {
+                novel: Duration,
+                readd: Duration,
+                forward: Duration,
+                batched: Duration,
+                reverse: Duration,
+                exact: Duration,
+                scan: Duration,
+            }
+
+            let mut measured: Vec<(&str, Results)> = Vec::new();
+
+            for motor in &motors {
+                let variant_path = bench_db_path("parents_store");
+                bench_remove(&variant_path);
+                // The flag is a no-op for rowid DDL, so every variant is opened
+                // through the same builder on purpose: the only variable under
+                // test is the storage shape, never the connection options.
+                let db = Builder::new_local(&variant_path.to_string_lossy())
+                    .experimental_without_rowid(true)
+                    .build()
+                    .await
+                    .unwrap();
+                let conn = db.connect().unwrap();
+                conn.pragma_update("journal_mode", "'mvcc'").await.unwrap();
+
+                let ddl = match motor.label.split_whitespace().next().unwrap() {
+                    "A" => {
+                        "CREATE TABLE pvar (id INTEGER PRIMARY KEY, tag_id INTEGER NOT NULL, \
+                         relate_tag_id INTEGER NOT NULL, limit_to INTEGER, \
+                         CHECK (tag_id != relate_tag_id)); \
+                         CREATE UNIQUE INDEX pvar_u \
+                             ON pvar (tag_id, relate_tag_id, IFNULL(limit_to, -1)); \
+                         CREATE INDEX pvar_r ON pvar (relate_tag_id);"
+                    }
+                    "R" => {
+                        "CREATE TABLE pvar (id INTEGER PRIMARY KEY, tag_id INTEGER NOT NULL, \
+                         relate_tag_id INTEGER NOT NULL, limit_to INTEGER NOT NULL DEFAULT -1, \
+                         CHECK (tag_id != relate_tag_id)); \
+                         CREATE UNIQUE INDEX pvar_u \
+                             ON pvar (tag_id, relate_tag_id, limit_to); \
+                         CREATE INDEX pvar_r ON pvar (relate_tag_id, tag_id, limit_to);"
+                    }
+                    _ => {
+                        "CREATE TABLE pvar (id INTEGER PRIMARY KEY, tag_id INTEGER NOT NULL, \
+                         relate_tag_id INTEGER NOT NULL, limit_to INTEGER NOT NULL DEFAULT -1, \
+                         CHECK (tag_id != relate_tag_id)); \
+                         CREATE UNIQUE INDEX pvar_u ON pvar (tag_id, relate_tag_id, limit_to);"
+                    }
+                };
+                conn.execute_batch(ddl).await.unwrap();
+
+                // Encode and sort the way `parents_bulk_add` feeds its chunks: in
+                // row-key order, so the index is extended at its right edge.
+                let mut rows: Vec<Vec<Value>> = batch.iter().map(motor.encode).collect();
+                rows.sort_unstable_by_key(|row| {
+                    (index_key(&row[0]), index_key(&row[1]), index_key(&row[2]))
+                });
+
+                let (novel, novel_written) =
+                    insert_rows(&conn, &rows, motor.insert_prefix, 1).await;
+                let (readd, readd_written) =
+                    insert_rows(&conn, &rows, motor.insert_prefix, rounds).await;
+                assert_eq!(novel_written, batch.len() as u64, "novel insert lost rows");
+                assert_eq!(
+                    readd_written,
+                    (batch.len() as u64) * rounds,
+                    "re-add lost rows"
+                );
+
+                let (forward, forward_rows) =
+                    list_for_ids(&conn, motor.forward_sql, &child_ids, rounds).await;
+                let (reverse, reverse_rows) =
+                    list_for_ids(&conn, motor.reverse_sql, &parent_ids, rounds).await;
+
+                // One statement gathering the same children the per-id loop
+                // walked: what batching alone buys on the existing schema.
+                let batched = {
+                    let t = Instant::now();
+                    for _ in 0..rounds {
+                        for window in child_ids.chunks(2000) {
+                            let placeholders = std::iter::repeat_n("?", window.len())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let params: Vec<Value> =
+                                window.iter().map(|id| Value::from(*id as i64)).collect();
+                            let sql = format!(
+                                "SELECT tag_id, relate_tag_id, limit_to FROM pvar \
+                                 WHERE tag_id IN ({placeholders})"
+                            );
+                            let mut rows = conn.query(&sql, params).await.unwrap();
+                            while let Some(row) = rows.next().await.unwrap() {
+                                let _: i64 = row.get(0).unwrap();
+                                let _: i64 = row.get(1).unwrap();
+                                let _: Option<i64> = row.get(2).unwrap();
+                            }
+                        }
+                    }
+                    t.elapsed()
+                };
+
+                // Exact triple probe, half present and half absent keys. The
+                // present keys carry each variant's row limit encoding: `A`
+                // keeps NULL, the sentinels store -1, so the probe parameter is
+                // adapted the same way `parent_structure_exists` does.
+                let mut exact_keys: Vec<(i64, i64, i64)> = Vec::with_capacity(probes as usize);
+                for edge in &batch {
+                    if exact_keys.len() >= probes as usize {
+                        break;
+                    }
+                    exact_keys.push((
+                        edge.relate_tag_id as i64,
+                        edge.tag_id as i64,
+                        match motor.label.starts_with('A') {
+                            true => edge.limit_to.unwrap_or(0) as i64,
+                            false => edge.limit_to.map(|id| id as i64).unwrap_or(-1),
+                        },
+                    ));
+                }
+                let exact = {
+                    let t = Instant::now();
+                    let mut hits = 0u64;
+                    for _ in 0..rounds {
+                        for (index, (parent, child, limit)) in exact_keys.iter().enumerate() {
+                            let limit_value = match motor.label.starts_with('A') && index % 2 == 0 {
+                                true => match *limit {
+                                    0 => Value::Null,
+                                    id => Value::from(id),
+                                },
+                                false => Value::from(*limit),
+                            };
+                            let mut rows = conn
+                                .query(
+                                    motor.exact_sql,
+                                    (Value::from(*parent), Value::from(*child), limit_value),
+                                )
+                                .await
+                                .unwrap();
+                            if rows.next().await.unwrap().is_some() {
+                                hits += 1;
+                            }
+                        }
+                    }
+                    println!("    {hits} probes resolved a row");
+                    t.elapsed()
+                };
+
+                // Whole-table streaming scan, slurp-importer shape.
+                let scan = {
+                    let t = Instant::now();
+                    for _ in 0..rounds {
+                        let mut rows = conn.query(motor.sum_sql, ()).await.unwrap();
+                        while let Some(row) = rows.next().await.unwrap() {
+                            let _: i64 = row.get(0).unwrap();
+                            let _: Option<i64> = row.get(1).unwrap();
+                            let _: i64 = row.get(2).unwrap();
+                        }
+                    }
+                    t.elapsed()
+                };
+
+                println!(
+                    "  {}: novel {novel_written} rows, re-add {readd_written}, \
+                     forward rows {forward_rows}, reverse rows {reverse_rows}",
+                    motor.label
+                );
+                measured.push((
+                    motor.label,
+                    Results {
+                        novel,
+                        readd,
+                        forward,
+                        batched,
+                        reverse,
+                        exact,
+                        scan,
+                    },
+                ));
+
+                drop(db);
+                bench_remove(&variant_path);
+            }
+
+            let baseline = &measured[0].1;
+            println!(
+                "\n  {:<38} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+                "", "novel us/r", "re-add", "fwd us/q", "rev us/q", "batch us/q", "exact us/q"
+            );
+            for (label, r) in &measured {
+                println!(
+                    "  {label:<38} {:>10.2} {:>10.2} {:>10.1} {:>10.1} {:>10.1} {:>10.1}",
+                    r.novel.as_secs_f64() * 1_000_000.0 / batch.len() as f64,
+                    r.readd.as_secs_f64() * 1_000_000.0 / (batch.len() * rounds as usize) as f64,
+                    r.forward.as_secs_f64() * 1_000_000.0
+                        / (child_ids.len() * rounds as usize) as f64,
+                    r.reverse.as_secs_f64() * 1_000_000.0
+                        / (parent_ids.len() * rounds as usize) as f64,
+                    r.batched.as_secs_f64() * 1_000_000.0
+                        / (child_ids.len() * rounds as usize) as f64,
+                    r.exact.as_secs_f64() * 1_000_000.0 / (probes * rounds) as f64,
+                );
+            }
+            println!("\n  Whole-table scan per iteration:");
+            for (label, r) in &measured {
+                println!(
+                    "    {label:<38} {:>9.2} ms   ({:.2}x baseline)",
+                    r.scan.as_secs_f64() * 1_000.0 / rounds as f64,
+                    r.scan.as_nanos() as f64 / baseline.scan.as_nanos().max(1) as f64,
+                );
+            }
+        });
     }
 }
