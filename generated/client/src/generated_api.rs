@@ -61,9 +61,10 @@ pub fn search_db_files_by_tag_groups(
     not_ids: Vec<u64>,
     not_tags: Vec<String>,
     limit: Option<u64>,
+    offset: Option<u64>,
 ) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::SearchFilesByTagGroups(
-        and_ids, and_tags, or_ids, or_tags, not_ids, not_tags, limit,
+        and_ids, and_tags, or_ids, or_tags, not_ids, not_tags, limit, offset,
     ))
 }
 /// Resolves tag names across namespaces while preserving boolean groups.
@@ -75,9 +76,40 @@ pub fn search_db_files_by_tag_groups_async(
     not_ids: Vec<u64>,
     not_tags: Vec<String>,
     limit: Option<u64>,
+    offset: Option<u64>,
 ) -> impl std::future::Future<Output = Result<Vec<u64>, Box<dyn std::error::Error + Send + Sync>>> {
     crate::init_data_request_async(crate::SupportedDBRequests::SearchFilesByTagGroups(
-        and_ids, and_tags, or_ids, or_tags, not_ids, not_tags, limit,
+        and_ids, and_tags, or_ids, or_tags, not_ids, not_tags, limit, offset,
+    ))
+}
+/// Counts the files a boolean tag-group search matches without returning
+/// them. Paged UIs ask for this alongside a `LIMIT`ed page fetch so the
+/// leading pages never carry the whole result set across IPC.
+pub fn search_db_files_by_tag_groups_count(
+    and_ids: Vec<u64>,
+    and_tags: Vec<String>,
+    or_ids: Vec<u64>,
+    or_tags: Vec<String>,
+    not_ids: Vec<u64>,
+    not_tags: Vec<String>,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    crate::init_data_request(crate::SupportedDBRequests::SearchFilesByTagGroupsCount(
+        and_ids, and_tags, or_ids, or_tags, not_ids, not_tags,
+    ))
+}
+/// Counts the files a boolean tag-group search matches without returning
+/// them. Paged UIs ask for this alongside a `LIMIT`ed page fetch so the
+/// leading pages never carry the whole result set across IPC.
+pub fn search_db_files_by_tag_groups_count_async(
+    and_ids: Vec<u64>,
+    and_tags: Vec<String>,
+    or_ids: Vec<u64>,
+    or_tags: Vec<String>,
+    not_ids: Vec<u64>,
+    not_tags: Vec<String>,
+) -> impl std::future::Future<Output = Result<u64, Box<dyn std::error::Error + Send + Sync>>> {
+    crate::init_data_request_async(crate::SupportedDBRequests::SearchFilesByTagGroupsCount(
+        and_ids, and_tags, or_ids, or_tags, not_ids, not_tags,
     ))
 }
 ///

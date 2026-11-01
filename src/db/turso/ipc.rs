@@ -70,15 +70,42 @@ impl TursoDatabase {
         not_ids: &[u64],
         not_tags: &[String],
         limit: &Option<u64>,
+        offset: &Option<u64>,
     ) -> Vec<u64> {
         let Ok(conn) = self.db.connect() else {
             return Vec::new();
         };
         self.search_db_files_by_tag_groups(
-            &conn, and_ids, and_tags, or_ids, or_tags, not_ids, not_tags, limit,
+            &conn, and_ids, and_tags, or_ids, or_tags, not_ids, not_tags, limit, offset,
         )
         .await
         .unwrap_or_default()
+    }
+
+    /// Counts the files a boolean tag-group search matches without returning
+    /// them. Paged UIs ask for this alongside a `LIMIT`ed page fetch so the
+    /// leading pages never carry the whole result set across IPC.
+    #[ipc(
+        name = "search_db_files_by_tag_groups_count",
+        request = "SearchFilesByTagGroupsCount"
+    )]
+    pub async fn ipc_search_db_files_by_tag_groups_count(
+        &self,
+        and_ids: &[u64],
+        and_tags: &[String],
+        or_ids: &[u64],
+        or_tags: &[String],
+        not_ids: &[u64],
+        not_tags: &[String],
+    ) -> u64 {
+        let Ok(conn) = self.db.connect() else {
+            return 0;
+        };
+        self.search_db_files_by_tag_groups_count(
+            &conn, and_ids, and_tags, or_ids, or_tags, not_ids, not_tags,
+        )
+        .await
+        .unwrap_or(0)
     }
 
     ///
@@ -701,7 +728,7 @@ impl TursoDatabase {
         let Ok(conn) = self.db.connect() else {
             return Vec::new();
         };
-        self.search_db_files(&conn, search, limit)
+        self.search_db_files(&conn, search, limit, &None)
             .await
             .unwrap_or_default()
     }

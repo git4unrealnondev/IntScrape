@@ -51,7 +51,7 @@ impl TursoDatabase {
         tags: &[String],
         limit: &Option<u64>,
     ) -> Result<Vec<u64>> {
-        self.search_db_files_by_tag_groups(conn, &[], tags, &[], &[], &[], &[], limit)
+        self.search_db_files_by_tag_groups(conn, &[], tags, &[], &[], &[], &[], limit, &None)
             .await
     }
 
@@ -66,7 +66,66 @@ impl TursoDatabase {
         not_ids: &[u64],
         not_tags: &[String],
         limit: &Option<u64>,
+        offset: &Option<u64>,
     ) -> Result<Vec<u64>> {
+        let searches = self
+            .tag_group_holders(and_ids, and_tags, or_ids, or_tags, not_ids, not_tags)
+            .await?;
+        self.search_db_files(
+            conn,
+            &SearchObj {
+                search_relate: None,
+                searches,
+            },
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    /// Counts the files a boolean tag-group search matches, using the same
+    /// holder resolution as `search_db_files_by_tag_groups` but asking the
+    /// driving scan for `COUNT(*)` instead of ids.
+    ///
+    /// A paged UI needs the total without pulling every matching id, so this
+    /// keeps the O(result) walk inside the database (a plain index-order
+    /// aggregation, no rows shipped) instead of sending the full result set
+    /// across IPC for a client-side `len()`.
+    pub(in crate::db::turso) async fn search_db_files_by_tag_groups_count(
+        &self,
+        conn: &Connection,
+        and_ids: &[u64],
+        and_tags: &[String],
+        or_ids: &[u64],
+        or_tags: &[String],
+        not_ids: &[u64],
+        not_tags: &[String],
+    ) -> Result<u64> {
+        let searches = self
+            .tag_group_holders(and_ids, and_tags, or_ids, or_tags, not_ids, not_tags)
+            .await?;
+        self.search_db_files_count(
+            conn,
+            &SearchObj {
+                search_relate: None,
+                searches,
+            },
+        )
+        .await
+    }
+
+    /// Builds the `SearchHolder` list behind a boolean tag-group search.
+    /// Shared by the id-returning search and its count sibling so both always
+    /// agree on what the groups mean.
+    async fn tag_group_holders(
+        &self,
+        and_ids: &[u64],
+        and_tags: &[String],
+        or_ids: &[u64],
+        or_tags: &[String],
+        not_ids: &[u64],
+        not_tags: &[String],
+    ) -> Result<Vec<SearchHolder>> {
         let mut searches = Vec::new();
         for tag_id in and_ids {
             searches.push(SearchHolder::And(vec![*tag_id]));
@@ -110,15 +169,7 @@ impl TursoDatabase {
             searches.push(SearchHolder::Not(resolved_not));
         }
 
-        self.search_db_files(
-            conn,
-            &SearchObj {
-                search_relate: None,
-                searches,
-            },
-            limit,
-        )
-        .await
+        Ok(searches)
     }
 
     /// Human-written tag searching layer.
@@ -148,8 +199,12 @@ impl TursoDatabase {
         conn: &Connection,
         search: &SearchObj,
         limit: &Option<u64>,
+        offset: &Option<u64>,
     ) -> Result<Vec<u64>> {
-        let sql = match self.build_search_sql(conn, search, limit).await? {
+        let sql = match self
+            .build_search_sql(conn, search, limit, offset)
+            .await?
+        {
             Some(sql) => sql,
             None => return Ok(Vec::new()),
         };
@@ -159,6 +214,32 @@ impl TursoDatabase {
             out.push(row.get(0)?);
         }
         Ok(out)
+    }
+
+    /// Counts the files a search matches, running the same driving scan and
+    /// predicates as `search_db_files` but aggregating instead of shipping
+    /// rows. A paged UI asks for this once per search instead of `len()`-ing a
+    /// full result set across IPC.
+    pub(in crate::db::turso) async fn search_db_files_count(
+        &self,
+        conn: &Connection,
+        search: &SearchObj,
+    ) -> Result<u64> {
+        let sql = match self.build_search_parts(conn, search).await? {
+            Some((_, count_select, conditions, _)) => {
+                let mut sql = count_select;
+                for condition in &conditions {
+                    sql.push_str(condition);
+                }
+                sql
+            }
+            None => return Ok(0),
+        };
+        let mut rows = conn.query(&sql, ()).await?;
+        match rows.next().await? {
+            Some(row) => Ok(row.get::<i64>(0)?.max(0) as u64),
+            None => Ok(0),
+        }
     }
 
     /// Resolves the searched tags and renders the statement `search_db_files`
@@ -171,7 +252,33 @@ impl TursoDatabase {
         conn: &Connection,
         search: &SearchObj,
         limit: &Option<u64>,
+        offset: &Option<u64>,
     ) -> Result<Option<String>> {
+        let Some((mut sql, _, conditions, order_by)) = self.build_search_parts(conn, search).await?
+        else {
+            return Ok(None);
+        };
+        for condition in &conditions {
+            sql.push_str(condition);
+        }
+        sql.push_str(&Self::append_order_limit_offset(order_by, limit, offset));
+        Ok(Some(sql))
+    }
+
+    /// Resolves the searched tags and renders the two statements the search can
+    /// run: the row-producing select (`search_db_files`) and a mirror that
+    /// aggregates `COUNT(<same column>)` instead (`search_db_files_count`).
+    ///
+    /// Returns `(row_select, count_select, conditions)`, or `None` when there
+    /// is nothing to search for. Both selects share the same driving scan and
+    /// predicate list; the aggregate stays a plain scan of the driver's index
+    /// (or the `File` table's primary key), so counting never needs a temp
+    /// B-tree or a sorter.
+    async fn build_search_parts(
+        &self,
+        conn: &Connection,
+        search: &SearchObj,
+    ) -> Result<Option<(String, String, Vec<String>, &'static str)>> {
         // Resolve every searched tag's namespace and popularity in one batched
         // query. The namespace picks the `Relationship_{ns}` partition a probe
         // has to hit; the count picks the driving scan.
@@ -284,7 +391,7 @@ impl TursoDatabase {
             return Ok(None);
         }
 
-        let (mut sql, order_by) = match &driver {
+        let (row_sql, count_sql, order_by) = match &driver {
             Driver::Tag {
                 namespace_id,
                 tag_id,
@@ -293,38 +400,55 @@ impl TursoDatabase {
                     "SELECT d.file_id AS file_id FROM Relationship_{namespace_id} d \
                      WHERE d.tag_id = {tag_id}"
                 ),
+                format!(
+                    "SELECT COUNT(d.file_id) FROM Relationship_{namespace_id} d \
+                     WHERE d.tag_id = {tag_id}"
+                ),
                 "d.file_id",
             ),
             Driver::AllFiles => (
                 "SELECT d.id AS file_id FROM File d WHERE 1".to_string(),
+                "SELECT COUNT(d.id) FROM File d WHERE 1".to_string(),
                 "d.id",
             ),
         };
-        for condition in &conditions {
-            sql.push_str(condition);
-        }
-        // `ORDER BY` stays *inside* the single SELECT, on the driver's own key
-        // column, instead of wrapping the scan in `SELECT file_id FROM (...)`.
-        //
-        // The relationship partition's primary key is `(tag_id, file_id)`, so
-        // within one tag the index already yields `file_id` in order. Wrapping
-        // the scan hid that from the planner: the outer `ORDER BY` became
-        // `USE SORTER FOR ORDER BY`, materialising and sorting every candidate
-        // before `LIMIT` could discard it. Ordering in place drops the sorter
-        // entirely and lets `LIMIT` stop as soon as enough rows are found.
-        // Measured on 20k rows in one tag, descending, LIMIT 50: 3.16 ms ->
-        // 0.03 ms with the sort removed, and 0.11 ms with a probe that matches
-        // every row. When a search is selective enough that the whole driver has
-        // to be walked anyway, this is neutral — it never pays a sort that the
-        // index order did not already provide.
-        //
-        // No outer wrapper is needed: limbo rejects a parenthesized compound as
-        // a compound operand, and this statement is a single `SELECT`.
-        sql.push_str(&format!(" ORDER BY {order_by} DESC"));
+        Ok(Some((row_sql, count_sql, conditions, order_by)))
+    }
+
+    /// Renders the `ORDER BY` / `LIMIT` / `OFFSET` tail. `ORDER BY` stays
+    /// *inside* the single SELECT, on the driver's own key column, instead of
+    /// wrapping the scan in `SELECT file_id FROM (...)`.
+    ///
+    /// The relationship partition's primary key is `(tag_id, file_id)`, so
+    /// within one tag the index already yields `file_id` in order. Wrapping
+    /// the scan hid that from the planner: the outer `ORDER BY` became
+    /// `USE SORTER FOR ORDER BY`, materialising and sorting every candidate
+    /// before `LIMIT` could discard it. Ordering in place drops the sorter
+    /// entirely and lets `LIMIT` stop as soon as enough rows are found.
+    /// Measured on 20k rows in one tag, descending, LIMIT 50: 3.16 ms ->
+    /// 0.03 ms with the sort removed, and 0.11 ms with a probe that matches
+    /// every row. When a search is selective enough that the whole driver has
+    /// to be walked anyway, this is neutral — it never pays a sort that the
+    /// index order did not already provide.
+    ///
+    /// `OFFSET` keeps the same property: a paged page k+1 is a skip of k * page
+    /// rows over the already-ordered index, so the planner walks only
+    /// `offset + limit` rows of the driving scan rather than the whole result
+    /// set — and the webui no longer has to pull every matching id to reach
+    /// page two.
+    ///
+    /// No outer wrapper is needed: limbo rejects a parenthesized compound as
+    /// a compound operand, and this statement is a single `SELECT`.
+    fn append_order_limit_offset(order_by: &str, limit: &Option<u64>, offset: &Option<u64>) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(" ORDER BY {order_by} DESC"));
         if let Some(limit) = limit {
-            sql.push_str(&format!(" LIMIT {limit}"));
+            out.push_str(&format!(" LIMIT {limit}"));
         }
-        Ok(Some(sql))
+        if let Some(offset) = offset.filter(|o| *o > 0) {
+            out.push_str(&format!(" OFFSET {offset}"));
+        }
+        out
     }
 
     /// Resolves each human tag name to up to `FTS_NAME_LIMIT` tag ids via the
@@ -725,7 +849,8 @@ mod tests {
                         searches: searches.clone(),
                     },
                     &limit,
-                )
+                &None,
+                    )
                 .await
                 .unwrap();
             assert_eq!(
@@ -810,6 +935,7 @@ mod tests {
                     search_relate: None,
                     searches: searches.clone(),
                 },
+                &None,
                 &None,
             )
             .await
@@ -1202,10 +1328,10 @@ mod tests {
                 searches: searches.clone(),
             };
             // Warm once so the first sample is not paying for a cold b-tree.
-            let _ = db.search_db_files(conn, &obj(), &limit).await.unwrap();
+            let _ = db.search_db_files(conn, &obj(), &limit, &None).await.unwrap();
             for _ in 0..iters {
                 let started = Instant::now();
-                let got = db.search_db_files(conn, &obj(), &limit).await.unwrap();
+                let got = db.search_db_files(conn, &obj(), &limit, &None).await.unwrap();
                 samples.push(started.elapsed().as_secs_f64() * 1000.0);
                 rows_total += got.len();
             }
@@ -1241,6 +1367,7 @@ mod tests {
                     search_relate: None,
                     searches,
                 },
+                &None,
                 &None,
             )
             .await
@@ -1438,7 +1565,8 @@ mod tests {
                                 .collect(),
                         },
                         &None,
-                    )
+                    &None,
+                        )
                     .await
                     .unwrap();
                 let got_set: BTreeSet<u64> = got.iter().copied().collect();
@@ -1545,6 +1673,7 @@ mod tests {
                     ],
                 },
                 &None,
+                &None,
             )
             .await
             .unwrap()
@@ -1587,7 +1716,7 @@ mod tests {
                         searches,
                     },
                     &None,
-                )
+                &None,                )
                 .await
                 .unwrap()
                 .expect("search should produce a statement");
@@ -1653,7 +1782,8 @@ mod tests {
                         .collect(),
                 },
                 &None,
-            )
+            &None,
+                )
             .await
             .unwrap();
         let in_window: Vec<u64> = got
@@ -1686,6 +1816,7 @@ mod tests {
                     searches: searches.clone(),
                 },
                 &None,
+                &None,
             )
             .await
             .unwrap();
@@ -1702,11 +1833,70 @@ mod tests {
                     searches,
                 },
                 &Some(2),
+                &None,
             )
             .await
             .unwrap();
         assert_eq!(limited, all[..2].to_vec(), "LIMIT takes the newest rows");
         drop(conn);
         db.shutdown().await;
+    }
+
+    /// Server-side paging must slice the same newest-first sequence the
+    /// unlimited search produces: `LIMIT n OFFSET m` returns rows
+    /// [m .. m + n] of that sequence, and overrunning the result yields an
+    /// empty page. This is what keeps the webui from pulling 500k ids to show
+    /// page two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offset_pages_the_newest_first_result() {
+        let db = new_test_db().await;
+        let (_file_ids, truth) = seed(&db, 30, 3).await;
+        let conn = db.connect().unwrap();
+
+        let mut counts: Vec<(u64, usize)> = truth.iter().map(|(id, s)| (*id, s.len())).collect();
+        counts.sort_by_key(|(_, n)| *n);
+        let tag = counts[counts.len() - 1].0;
+
+        let searches = vec![SearchHolder::And(vec![tag])];
+        let all: Vec<u64> = db
+            .search_db_files(&conn, &tags_obj(searches.clone()), &None, &None)
+            .await
+            .unwrap();
+        assert!(all.len() > 10, "need a sizeable tag for paging to matter");
+
+        for (limit, offset) in [(3u64, 0u64), (3, 3), (3, 7), (2, all.len() as u64 - 1), (5, all.len() as u64)] {
+            let paged = db
+                .search_db_files(&conn, &tags_obj(searches.clone()), &Some(limit), &Some(offset))
+                .await
+                .unwrap();
+            let window: Vec<u64> = all
+                .iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .copied()
+                .collect();
+            assert_eq!(
+                paged, window,
+                "LIMIT {limit} OFFSET {offset} must be the matching slice of the full result"
+            );
+        }
+
+        // Count agreement: the aggregate sees exactly what the scan yields.
+        let counted = db.search_db_files_count(&conn, &tags_obj(searches)).await.unwrap();
+        assert_eq!(
+            counted,
+            all.len() as u64,
+            "COUNT over the driving scan must equal the result size"
+        );
+
+        drop(conn);
+        db.shutdown().await;
+    }
+
+    fn tags_obj(searches: Vec<SearchHolder>) -> SearchObj {
+        SearchObj {
+            search_relate: None,
+            searches,
+        }
     }
 }

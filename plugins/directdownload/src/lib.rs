@@ -138,6 +138,16 @@ fn on_regex(
     }
 }
 
+/// The host runs every scraper job through `url_dump` before handing it to the
+/// text/download pipeline, and treats a missing symbol as a fatal scrape error.
+/// This plugin cannot enumerate anything further (the url is already final and
+/// queued via `on_regex`), so the job simply passes through unchanged, the same
+/// way MEGA's passthrough branch works.
+#[unsafe(no_mangle)]
+pub fn url_dump(data: &ScraperDataReturn) -> Vec<ScraperDataReturn> {
+    vec![data.clone()]
+}
+
 fn ns_source_url() -> GenericNamespaceObj {
     GenericNamespaceObj {
         name: NS_SOURCE_URL.into(),
