@@ -216,28 +216,47 @@ impl TursoDatabase {
         Ok(out)
     }
 
+    /// Upper bound a count is willing to scan before it stops. An exact total
+    /// forces a walk of the whole match set; a paged UI only needs to know
+    /// whether more pages exist, so counting stops at the cap and the caller
+    /// displays "{cap}+". The page fetch already early-terminates the same way.
+    pub(crate) const COUNT_SCAN_CAP: u64 = 20_000;
+
     /// Counts the files a search matches, running the same driving scan and
     /// predicates as `search_db_files` but aggregating instead of shipping
     /// rows. A paged UI asks for this once per search instead of `len()`-ing a
     /// full result set across IPC.
+    ///
+    /// The inner scan is bounded by `COUNT_SCAN_CAP + 1` rows: once the count
+    /// reaches the cap the scan stops early and the cap is returned. A caller
+    /// seeing exactly the cap knows the real total is *at least* the cap (the
+    /// +1 overshoot row keeps an exact-cap total from being distinguishable,
+    /// which is fine for a "N+" display).
     pub(in crate::db::turso) async fn search_db_files_count(
         &self,
         conn: &Connection,
         search: &SearchObj,
     ) -> Result<u64> {
         let sql = match self.build_search_parts(conn, search).await? {
-            Some((_, count_select, conditions, _)) => {
-                let mut sql = count_select;
+            // The cap must bound the *row scan*, so the inner select is the
+            // row-producing statement (not the count aggregate) sliced by
+            // LIMIT; the outer SELECT counts what survived.
+            Some((row_select, _, conditions, _)) => {
+                let mut inner = row_select;
                 for condition in &conditions {
-                    sql.push_str(condition);
+                    inner.push_str(condition);
                 }
-                sql
+                inner.push_str(&format!(" LIMIT {}", Self::COUNT_SCAN_CAP + 1));
+                format!("SELECT COUNT(*) FROM ({inner})")
             }
             None => return Ok(0),
         };
         let mut rows = conn.query(&sql, ()).await?;
         match rows.next().await? {
-            Some(row) => Ok(row.get::<i64>(0)?.max(0) as u64),
+            Some(row) => {
+                let counted = row.get::<i64>(0)?.max(0) as u64;
+                Ok(counted.min(Self::COUNT_SCAN_CAP))
+            }
             None => Ok(0),
         }
     }
