@@ -101,6 +101,26 @@ impl PluginManager {
             .cloned()
     }
 
+    /// Resolves a plugin by name or any of its site aliases (case-insensitive),
+    /// so users can refer to it as e.g. `furaffinity`, `FurAffinity` or `fa`.
+    pub fn plugin_for_site(&self, site: &str) -> Option<Plugin> {
+        let needle = site.to_ascii_lowercase();
+        if let Some(plugin) = self
+            .storage
+            .read()
+            .values()
+            .find(|p| p.name.to_ascii_lowercase() == needle)
+        {
+            return Some(plugin.clone());
+        }
+        let sites = self.storage_site.read();
+        let plugin_name = sites
+            .iter()
+            .find(|(alias, _)| alias.to_ascii_lowercase() == needle)
+            .map(|(_, name)| name.clone());
+        plugin_name.and_then(|name| self.storage.read().get(&name).cloned())
+    }
+
     /// Adds tags to cache will let system process later.
     /// called from db needs to be relatively fast and non-blocking
     pub fn add_regex_tags(&self, tags: HashMap<Tag, u64>) {

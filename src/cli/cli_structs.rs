@@ -38,6 +38,8 @@ pub enum TasksStruct {
 
     /// Imports a file into the db.
     Import(Directory),
+    /// Adds or updates a plugin's login (cookie / API key) credentials.
+    Login(LoginArgs),
 }
 
 /// Type of job in db. Will be used to confirm what the scraping logic should work.
@@ -68,6 +70,21 @@ pub struct ScraperTest {
     pub action_type: DbJobType,
     /// Input to send to the scraper
     pub input: Option<String>,
+}
+
+/// `tasks login <site>`: prompts for the plugin's credentials (including
+/// optional ones like session cookies or API keys) and stores them.
+#[derive(Debug, Parser)]
+pub struct LoginArgs {
+    /// Plugin name or site alias (e.g. `furaffinity`, `FurAffinity`, `fa`).
+    pub site: String,
+    /// Overwrite credentials that are already stored.
+    #[arg(long)]
+    pub force: bool,
+    /// Import session cookies from a Netscape-format cookies.txt file
+    /// (curl/wget style) instead of prompting.
+    #[arg(long, value_name = "PATH")]
+    pub cookies: Option<String>,
 }
 
 #[derive(Debug, Parser)]

@@ -30,6 +30,12 @@ fn dylib_file_name(plugin_name: &str) -> String {
 
 fn main() -> Result<(), Box<dyn Error>> {
     if env::var("PROFILE").is_ok_and(|profile| profile == "debug") {
+        // Debug builds never refresh compiled_plugins/, so plugin edits
+        // silently keep serving the stale .so. Warn loudly instead.
+        println!(
+            "cargo:warning=DEBUG build: compiled_plugins/ is NOT refreshed; \
+             run `cargo build --release` after editing plugins, then restart the daemon."
+        );
         return Ok(());
     }
 

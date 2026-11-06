@@ -90,7 +90,7 @@ pub fn time_conv(inp: &str) -> u64 {
 }
 
 /// Returns the main argument and parses data.
-pub async fn main(db: Arc<TursoDatabase>) {
+pub async fn main(db: Arc<TursoDatabase>, plugin_manager: Arc<crate::plugins::PluginManager>) {
     let args = cli_structs::MainWrapper::parse();
     if args.a.is_none() {
         return;
@@ -865,6 +865,32 @@ pub async fn main(db: Arc<TursoDatabase>) {
                        // data.recache_roaring();
                     }
                 }*/
+            }
+            cli_structs::TasksStruct::Login(args) => {
+                match plugin_manager.plugin_for_site(&args.site) {
+                    Some(plugin) => {
+                        if let Some(path) = &args.cookies {
+                            match crate::web::manager::import_cookies_txt(&db, &plugin, path) {
+                                Ok(stored) => {
+                                    println!("Stored {stored} login item(s) for {}.", plugin.name)
+                                }
+                                Err(e) => println!("{e}"),
+                            }
+                        } else {
+                            let stored = crate::web::manager::prompt_plugin_login(
+                                &db, &plugin, true, args.force,
+                            );
+                            println!("Stored {stored} login item(s) for {}.", plugin.name);
+                        }
+                    }
+                    None => {
+                        println!(
+                            "No plugin found for '{}'. Known sites: {}",
+                            args.site,
+                            plugin_manager.get_storage_sites().join(", ")
+                        );
+                    }
+                }
             }
             cli_structs::TasksStruct::Csv(_csvstruct) => {}
         },

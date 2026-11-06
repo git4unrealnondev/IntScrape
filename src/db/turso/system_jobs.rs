@@ -40,13 +40,14 @@ impl TursoDatabase {
             return false;
         }
 
-        // A slurp owns the database and has already stopped the poller from
-        // claiming new work (including this job). If this job was claimed just
-        // before the slurp started, back off so its BEGIN IMMEDIATE writes are
-        // not contended by a maintenance reader.
-        if self.is_slurping() {
+        // A slurp no longer pauses the poller or the IPC server; its write side
+        // is short BEGIN IMMEDIATE batches that other jobs interleave with.
+        // Only a second slurp (claimed in the race window before the first one
+        // raised the flag) defers — a concurrent bulk import would fight over
+        // the Tags_slurp staging table and the per-stage cursors.
+        if self.is_slurping() && job.config.site.as_str() == SYSTEM_DATABASE_SLURP_SITE {
             log::warn!(
-                "Paused system job {} while a database slurp is running",
+                "Deferring system job {} because another database slurp is running",
                 job.id
             );
             return false;

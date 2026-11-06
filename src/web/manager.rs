@@ -1109,7 +1109,27 @@ impl Scraper {
                 self.plugin.name, self.job.id, file_url
             );
 
-            let mut response = match self.file_client.get(url.clone()).send().await {
+            // Media downloads use the bare file client, so any login cookies
+            // from the job params have to be attached here or gated files
+            // (e.g. registered-users-only submissions) will fail.
+            let mut request = self.file_client.get(url.clone());
+            let cookies: Vec<String> = self
+                .job
+                .config
+                .param
+                .iter()
+                .filter_map(|p| match p {
+                    ScraperParam::Login(LoginType::Cookie(name, Some(value))) => {
+                        Some(format!("{name}={value}"))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !cookies.is_empty() {
+                request = request.header(reqwest::header::COOKIE, cookies.join("; "));
+            }
+
+            let mut response = match request.send().await {
                 Ok(res) => res,
                 Err(err) => {
                     log::error!(
@@ -2071,125 +2091,28 @@ impl DownloadsManager {
     /// Handles loading in login information into the db
     ///
     fn handle_login_db(self: &Arc<Self>, plugin: &Plugin) -> Result<(), Box<dyn Error>> {
-        for property in &plugin.properties {
-            if let PluginProperties::Login((login_need, login_type)) = property
-                && login_need == &LoginNeed::Required
-            {
-                match login_type {
-                    LoginType::Api(key, api) => {
-                        if self
-                            .db
-                            .setting_get_sync_blocking(&format!(
-                                "PLUGIN_{}_{}",
-                                plugin.name, "API_KEY"
-                            ))
-                            .is_none()
-                        {
-                            dbg!(&plugin.name, &key, &api);
-                            let mut user_name = String::new();
-                            print!("Api Key: ");
-                            let _ = stdout().flush();
-                            stdin().read_line(&mut user_name)?;
-                            if user_name.ends_with('\n') {
-                                user_name.pop();
-                            }
-                            if user_name.ends_with('\r') {
-                                user_name.pop();
-                            }
-                            let mut user_pass = String::new();
-                            print!("Password: ");
-                            let _ = stdout().flush();
-                            stdin().read_line(&mut user_pass)?;
-                            if user_pass.ends_with('\n') {
-                                user_pass.pop();
-                            }
-                            if user_pass.ends_with('\r') {
-                                user_pass.pop();
-                            }
-                            self.db.setting_set_sync_blocking(&DbSettingsObj {
-                                name: format!("PLUGIN_{}_API_KEY", plugin.name),
-                                description: Some("API Login for site.".into()),
-                                num: None,
-                                param: Some(user_name),
-                            });
-                            self.db.setting_set_sync_blocking(&DbSettingsObj {
-                                name: format!("PLUGIN_{}_API_PASS", plugin.name),
-                                description: Some("API Login for site.".into()),
-                                num: None,
-                                param: Some(user_pass),
-                            });
-                        }
-                    }
-                    LoginType::ApiNamespaced(ns, key, api)
-                        if self
-                            .db
-                            .setting_get_sync_blocking(&format!(
-                                "PLUGIN_{}_{}_{}",
-                                plugin.name, ns, "API_NS"
-                            ))
-                            .is_none() =>
-                    {
-                        dbg!(&plugin.name, &key, &api);
-                        let mut user_name = String::new();
-                        print!("Api Key: ");
-                        let _ = stdout().flush();
-                        stdin().read_line(&mut user_name)?;
-                        if user_name.ends_with('\n') {
-                            user_name.pop();
-                        }
-                        if user_name.ends_with('\r') {
-                            user_name.pop();
-                        }
-                        let mut user_pass = String::new();
-                        print!("Password: ");
-                        let _ = stdout().flush();
-                        stdin().read_line(&mut user_pass)?;
-                        if user_pass.ends_with('\n') {
-                            user_pass.pop();
-                        }
-                        if user_pass.ends_with('\r') {
-                            user_pass.pop();
-                        }
-                        self.db.setting_set_sync_blocking(&DbSettingsObj {
-                            name: format!("PLUGIN_{}_{}_{}", plugin.name, ns, "API_NS"),
-                            description: Some("API Login for site.".into()),
-                            num: None,
-                            param: Some(user_name),
-                        });
-                    }
-                    LoginType::Cookie(cookie_name, help_text)
-                        if self
-                            .db
-                            .setting_get_sync_blocking(&format!(
-                                "PLUGIN_{}_{}_{}",
-                                plugin.name, cookie_name, "COOKIE"
-                            ))
-                            .is_none() =>
-                    {
-                        let mut user_name = String::new();
-                        if let Some(help_text) = help_text {
-                            println!("{help_text}");
-                        }
-                        print!("Cookie: ");
-                        let _ = stdout().flush();
-                        stdin().read_line(&mut user_name)?;
-                        if user_name.ends_with('\n') {
-                            user_name.pop();
-                        }
-                        if user_name.ends_with('\r') {
-                            user_name.pop();
-                        }
+        let _stored = prompt_plugin_login(&self.db, plugin, false, false);
 
-                        self.db.setting_set_sync_blocking(&DbSettingsObj {
-                            name: format!("PLUGIN_{}_{}_{}", plugin.name, cookie_name, "COOKIE"),
-                            description: Some("Cookie for site..".into()),
-                            num: None,
-                            param: Some(user_name),
-                        });
-                    }
-                    _ => {}
-                }
-            }
+        // Optional logins are never prompted for at startup (they are not
+        // needed for most jobs). Point the user at the CLI adder instead.
+        let missing_optional = plugin
+            .properties
+            .iter()
+            .filter_map(|p| match p {
+                PluginProperties::Login((LoginNeed::Optional, login_type)) => Some(login_type),
+                _ => None,
+            })
+            .any(|login_type| {
+                login_setting_keys(plugin, login_type)
+                    .iter()
+                    .any(|k| self.db.setting_get_sync_blocking(k).is_none())
+            });
+        if missing_optional {
+            println!(
+                "{}: an optional login is not set; run `intscrape tasks login {}` to add one.",
+                plugin.name,
+                plugin.name.to_ascii_lowercase()
+            );
         }
 
         Ok(())
@@ -2314,6 +2237,196 @@ impl DownloadsManager {
             }
         }
     }
+}
+
+/// Setting keys a login type is stored under.
+fn login_setting_keys(plugin: &Plugin, login_type: &LoginType) -> Vec<String> {
+    match login_type {
+        LoginType::Cookie(name, _) => vec![format!("PLUGIN_{}_{}_COOKIE", plugin.name, name)],
+        LoginType::ApiNamespaced(ns, _, _) => {
+            vec![format!("PLUGIN_{}_{}_API_NS", plugin.name, ns)]
+        }
+        LoginType::Api(_, _) => vec![
+            format!("PLUGIN_{}_API_KEY", plugin.name),
+            format!("PLUGIN_{}_API_PASS", plugin.name),
+        ],
+        _ => vec![],
+    }
+}
+
+fn read_login_line(prompt: &str) -> String {
+    print!("{prompt}");
+    let _ = std::io::stdout().flush();
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_line(&mut buf);
+    while buf.ends_with(['\n', '\r']) {
+        buf.pop();
+    }
+    buf
+}
+
+/// Prompts for a plugin's logins and stores them in the settings DB.
+/// `include_optional` also covers `LoginNeed::Optional` logins (cookies,
+/// API keys); `overwrite` re-prompts for values that already exist.
+/// Returns how many setting values were stored.
+/// Imports session cookies for a plugin from a Netscape-format
+/// cookies.txt file (curl/wget style), storing each cookie the plugin
+/// declares under `PLUGIN_{name}_{cookie}_COOKIE`.
+/// Returns how many cookies were stored.
+pub(crate) fn import_cookies_txt(
+    db: &TursoDatabase,
+    plugin: &Plugin,
+    path: &str,
+) -> Result<usize, String> {
+    let wanted: Vec<String> = plugin
+        .properties
+        .iter()
+        .filter_map(|p| match p {
+            PluginProperties::Login((_, LoginType::Cookie(name, _))) => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    if wanted.is_empty() {
+        return Err(format!("{} declares no cookie logins.", plugin.name));
+    }
+
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("Could not read {path}: {e}"))?;
+
+    // Domain aliases that look like hosts (e.g. `furaffinity.net`).
+    let aliases: Vec<String> = plugin
+        .properties
+        .iter()
+        .filter_map(|p| match p {
+            PluginProperties::Sites(sites) => {
+                Some(sites.iter().map(|s| s.to_ascii_lowercase()).collect::<Vec<_>>())
+            }
+            _ => None,
+        })
+        .flatten()
+        .filter(|s| s.contains('.'))
+        .collect();
+
+    let mut stored = 0usize;
+    for line in text.lines() {
+        let line = line.strip_prefix("#HttpOnly_").unwrap_or(line);
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 7 {
+            continue;
+        }
+        let domain = fields[0].trim_start_matches('.').to_ascii_lowercase();
+        let name = fields[5];
+        let value = fields[6..].join(" ");
+        if !wanted.iter().any(|w| w == name) {
+            continue;
+        }
+        if !aliases.iter().any(|a| {
+            domain == *a || domain.ends_with(&format!(".{a}")) || a.ends_with(&format!(".{domain}"))
+        }) {
+            continue;
+        }
+        db.setting_set_sync_blocking(&DbSettingsObj {
+            name: format!("PLUGIN_{}_{}_COOKIE", plugin.name, name),
+            description: Some("Cookie for site..".into()),
+            num: None,
+            param: Some(value),
+        });
+        println!("Stored cookie '{}' for {}.", name, plugin.name);
+        stored += 1;
+    }
+
+    if stored == 0 {
+        return Err(format!(
+            "No matching cookies found in {path} (plugin wants: {}).",
+            wanted.join(", ")
+        ));
+    }
+    Ok(stored)
+}
+
+pub(crate) fn prompt_plugin_login(
+    db: &TursoDatabase,
+    plugin: &Plugin,
+    include_optional: bool,
+    overwrite: bool,
+) -> usize {
+    let exists = |key: &str| db.setting_get_sync_blocking(key).is_some();
+    let mut stored = 0usize;
+
+    for property in &plugin.properties {
+        let PluginProperties::Login((login_need, login_type)) = property else {
+            continue;
+        };
+        if *login_need == LoginNeed::Optional && !include_optional {
+            continue;
+        }
+
+        match login_type {
+            LoginType::Api(key, _api) => {
+                let setting_key = format!("PLUGIN_{}_API_KEY", plugin.name);
+                if overwrite || !exists(&setting_key) {
+                    if !key.is_empty() {
+                        println!("{key}");
+                    }
+                    let user_name = read_login_line("Api Key: ");
+                    let user_pass = read_login_line("Password: ");
+                    db.setting_set_sync_blocking(&DbSettingsObj {
+                        name: format!("PLUGIN_{}_API_KEY", plugin.name),
+                        description: Some("API Login for site.".into()),
+                        num: None,
+                        param: Some(user_name),
+                    });
+                    db.setting_set_sync_blocking(&DbSettingsObj {
+                        name: format!("PLUGIN_{}_API_PASS", plugin.name),
+                        description: Some("API Login for site.".into()),
+                        num: None,
+                        param: Some(user_pass),
+                    });
+                    stored += 2;
+                }
+            }
+            LoginType::ApiNamespaced(ns, key, _api) => {
+                let setting_key = format!("PLUGIN_{}_{}_API_NS", plugin.name, ns);
+                if overwrite || !exists(&setting_key) {
+                    if let Some(help) = key.as_deref().or(_api.as_deref()) {
+                        println!("{help}");
+                    }
+                    let user_name = read_login_line("Api Key: ");
+                    let user_pass = read_login_line("Password: ");
+                    db.setting_set_sync_blocking(&DbSettingsObj {
+                        name: setting_key,
+                        description: Some("API Login for site.".into()),
+                        num: None,
+                        param: Some(user_name),
+                    });
+                    stored += 1;
+                    let _ = user_pass;
+                }
+            }
+            LoginType::Cookie(cookie_name, help_text) => {
+                let setting_key = format!("PLUGIN_{}_{}_COOKIE", plugin.name, cookie_name);
+                if overwrite || !exists(&setting_key) {
+                    if let Some(help) = help_text {
+                        println!("{help}");
+                    }
+                    let value = read_login_line("Cookie: ");
+                    db.setting_set_sync_blocking(&DbSettingsObj {
+                        name: setting_key,
+                        description: Some("Cookie for site..".into()),
+                        num: None,
+                        param: Some(value),
+                    });
+                    stored += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    stored
 }
 
 pub fn expected_hash(hash: &HashesSupported) -> &str {

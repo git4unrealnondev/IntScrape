@@ -66,6 +66,14 @@ const SLURP_HASH_WRITE_BATCH: usize = 25_000;
 /// never applied to a different database.
 const SLURP_CHECKPOINT_TABLE: &str = "_slurp_checkpoint";
 
+/// Per-batch source-id -> target-id maps for the tags and files stages. Rows
+/// are written in the same transaction as the batch they describe, so a
+/// checkpoint cursor never outpaces the mapping the relationship and hash
+/// stages need to route their own rows. Both tables are dropped when a slurp
+/// completes.
+const SLURP_TAG_MAP_TABLE: &str = "_slurp_tag_map";
+const SLURP_FILE_MAP_TABLE: &str = "_slurp_file_map";
+
 /// Keyset scans build `{column} > last` from a seed of 0, which silently drops
 /// a source row whose id is 0 (some hydrus databases genuinely assign a File
 /// the id 0, main.db's 6.8M-row File table has one). Seed the first read at
@@ -209,15 +217,20 @@ impl TursoDatabase {
         let (sauce, _slurp_source_temp) = self.open_slurp_source(source).await?;
         let source_conn = sauce.connect()?;
 
-        // Background pollers (system-job spawner) must stop reading the
-        // destination while the import runs: an open reader snapshot keeps the
-        // WAL from truncating, which slows every checkpoint as the import
-        // grows. The IPC server is paused and drained so the import's
-        // BEGIN IMMEDIATE transactions never wait on a UI request. The flags
-        // are cleared even when the loop bails on a non-MVCC error so a failed
-        // slurp never leaves the app paused behind it.
+        // The slurp no longer pauses the IPC server or the background pollers:
+        // it runs alongside live UI traffic and other jobs. Its write side is
+        // a sequence of short BEGIN IMMEDIATE batch transactions that commit
+        // between every batch, so scraper writers (which fall back from
+        // CONCURRENT to IMMEDIATE while the WAL fast lane holds) and readers
+        // interleave with the import. Conflicts surface as Busy errors and are
+        // retried by the loop below; every committed batch is idempotent
+        // (INSERT OR IGNORE bulk-add helpers plus a per-batch cursor), so a
+        // retried or resumed attempt never double-imports. The slurping flag
+        // stays up for the duration so the spawner defers further slurp jobs
+        // and write_tx_behavior keeps serving IMMEDIATE to scrape writers.
+        // The flag is cleared even when the loop bails on a non-MVCC error so
+        // a failed slurp never leaves the app paused behind it.
         self.set_slurping(true);
-        self.ipc_pause().await;
         // Snapshot the mode the destination serves in before the import (WAL
         // on a normal boot). The import streams into the same WAL journal; a
         // destination that is somehow still in MVCC (opened by an older core
@@ -273,7 +286,6 @@ impl TursoDatabase {
                 );
             }
         }
-        self.ipc_resume().await;
         self.set_slurping(false);
         result
     }
@@ -450,6 +462,23 @@ impl TursoDatabase {
             (),
         )
         .await?;
+        // Source-id -> target-id maps for the tags and files stages, written in
+        // the same transaction as each batch so a cursor never advances past a
+        // batch whose mapping did not land. The relationship and hash stages
+        // resolve through these maps, so a resumed run can skip the batches
+        // behind the cursor and still route every later row to the right
+        // target id.
+        for table in [SLURP_TAG_MAP_TABLE, SLURP_FILE_MAP_TABLE] {
+            conn.execute(
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {table} (
+                         source_id INTEGER PRIMARY KEY,
+                         target_id INTEGER NOT NULL);"
+                ),
+                (),
+            )
+            .await?;
+        }
         let source_key = slurp_source_key(source_path);
         {
             let mut stmt = conn
@@ -470,6 +499,9 @@ impl TursoDatabase {
                 }
                 conn.execute(format!("DELETE FROM {SLURP_CHECKPOINT_TABLE}"), ())
                     .await?;
+                for table in [SLURP_TAG_MAP_TABLE, SLURP_FILE_MAP_TABLE] {
+                    conn.execute(format!("DELETE FROM {table}"), ()).await?;
+                }
             }
         }
         conn.execute(
@@ -589,7 +621,40 @@ impl TursoDatabase {
                         .await?;
                 }
             }
-            conn.execute("DROP TABLE IF EXISTS Tags_slurp", ()).await?;
+            // Resume: a tags cursor from an interrupted earlier run points at
+            // the last source id whose batch fully committed (the cursor is
+            // written inside the batch's own transaction). Its mapping rows
+            // live in _slurp_tag_map, so the covered batches are skipped whole
+            // and the relationship stage still routes through the preloaded
+            // map. A cursor without map rows (state left by an older build) is
+            // discarded: re-walking is idempotent, skipping blind is not.
+            let tags_resume = checkpoint.get("tags").copied().unwrap_or_default();
+            let mut tags_map_loaded = 0_usize;
+            if tags_resume.last_tag_id > 0 {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT source_id, target_id FROM {SLURP_TAG_MAP_TABLE}"
+                    ))
+                    .await?;
+                let mut rows = stmt.query(()).await?;
+                while let Some(row) = rows.next().await? {
+                    slurp_tags.insert(row.get::<i64>(0)? as u64, row.get::<i64>(1)? as u64);
+                    tags_map_loaded += 1;
+                }
+                if tags_map_loaded == 0 {
+                    log::warn!(
+                        "Slurp tags: cursor {} has no mapping rows; re-walking the stage from the start.",
+                        tags_resume.last_tag_id
+                    );
+                }
+            }
+            let tags_resuming = tags_resume.last_tag_id > 0 && tags_map_loaded > 0;
+            // The staging table holds committed batches when a warm import is
+            // resumed mid-stage; dropping it here would lose those rows. A
+            // fresh warm run always starts with an empty staging table.
+            if !tags_resuming {
+                conn.execute("DROP TABLE IF EXISTS Tags_slurp", ()).await?;
+            }
 
             // Only a destination that already owns tags needs the per-batch
             // "exists?" lookup; an empty Tags table has nothing to resolve.
@@ -631,8 +696,11 @@ impl TursoDatabase {
                     .await?;
                 log::info!("Slurp tags: cold import, inserting directly into indexed Tags");
             } else {
+                // IF NOT EXISTS: a resumed warm run keeps the staging table
+                // the interrupted attempt left behind (it holds committed
+                // batches covered by the cursor).
                 conn.execute_batch(
-                    "CREATE TABLE Tags_slurp (
+                    "CREATE TABLE IF NOT EXISTS Tags_slurp (
                          id INTEGER PRIMARY KEY ,
                          name TEXT NOT NULL,
                          namespace INTEGER NOT NULL,
@@ -673,8 +741,32 @@ impl TursoDatabase {
                     .await?;
                 stmt.query_row(()).await?.get(0)?
             };
-            let mut last_tag_id = 0_u64;
-            let mut first_tag_pass = true;
+            if tags_resuming {
+                // Committed batches of the interrupted attempt already occupy
+                // ids in the staging table; new rows must continue above both
+                // id spaces or the staging insert would collide. The staging
+                // table can be absent here: a resumed cold import's rows went
+                // straight into canonical Tags, so this attempt creates the
+                // staging table fresh below and starts from canonical's max.
+                let mut exists = conn
+                    .prepare(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM sqlite_schema
+                             WHERE type = 'table' AND name = 'Tags_slurp'
+                         )",
+                    )
+                    .await?;
+                let has_staging: i64 = exists.query_row(()).await?.get(0)?;
+                if has_staging != 0 {
+                    let mut stmt = conn
+                        .prepare("SELECT COALESCE(MAX(id), 0) FROM Tags_slurp")
+                        .await?;
+                    let staged_max: i64 = stmt.query_row(()).await?.get(0)?;
+                    next_insert_id = next_insert_id.max(staged_max);
+                }
+            }
+            let mut last_tag_id = tags_resume.last_tag_id;
+            let mut first_tag_pass = !tags_resuming;
             loop {
                 let batch_started = Instant::now();
                 let mut stmt = source
@@ -712,9 +804,11 @@ impl TursoDatabase {
                         &mut next_insert_id,
                     )
                     .await?;
-                conn.execute("COMMIT", ()).await?;
-                tag_count += batch.len() as u64;
-                tags_added += batch_new;
+                // Persist the batch's source->target mapping and the stage
+                // cursor inside the same transaction as the batch itself, so
+                // the cursor can never advance past mapping rows (or tag rows)
+                // that did not land.
+                let mut pairs: Vec<(u64, i64)> = Vec::with_capacity(batch.len());
                 for (source_id, name, namespace, description) in &batch {
                     let key = Tag {
                         name: name.clone(),
@@ -724,8 +818,42 @@ impl TursoDatabase {
                         },
                     };
                     if let Some(&target_id) = mapping.get(&key) {
-                        slurp_tags.insert(*source_id, target_id as u64);
+                        pairs.push((*source_id, target_id));
                     }
+                }
+                if !pairs.is_empty() {
+                    let mut holders = Vec::with_capacity(pairs.len());
+                    let mut params: Vec<Value> = Vec::with_capacity(pairs.len() * 2);
+                    for (source_id, target_id) in &pairs {
+                        holders.push("(?, ?)");
+                        params.push(Value::from(*source_id as i64));
+                        params.push(Value::from(*target_id));
+                    }
+                    conn.execute(
+                        &format!(
+                            "INSERT OR IGNORE INTO {SLURP_TAG_MAP_TABLE}
+                                 (source_id, target_id) VALUES {}",
+                            holders.join(", ")
+                        ),
+                        params_from_iter(params),
+                    )
+                    .await?;
+                }
+                slurp_checkpoint_write(
+                    &conn,
+                    "tags",
+                    SlurpStageCheckpoint {
+                        finished: false,
+                        last_file_id: 0,
+                        last_tag_id: *last_id,
+                    },
+                )
+                .await?;
+                conn.execute("COMMIT", ()).await?;
+                tag_count += batch.len() as u64;
+                tags_added += batch_new;
+                for (source_id, target_id) in &pairs {
+                    slurp_tags.insert(*source_id, *target_id as u64);
                 }
                 last_tag_id = *last_id;
                 log::info!(
@@ -743,6 +871,37 @@ impl TursoDatabase {
             // multi-gigabyte single-threaded sort in the MVCC layer that takes
             // tens of minutes. Skip it, drop the empty import table, and keep
             // the indexed canonical table in place.
+            //
+            // The swap decision counts the staging table, not just this
+            // attempt's additions: a resumed run may add nothing while the
+            // interrupted attempt's committed batches still sit staged, and
+            // those must go through the swap or they would be lost. Staging
+            // rows are exactly the genuinely-new tags across attempts, so
+            // folding them into tags_added also keeps the relationship
+            // stage's recount/cold-import heuristics correct on resume.
+            let staged_rows: usize = if !cold_import {
+                // The staging table may not exist at all: a previous attempt
+                // can have completed the swap before crashing later, leaving
+                // Tags_slurp renamed into canonical Tags.
+                let mut exists = conn
+                    .prepare(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM sqlite_schema
+                             WHERE type = 'table' AND name = 'Tags_slurp'
+                         )",
+                    )
+                    .await?;
+                let has_staging: i64 = exists.query_row(()).await?.get(0)?;
+                if has_staging != 0 {
+                    let mut stmt = conn.prepare("SELECT COUNT(*) FROM Tags_slurp").await?;
+                    stmt.query_row(()).await?.get::<i64>(0)? as usize
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            tags_added = tags_added.max(staged_rows);
             if cold_import {
                 // idx_tags_name_namespace carried every insert up front; the
                 // covering index is rebuilt once here (counts were all 0
@@ -844,8 +1003,36 @@ impl TursoDatabase {
                 "NULL"
             };
 
-            let mut last_file_id = 0_u64;
-            let mut first_file_pass = true;
+            // Resume: a files cursor from an interrupted earlier run points at
+            // the last source id whose batch fully committed (cursor and map
+            // rows are written inside the batch's own transaction). The
+            // skipped batches' source->target mapping is preloaded from
+            // _slurp_file_map so the hash and relationship stages still route
+            // through it. A cursor without map rows (older-build state) is
+            // discarded; re-walking is idempotent, skipping blind is not.
+            let files_resume = checkpoint.get("files").copied().unwrap_or_default();
+            let mut files_map_loaded = 0_usize;
+            if files_resume.last_file_id > 0 {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT source_id, target_id FROM {SLURP_FILE_MAP_TABLE}"
+                    ))
+                    .await?;
+                let mut rows = stmt.query(()).await?;
+                while let Some(row) = rows.next().await? {
+                    slurp_files.insert(row.get::<i64>(0)? as u64, row.get::<i64>(1)? as u64);
+                    files_map_loaded += 1;
+                }
+                if files_map_loaded == 0 {
+                    log::warn!(
+                        "Slurp files: cursor {} has no mapping rows; re-walking the stage from the start.",
+                        files_resume.last_file_id
+                    );
+                }
+            }
+            let files_resuming = files_resume.last_file_id > 0 && files_map_loaded > 0;
+            let mut last_file_id = files_resume.last_file_id;
+            let mut first_file_pass = !files_resuming;
             loop {
                 let batch_started = Instant::now();
                 let file_query = format!(
@@ -898,15 +1085,51 @@ impl TursoDatabase {
                 let resolved = self
                     .file_add_bulk(&conn, &files.iter().cloned().collect::<Vec<_>>())
                     .await?;
-                conn.execute("COMMIT", ()).await?;
                 let target_by_hash: HashMap<&str, u64> = resolved
                     .iter()
                     .filter_map(|file| file.id.map(|id| (file.hash.as_str(), id)))
                     .collect();
+                // Persist the batch's source->target mapping and the stage
+                // cursor inside the same transaction as the batch itself, so
+                // the cursor can never advance past mapping rows (or file
+                // rows) that did not land.
+                let mut pairs: Vec<(u64, i64)> = Vec::with_capacity(batch.len());
                 for (source_id, hash, _, _, _) in &batch {
                     if let Some(&target_id) = target_by_hash.get(hash.as_str()) {
-                        slurp_files.insert(*source_id, target_id);
+                        pairs.push((*source_id, target_id as i64));
                     }
+                }
+                if !pairs.is_empty() {
+                    let mut holders = Vec::with_capacity(pairs.len());
+                    let mut params: Vec<Value> = Vec::with_capacity(pairs.len() * 2);
+                    for (source_id, target_id) in &pairs {
+                        holders.push("(?, ?)");
+                        params.push(Value::from(*source_id as i64));
+                        params.push(Value::from(*target_id));
+                    }
+                    conn.execute(
+                        &format!(
+                            "INSERT OR IGNORE INTO {SLURP_FILE_MAP_TABLE}
+                                 (source_id, target_id) VALUES {}",
+                            holders.join(", ")
+                        ),
+                        params_from_iter(params),
+                    )
+                    .await?;
+                }
+                slurp_checkpoint_write(
+                    &conn,
+                    "files",
+                    SlurpStageCheckpoint {
+                        finished: false,
+                        last_file_id: *last_id,
+                        last_tag_id: 0,
+                    },
+                )
+                .await?;
+                conn.execute("COMMIT", ()).await?;
+                for (source_id, target_id) in &pairs {
+                    slurp_files.insert(*source_id, *target_id as u64);
                 }
 
                 last_file_id = *last_id;
@@ -1137,7 +1360,20 @@ impl TursoDatabase {
             // that manages to insert nothing must not tear down and rebuild
             // an index for zero benefit (multi-minute CREATE on big
             // partitions, and it vanishes from the planner meanwhile).
-            let cold_import = tags_added > 0;
+            // The tag map table outlives the attempt that wrote it: on a
+            // resumed run it holds the genuinely-new tags the interrupted
+            // attempt landed (a resumed cold import's rows sit in canonical
+            // Tags, invisible to this attempt's tags_added), so the index
+            // drop/rebuild and recount paths must fire for them too.
+            let tag_map_nonempty: bool = {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT EXISTS(SELECT 1 FROM {SLURP_TAG_MAP_TABLE})"
+                    ))
+                    .await?;
+                stmt.query_row(()).await?.get::<i64>(0)? != 0
+            };
+            let cold_import = tags_added > 0 || tag_map_nonempty;
             // Set once if any recount fires these: Tags.count churns
             // idx_tags_count_covering (ordered by count) so it must be
             // down while recounts run and restored once all are done.
@@ -1742,6 +1978,12 @@ impl TursoDatabase {
         // skips recounts, exactly like the pre-existing warm re-slurp path.
         conn.execute(format!("DROP TABLE IF EXISTS {SLURP_CHECKPOINT_TABLE}"), ())
             .await?;
+        // The per-batch mapping tables belong to the run's progress state:
+        // once every stage committed there is nothing left to resume.
+        for table in [SLURP_TAG_MAP_TABLE, SLURP_FILE_MAP_TABLE] {
+            conn.execute(format!("DROP TABLE IF EXISTS {table}"), ())
+                .await?;
+        }
 
         Ok((namespace_count, tag_count, file_count))
     }
@@ -3753,6 +3995,122 @@ mod tests {
         );
     }
 
+    /// The tags stage resumes from its persisted cursor: committed batches are
+    /// skipped whole (their source->target mapping comes from _slurp_tag_map),
+    /// the tail still lands, and the relationship stage routes through the
+    /// preloaded map — a relationship row pointing at a skipped tag must not
+    /// be silently dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slurp_resume_skips_committed_tag_batches() {
+        let db = new_target().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source_path = temp_dir.path().join("source.db");
+        let script = "CREATE TABLE Namespace (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
+             INSERT INTO Namespace (name, description) VALUES ('ns', 'test');
+             CREATE TABLE Tags (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
+                 count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
+             INSERT INTO Tags (name, namespace) VALUES ('cat', 1), ('dog', 1);
+             CREATE TABLE FileStorageLocations (
+                 id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
+             INSERT INTO FileStorageLocations (location) VALUES ('/tmp');
+             CREATE TABLE File (
+                 id INTEGER PRIMARY KEY, hash TEXT UNIQUE, extension TEXT,
+                 storage_id INTEGER, size_bytes INTEGER);
+             INSERT INTO File (hash, extension, storage_id, size_bytes) VALUES
+                 ('h1', 'jpg', 1, 10);
+             CREATE TABLE Relationship (
+                 file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+                 PRIMARY KEY (file_id, tag_id)) WITHOUT ROWID;
+             INSERT INTO Relationship (file_id, tag_id) VALUES (1, 1), (1, 2);
+             CREATE TABLE Parents (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER NOT NULL,
+                 relate_tag_id INTEGER NOT NULL, limit_to INTEGER);";
+        write_source(&source_path, script).await;
+
+        // Full run first: everything lands and the progress tables are cleaned.
+        assert_eq!(db.db_slurp(&source_path).await.unwrap(), (1, 2, 1));
+        slurp_assert_no_progress_tables(&db).await;
+        {
+            let conn = db.connect().unwrap();
+            let mut rows = conn.query("SELECT COUNT(*) FROM Tags;", ()).await.unwrap();
+            assert_eq!(
+                rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+                2
+            );
+        }
+
+        // Simulate a crash after source tag 1's batch committed: cursor plus
+        // mapping row survive, the staging table does not (the crash happened
+        // before any warm staging existed). The resume must skip the covered
+        // batch, land the tail, and keep every relationship.
+        seed_interrupted_slurp_state(
+            &db,
+            &source_path,
+            SlurpStageCheckpoint {
+                finished: false,
+                last_file_id: 0,
+                last_tag_id: 0,
+            },
+            &[],
+        )
+        .await;
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                &format!(
+                    "CREATE TABLE IF NOT EXISTS {SLURP_TAG_MAP_TABLE} (
+                         source_id INTEGER PRIMARY KEY,
+                         target_id INTEGER NOT NULL);"
+                ),
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                &format!("INSERT INTO {SLURP_TAG_MAP_TABLE} (source_id, target_id) VALUES (1, 1)"),
+                (),
+            )
+            .await
+            .unwrap();
+            slurp_checkpoint_write(
+                &conn,
+                "tags",
+                SlurpStageCheckpoint {
+                    finished: false,
+                    last_file_id: 0,
+                    last_tag_id: 1,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // The resumed attempt counts only what it processed: the covered
+        // batch is skipped, so its tag never re-enters the count.
+        assert_eq!(db.db_slurp(&source_path).await.unwrap(), (1, 1, 1));
+        slurp_assert_no_progress_tables(&db).await;
+        {
+            let conn = db.connect().unwrap();
+            let mut rows = conn.query("SELECT COUNT(*) FROM Tags;", ()).await.unwrap();
+            assert_eq!(
+                rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+                2,
+                "resumed run must neither duplicate nor drop tags"
+            );
+            let mut rows = conn
+                .query("SELECT COUNT(*) FROM Relationship_1;", ())
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
+                2,
+                "relationships pointing at skipped tags must route through the preloaded map"
+            );
+        }
+    }
+
     /// The secondary-hash stage resumes from its persisted cursor: committed
     /// batches are never re-read, and a re-run lands the exact same hash set.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3857,7 +4215,7 @@ mod tests {
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM sqlite_schema
-                 WHERE type = 'table' AND name IN ('_slurp_checkpoint', '_slurp_pending_recount');",
+                 WHERE type = 'table' AND name IN ('_slurp_checkpoint', '_slurp_pending_recount', '_slurp_tag_map', '_slurp_file_map');",
                 (),
             )
             .await

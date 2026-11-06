@@ -35,6 +35,14 @@ mod migrations;
 
 const TAG_CACHE_LIMIT: usize = 100_000;
 
+/// Process-global slurp liveness, mirrored from [`TursoDatabase::set_slurping`]
+/// so the static [`TursoDatabase::write_tx_behavior`] can consult it without an
+/// instance handle. A slurp running under the WAL fast lane rejects
+/// `CONCURRENT` transactions ("only supported when MVCC is enabled"), so write
+/// paths must fall back to `BEGIN IMMEDIATE` for the import's duration and
+/// interleave with the slurp's own short per-batch transactions.
+static SLURP_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 /// used for the internal tag db structures
 pub struct TagDb {
@@ -141,7 +149,20 @@ impl TursoDatabase {
     /// re-runs the whole transaction body when the commit loses a conflict.
     /// `INTSCRAPE_WRITE_TX` overrides this for rollback/benchmarks.
     pub(in crate::db::turso) fn write_tx_behavior() -> TransactionBehavior {
-        Self::behavior_from_env("INTSCRAPE_WRITE_TX").unwrap_or(TransactionBehavior::Concurrent)
+        // An explicit env override always wins.
+        if let Some(behavior) = Self::behavior_from_env("INTSCRAPE_WRITE_TX") {
+            return behavior;
+        }
+        // While a slurp holds the WAL fast lane, MVCC `CONCURRENT`
+        // transactions are rejected outright; scrape writes run as short
+        // `BEGIN IMMEDIATE` transactions instead and take their turns between
+        // the slurp's per-batch commits. When no slurp is running (the
+        // destination back in MVCC), `CONCURRENT` resumes.
+        if SLURP_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+            TransactionBehavior::Immediate
+        } else {
+            TransactionBehavior::Concurrent
+        }
     }
 
     /// Behavior for write paths that must not run concurrently: DDL (banned in
@@ -320,6 +341,7 @@ impl TursoDatabase {
     pub(crate) fn set_slurping(&self, slurping: bool) {
         self.slurping
             .store(slurping, std::sync::atomic::Ordering::SeqCst);
+        SLURP_ACTIVE.store(slurping, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Whether the IPC server should refuse new connections so a slurp can
@@ -341,8 +363,10 @@ impl TursoDatabase {
     }
 
     /// Blocks the IPC accept loop from taking new connections, then waits for
-    /// every in-flight request handler to finish. Callers use this around a
-    /// slurp so BEGIN IMMEDIATE transactions never wait on a UI snapshot.
+    /// every in-flight request handler to finish. Kept for callers that need a
+    /// hard exclusive window; the slurp no longer uses it (it now runs
+    /// alongside live IPC traffic through short per-batch transactions).
+    #[allow(dead_code)]
     pub(crate) async fn ipc_pause(&self) {
         self.ipc_paused
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -352,6 +376,7 @@ impl TursoDatabase {
     }
 
     /// Lets the IPC accept loop resume accepting connections.
+    #[allow(dead_code)]
     pub(crate) async fn ipc_resume(&self) {
         self.ipc_paused
             .store(false, std::sync::atomic::Ordering::SeqCst);

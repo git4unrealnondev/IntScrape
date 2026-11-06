@@ -69,6 +69,7 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
                 PluginProperties::Ratelimit(1, std::time::Duration::from_secs(1)),
                 PluginProperties::JobNum(5),
                 PluginProperties::Sites(vec!["e6ai".into(), "E6AI".into(), "e6ai.com".into()]),
+                PluginProperties::Login((LoginNeed::Optional, LoginType::Api("Put API key first then username.".into(), None) ))
             ],
             ..Default::default()
         },

@@ -78,8 +78,21 @@ dependencies = [
 name = "agnph"
 version = "0.1.0"
 dependencies = [
- "scraper",
+ "scraper 0.27.0",
  "shared_types",
+]
+
+[[package]]
+name = "ahash"
+version = "0.8.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
+dependencies = [
+ "cfg-if",
+ "getrandom 0.3.4",
+ "once_cell",
+ "version_check",
+ "zerocopy",
 ]
 
 [[package]]
@@ -346,7 +359,7 @@ dependencies = [
  "cfg-if",
  "derive-deftly",
  "derive_builder_fork_arti",
- "derive_more",
+ "derive_more 2.1.1",
  "educe",
  "fs-mistrust",
  "futures",
@@ -1303,7 +1316,7 @@ dependencies = [
  "client",
  "regex",
  "reqwest",
- "scraper",
+ "scraper 0.27.0",
  "shared_types",
  "tokio",
 ]
@@ -1925,15 +1938,38 @@ dependencies = [
 
 [[package]]
 name = "cssparser"
+version = "0.31.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b3df4f93e5fbbe73ec01ec8d3f68bba73107993a5b1e7519273c32db9b0d5be"
+dependencies = [
+ "cssparser-macros 0.6.1",
+ "dtoa-short",
+ "itoa",
+ "phf 0.11.3",
+ "smallvec",
+]
+
+[[package]]
+name = "cssparser"
 version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c9cdaae01d5ed7882b04d795e7f752f46ff52d2fa3b50a20d28c464510bba98"
 dependencies = [
- "cssparser-macros",
+ "cssparser-macros 0.7.1",
  "dtoa-short",
  "itoa",
  "phf 0.13.1",
  "smallvec",
+]
+
+[[package]]
+name = "cssparser-macros"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13b588ba4ac1a99f7f2964d24b3d896ddc6bf847ee3855dbd4366f058cfcd331"
+dependencies = [
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2223,6 +2259,17 @@ dependencies = [
 
 [[package]]
 name = "derive_more"
+version = "0.99.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6edb4b64a43d977b8e99788fe3a04d483834fba1215a7e02caa415b626497f7f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "derive_more"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d751e9e49156b02b44f9c1815bcb94b984cdcc4396ecc32521c739452808b134"
@@ -2360,7 +2407,7 @@ version = "0.1.0"
 dependencies = [
  "json",
  "regex",
- "scraper",
+ "scraper 0.27.0",
  "serde_json",
  "shared_types",
 ]
@@ -2474,6 +2521,12 @@ dependencies = [
  "quote",
  "syn 1.0.109",
 ]
+
+[[package]]
+name = "ego-tree"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12a0bb14ac04a9fcf170d0bbbef949b44cc492f4452bd20c095636956f653642"
 
 [[package]]
 name = "ego-tree"
@@ -2722,7 +2775,7 @@ checksum = "4e7f34442dbe69c60fe8eaf58a8cafff81a1f278816d8ab4db255b3bef4ac3c4"
 dependencies = [
  "getrandom 0.3.4",
  "libm",
- "siphasher",
+ "siphasher 1.0.4",
 ]
 
 [[package]]
@@ -2993,6 +3046,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
+name = "furaffinity"
+version = "0.1.0"
+dependencies = [
+ "client",
+ "scraper 0.20.0",
+ "shared_types",
+ "url",
+]
+
+[[package]]
+name = "futf"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df420e2e84819663797d1ec6544b13c5be84629e7bb00dc960d6917db2987843"
+dependencies = [
+ "mac",
+ "new_debug_unreachable",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3108,6 +3181,15 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "fxhash"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c31b6d751ae2c7f11320402d34e41349dd1016f8d5d45e48c4312bc8625af50c"
+dependencies = [
+ "byteorder",
 ]
 
 [[package]]
@@ -3440,9 +3522,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31e981cc9b710410461bf2e474b54da9ccb2fa3212936295bc5c02cb09f3d3f2"
 dependencies = [
  "html5ever 0.40.1",
- "tendril",
+ "tendril 0.5.1",
  "thiserror 2.0.21",
  "unicode-width 0.2.2",
+]
+
+[[package]]
+name = "html5ever"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c13771afe0e6e846f1e67d038d4cb29998a6779f93c809212e4e9c32efd244d4"
+dependencies = [
+ "log",
+ "mac",
+ "markup5ever 0.12.1",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -4578,13 +4674,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef0d4ed8669f8f8826eb00dc878084aa8f253506c4fd5e8f58f5bce72ddb97e"
 
 [[package]]
+name = "mac"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
+
+[[package]]
+name = "markup5ever"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16ce3abbeba692c8b8441d036ef91aea6df8da2c6b6e21c7e14d3c18e526be45"
+dependencies = [
+ "log",
+ "phf 0.11.3",
+ "phf_codegen 0.11.3",
+ "string_cache 0.8.9",
+ "string_cache_codegen 0.5.4",
+ "tendril 0.4.3",
+]
+
+[[package]]
 name = "markup5ever"
 version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7122d987ec5f704ee56f6e5b41a7d93722e9aae27ae07cafa4036c4d3f9757de"
 dependencies = [
  "log",
- "tendril",
+ "tendril 0.5.1",
  "web_atoms 0.2.6",
 ]
 
@@ -4595,7 +4711,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ab3dc68ac4a0f5719e560136778c1ee716e296030d75dbd4484e37e39e3a842"
 dependencies = [
  "log",
- "tendril",
+ "tendril 0.5.1",
  "web_atoms 0.3.0",
 ]
 
@@ -5054,7 +5170,7 @@ name = "novellight"
 version = "0.1.0"
 dependencies = [
  "regex",
- "scraper",
+ "scraper 0.27.0",
  "serde",
  "serde_json",
  "shared_types",
@@ -5563,6 +5679,25 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "phf"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fabbf1ead8a5bcbc20f5f8b939ee3f5b0f6f281b6ad3468b84656b658b455259"
+dependencies = [
+ "phf_shared 0.10.0",
+]
+
+[[package]]
+name = "phf"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
+dependencies = [
+ "phf_macros 0.11.3",
+ "phf_shared 0.11.3",
+]
+
+[[package]]
+name = "phf"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1562dc717473dbaa4c1f85a36410e03c047b2e7df7f45ee938fbef64ae7fadf"
@@ -5581,6 +5716,26 @@ dependencies = [
  "phf_macros 0.14.0",
  "phf_shared 0.14.0",
  "serde",
+]
+
+[[package]]
+name = "phf_codegen"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fb1c3a8bc4dd4e5cfce29b44ffc14bedd2ee294559a294e2a4d4c9e9a6a13cd"
+dependencies = [
+ "phf_generator 0.10.0",
+ "phf_shared 0.10.0",
+]
+
+[[package]]
+name = "phf_codegen"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aef8048c789fa5e851558d709946d6d79a8ff88c0440c587967f8e94bfb1216a"
+dependencies = [
+ "phf_generator 0.11.3",
+ "phf_shared 0.11.3",
 ]
 
 [[package]]
@@ -5605,6 +5760,26 @@ dependencies = [
 
 [[package]]
 name = "phf_generator"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d5285893bb5eb82e6aaf5d59ee909a06a16737a8970984dd7746ba9283498d6"
+dependencies = [
+ "phf_shared 0.10.0",
+ "rand 0.8.8",
+]
+
+[[package]]
+name = "phf_generator"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
+dependencies = [
+ "phf_shared 0.11.3",
+ "rand 0.8.8",
+]
+
+[[package]]
+name = "phf_generator"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "135ace3a761e564ec88c03a77317a7c6b80bb7f7135ef2544dbe054243b89737"
@@ -5621,6 +5796,19 @@ checksum = "aeb62e0959d5a1bebc965f4d15d9e2b7cea002b6b0f5ba8cde6cc26738467100"
 dependencies = [
  "fastrand",
  "phf_shared 0.14.0",
+]
+
+[[package]]
+name = "phf_macros"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f84ac04429c13a7ff43785d75ad27569f2951ce0ffd30a3321230db2fc727216"
+dependencies = [
+ "phf_generator 0.11.3",
+ "phf_shared 0.11.3",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -5651,11 +5839,29 @@ dependencies = [
 
 [[package]]
 name = "phf_shared"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6796ad771acdc0123d2a88dc428b5e38ef24456743ddb1744ed628f9815c096"
+dependencies = [
+ "siphasher 0.3.11",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
+dependencies = [
+ "siphasher 1.0.4",
+]
+
+[[package]]
+name = "phf_shared"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266"
 dependencies = [
- "siphasher",
+ "siphasher 1.0.4",
 ]
 
 [[package]]
@@ -5664,7 +5870,7 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6fd9027e2d9319be6349febd1db4e8d02aa544921200c9b777720ac34a3aa89"
 dependencies = [
- "siphasher",
+ "siphasher 1.0.4",
 ]
 
 [[package]]
@@ -6618,7 +6824,7 @@ name = "rokuhentai"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "scraper",
+ "scraper 0.27.0",
  "shared_types",
  "url",
 ]
@@ -6667,7 +6873,7 @@ name = "rule34video"
 version = "0.1.0"
 dependencies = [
  "json",
- "scraper",
+ "scraper 0.27.0",
  "shared_types",
 ]
 
@@ -6886,7 +7092,7 @@ version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e091498d7a0a629f344befcf15b1f823a24d5a83d584feeacacc7c764e67c11"
 dependencies = [
- "derive_more",
+ "derive_more 2.1.1",
  "educe",
  "either",
  "fluid-let",
@@ -6967,17 +7173,33 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scraper"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b90460b31bfe1fc07be8262e42c665ad97118d4585869de9345a84d501a9eaf0"
+dependencies = [
+ "ahash",
+ "cssparser 0.31.2",
+ "ego-tree 0.6.3",
+ "getopts",
+ "html5ever 0.27.0",
+ "once_cell",
+ "selectors 0.25.0",
+ "tendril 0.4.3",
+]
+
+[[package]]
+name = "scraper"
 version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bdd0be4d296f048bfb06dd01bbc80ef789ddd2e55583e8d2e6b804942abfabc2"
 dependencies = [
- "cssparser",
- "ego-tree",
+ "cssparser 0.37.0",
+ "ego-tree 0.11.1",
  "getopts",
  "html5ever 0.39.0",
  "precomputed-hash",
- "selectors",
- "tendril",
+ "selectors 0.38.0",
+ "tendril 0.5.1",
 ]
 
 [[package]]
@@ -7039,20 +7261,39 @@ dependencies = [
 
 [[package]]
 name = "selectors"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4eb30575f3638fc8f6815f448d50cb1a2e255b0897985c8c59f4d37b72a07b06"
+dependencies = [
+ "bitflags",
+ "cssparser 0.31.2",
+ "derive_more 0.99.20",
+ "fxhash",
+ "log",
+ "new_debug_unreachable",
+ "phf 0.10.1",
+ "phf_codegen 0.10.0",
+ "precomputed-hash",
+ "servo_arc 0.3.0",
+ "smallvec",
+]
+
+[[package]]
+name = "selectors"
 version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8adfa1c298912827b8a28b223b3b874357397ae706e6190acd9bf28cee99114d"
 dependencies = [
  "bitflags",
- "cssparser",
- "derive_more",
+ "cssparser 0.37.0",
+ "derive_more 2.1.1",
  "log",
  "new_debug_unreachable",
  "phf 0.13.1",
  "phf_codegen 0.13.1",
  "precomputed-hash",
  "rustc-hash 2.1.3",
- "servo_arc",
+ "servo_arc 0.4.3",
  "smallvec",
 ]
 
@@ -7216,6 +7457,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "servo_arc"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d036d71a959e00c77a63538b90a6c2390969f9772b096ea837205c6bd0491a44"
+dependencies = [
+ "stable_deref_trait",
 ]
 
 [[package]]
@@ -7471,6 +7721,12 @@ dependencies = [
 
 [[package]]
 name = "siphasher"
+version = "0.3.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38b58827f4464d87d377d175e90bf58eb00fd8716ff0a62f80356b5e61555d0d"
+
+[[package]]
+name = "siphasher"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
@@ -7691,6 +7947,19 @@ checksum = "fe895eb47f22e2ddd4dabc02bce419d2e643c8e3b585c78158b349195bc24d82"
 
 [[package]]
 name = "string_cache"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf776ba3fa74f83bf4b63c3dcbbf82173db2632ed8452cb2d891d33f459de70f"
+dependencies = [
+ "new_debug_unreachable",
+ "parking_lot",
+ "phf_shared 0.11.3",
+ "precomputed-hash",
+ "serde",
+]
+
+[[package]]
+name = "string_cache"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a18596f8c785a729f2819c0f6a7eae6ebeebdfffbfe4214ae6b087f690e31901"
@@ -7711,6 +7980,18 @@ dependencies = [
  "parking_lot",
  "phf_shared 0.14.0",
  "precomputed-hash",
+]
+
+[[package]]
+name = "string_cache_codegen"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c711928715f1fe0fe509c53b43e993a9a557babc2d0a3567d0a3006f1ac931a0"
+dependencies = [
+ "phf_generator 0.11.3",
+ "phf_shared 0.11.3",
+ "proc-macro2",
+ "quote",
 ]
 
 [[package]]
@@ -8047,6 +8328,17 @@ dependencies = [
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tendril"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d24a120c5fc464a3458240ee02c299ebcb9d67b5249c8848b09d639dca8d7bb0"
+dependencies = [
+ "futf",
+ "mac",
+ "utf-8",
 ]
 
 [[package]]
@@ -8391,7 +8683,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e44c7b006f22966d44a2a0a6c1ee71e472c62182c7f0460077df3294d52f23c4"
 dependencies = [
  "derive-deftly",
- "derive_more",
+ "derive_more 2.1.1",
  "educe",
  "extend",
  "getrandom 0.4.3",
@@ -8439,7 +8731,7 @@ dependencies = [
  "bytes",
  "caret",
  "derive-deftly",
- "derive_more",
+ "derive_more 2.1.1",
  "educe",
  "itertools 0.15.0",
  "paste",
@@ -8467,7 +8759,7 @@ checksum = "98dec924caf6e9548b4860878373132bf89536eb0d1658666df12dff72b855cd"
 dependencies = [
  "caret",
  "derive_builder_fork_arti",
- "derive_more",
+ "derive_more 2.1.1",
  "digest 0.10.7",
  "thiserror 2.0.21",
  "tor-bytes",
@@ -8488,7 +8780,7 @@ dependencies = [
  "caret",
  "cfg-if",
  "derive-deftly",
- "derive_more",
+ "derive_more 2.1.1",
  "educe",
  "futures",
  "httparse",
@@ -8545,7 +8837,7 @@ dependencies = [
  "cfg-if",
  "derive-deftly",
  "derive_builder_fork_arti",
- "derive_more",
+ "derive_more 2.1.1",
  "downcast-rs",
  "dyn-clone",
  "educe",
@@ -8639,7 +8931,7 @@ version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ed097865bfb6d453d9258620cbc952cf7481e9dcfc8901071ee1b8506cea86"
 dependencies = [
- "derive_more",
+ "derive_more 2.1.1",
  "digest 0.10.7",
  "hex",
  "imara-diff",
@@ -8658,7 +8950,7 @@ checksum = "f942f4ebaf2ac5275e48d02d77abe1616ce2e8854f032a1b0698ede0566dddfc"
 dependencies = [
  "async-compression",
  "base64ct",
- "derive_more",
+ "derive_more 2.1.1",
  "futures",
  "hex",
  "http",
@@ -8708,7 +9000,7 @@ dependencies = [
  "async-trait",
  "base64ct",
  "derive_builder_fork_arti",
- "derive_more",
+ "derive_more 2.1.1",
  "digest 0.10.7",
  "educe",
  "event-listener 5.4.2",
@@ -8762,7 +9054,7 @@ version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca01de513501849b2298e4f16f8760832ef43344b10fe17600daed9a35128b24"
 dependencies = [
- "derive_more",
+ "derive_more 2.1.1",
  "futures",
  "paste",
  "retry-error",
@@ -8780,7 +9072,7 @@ version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72965a7044f573bb121467404d423d296592dd3cef87ad7aca4c96cc2b65e75a"
 dependencies = [
- "derive_more",
+ "derive_more 2.1.1",
  "thiserror 2.0.21",
  "void",
 ]
@@ -8795,7 +9087,7 @@ dependencies = [
  "base64ct",
  "derive-deftly",
  "derive_builder_fork_arti",
- "derive_more",
+ "derive_more 2.1.1",
  "dyn-clone",
  "educe",
  "futures",
@@ -8838,7 +9130,7 @@ dependencies = [
  "async-trait",
  "cfg-if",
  "derive-deftly",
- "derive_more",
+ "derive_more 2.1.1",
  "educe",
  "either",
  "futures",
@@ -8884,7 +9176,7 @@ dependencies = [
  "cipher 0.5.2",
  "data-encoding",
  "derive-deftly",
- "derive_more",
+ "derive_more 2.1.1",
  "digest 0.10.7",
  "hex",
  "humantime",
@@ -8920,7 +9212,7 @@ dependencies = [
  "cfg-if",
  "derive-deftly",
  "derive_builder_fork_arti",
- "derive_more",
+ "derive_more 2.1.1",
  "digest 0.10.7",
  "educe",
  "fs-mistrust",
@@ -8974,7 +9266,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5534581a7f347ffcade7ea32ecccdbc035d36468bc8c03b0dce83363b6d41801"
 dependencies = [
  "derive-deftly",
- "derive_more",
+ "derive_more 2.1.1",
  "downcast-rs",
  "paste",
  "rand 0.10.3",
@@ -9001,7 +9293,7 @@ dependencies = [
  "data-encoding",
  "derive-deftly",
  "derive_builder_fork_arti",
- "derive_more",
+ "derive_more 2.1.1",
  "downcast-rs",
  "dyn-clone",
  "fs-mistrust",
@@ -9042,7 +9334,7 @@ dependencies = [
  "caret",
  "derive-deftly",
  "derive_builder_fork_arti",
- "derive_more",
+ "derive_more 2.1.1",
  "hex",
  "itertools 0.15.0",
  "safelog",
@@ -9070,7 +9362,7 @@ dependencies = [
  "curve25519-dalek",
  "der-parser",
  "derive-deftly",
- "derive_more",
+ "derive_more 2.1.1",
  "digest 0.10.7",
  "ed25519-dalek",
  "educe",
@@ -9125,7 +9417,7 @@ checksum = "96853fc516264fe2ebefbe40d276b6a3b84e15fc08b74fd7a85e2c5df9f11c37"
 dependencies = [
  "cfg-if",
  "derive-deftly",
- "derive_more",
+ "derive_more 2.1.1",
  "dyn-clone",
  "educe",
  "extend",
@@ -9169,7 +9461,7 @@ checksum = "cd22ffd4d6aa9389ec8e20e9b0d579d61101682c5ec8379115a388e473e83297"
 dependencies = [
  "async-trait",
  "bitflags",
- "derive_more",
+ "derive_more 2.1.1",
  "digest 0.10.7",
  "futures",
  "hex",
@@ -9205,7 +9497,7 @@ dependencies = [
  "cipher 0.5.2",
  "derive-deftly",
  "derive_builder_fork_arti",
- "derive_more",
+ "derive_more 2.1.1",
  "digest 0.10.7",
  "educe",
  "enumset",
@@ -9255,7 +9547,7 @@ checksum = "e7a3bc60cbe74bf41cd63e2506a9a16bd52047668771578b12ff2453ec4c7522"
 dependencies = [
  "amplify",
  "derive-deftly",
- "derive_more",
+ "derive_more 2.1.1",
  "extend",
  "filetime",
  "fs-mistrust",
@@ -9295,7 +9587,7 @@ dependencies = [
  "ctr 0.10.1",
  "derive-deftly",
  "derive_builder_fork_arti",
- "derive_more",
+ "derive_more 2.1.1",
  "digest 0.10.7",
  "educe",
  "enum_dispatch",
@@ -9388,7 +9680,7 @@ dependencies = [
  "cfg-if",
  "coarsetime",
  "derive_builder_fork_arti",
- "derive_more",
+ "derive_more 2.1.1",
  "dyn-clone",
  "educe",
  "futures",
@@ -9419,7 +9711,7 @@ dependencies = [
  "assert_matches",
  "async-trait",
  "derive-deftly",
- "derive_more",
+ "derive_more 2.1.1",
  "educe",
  "futures",
  "humantime",
@@ -9490,7 +9782,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa976f4c84404c9aaf7e8690fe30904a69084d0069ff7b2dfc0c58919d65eebd"
 dependencies = [
  "derive-deftly",
- "derive_more",
+ "derive_more 2.1.1",
  "serde",
  "thiserror 2.0.21",
  "tor-memquota",
@@ -10041,6 +10333,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "utf-8"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
 
 [[package]]
 name = "utf16_iter"

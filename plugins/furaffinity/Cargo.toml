@@ -1,0 +1,13 @@
+[package]
+name = "furaffinity"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+scraper = "0.20"
+shared_types = { workspace = true }
+url = "2.5.8"
+client = { workspace = true }

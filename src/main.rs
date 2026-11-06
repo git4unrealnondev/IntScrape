@@ -150,7 +150,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     plugin_manager.callback_on_start();
 
     // Does the CLI input processing
-    cli::main(db.clone()).await;
+    cli::main(db.clone(), plugin_manager.clone()).await;
 
     // Handles adding jobs into system
     let plugin_manager_clone = plugin_manager.clone();
@@ -164,18 +164,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             if should_exit_for_spawner.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }
-            // A slurp owns the database exclusively. Skip this poll so the
-            // jobs read does not pin an MVCC snapshot and stall WAL
-            // truncation (the lurking cost is every insert batch slowing down
-            // as an unreclaimable WAL grows); the claimed slurp job finishes on
-            // its own task and this loop resumes once it clears.
-            if db_spawn.is_slurping() {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                continue;
-            }
+            // A slurp no longer owns the database exclusively: it commits in
+            // short BEGIN IMMEDIATE batches and other jobs run alongside it.
+            // Only *new* slurp jobs are deferred while one runs (a second bulk
+            // import would fight over the Tags_slurp staging table and the
+            // per-stage cursors); every other system job still claims work so
+            // maintenance keeps up during a multi-hour import. WAL-mode
+            // readers no longer pin an MVCC snapshot that stalls the import's
+            // WAL truncation, so the poll itself is safe to run.
             let mut sites = plugin_manager_clone.get_storage_sites();
             sites.push(SYSTEM_DATABASE_BACKUP_SITE.to_string());
-            sites.push(SYSTEM_DATABASE_SLURP_SITE.to_string());
+            if !db_spawn.is_slurping() {
+                sites.push(SYSTEM_DATABASE_SLURP_SITE.to_string());
+            }
             sites.push(SYSTEM_FILE_SIZE_SITE.to_string());
             sites.push(SYSTEM_FILE_HASH_SITE.to_string());
             sites.push(SYSTEM_STORAGE_CHECK_SITE.to_string());
