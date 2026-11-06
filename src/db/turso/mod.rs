@@ -109,7 +109,12 @@ impl TursoDatabase {
         let message = error.to_string().to_ascii_lowercase();
         matches!(error, turso::Error::Busy(_) | turso::Error::BusySnapshot(_))
             || message.contains("busy")
-            || message.contains("conflict")
+            // Intentionally no bare "conflict" substring match: deterministic
+            // SQL errors mention the word too ("ON CONFLICT clause does not
+            // match any PRIMARY KEY or UNIQUE constraint"), and retrying those
+            // eight times just delays a real error report.
+            || message.contains("write conflict")
+            || message.contains("snapshot conflict")
     }
 
     /// The journal mode the database is served in. Defaults to `mvcc` so
