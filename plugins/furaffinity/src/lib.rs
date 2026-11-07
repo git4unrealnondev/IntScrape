@@ -114,33 +114,6 @@ fn source_url_tag(url: &str) -> Tag {
     }
 }
 
-/// "Visited" marker for a page: stored the first time the page is parsed,
-/// so the same URL is never fetched again. The marker is a tag named by
-/// the page URL, parented to a constant "visited" tag, checked via
-/// `SkipIf::ParentsRelate`. Remove with `tasks database remove namespace
-/// FA_Visited_Page` to force a re-scrape.
-fn visited_page_plugin_tag(url: &str) -> PluginTag {
-    let namespace = ns("FA_Visited_Page", "FurAffinity page already visited");
-    PluginTag {
-        tag: Tag {
-            name: url.to_string(),
-            namespace: namespace.clone(),
-        },
-        relates_to: Some(RelationContext {
-            tag: Tag {
-                name: "visited".into(),
-                namespace,
-            },
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
-}
-
-fn visited_skip(url: &str) -> shared_types::SkipIf {
-    shared_types::SkipIf::ParentsRelate(visited_page_plugin_tag(url))
-}
-
 fn tag_on(name: String, namespace: GenericNamespaceObj, relates_to: &RelationContext) -> PluginTag {
     PluginTag {
         tag: Tag { name, namespace },
@@ -249,7 +222,7 @@ fn normalize_url(raw: &str) -> Option<String> {
     {
         // Gallery-style pages already encode the page in the path
         // (/gallery/<user>/<n>/); fetch as given (with a canonical
-        // trailing slash so visited-markers match).
+        // trailing slash).
         return Some(if raw.ends_with('/') {
             raw.to_string()
         } else {
@@ -296,19 +269,19 @@ pub fn url_dump(
                         ),
                         modifiers.clone(),
                     );
-                    entry.skip_conditions = if let Some(id) = extract_submission_id(&normalized) {
+                    if let Some(id) = extract_submission_id(&normalized) {
                         // Don't re-visit a submission whose file is stored.
-                        vec![shared_types::SkipIf::FileTagRelationship(sub_id_tag(&id))]
-                    } else {
-                        // Don't re-visit a listing page already parsed.
-                        vec![visited_skip(&normalized)]
-                    };
+                        // Listing pages have no visited checker, so they are
+                        // re-fetched on every run.
+                        entry.skip_conditions =
+                            vec![shared_types::SkipIf::FileTagRelationship(sub_id_tag(&id))];
+                    }
                     out.push(entry);
                 }
             }
             ScraperParam::Normal(term) if !term.trim().is_empty() => {
                 let url = format!("https://{SITE_ROOT}/search/?q={}", form_encode(term.trim()));
-                let mut entry = with_modifiers(
+                let entry = with_modifiers(
                     job_for(
                         &scraperdata.job.site,
                         url.clone(),
@@ -317,7 +290,6 @@ pub fn url_dump(
                     ),
                     modifiers.clone(),
                 );
-                entry.skip_conditions = vec![visited_skip(&url)];
                 out.push(entry);
             }
             _ => {}
@@ -797,7 +769,7 @@ fn parse_listing_page(
         && let Some(account) = extract_account_name(source_url)
     {
         let gallery_url = format!("https://{SITE_ROOT}/gallery/{account}/");
-        let mut entry = with_modifiers(
+        let entry = with_modifiers(
             job_for(
                 &scraperdata.job.site,
                 gallery_url.clone(),
@@ -810,7 +782,6 @@ fn parse_listing_page(
             ),
             cookie_modifiers(scraperdata),
         );
-        entry.skip_conditions = vec![visited_skip(&gallery_url)];
         jobs.insert(entry);
     }
 
@@ -819,7 +790,7 @@ fn parse_listing_page(
     if recursion && let Some(next) = next_listing_url(document, source_url) {
         let mut user_data = scraperdata.job.user_data.clone();
         user_data.insert("recursion".into(), "true".into());
-        let mut entry = with_modifiers(
+        let entry = with_modifiers(
             job_for(
                 &scraperdata.job.site,
                 next.clone(),
@@ -828,16 +799,12 @@ fn parse_listing_page(
             ),
             cookie_modifiers(scraperdata),
         );
-        entry.skip_conditions = vec![visited_skip(&next)];
         jobs.insert(entry);
     }
 
-    // Mark this page visited so it is never fetched again.
-    finalize(
-        HashSet::new(),
-        HashSet::from([visited_page_plugin_tag(source_url)]),
-        jobs,
-    )
+    // No visited marker: listing pages are intentionally re-fetched on
+    // every run so new submissions are picked up.
+    finalize(HashSet::new(), HashSet::new(), jobs)
 }
 
 fn next_listing_url(document: &Html, source_url: &str) -> Option<String> {
@@ -1101,8 +1068,8 @@ mod tests {
         };
         // 2 submissions + 1 next-page job
         assert_eq!(obj.jobs.len(), 3);
-        // Next-page (listing) jobs outrank submission jobs, and the page
-        // itself is marked visited.
+        // Next-page (listing) jobs outrank submission jobs, and no visited
+        // marker is emitted (the visited checker is disabled).
         let next = obj
             .jobs
             .iter()
@@ -1114,11 +1081,13 @@ mod tests {
             .find(|j| matches!(&j.job.param[0], ScraperParam::Url(u) if u.url.contains("/view/")))
             .unwrap();
         assert!(next.job.priority > sub.job.priority);
-        assert!(
-            obj.tags
-                .iter()
-                .any(|t| t.tag.namespace.name == "FA_Visited_Page")
-        );
+        assert!(obj.tags.is_empty());
+        // Only the submission job is skipped; the next listing page is checked.
+        assert!(matches!(
+            sub.skip_conditions[..],
+            [shared_types::SkipIf::FileTagRelationship(_)]
+        ));
+        assert!(next.skip_conditions.is_empty());
         let urls: Vec<String> = obj
             .jobs
             .iter()
@@ -1175,10 +1144,26 @@ mod tests {
 
         let out = url_dump(&mk(url("https://www.furaffinity.net/gallery/yggiiggy/")));
         assert_eq!(out[0].job.priority, LISTING_PRIORITY);
-        assert!(matches!(
-            out[0].skip_conditions[0],
-            shared_types::SkipIf::ParentsRelate(_)
-        ));
+        // Listing pages have no visited checker, so they always re-run.
+        assert!(out[0].skip_conditions.is_empty());
+
+        // Only submissions are skipped: every other page type (gallery,
+        // favorites, scraps, profile, search, and plain search terms) must
+        // be checked/fetched on every run.
+        for listing in [
+            "https://www.furaffinity.net/gallery/yggiiggy/",
+            "https://www.furaffinity.net/favorites/yggiiggy/",
+            "https://www.furaffinity.net/scraps/yggiiggy/",
+            "https://www.furaffinity.net/user/yggiiggy/",
+            "https://www.furaffinity.net/search/?q=avian",
+        ] {
+            let out = url_dump(&mk(url(listing)));
+            assert_eq!(out.len(), 1, "{listing}");
+            assert!(out[0].skip_conditions.is_empty(), "{listing}");
+        }
+        let out = url_dump(&mk(ScraperParam::Normal("avian".into())));
+        assert_eq!(out.len(), 1);
+        assert!(out[0].skip_conditions.is_empty());
     }
 
     #[test]
