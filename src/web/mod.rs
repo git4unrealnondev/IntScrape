@@ -1,4 +1,4 @@
-use shared_types::{FileInternal, FileManager};
+use shared_types::FileManager;
 
 pub mod downloading;
 pub mod manager;

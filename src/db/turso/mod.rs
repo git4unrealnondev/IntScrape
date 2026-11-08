@@ -24,7 +24,7 @@ mod schema_current;
 mod search;
 mod slurp;
 mod sql;
-pub(crate) mod system_jobs;
+pub mod system_jobs;
 mod tag;
 
 mod api;

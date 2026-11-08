@@ -4121,12 +4121,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "intmap"
-version = "3.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2e611826a1868311677fdcdfbec9e8621d104c732d080f546a854530232f0ee"
-
-[[package]]
 name = "intrusive-collections"
 version = "0.9.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4137,7 +4131,7 @@ dependencies = [
 
 [[package]]
 name = "intscrape"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "cfg-if",
@@ -4153,7 +4147,6 @@ dependencies = [
  "image",
  "image_hasher",
  "interprocess",
- "intmap",
  "ipc_macro",
  "jwalk",
  "libc",
@@ -4161,20 +4154,18 @@ dependencies = [
  "log",
  "md5",
  "memmap2",
- "nohash-hasher",
  "parking_lot",
  "priority-semaphore",
  "rand 0.10.3",
  "rayon",
  "regex",
  "reqwest",
- "roaring",
+ "serde",
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",
  "shared_types",
  "smol_str",
- "strsim 0.11.1",
  "strum 0.28.0",
  "tempfile",
  "tokio",
@@ -5117,12 +5108,6 @@ checksum = "418abd1b6d34fbf6cae440dc874771b0525a604428704c76e48b29a5e67b8003"
 dependencies = [
  "memchr",
 ]
-
-[[package]]
-name = "nohash-hasher"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "nom"

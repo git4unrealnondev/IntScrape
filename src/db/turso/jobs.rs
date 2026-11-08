@@ -6,6 +6,14 @@ use shared_types::{DbJobRecreation, DbJobsObj, PluginJob, ScraperParam};
 use turso::{Connection, Error, Result, Row, Value, params_from_iter};
 
 use crate::db::{SQL_CHUNK_SIZE, turso::TursoDatabase};
+
+/// Serialize a job field to JSON, mapping failures onto Turso's error type
+/// instead of panicking. (These types are plain serializable data, so this
+/// is not expected to fail, but the error path should not be a panic.)
+fn job_json<T: serde::Serialize>(value: &T) -> Result<String> {
+    serde_json::to_string(value)
+        .map_err(|error| turso::Error::Error(format!("serializing job to JSON: {error}")))
+}
 use crate::helper_functions::get_sys_time_in_secs;
 
 impl TursoDatabase {
@@ -31,10 +39,10 @@ impl TursoDatabase {
                 job.config.reptime as i64,
                 job.config.priority as i64,
                 job.isrunning,
-                serde_json::to_string(&job.config.recreation).unwrap(),
+                job_json(&job.config.recreation)?,
                 job.config.site.clone(),
-                serde_json::to_string(&persistable_params(&job.config.param)).unwrap(),
-                serde_json::to_string(&job.config.user_data).unwrap(),
+                job_json(&persistable_params(&job.config.param))?,
+                job_json(&job.config.user_data)?,
                 job.id as i64,
             ),
         )
@@ -178,9 +186,9 @@ impl TursoDatabase {
         conn: &Connection,
         config: &PluginJob,
     ) -> Result<u64> {
-        let param_json = serde_json::to_string(&persistable_params(&config.param)).unwrap();
-        let user_data_json = serde_json::to_string(&config.user_data).unwrap();
-        let recreation_json = serde_json::to_string(&config.recreation).unwrap();
+        let param_json = job_json(&persistable_params(&config.param))?;
+        let user_data_json = job_json(&config.user_data)?;
+        let recreation_json = job_json(&config.recreation)?;
 
         let mut stmt = conn
             .prepare(
@@ -228,14 +236,14 @@ impl TursoDatabase {
                 params.push(Value::from(config.reptime as i64));
                 params.push(Value::from(config.priority as i64));
                 params.push(Value::from(
-                    serde_json::to_string(&config.recreation).unwrap(),
+                    job_json(&config.recreation)?,
                 ));
                 params.push(Value::from(config.site.clone()));
                 params.push(Value::from(
-                    serde_json::to_string(&persistable_params(&config.param)).unwrap(),
+                    job_json(&persistable_params(&config.param))?,
                 ));
                 params.push(Value::from(
-                    serde_json::to_string(&config.user_data).unwrap(),
+                    job_json(&config.user_data)?,
                 ));
             }
             let sql = format!(
@@ -511,61 +519,6 @@ fn serialize_error(error: serde_json::Error) -> Error {
     Error::ConversionFailure(error.to_string())
 }
 
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-
-    async fn new_db() -> (Arc<TursoDatabase>, tempfile::TempDir) {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir.path().join("target.db");
-        let should_exit = Arc::new(AtomicBool::new(false));
-        (
-            TursoDatabase::new_with_exit(&db_path, should_exit).await,
-            temp_dir,
-        )
-    }
-
-    fn slurp_job() -> PluginJob {
-        PluginJob {
-            time: 0,
-            reptime: 0,
-            priority: i64::MAX as u64,
-            recreation: None,
-            site: "SYSTEM_DB_SLURP".to_string(),
-            param: vec![ScraperParam::Normal("/tmp/source.db".to_string())],
-            user_data: BTreeMap::new(),
-        }
-    }
-
-    /// Reproduces the runtime parse error from the webui slurp adder:
-    /// `ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint`
-    /// when `jobs_add_single` inserts the SYSTEM_DB_SLURP job through the
-    /// normal connection/builder path.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn slurp_job_upsert_parses() {
-        let (db, _keep) = new_db().await;
-        let id = db.jobs_add_single(slurp_job()).await;
-        assert_ne!(id, 0, "jobs_add_single failed to insert the slurp job");
-    }
-
-    /// Same as [`Self::slurp_job_upsert_parses`], but against a copy of the
-    /// real development database, which is where the runtime error surfaced.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn slurp_job_upsert_parses_on_dev_db_copy() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        for suffix in ["", "-wal", "-log", "-shm"] {
-            let source = PathBuf::from(format!("/home/linux/rust/IntScrape/turso.db{suffix}"));
-            if source.exists() {
-                std::fs::copy(&source, temp_dir.path().join(format!("turso.db{suffix}"))).unwrap();
-            }
-        }
-        let db_path = temp_dir.path().join("turso.db");
-        let should_exit = Arc::new(AtomicBool::new(false));
-        let db = TursoDatabase::new_with_exit(&db_path, should_exit).await;
-        let id = db.jobs_add_single(slurp_job()).await;
-        assert_ne!(id, 0, "jobs_add_single failed on the dev db copy");
-    }
-}
+mod tests;

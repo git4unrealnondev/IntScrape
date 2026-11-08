@@ -13,7 +13,7 @@ use shared_types::{
 };
 use turso::Result;
 
-use crate::db::hashessupportedtokey;
+use crate::db::hashes_supported_to_key;
 use crate::db::turso::TursoDatabase;
 
 // Thread-local runtime for blocking sync wrappers. Each thread that needs to
@@ -72,7 +72,7 @@ impl TursoDatabase {
             }
         };
 
-        let keys: Vec<(String, String)> = hashes.iter().map(hashessupportedtokey).collect();
+        let keys: Vec<(String, String)> = hashes.iter().map(hashes_supported_to_key).collect();
         match self.hashes_files_get(&conn, &keys).await {
             Ok(found) => found,
             Err(error) => {

@@ -2,7 +2,7 @@ use shared_types::{FileInternal, HashesSupported};
 
 pub mod turso;
 
-pub(crate) mod system_jobs;
+pub mod system_jobs;
 
 pub const SYSTEM_DATABASE_BACKUP_SITE: &str = "SYSTEM_BACKUP";
 pub const SYSTEM_DATABASE_SLURP_SITE: &str = "SYSTEM_DB_SLURP";
@@ -23,7 +23,7 @@ pub struct SourceUrlFileStatus {
     pub dead: bool,
 }
 
-pub fn hashessupportedtoinner(hash: &HashesSupported) -> (&str, &String) {
+pub fn hashes_supported_to_inner(hash: &HashesSupported) -> (&str, &String) {
     match hash {
         HashesSupported::Md5(md5) => ("MD5", md5),
         HashesSupported::Sha1(hash) => ("SHA1", hash),
@@ -35,13 +35,7 @@ pub fn hashessupportedtoinner(hash: &HashesSupported) -> (&str, &String) {
     }
 }
 
-pub fn hashessupportedtokey(hash: &HashesSupported) -> (String, String) {
-    let (algorithm, digest) = hashessupportedtoinner(hash);
+pub fn hashes_supported_to_key(hash: &HashesSupported) -> (String, String) {
+    let (algorithm, digest) = hashes_supported_to_inner(hash);
     (algorithm.to_string(), digest.clone())
 }
-
-/// Legacy rusqlite-backed `MainDatabase` layer, kept for reference and its
-/// unit tests. Enabled with the `legacy` cargo feature (or `--features legacy`
-/// when running `cargo test`); the turso backend is the live implementation.
-#[cfg(feature = "legacy")]
-pub mod old_code;

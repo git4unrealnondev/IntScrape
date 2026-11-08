@@ -10,7 +10,7 @@ use std::{
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use shared_types::{
     CallbackCustomData, CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks,
-    PluginTag, SQL_CHUNK_SIZE, Tag,
+    PluginTag, PLUGIN_BATCH_SIZE, Tag,
 };
 
 use thumbnailer::{ThumbnailSize, create_thumbnails_dynamic};
@@ -81,7 +81,7 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
         // Collect a small chunk of file IDs (e.g., 1000 items) into memory at a time
         let batch: Vec<_> = total_file_ids_iter
             .by_ref()
-            .take(SQL_CHUNK_SIZE as usize)
+            .take(PLUGIN_BATCH_SIZE as usize)
             .collect();
 
         if batch.is_empty() {
@@ -261,7 +261,13 @@ fn thumbnail_path(base: &Path, hash: &str) -> Option<PathBuf> {
 }
 
 #[unsafe(no_mangle)]
-fn get_plugin_info() -> Vec<shared_types::Plugin> {
+fn get_plugin_info() -> shared_types::CVec<shared_types::Plugin> {
+    // The host consumes this via `CVec::into_vec` (see `src/plugins.rs`).
+    // The inner helper keeps the original `Vec` body unchanged.
+    shared_types::CVec::from_vec(get_plugin_info_impl())
+}
+
+fn get_plugin_info_impl() -> Vec<shared_types::Plugin> {
     vec![shared_types::Plugin {
         name: "file_thumbnail".into(),
         callbacks: vec![

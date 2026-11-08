@@ -5,7 +5,7 @@
 //! fixture, then print per-row latency. Run them with
 //!
 //! ```text
-//! cargo test --bin intscrape db::turso::bench -- --ignored --nocapture
+//! cargo test --lib db::turso::bench -- --ignored --nocapture
 //! ```
 //!
 //! Every knob is an environment variable so a run can be scaled without
@@ -13,7 +13,7 @@
 //! the interesting numbers come from scaling up:
 //!
 //! ```text
-//! BENCH_FILES=200000 BENCH_TAGS=200000 cargo test --bin intscrape \
+//! BENCH_FILES=200000 BENCH_TAGS=200000 cargo test --lib \
 //!     db::turso::bench -- --ignored --nocapture
 //! ```
 //!

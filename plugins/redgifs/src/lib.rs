@@ -66,7 +66,13 @@ use request::{PageKind, key, request_from_params};
 
 /// Plugin registration, read once by the host at startup.
 #[unsafe(no_mangle)]
-pub fn get_plugin_info() -> Vec<Plugin> {
+fn get_plugin_info() -> shared_types::CVec<Plugin> {
+    // The host consumes this via `CVec::into_vec` (see `src/plugins.rs`).
+    // The inner helper keeps the original `Vec` body unchanged.
+    shared_types::CVec::from_vec(get_plugin_info_impl())
+}
+
+pub fn get_plugin_info_impl() -> Vec<Plugin> {
     vec![Plugin {
         name: "Redgifs".to_string(),
         properties: vec![
@@ -495,7 +501,7 @@ mod tests {
 
     #[test]
     fn plugin_registers_site_and_user_agent() {
-        let plugins = get_plugin_info();
+        let plugins = get_plugin_info_impl();
         let plugin = &plugins[0];
         assert_eq!(plugin.name, "Redgifs");
 

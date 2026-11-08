@@ -139,6 +139,26 @@ pub fn get_file_hashes_async(
 > {
     crate::init_data_request_async(crate::SupportedDBRequests::GetFileHashes(file_id))
 }
+/// Gets every recorded SHA512 digest in one query, sorted by digest.
+///
+/// Bulk counterpart of `get_file_hashes` for callers that need the whole
+/// list (e.g. the WebUI `/api/v0/file-hashes` endpoint): one IPC round
+/// trip and one indexed scan instead of one round trip and one query per
+/// file. See `file_hashes_get_all_sha512`.
+pub fn get_file_hashes_all_sha512() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    crate::init_data_request(crate::SupportedDBRequests::GetAllFileHashesSha512())
+}
+/// Gets every recorded SHA512 digest in one query, sorted by digest.
+///
+/// Bulk counterpart of `get_file_hashes` for callers that need the whole
+/// list (e.g. the WebUI `/api/v0/file-hashes` endpoint): one IPC round
+/// trip and one indexed scan instead of one round trip and one query per
+/// file. See `file_hashes_get_all_sha512`.
+pub fn get_file_hashes_all_sha512_async()
+-> impl std::future::Future<Output = Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>>>
+{
+    crate::init_data_request_async(crate::SupportedDBRequests::GetAllFileHashesSha512())
+}
 /// Resolves files by their secondary hashes in one bulk lookup, keyed by
 /// `(algorithm, digest)`. Omits any hash that does not match a known file.
 /// Used by bulk importers (e.g. the e6 CSV dump importer) that attach

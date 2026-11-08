@@ -1,6 +1,6 @@
 use std::{str::FromStr, time::Duration};
 
-use log::info;
+use log::{info, warn};
 use reqwest::{
     Client, ClientBuilder, RequestBuilder, StatusCode,
     header::{HeaderMap, HeaderName, HeaderValue},
@@ -52,8 +52,12 @@ impl Scraper {
                     let key = key.clone();
                     let val = val.clone();
                     let mut headers = HeaderMap::new();
-                    let header_key = HeaderName::from_str(&key).unwrap();
-                    let header_val = HeaderValue::from_str(&val).unwrap();
+                    let (Ok(header_key), Ok(header_val)) =
+                        (HeaderName::from_str(&key), HeaderValue::from_str(&val))
+                    else {
+                        warn!("Skipping invalid header {key:?}: {val:?}");
+                        continue;
+                    };
                     headers.insert(header_key, header_val);
                     client = client.default_headers(headers);
                 }
@@ -65,7 +69,14 @@ impl Scraper {
                 }
                 DownloadModifiers::Cookie((url, cookie)) => {
                     let jar = reqwest::cookie::Jar::default();
-                    jar.add_cookie_str(&cookie, &url.parse::<Url>().unwrap());
+                    // A malformed cookie URL configured by a plugin should
+                    // not take down the daemon; skip the cookie instead.
+                    if let Ok(parsed_url) = url.parse::<Url>() {
+                        jar.add_cookie_str(&cookie, &parsed_url);
+                    } else {
+                        warn!("Skipping cookie for invalid url {url:?}");
+                        continue;
+                    }
                     client = client.cookie_provider(jar.into());
                 }
             }

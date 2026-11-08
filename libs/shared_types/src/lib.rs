@@ -4,9 +4,16 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 pub const DEFAULT_PRIORITY: u64 = 10;
-pub const SQL_CHUNK_SIZE: u64 = 1000;
+/// Batch size plugins use when flushing work to the host (e.g. every 1000
+/// files). Distinct from the DB layer's `SQL_CHUNK_SIZE`, which is bounded
+/// by Turso's per-statement bind-variable limit.
+pub const PLUGIN_BATCH_SIZE: u64 = 1000;
 
-/// FFI-safe alternative to String
+/// FFI-safe alternative to `Vec<T>` across the plugin boundary: a
+/// `#[repr(C)]` {ptr, len, cap} triple. Note that `T` itself must still be
+/// layout-compatible between host and plugin (they are built together by
+/// `build.rs` with the same toolchain); serializing to bytes would be the
+/// fully stable ABI, but that is a deliberate, larger redesign.
 #[repr(C)]
 pub struct CVec<T> {
     pub ptr: *mut T,
@@ -33,25 +40,6 @@ impl<T> CVec<T> {
             unsafe { Vec::from_raw_parts(self.ptr, self.len, self.cap) }
         }
     }
-}
-
-#[derive(Debug, Default, Copy, Clone)]
-#[repr(C)]
-pub struct SensorData {
-    pub value: f64,
-    pub timestamp: u64,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[repr(C)]
-pub enum DbRequest {
-    GetUserById { client_id: u64, user_id: u64 },
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[repr(C)]
-pub enum DbResponse {
-    UserData { user_id: u64, balance: f64 },
 }
 
 #[derive(PartialEq, Deserialize, Debug, Serialize, bitcode::Encode, bitcode::Decode, Clone)]

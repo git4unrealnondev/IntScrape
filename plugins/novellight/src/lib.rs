@@ -8,7 +8,13 @@ use shared_types::{
 };
 
 #[unsafe(no_mangle)]
-fn get_plugin_info() -> Vec<shared_types::Plugin> {
+fn get_plugin_info() -> shared_types::CVec<shared_types::Plugin> {
+    // The host consumes this via `CVec::into_vec` (see `src/plugins.rs`).
+    // The inner helper keeps the original `Vec` body unchanged.
+    shared_types::CVec::from_vec(get_plugin_info_impl())
+}
+
+fn get_plugin_info_impl() -> Vec<shared_types::Plugin> {
     vec![shared_types::Plugin {
         name: "Novelight".into(),
         properties: vec![

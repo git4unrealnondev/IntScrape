@@ -49,7 +49,13 @@ pub fn on_start() {
 }
 
 #[unsafe(no_mangle)]
-pub fn get_plugin_info() -> Vec<Plugin> {
+fn get_plugin_info() -> shared_types::CVec<Plugin> {
+    // The host consumes this via `CVec::into_vec` (see `src/plugins.rs`).
+    // The inner helper keeps the original `Vec` body unchanged.
+    shared_types::CVec::from_vec(get_plugin_info_impl())
+}
+
+pub fn get_plugin_info_impl() -> Vec<Plugin> {
     vec![Plugin {
         name: "4chan".into(),
         properties: vec![

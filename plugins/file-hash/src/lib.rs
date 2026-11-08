@@ -9,7 +9,7 @@ use std::{
 
 use client::setting_get;
 use shared_types::{
-    CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks, PluginTag, SQL_CHUNK_SIZE,
+    CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks, PluginTag, PLUGIN_BATCH_SIZE,
     Tag,
 };
 
@@ -71,7 +71,7 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
     for (idx, (file_id, tables)) in total_file_ids.iter().enumerate() {
         // Stop scheduling new work immediately if exit is requested
 
-        if idx % SQL_CHUNK_SIZE as usize == 0 {
+        if idx % PLUGIN_BATCH_SIZE as usize == 0 {
             pool.join();
             let batch = std::mem::take(&mut *pending_tags.lock().unwrap());
             if !batch.is_empty() && client::put_tags_to_files(batch).is_err() {
@@ -149,7 +149,13 @@ fn on_start() {
 }
 
 #[unsafe(no_mangle)]
-fn get_plugin_info() -> Vec<shared_types::Plugin> {
+fn get_plugin_info() -> shared_types::CVec<shared_types::Plugin> {
+    // The host consumes this via `CVec::into_vec` (see `src/plugins.rs`).
+    // The inner helper keeps the original `Vec` body unchanged.
+    shared_types::CVec::from_vec(get_plugin_info_impl())
+}
+
+fn get_plugin_info_impl() -> Vec<shared_types::Plugin> {
     vec![shared_types::Plugin {
         name: "file_hash".into(),
         callbacks: vec![

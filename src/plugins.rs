@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicBool},
     thread::JoinHandle,
@@ -192,7 +191,7 @@ impl PluginManager {
                         continue;
                     }
 
-                    info!("Found plugin candidate: {:?}", path.file_name().unwrap());
+                    info!("Found plugin candidate: {:?}", path.file_name().map(|n| n.to_string_lossy()));
 
                     unsafe {
                         let lib = match Library::new(&path) {
@@ -259,18 +258,22 @@ impl PluginManager {
     ///
     fn get_info(&self, lib: &Library, path: PathBuf) -> Option<Vec<shared_types::Plugin>> {
         info!("Trying to load library at path: {}", path.to_string_lossy());
-        let temp: libloading::Symbol<unsafe extern "C" fn() -> Vec<shared_types::Plugin>> =
-            match unsafe { lib.get(b"get_plugin_info") } {
-                Err(_) => {
-                    error!(
-                        "Could not run get_plugin_info pull for lib. {}",
-                        path.to_string_lossy()
-                    );
-                    return None;
-                }
-                Ok(lib) => lib,
-            };
-        unsafe { Some(temp()) }
+        // Plugins export `get_plugin_info` returning the `#[repr(C)]`
+        // `CVec<Plugin>` container (see `shared_types::CVec`), not a Rust
+        // `Vec` directly, so the host does not depend on the `Vec` layout.
+        let temp: libloading::Symbol<
+            unsafe extern "C" fn() -> shared_types::CVec<shared_types::Plugin>,
+        > = match unsafe { lib.get(b"get_plugin_info") } {
+            Err(_) => {
+                error!(
+                    "Could not run get_plugin_info pull for lib. {}",
+                    path.to_string_lossy()
+                );
+                return None;
+            }
+            Ok(lib) => lib,
+        };
+        unsafe { Some(temp().into_vec()) }
     }
 
     ///
@@ -709,7 +712,11 @@ impl PluginManager {
             }
         }
         for thread in threads {
-            thread.join().unwrap();
+            // A panicking plugin `on_start` thread should not take the
+            // daemon down with it; log and carry on.
+            if let Err(error) = thread.join() {
+                error!("Plugins: background thread panicked: {error:?}");
+            }
         }
     }
 }

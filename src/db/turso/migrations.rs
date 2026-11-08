@@ -171,11 +171,16 @@ DROP TABLE Parents_old;
         log::info!(
             "Migration 9->10: rebuilding Parents with the sentinel limit_to and a covering reverse index."
         );
+        // `idx_parents_lim` is dropped for the same reason as the others:
+        // it follows the renamed table, and `table_create_parents_v2`
+        // recreates it under the same name, which would collide
+        // ("index already exists") on any database that still carries it.
         conn.execute_batch(
             "ALTER TABLE Parents RENAME TO Parents_old;
              DROP INDEX IF EXISTS idx_parents_rel;
              DROP INDEX IF EXISTS idx_unique_parents_null_safe;
-             DROP INDEX IF EXISTS idx_unique_parents;",
+             DROP INDEX IF EXISTS idx_unique_parents;
+             DROP INDEX IF EXISTS idx_parents_lim;",
         )
         .await?;
 

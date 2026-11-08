@@ -1,6 +1,6 @@
 use std::{
     error::Error,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -8,9 +8,7 @@ use std::{
     time::Duration,
 };
 
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
-
-use crate::{
+use intscrape::{
     db::turso::TursoDatabase,
     db::{
         SYSTEM_DATABASE_BACKUP_SITE, SYSTEM_DATABASE_SLURP_SITE, SYSTEM_FILE_HASH_SITE,
@@ -29,36 +27,40 @@ use fast_log::{
 };
 use rayon::ThreadPoolBuilder;
 
-pub mod backup_path;
-pub mod cli;
-pub mod db;
-pub mod helper_functions;
-pub mod ipc;
-pub mod plugins;
-pub mod web;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[cfg(feature = "dhat-heap")]
-#[global_allocator]
-static ALLOC: dhat::Alloc = dhat::Alloc;
-
-const TURSO_DB_PATH: &str = "turso.db";
-const LOG_PATH: &str = "log.txt";
-pub const PLUGINS_PATH: &str = "compiled_plugins";
-const DB_VERSION: u64 = 12;
+/// Default data paths. Each can be overridden with an environment variable
+/// so the daemon does not have to be run from the source tree:
+/// `INTSCRAPE_DB_PATH`, `INTSCRAPE_LOG_PATH`, `INTSCRAPE_PLUGINS_PATH`.
+const DEFAULT_DB_PATH: &str = "turso.db";
+const DEFAULT_LOG_PATH: &str = "log.txt";
+const DEFAULT_PLUGINS_PATH: &str = "compiled_plugins";
 const JOB_PROCESSING_CHUNK_SIZE: usize = 256;
+/// Default number of tokio worker threads (see `worker_threads()`).
+const DEFAULT_WORKER_THREADS: usize = 16;
+
+fn env_path(name: &str, default: &str) -> PathBuf {
+    std::env::var(name)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(default))
+}
+
+/// Number of tokio worker threads. Override with `INTSCRAPE_WORKER_THREADS`
+/// for machines with very different core counts than the original host.
+fn worker_threads() -> usize {
+    std::env::var("INTSCRAPE_WORKER_THREADS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_WORKER_THREADS)
+}
 
 ///
-/// Sets up logging in the environment
+/// Sets up logging in the environment. The log file is appended to (and
+/// rotated by size via `file_split`), never deleted on startup, so logs
+/// from previous runs survive a restart.
 ///
-fn setup_log() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let log_path = Path::new(LOG_PATH);
-
-    // Clears log
-    if std::fs::exists(log_path)? {
-        std::fs::remove_file(log_path)?;
-    }
-
-    // Sets up log
+fn setup_log(log_path: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
     fast_log::init(
         fast_log::Config::new()
             .level(log::LevelFilter::Info)
@@ -75,22 +77,37 @@ fn setup_log() -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
-// The whole daemon (all plugin jobs, the turso write layer, and every
-// reqwest/TLS connection future) shares this runtime. 4 workers was too few:
-// when the DB layer saturated them, in-flight TLS handshakes stopped being
-// polled for tens of seconds and the servers killed the stalled connections
-// ("tls handshake eof"). Give the runtime headroom so network futures are
-// always serviced promptly. The host has 72 cores; per-container CPU quota is
-// uncapped, so 16 workers is well within the box.
-#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
-async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+fn main() {
+    // The whole daemon (all plugin jobs, the turso write layer, and every
+    // reqwest/TLS connection future) shares this runtime. 4 workers was too few:
+    // when the DB layer saturated them, in-flight TLS handshakes stopped being
+    // polled for tens of seconds and the servers killed the stalled connections
+    // ("tls handshake eof"). Give the runtime headroom so network futures are
+    // always serviced promptly; the exact count is tunable via
+    // INTSCRAPE_WORKER_THREADS (default 16).
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads())
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    if let Err(error) = runtime.block_on(run_app()) {
+        eprintln!("intscrape: {error}");
+        std::process::exit(1);
+    }
+}
+
+async fn run_app() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let db_path = env_path("INTSCRAPE_DB_PATH", DEFAULT_DB_PATH);
+    let log_path = env_path("INTSCRAPE_LOG_PATH", DEFAULT_LOG_PATH);
+    let plugins_path = env_path("INTSCRAPE_PLUGINS_PATH", DEFAULT_PLUGINS_PATH);
+
     // ctrl C handler
     let should_exit = Arc::new(AtomicBool::new(false));
 
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
-    setup_log()?;
+    setup_log(&log_path)?;
 
     let heavy_processing_pool = Arc::new(
         ThreadPoolBuilder::new()
@@ -98,13 +115,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .build()?,
     );
 
-    let db = TursoDatabase::new_with_exit(Path::new(TURSO_DB_PATH), should_exit.clone()).await;
-    log::info!("Turso database ready at {TURSO_DB_PATH}");
+    let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+    log::info!("Turso database ready at {}", db_path.display());
 
-    let plugins_path =
-        std::env::var("INTSCRAPE_PLUGINS_PATH").unwrap_or_else(|_| PLUGINS_PATH.to_owned());
     let plugin_manager =
-        PluginManager::new(Path::new(&plugins_path), db.clone(), should_exit.clone());
+        PluginManager::new(&plugins_path, db.clone(), should_exit.clone());
     db.set_plugin_manager(plugin_manager.clone());
 
     let download_manager = DownloadsManager::new(
@@ -139,7 +154,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             log::info!("received Ctrl+C!");
             should_exit_clone.store(true, std::sync::atomic::Ordering::SeqCst);
         })?;
-        //.expect("Error setting Ctrl-C handler");
     }
 
     // Container runtimes use SIGTERM for a normal stop. Ctrl-C handlers do not
@@ -150,7 +164,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     plugin_manager.callback_on_start();
 
     // Does the CLI input processing
-    cli::main(db.clone(), plugin_manager.clone()).await;
+    intscrape::cli::main(db.clone(), plugin_manager.clone()).await;
 
     // Handles adding jobs into system
     let plugin_manager_clone = plugin_manager.clone();
@@ -186,7 +200,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
             for job in jobs_to_run
                 .iter()
-                .filter(|job| crate::db::system_jobs::is_system_job(job))
+                .filter(|job| intscrape::db::system_jobs::is_system_job(job))
             {
                 if should_exit_for_spawner.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
@@ -216,7 +230,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
             let jobs_to_run: Vec<_> = jobs_to_run
                 .into_iter()
-                .filter(|job| !crate::db::system_jobs::is_system_job(job))
+                .filter(|job| !intscrape::db::system_jobs::is_system_job(job))
                 .collect();
 
             download_manager_clone
