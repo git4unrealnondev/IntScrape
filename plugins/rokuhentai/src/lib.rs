@@ -938,15 +938,7 @@ fn data(
     tags: HashSet<PluginTag>,
     jobs: HashSet<ScraperDataReturn>,
 ) -> Vec<ScraperReturn> {
-    if files.is_empty() && tags.is_empty() && jobs.is_empty() {
-        return vec![ScraperReturn::Nothing];
-    }
-
-    vec![ScraperReturn::Data(shared_types::ScraperObject {
-        files,
-        jobs,
-        tags,
-    })]
+    shared_types::helpers::finalize(files, tags, jobs)
 }
 
 /// Output for a manga landing page: the manga's own tags, scoped to the moment the

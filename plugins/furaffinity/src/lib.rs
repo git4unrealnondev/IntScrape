@@ -68,36 +68,15 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
 
 /// /view/<id>/ or /full/<id>/ -> <id>
 fn extract_submission_id(url: &str) -> Option<String> {
-    let mut segments = url.split('/');
-    while let Some(seg) = segments.next() {
-        if (seg == "view" || seg == "full")
-            && let Some(id) = segments.next()
-            && id.chars().all(|c| c.is_ascii_digit())
-            && !id.is_empty()
-        {
-            return Some(id.to_string());
-        }
-    }
-    None
+    shared_types::helpers::numeric_segment_after(url, &["view", "full"])
 }
 
 fn abs_url(href: &str) -> String {
-    if let Some(rest) = href.strip_prefix("//") {
-        format!("https://{rest}")
-    } else if href.starts_with("http") {
-        href.to_string()
-    } else if let Some(rest) = href.strip_prefix('/') {
-        format!("https://{SITE_ROOT}/{rest}")
-    } else {
-        format!("https://{SITE_ROOT}/{href}")
-    }
+    shared_types::helpers::abs_url(href, SITE_ROOT)
 }
 
 fn ns(name: &str, description: &str) -> GenericNamespaceObj {
-    GenericNamespaceObj {
-        name: name.into(),
-        description: Some(description.into()),
-    }
+    GenericNamespaceObj::new(name, description)
 }
 
 fn sub_id_tag(id: &str) -> Tag {
@@ -133,19 +112,7 @@ fn job_for(
     priority: u64,
     user_data: BTreeMap<String, String>,
 ) -> ScraperDataReturn {
-    ScraperDataReturn {
-        job: PluginJob {
-            site: site.to_string(),
-            priority,
-            param: vec![ScraperParam::Url(shared_types::Url {
-                url,
-                ..Default::default()
-            })],
-            user_data,
-            ..Default::default()
-        },
-        ..Default::default()
-    }
+    shared_types::helpers::job_for(site, url, priority, user_data)
 }
 
 /// Builds `Cookie` header modifiers from the job's login cookies (plus any
@@ -153,73 +120,12 @@ fn job_for(
 /// `ScraperParam::Login` params, so cookies have to travel as local
 /// modifiers on the URL itself or they are never sent.
 ///
-/// Cookies are deduplicated by name (last value wins). Without this, every
-/// DB round-trip — where the manager re-injects the stored `a`/`b` logins on
-/// top of a URL that already carries them as a `Cookie` header — appends
-/// another copy of the pair. The header grows without bound until the site
-/// rejects it with `400 Bad Request` for an oversized header, and the failed
-/// job is kept for the next boot, so it grows again. Deduping by name also
-/// heals jobs already stored with a bloated header.
+/// Delegates to the shared helper, which deduplicates by cookie name
+/// (last value wins) — without that, every DB round-trip appended
+/// another copy of the `a`/`b` pair until FA rejected the oversized
+/// header with `400`. Deduping also heals jobs already stored bloated.
 fn cookie_modifiers(scraperdata: &shared_types::ScraperDataReturn) -> Vec<TargetModifier> {
-    // (name, value) in first-seen order; a later occurrence of the same
-    // name replaces the value in place.
-    let mut cookies: Vec<(String, String)> = Vec::new();
-    let push_cookie = |cookies: &mut Vec<(String, String)>, pair: &str| {
-        let pair = pair.trim();
-        let Some((name, value)) = pair.split_once('=') else {
-            return;
-        };
-        let name = name.trim().to_string();
-        let value = value.trim().to_string();
-        if name.is_empty() {
-            return;
-        }
-        if let Some(existing) = cookies.iter_mut().find(|(n, _)| *n == name) {
-            existing.1 = value;
-        } else {
-            cookies.push((name, value));
-        }
-    };
-    let push_header = |cookies: &mut Vec<(String, String)>, header: &str| {
-        for pair in header.split(';') {
-            push_cookie(cookies, pair);
-        }
-    };
-
-    // URL-carried cookies first, then login params, so fresh values from the
-    // settings store win over anything already baked into a stored job.
-    for param in &scraperdata.job.param {
-        if let ScraperParam::Url(url) = param {
-            for m in &url.local_modifiers {
-                match &m.modifier {
-                    DownloadModifiers::Header((k, v)) if k == "Cookie" => {
-                        push_header(&mut cookies, v)
-                    }
-                    DownloadModifiers::Cookie((_, v)) => push_header(&mut cookies, v),
-                    _ => {}
-                }
-            }
-        }
-    }
-    for param in &scraperdata.job.param {
-        if let ScraperParam::Login(LoginType::Cookie(name, Some(value))) = param {
-            push_cookie(&mut cookies, &format!("{name}={value}"));
-        }
-    }
-
-    if cookies.is_empty() {
-        Vec::new()
-    } else {
-        let header = cookies
-            .iter()
-            .map(|(name, value)| format!("{name}={value}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        vec![TargetModifier {
-            target: ModifierTarget::Text,
-            modifier: DownloadModifiers::Header(("Cookie".into(), header)),
-        }]
-    }
+    shared_types::helpers::cookie_modifiers(&scraperdata.job.param)
 }
 
 fn with_modifiers(
@@ -790,11 +696,7 @@ fn parse_listing_page(
     source_url: &str,
     scraperdata: &shared_types::ScraperDataReturn,
 ) -> Vec<shared_types::ScraperReturn> {
-    let recursion = scraperdata
-        .job
-        .user_data
-        .get("recursion")
-        .is_none_or(|f| f != "false");
+    let recursion = shared_types::helpers::is_recursion(&scraperdata.job.user_data);
 
     // Submission thumbnails are <figure id="sid-<id>">; fall back to links.
     let mut ids: Vec<String> = Vec::new();
@@ -935,15 +837,7 @@ fn finalize(
     tags: HashSet<PluginTag>,
     jobs: HashSet<ScraperDataReturn>,
 ) -> Vec<ScraperReturn> {
-    if files.is_empty() && tags.is_empty() && jobs.is_empty() {
-        vec![ScraperReturn::Nothing]
-    } else {
-        vec![ScraperReturn::Data(shared_types::ScraperObject {
-            files,
-            tags,
-            jobs,
-        })]
-    }
+    shared_types::helpers::finalize(files, tags, jobs)
 }
 
 #[cfg(test)]

@@ -119,11 +119,7 @@ pub fn parser_call(
     let mut tags = HashSet::new();
     let mut jobs = HashSet::new();
 
-    let recursion = scraperdata
-        .job
-        .user_data
-        .get("recursion")
-        .is_none_or(|f| f != "false");
+    let recursion = shared_types::helpers::is_recursion(&scraperdata.job.user_data);
 
     if let Some(post_id) = scraperdata.job.user_data.get("comments_post_id") {
         let Some(limit_to) = scraperdata.job.user_data.get("comments_limit_to") else {
@@ -522,16 +518,7 @@ pub fn parser_call(
         }
     }
 
-    if files.is_empty() && jobs.is_empty() && tags.is_empty() {
-        return vec![ScraperReturn::Nothing];
-    }
-
-    vec![ScraperReturn::Data(shared_types::ScraperObject {
-        files,
-        jobs,
-        tags,
-        ..Default::default()
-    })]
+    shared_types::helpers::finalize(files, tags, jobs)
 }
 
 /// Generates a set of urls based on url_properties

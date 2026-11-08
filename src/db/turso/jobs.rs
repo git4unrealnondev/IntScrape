@@ -1,27 +1,12 @@
 use std::collections::BTreeMap;
 
 use log::info;
+use shared_types::helpers::persistable_params;
 use shared_types::{DbJobRecreation, DbJobsObj, PluginJob, ScraperParam};
 use turso::{Connection, Error, Result, Row, Value, params_from_iter};
 
 use crate::db::{SQL_CHUNK_SIZE, turso::TursoDatabase};
 use crate::helper_functions::get_sys_time_in_secs;
-
-/// Params safe to write to the `Jobs` table.
-///
-/// `ScraperParam::Login` entries are runtime-injected from the settings
-/// store at dispatch time (`DownloadManager::load_logins`); they are not
-/// part of a job's identity. Persisting them meant every retry/recreation
-/// update wrote the injected cookies back to the DB, where the next boot
-/// injected another copy on top — cookie headers grew without bound until
-/// the site rejected the oversized header with `400`.
-fn persistable_params(params: &[ScraperParam]) -> Vec<ScraperParam> {
-    params
-        .iter()
-        .filter(|p| !matches!(p, ScraperParam::Login(_)))
-        .cloned()
-        .collect()
-}
 
 impl TursoDatabase {
     /// Updates an existing job row.

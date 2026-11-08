@@ -137,18 +137,26 @@ impl Scraper {
                     }
                     DownloadModifiers::Timeout(None) => request_builder,
                     DownloadModifiers::Header((key, value)) => {
+                        // Cookie headers are deduped by name: a job stored
+                        // with a bloated header must not be re-sent as-is.
+                        let value = if key.eq_ignore_ascii_case("cookie") {
+                            shared_types::helpers::dedupe_cookie_header(value)
+                        } else {
+                            value.clone()
+                        };
                         if let (Ok(h_name), Ok(h_val)) = (
                             HeaderName::from_bytes(key.as_bytes()),
-                            HeaderValue::from_str(value),
+                            HeaderValue::from_str(&value),
                         ) {
                             request_builder.header(h_name, h_val)
                         } else {
                             request_builder
                         }
                     }
-                    DownloadModifiers::Cookie((_, cookie)) => {
-                        request_builder.header(reqwest::header::COOKIE, cookie)
-                    }
+                    DownloadModifiers::Cookie((_, cookie)) => request_builder.header(
+                        reqwest::header::COOKIE,
+                        shared_types::helpers::dedupe_cookie_header(cookie),
+                    ),
                 };
             }
         }

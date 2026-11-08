@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use shared_types::helpers::collect_namespaces;
 use shared_types::{
     FileInternal, FileManager, FileTagAction, GenericNamespaceObj, ScraperDataReturn, Tag,
     TagOperation,
@@ -108,21 +109,12 @@ impl TursoDatabase {
         // every namespace this scrape references exists (and is cached) up
         // front so the chunk transactions below are DML-only. The ensure is a
         // fast no-op once everything is cached.
-        let namespace_set: HashSet<GenericNamespaceObj> = map
-            .iter()
-            .flat_map(|(_, actions)| actions.iter())
-            .flat_map(|action| action.tags.iter())
-            .flat_map(|plugin_tag| {
-                let mut nss = vec![plugin_tag.tag.namespace.clone()];
-                if let Some(relation) = &plugin_tag.relates_to {
-                    nss.push(relation.tag.namespace.clone());
-                    if let Some(limit) = &relation.limit_to {
-                        nss.push(limit.namespace.clone());
-                    }
-                }
-                nss
-            })
-            .collect();
+        let namespace_set = collect_namespaces(
+            &map.values()
+                .flat_map(|actions| actions.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
         if let Err(error) = database.namespace_ensure_set(&namespace_set).await {
             log::error!("Failed to pre-ensure namespaces for scrape: {error}");
             return false;

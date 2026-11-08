@@ -739,3 +739,396 @@ pub struct TagParents {
     /// IE Only limit this to A->B as it relates to C.
     pub limit_to: Option<u64>,
 }
+
+impl GenericNamespaceObj {
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: Some(description.into()),
+        }
+    }
+}
+
+impl Tag {
+    pub fn new(name: impl Into<String>, namespace: GenericNamespaceObj) -> Self {
+        Self {
+            name: name.into(),
+            namespace,
+        }
+    }
+}
+
+impl PluginTag {
+    pub fn new(name: impl Into<String>, namespace: GenericNamespaceObj) -> Self {
+        Self {
+            tag: Tag::new(name, namespace),
+            ..Default::default()
+        }
+    }
+
+    pub fn related(
+        name: impl Into<String>,
+        namespace: GenericNamespaceObj,
+        relates_to: &RelationContext,
+    ) -> Self {
+        Self {
+            tag: Tag::new(name, namespace),
+            relates_to: Some(relates_to.clone()),
+            ..Default::default()
+        }
+    }
+}
+
+impl FileTagAction {
+    pub fn add(tags: Vec<PluginTag>) -> Self {
+        Self {
+            operation: TagOperation::Add,
+            tags,
+        }
+    }
+}
+
+/// Shared, dependency-free helpers used by plugins and the host.
+///
+/// Everything here was previously copy-pasted across plugins/host call
+/// sites (cookie dedup, `finalize`, URL absolutizing, id extraction,
+/// namespace collection, job-param filtering). Keeping one implementation
+/// stops the copies from diverging — the cookie-header growth that caused
+/// FurAffinity `400`s was exactly such a divergence.
+pub mod helpers {
+    use super::{
+        DownloadModifiers, FileObject, FileTagAction, FileSource, GenericNamespaceObj,
+        HashesSupported, LoginType, ModifierTarget, PluginJob, ScraperDataReturn, ScraperObject,
+        ScraperParam, ScraperReturn, TargetModifier, Url,
+    };
+    use std::collections::{BTreeMap, HashSet};
+
+    /// Collapse files/tags/jobs into the standard plugin return:
+    /// `Nothing` when everything is empty, else one `Data`.
+    pub fn finalize(
+        files: HashSet<FileObject>,
+        tags: HashSet<super::PluginTag>,
+        jobs: HashSet<ScraperDataReturn>,
+    ) -> Vec<ScraperReturn> {
+        if files.is_empty() && tags.is_empty() && jobs.is_empty() {
+            vec![ScraperReturn::Nothing]
+        } else {
+            vec![ScraperReturn::Data(ScraperObject {
+                files,
+                tags,
+                jobs,
+            })]
+        }
+    }
+
+    /// Deduplicate a `Cookie` header string by cookie name (last wins),
+    /// preserving first-seen order. Heals headers bloated by repeated
+    /// login injection (e.g. `a=…; b=…; a=…; b=…` → `a=…; b=…`).
+    pub fn dedupe_cookie_header(header: &str) -> String {
+        let mut cookies: Vec<(String, String)> = Vec::new();
+        for pair in header.split(';') {
+            push_cookie_pair(&mut cookies, pair);
+        }
+        cookies
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    fn push_cookie_pair(cookies: &mut Vec<(String, String)>, pair: &str) {
+        let Some((name, value)) = pair.trim().split_once('=') else {
+            return;
+        };
+        let name = name.trim().to_string();
+        let value = value.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        if let Some(existing) = cookies.iter_mut().find(|(n, _)| *n == name) {
+            existing.1 = value;
+        } else {
+            cookies.push((name, value));
+        }
+    }
+
+    /// Build a single deduplicated `Cookie` header from job params:
+    /// cookies carried on URLs (as `Header` or `Cookie` modifiers) first,
+    /// then `ScraperParam::Login(LoginType::Cookie)` values, which win.
+    /// `None` when there are no cookies.
+    pub fn cookie_header_from_params(params: &[ScraperParam]) -> Option<String> {
+        let mut cookies: Vec<(String, String)> = Vec::new();
+        for param in params {
+            let modifiers: &[TargetModifier] = match param {
+                ScraperParam::Url(url) => &url.local_modifiers,
+                ScraperParam::UrlPost(post) => &post.local_modifiers,
+                _ => continue,
+            };
+            for m in modifiers {
+                match &m.modifier {
+                    DownloadModifiers::Header((k, v)) if k == "Cookie" => {
+                        for pair in v.split(';') {
+                            push_cookie_pair(&mut cookies, pair);
+                        }
+                    }
+                    DownloadModifiers::Cookie((_, v)) => {
+                        for pair in v.split(';') {
+                            push_cookie_pair(&mut cookies, pair);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for param in params {
+            if let ScraperParam::Login(LoginType::Cookie(name, Some(value))) = param {
+                push_cookie_pair(&mut cookies, &format!("{name}={value}"));
+            }
+        }
+        if cookies.is_empty() {
+            None
+        } else {
+            Some(
+                cookies
+                    .iter()
+                    .map(|(name, value)| format!("{name}={value}"))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+        }
+    }
+
+    /// The standard single-`Cookie`-header modifiers for text downloads,
+    /// built from the job's login cookies (empty when there are none).
+    pub fn cookie_modifiers(params: &[ScraperParam]) -> Vec<TargetModifier> {
+        match cookie_header_from_params(params) {
+            Some(header) => vec![TargetModifier {
+                target: ModifierTarget::Text,
+                modifier: DownloadModifiers::Header(("Cookie".into(), header)),
+            }],
+            None => Vec::new(),
+        }
+    }
+
+    /// Resolve a possibly-relative href against a site base
+    /// (e.g. `"www.furaffinity.net"` or `"https://www.furaffinity.net"`).
+    pub fn abs_url(href: &str, base: &str) -> String {
+        let base = base.trim_end_matches('/');
+        let base = base
+            .strip_prefix("https://")
+            .or_else(|| base.strip_prefix("http://"))
+            .unwrap_or(base);
+        if let Some(rest) = href.strip_prefix("//") {
+            format!("https://{rest}")
+        } else if href.starts_with("http") {
+            href.to_string()
+        } else if let Some(rest) = href.strip_prefix('/') {
+            format!("https://{base}/{rest}")
+        } else {
+            format!("https://{base}/{href}")
+        }
+    }
+
+    /// Segment following `keyword` in a URL path, if present.
+    pub fn segment_after(url: &str, keyword: &str) -> Option<String> {
+        let mut segments = url.split('/');
+        while let Some(seg) = segments.next() {
+            if seg == keyword {
+                return segments.next().map(str::to_string);
+            }
+        }
+        None
+    }
+
+    /// Numeric segment following `keyword` (e.g. `/view/123/` → `123`).
+    pub fn numeric_segment_after(url: &str, keywords: &[&str]) -> Option<String> {
+        let mut segments = url.split('/');
+        while let Some(seg) = segments.next() {
+            if keywords.contains(&seg)
+                && let Some(id) = segments.next()
+                && !id.is_empty()
+                && id.chars().all(|c| c.is_ascii_digit())
+            {
+                return Some(id.to_string());
+            }
+        }
+        None
+    }
+
+    /// Last non-empty path segment of a URL.
+    pub fn last_segment(url: &str) -> Option<String> {
+        url.trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    /// All `ScraperParam::Normal` search terms in a job's params.
+    pub fn normal_tags(params: &[ScraperParam]) -> Vec<&str> {
+        params
+            .iter()
+            .filter_map(|p| match p {
+                ScraperParam::Normal(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether a job recurses into discovered pages (default: yes).
+    pub fn is_recursion(user_data: &BTreeMap<String, String>) -> bool {
+        user_data.get("recursion").is_none_or(|f| f != "false")
+    }
+
+    pub fn set_recursion(user_data: &mut BTreeMap<String, String>, recursion: bool) {
+        user_data.insert("recursion".into(), recursion.to_string());
+    }
+
+    /// The `INTSCRAPE_REDOWNLOAD` early-return shared by listing plugins:
+    /// re-emit the already-known file for `source_url` keyed by hash.
+    pub fn redownload_return(
+        source_url: &str,
+        user_data: &BTreeMap<String, String>,
+    ) -> Option<Vec<ScraperReturn>> {
+        let hash = user_data.get("INTSCRAPE_REDOWNLOAD_HASH")?;
+        let file = FileObject {
+            source: Some(FileSource::Url(source_url.to_string())),
+            hash: vec![HashesSupported::Sha512(hash.clone())],
+            ..Default::default()
+        };
+        Some(finalize(HashSet::from([file]), HashSet::new(), HashSet::new()))
+    }
+
+    /// Single-URL job for `url_dump` implementations.
+    pub fn job_for(
+        site: &str,
+        url: String,
+        priority: u64,
+        user_data: BTreeMap<String, String>,
+    ) -> ScraperDataReturn {
+        ScraperDataReturn {
+            job: PluginJob {
+                site: site.to_string(),
+                priority,
+                param: vec![ScraperParam::Url(Url {
+                    url,
+                    ..Default::default()
+                })],
+                user_data,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Params safe to persist in the `Jobs` table. `ScraperParam::Login`
+    /// entries are runtime-injected from settings at dispatch; storing
+    /// them made every retry write another copy back to the DB, growing
+    /// cookie headers without bound.
+    pub fn persistable_params(params: &[ScraperParam]) -> Vec<ScraperParam> {
+        params
+            .iter()
+            .filter(|p| !matches!(p, ScraperParam::Login(_)))
+            .cloned()
+            .collect()
+    }
+
+    /// Every namespace referenced by a set of tag actions (the tag
+    /// itself, its `relates_to` target, and the relation's `limit_to`).
+    /// Used to pre-ensure namespaces so DML transactions stay DML-only.
+    pub fn collect_namespaces(actions: &[FileTagAction]) -> HashSet<GenericNamespaceObj> {
+        actions
+            .iter()
+            .flat_map(|action| action.tags.iter())
+            .flat_map(|plugin_tag| {
+                let mut nss = vec![plugin_tag.tag.namespace.clone()];
+                if let Some(relation) = &plugin_tag.relates_to {
+                    nss.push(relation.tag.namespace.clone());
+                    if let Some(limit) = &relation.limit_to {
+                        nss.push(limit.namespace.clone());
+                    }
+                }
+                nss
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn dedupe_cookie_header_collapses_repeats() {
+            assert_eq!(
+                dedupe_cookie_header("a=1; b=2; a=1; b=2; a=3"),
+                "a=3; b=2"
+            );
+            assert_eq!(dedupe_cookie_header(""), "");
+        }
+
+        #[test]
+        fn cookie_header_from_params_login_wins_over_url() {
+            let params = vec![
+                ScraperParam::Url(Url {
+                    url: "https://x/".into(),
+                    local_modifiers: vec![TargetModifier {
+                        target: ModifierTarget::Text,
+                        modifier: DownloadModifiers::Header((
+                            "Cookie".into(),
+                            "a=OLD; a=OLD; b=2".into(),
+                        )),
+                    }],
+                }),
+                ScraperParam::Login(LoginType::Cookie("a".into(), Some("NEW".into()))),
+            ];
+            assert_eq!(
+                cookie_header_from_params(&params).as_deref(),
+                Some("a=NEW; b=2")
+            );
+            assert_eq!(cookie_header_from_params(&[]), None);
+        }
+
+        #[test]
+        fn abs_url_variants() {
+            assert_eq!(abs_url("//d.x/y", "www.x"), "https://d.x/y");
+            assert_eq!(abs_url("https://d.x/y", "www.x"), "https://d.x/y");
+            assert_eq!(abs_url("/y", "www.x"), "https://www.x/y");
+            assert_eq!(abs_url("y", "https://www.x/"), "https://www.x/y");
+        }
+
+        #[test]
+        fn segment_helpers() {
+            assert_eq!(
+                numeric_segment_after("https://x/view/123/", &["view", "full"]),
+                Some("123".into())
+            );
+            assert_eq!(numeric_segment_after("https://x/view/abc/", &["view"]), None);
+            assert_eq!(last_segment("https://x/a/b/"), Some("b".into()));
+            assert_eq!(segment_after("https://x/gallery/bob/", "gallery"), Some("bob".into()));
+        }
+
+        #[test]
+        fn finalize_empty_is_nothing() {
+            assert_eq!(
+                finalize(HashSet::new(), HashSet::new(), HashSet::new()),
+                vec![ScraperReturn::Nothing]
+            );
+        }
+
+        #[test]
+        fn collect_namespaces_includes_relations() {
+            use super::super::{PluginTag, RelationContext, Tag};
+            let rel = RelationContext {
+                tag: Tag::new("t", GenericNamespaceObj::new("ns2", "d")),
+                ..Default::default()
+            };
+            let action = FileTagAction::add(vec![PluginTag {
+                tag: Tag::new("t", GenericNamespaceObj::new("ns1", "d")),
+                relates_to: Some(rel),
+                ..Default::default()
+            }]);
+            let set = collect_namespaces(&[action]);
+            assert_eq!(set.len(), 2);
+        }
+    }
+}

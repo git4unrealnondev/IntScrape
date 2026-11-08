@@ -3,8 +3,8 @@ use std::{collections::HashSet, fmt};
 use scraper::{Element, Html, Selector};
 use shared_types::{
     DownloadModifiers, FileObject, FileSource, FileTagAction, GenericNamespaceObj, HashesSupported,
-    PluginProperties, PluginTag, RelationContext, ScraperDataReturn, ScraperParam, ScraperReturn,
-    SkipIf, Tag, TargetModifier, Url,
+    PluginProperties, PluginTag, RelationContext, ScraperDataReturn, ScraperParam, SkipIf, Tag,
+    TargetModifier, Url,
 };
 
 pub enum Site {
@@ -110,11 +110,7 @@ pub fn parser_call(
 ) -> Vec<shared_types::ScraperReturn> {
     let site = &Site::AGNPH;
 
-    let recursion = scraperdata
-        .job
-        .user_data
-        .get("recursion")
-        .is_none_or(|f| f != "false");
+    let recursion = shared_types::helpers::is_recursion(&scraperdata.job.user_data);
 
     let mut files = HashSet::new();
     let mut jobs = HashSet::new();
@@ -371,15 +367,7 @@ pub fn parser_call(
         }
     }
 
-    if files.is_empty() && jobs.is_empty() && tags.is_empty() {
-        return vec![ScraperReturn::Nothing];
-    }
-
-    vec![ScraperReturn::Data(shared_types::ScraperObject {
-        files,
-        jobs,
-        tags,
-    })]
+    shared_types::helpers::finalize(files, tags, jobs)
 }
 
 fn nsobjplg(name: &NsIdent, site: &Site) -> GenericNamespaceObj {

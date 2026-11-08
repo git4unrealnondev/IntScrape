@@ -6,9 +6,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use shared_types::helpers::collect_namespaces;
 use shared_types::{
-    DbSettingsObj, FileAction, FileInternal, FileManager, FileTagAction, GenericNamespaceObj,
-    HashesSupported, PluginJob, Tag,
+    DbSettingsObj, FileAction, FileInternal, FileManager, FileTagAction, HashesSupported,
+    PluginJob, Tag,
 };
 use turso::Result;
 
@@ -344,20 +345,7 @@ impl TursoDatabase {
 
         // Ensure all referenced namespaces exist (see put_tags_to_file) so
         // this transaction stays DML-only.
-        let namespace_set: std::collections::HashSet<GenericNamespaceObj> = tag_actions
-            .iter()
-            .flat_map(|action| action.tags.iter())
-            .flat_map(|plugin_tag| {
-                let mut nss = vec![plugin_tag.tag.namespace.clone()];
-                if let Some(relation) = &plugin_tag.relates_to {
-                    nss.push(relation.tag.namespace.clone());
-                    if let Some(limit) = &relation.limit_to {
-                        nss.push(limit.namespace.clone());
-                    }
-                }
-                nss
-            })
-            .collect();
+        let namespace_set = collect_namespaces(tag_actions);
         if let Err(error) = self.namespace_ensure_set(&namespace_set).await {
             log::error!("Failed to pre-ensure namespaces for tag actions: {error}");
             return false;

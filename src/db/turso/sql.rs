@@ -61,20 +61,6 @@ async fn tags_resolve_existing<'a>(
     Ok(out)
 }
 
-fn job_to_params(job: &DbJobsObj) -> Vec<Value> {
-    vec![
-        Value::from(job.id as i64),
-        Value::from(job.config.time as i64),
-        Value::from(job.config.reptime as i64),
-        Value::from(job.config.priority as i64),
-        Value::from(job.isrunning),
-        Value::from(serde_json::to_string(&job.config.recreation).unwrap()),
-        Value::from(job.config.site.clone()),
-        Value::from(serde_json::to_string(&job.config.param).unwrap()),
-        Value::from(serde_json::to_string(&job.config.user_data).unwrap()),
-    ]
-}
-
 impl TursoDatabase {
     /// Loads the namespace into the internal cache
     pub(in crate::db::turso) async fn namespace_load(&self, conn: &Connection) -> Result<()> {
@@ -140,42 +126,6 @@ impl TursoDatabase {
             ),
         )
         .await?;
-        Ok(())
-    }
-
-    /// Adds relationships into the db
-    pub(in crate::db::turso) async fn relationship_bulk_add(
-        &self,
-        conn: &Connection,
-        relationships: &[(u64, TagDb)],
-    ) -> Result<()> {
-        let mut namespace_tag_map: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
-        for (file_id, tag_db) in relationships {
-            namespace_tag_map
-                .entry(tag_db.namespace_id)
-                .or_default()
-                .push((*file_id as i64, tag_db.id));
-        }
-
-        for (namespace_id, mapping) in namespace_tag_map {
-            for chunk in mapping.chunks(SQL_CHUNK_SIZE) {
-                let mut holders = Vec::with_capacity(chunk.len());
-                let mut params = Vec::with_capacity(chunk.len() * 2);
-
-                for (file_id, tag_id) in chunk {
-                    holders.push("(?, ?)");
-                    params.push(file_id.clone());
-                    params.push(tag_id.clone());
-                }
-
-                let sql_string = format!(
-                    "INSERT INTO Relationship_{namespace_id} (file_id, tag_id) VALUES {};",
-                    holders.join(", ")
-                );
-                conn.execute(sql_string, params_from_iter(params)).await?;
-            }
-        }
-
         Ok(())
     }
 

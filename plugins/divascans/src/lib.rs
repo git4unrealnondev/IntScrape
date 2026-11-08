@@ -3,8 +3,8 @@ use std::{collections::HashSet, fmt};
 
 use shared_types::{
     DEFAULT_PRIORITY, FileObject, FileSource, FileTagAction, GenericNamespaceObj, PluginJob,
-    PluginProperties, PluginTag, RelationContext, ScraperDataReturn, ScraperParam, ScraperReturn,
-    SkipIf, Tag, TargetModifier, Url,
+    PluginProperties, PluginTag, RelationContext, ScraperDataReturn, ScraperParam, SkipIf, Tag,
+    TargetModifier, Url,
 };
 
 pub enum Site {
@@ -378,15 +378,7 @@ pub fn parser_call(
         }
     }
 
-    if files.is_empty() && jobs.is_empty() && tags.is_empty() {
-        return vec![ScraperReturn::Nothing];
-    }
-
-    vec![ScraperReturn::Data(shared_types::ScraperObject {
-        files,
-        jobs,
-        tags,
-    })]
+    shared_types::helpers::finalize(files, tags, jobs)
 }
 
 fn nsobjplg(name: &NsIdent, site: &Site) -> GenericNamespaceObj {

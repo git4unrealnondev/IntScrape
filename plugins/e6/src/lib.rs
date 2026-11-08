@@ -182,25 +182,11 @@ pub fn parser_call(
         .user_data
         .contains_key("INTSCRAPE_REDOWNLOAD")
     {
-        let Some(hash) = scraperdata.job.user_data.get("INTSCRAPE_REDOWNLOAD_HASH") else {
-            return vec![ScraperReturn::Nothing];
-        };
-        let file = FileObject {
-            source: Some(FileSource::Url(source_url.to_string())),
-            hash: vec![HashesSupported::Sha512(hash.clone())],
-            ..Default::default()
-        };
-        return vec![ScraperReturn::Data(shared_types::ScraperObject {
-            files: HashSet::from([file]),
-            ..Default::default()
-        })];
+        return shared_types::helpers::redownload_return(source_url, &scraperdata.job.user_data)
+            .unwrap_or_else(|| vec![ScraperReturn::Nothing]);
     }
 
-    let recursion = scraperdata
-        .job
-        .user_data
-        .get("recursion")
-        .is_none_or(|f| f != "false");
+    let recursion = shared_types::helpers::is_recursion(&scraperdata.job.user_data);
 
     let site = if ["e6", "e621", "e621.com"].contains(&scraperdata.job.site.to_lowercase().as_str())
     {
@@ -594,16 +580,7 @@ pub fn parser_call(
         }
     }
 
-    if files.is_empty() && jobs.is_empty() && tags.is_empty() {
-        return vec![ScraperReturn::Nothing];
-    }
-
-    vec![ScraperReturn::Data(shared_types::ScraperObject {
-        files,
-        jobs,
-        tags,
-        ..Default::default()
-    })]
+    shared_types::helpers::finalize(files, tags, jobs)
 }
 
 fn nsobjplg(name: &NsIdent, site: &Site) -> GenericNamespaceObj {

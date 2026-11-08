@@ -158,15 +158,7 @@ fn parser_call(
         }
     }
 
-    if files.is_empty() && jobs.is_empty() && tags.is_empty() {
-        return vec![ScraperReturn::Nothing];
-    }
-
-    vec![ScraperReturn::Data(shared_types::ScraperObject {
-        files,
-        jobs,
-        tags,
-    })]
+    shared_types::helpers::finalize(files, tags, jobs)
 }
 
 fn build_url(params: &[shared_types::ScraperParam], page_num: u64) -> Option<String> {

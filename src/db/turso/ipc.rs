@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use shared_types::helpers::collect_namespaces;
 use shared_types::{
     DbJobsObj, DbSettingsObj, FileAction, FileInternal, FileTagAction, GenericNamespaceObj,
     PluginJob, SearchObj, Tag, TagParents, TagSearch,
@@ -260,20 +261,7 @@ impl TursoDatabase {
         // namespace runs the partition DDL, which must run outside the write
         // transaction below. Ensure namespaces up front so the write
         // transaction stays DML-only.
-        let namespace_set: HashSet<GenericNamespaceObj> = tag
-            .iter()
-            .flat_map(|action| action.tags.iter())
-            .flat_map(|plugin_tag| {
-                let mut nss = vec![plugin_tag.tag.namespace.clone()];
-                if let Some(relation) = &plugin_tag.relates_to {
-                    nss.push(relation.tag.namespace.clone());
-                    if let Some(limit) = &relation.limit_to {
-                        nss.push(limit.namespace.clone());
-                    }
-                }
-                nss
-            })
-            .collect();
+        let namespace_set = collect_namespaces(tag);
         if let Err(error) = self.namespace_ensure_set(&namespace_set).await {
             log::error!("Failed to pre-ensure namespaces for file {file_id}: {error}");
             return false;
@@ -384,21 +372,13 @@ impl TursoDatabase {
 
         // Ensure all referenced namespaces exist (see put_tags_to_file) so
         // the transaction below stays DML-only.
-        let namespace_set: HashSet<GenericNamespaceObj> = tags_by_file
-            .values()
-            .flatten()
-            .flat_map(|action| action.tags.iter())
-            .flat_map(|plugin_tag| {
-                let mut nss = vec![plugin_tag.tag.namespace.clone()];
-                if let Some(relation) = &plugin_tag.relates_to {
-                    nss.push(relation.tag.namespace.clone());
-                    if let Some(limit) = &relation.limit_to {
-                        nss.push(limit.namespace.clone());
-                    }
-                }
-                nss
-            })
-            .collect();
+        let namespace_set = collect_namespaces(
+            &tags_by_file
+                .values()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
         if let Err(error) = self.namespace_ensure_set(&namespace_set).await {
             log::error!("Failed to pre-ensure namespaces for bulk tag add: {error}");
             return false;

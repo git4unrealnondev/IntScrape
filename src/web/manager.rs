@@ -1121,25 +1121,14 @@ impl Scraper {
             // from the job params have to be attached here or gated files
             // (e.g. registered-users-only submissions) will fail.
             let mut request = self.file_client.get(url.clone());
-            // Deduped by cookie name (last wins): jobs persisted before
-            // login params stopped being written to the DB may carry the
-            // same cookie many times over.
-            let mut cookies: Vec<(String, String)> = Vec::new();
-            for p in &self.job.config.param {
-                if let ScraperParam::Login(LoginType::Cookie(name, Some(value))) = p {
-                    if let Some(existing) = cookies.iter_mut().find(|(n, _)| n == name) {
-                        existing.1 = value.clone();
-                    } else {
-                        cookies.push((name.clone(), value.clone()));
-                    }
-                }
-            }
-            let cookies: Vec<String> = cookies
-                .iter()
-                .map(|(name, value)| format!("{name}={value}"))
-                .collect();
-            if !cookies.is_empty() {
-                request = request.header(reqwest::header::COOKIE, cookies.join("; "));
+            // Shared helper dedupes by cookie name (last wins), so jobs
+            // persisted before login params stopped being written to the
+            // DB — which may carry the same cookie many times over — still
+            // send one copy of each.
+            if let Some(cookie) =
+                shared_types::helpers::cookie_header_from_params(&self.job.config.param)
+            {
+                request = request.header(reqwest::header::COOKIE, cookie);
             }
 
             let mut response = match request.send().await {
