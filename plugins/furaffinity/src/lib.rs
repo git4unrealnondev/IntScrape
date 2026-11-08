@@ -152,31 +152,72 @@ fn job_for(
 /// already attached to the incoming URL). The downloader skips raw
 /// `ScraperParam::Login` params, so cookies have to travel as local
 /// modifiers on the URL itself or they are never sent.
+///
+/// Cookies are deduplicated by name (last value wins). Without this, every
+/// DB round-trip — where the manager re-injects the stored `a`/`b` logins on
+/// top of a URL that already carries them as a `Cookie` header — appends
+/// another copy of the pair. The header grows without bound until the site
+/// rejects it with `400 Bad Request` for an oversized header, and the failed
+/// job is kept for the next boot, so it grows again. Deduping by name also
+/// heals jobs already stored with a bloated header.
 fn cookie_modifiers(scraperdata: &shared_types::ScraperDataReturn) -> Vec<TargetModifier> {
-    let mut cookies: Vec<String> = Vec::new();
+    // (name, value) in first-seen order; a later occurrence of the same
+    // name replaces the value in place.
+    let mut cookies: Vec<(String, String)> = Vec::new();
+    let push_cookie = |cookies: &mut Vec<(String, String)>, pair: &str| {
+        let pair = pair.trim();
+        let Some((name, value)) = pair.split_once('=') else {
+            return;
+        };
+        let name = name.trim().to_string();
+        let value = value.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        if let Some(existing) = cookies.iter_mut().find(|(n, _)| *n == name) {
+            existing.1 = value;
+        } else {
+            cookies.push((name, value));
+        }
+    };
+    let push_header = |cookies: &mut Vec<(String, String)>, header: &str| {
+        for pair in header.split(';') {
+            push_cookie(cookies, pair);
+        }
+    };
+
+    // URL-carried cookies first, then login params, so fresh values from the
+    // settings store win over anything already baked into a stored job.
     for param in &scraperdata.job.param {
-        match param {
-            ScraperParam::Login(LoginType::Cookie(name, Some(value))) => {
-                cookies.push(format!("{name}={value}"));
-            }
-            ScraperParam::Url(url) => {
-                for m in &url.local_modifiers {
-                    if let DownloadModifiers::Header((k, v)) = &m.modifier
-                        && k == "Cookie"
-                    {
-                        cookies.push(v.clone());
+        if let ScraperParam::Url(url) = param {
+            for m in &url.local_modifiers {
+                match &m.modifier {
+                    DownloadModifiers::Header((k, v)) if k == "Cookie" => {
+                        push_header(&mut cookies, v)
                     }
+                    DownloadModifiers::Cookie((_, v)) => push_header(&mut cookies, v),
+                    _ => {}
                 }
             }
-            _ => {}
         }
     }
+    for param in &scraperdata.job.param {
+        if let ScraperParam::Login(LoginType::Cookie(name, Some(value))) = param {
+            push_cookie(&mut cookies, &format!("{name}={value}"));
+        }
+    }
+
     if cookies.is_empty() {
         Vec::new()
     } else {
+        let header = cookies
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
         vec![TargetModifier {
             target: ModifierTarget::Text,
-            modifier: DownloadModifiers::Header(("Cookie".into(), cookies.join("; "))),
+            modifier: DownloadModifiers::Header(("Cookie".into(), header)),
         }]
     }
 }
@@ -666,39 +707,81 @@ fn parse_submission_page(
     finalize(HashSet::from([file]), tags, HashSet::new())
 }
 
+/// FA renders a preview thumbnail rather than the file itself for
+/// non-image submissions (stories, music, ...). The preview is named
+/// `<id>.thumbnail.<filename>.<ext>.gif` on `d.furaffinity.net`, so it
+/// looks like a plausible file URL but is just a gif preview of e.g. an
+/// `.rtf` story. It must never be treated as the submission file.
+fn is_thumbnail(url: &str) -> bool {
+    url.contains(".thumbnail.")
+}
+
+/// Reconstructs the full-file URL from a preview thumbnail URL, if
+/// possible: drop the `.thumbnail.` marker and the preview's trailing
+/// `.gif`, and switch the serving path from `/art/` to `/download/art/`
+/// (the same prefix the site's own Download button uses).
+/// e.g. `…/art/u/stories/1723752310/1723752148.thumbnail.u_file.rtf.gif`
+///   -> `…/download/art/u/stories/1723752310/1723752148.u_file.rtf`
+fn full_url_from_thumbnail(thumbnail: &str) -> Option<String> {
+    let full = abs_url(thumbnail);
+    let (head, rest) = full.split_once(".thumbnail.")?;
+    let full = format!("{head}.{rest}");
+    let full = full
+        .strip_suffix(".gif")
+        .map_or_else(|| full.clone(), ToOwned::to_owned);
+    Some(full.replacen("/art/", "/download/art/", 1))
+}
+
 fn submission_image_url(document: &Html, submission_id: &str) -> Option<String> {
-    // 1. Full-resolution source on the main image.
+    // A thumbnail URL found on the main image, kept as a fallback: it can
+    // be turned back into the full-file URL if nothing better exists.
+    let mut thumbnail = None;
+
+    // 1. Full-resolution source on the main image (skipping previews).
     if let Ok(sel) = Selector::parse("#submissionImg")
         && let Some(elem) = document.select(&sel).next()
     {
-        if let Some(src) = elem.value().attr("data-fullview-src") {
-            return Some(abs_url(src));
-        }
-        if let Some(src) = elem.value().attr("src")
-            && src.contains("d.furaffinity.net")
-        {
-            return Some(abs_url(src));
+        for attr in ["data-fullview-src", "src"] {
+            if let Some(src) = elem.value().attr(attr)
+                && (attr == "data-fullview-src" || src.contains("d.furaffinity.net"))
+            {
+                if is_thumbnail(src) {
+                    thumbnail = thumbnail.or(Some(src.to_string()));
+                } else {
+                    return Some(abs_url(src));
+                }
+            }
         }
     }
 
-    // 2. The Download button points straight at the full file.
+    // 2. The Download button points straight at the full file. It must be
+    // checked before any thumbnail is used: for stories the main image is
+    // only the `.thumbnail.*.gif` preview.
     if let Ok(sel) = Selector::parse(".submission-controls-upper a[href*=\"d.furaffinity.net\"]")
         && let Some(href) = document
             .select(&sel)
             .next()
             .and_then(|e| e.value().attr("href"))
+        && !is_thumbnail(href)
     {
         return Some(abs_url(href));
     }
 
-    // 3. Last resort: og:image (thumbnail, but better than nothing).
+    // 3. No download link: derive the full file from the preview thumbnail.
+    if let Some(thumb) = thumbnail
+        && let Some(full) = full_url_from_thumbnail(&thumb)
+    {
+        return Some(full);
+    }
+
+    // 4. Last resort: og:image (thumbnail, but better than nothing).
     // Must reference this submission, or it is a site banner (e.g. the
     // login-blocked page's generic image).
     Selector::parse("meta[property='og:image']")
         .ok()
         .and_then(|s| document.select(&s).next())
         .and_then(|e| e.value().attr("content"))
-        .filter(|c| c.contains(submission_id))
+        .filter(|c| c.contains(submission_id) && !is_thumbnail(c))
         .map(abs_url)
 }
 
@@ -990,6 +1073,58 @@ mod tests {
     }
 
     #[test]
+    fn story_submission_uses_download_url_not_thumbnail() {
+        // /view/57767297/ is a story: #submissionImg is only the
+        // `.thumbnail.*.gif` preview, and the real file is behind the
+        // Download button's `/download/art/…/*.rtf` URL.
+        let html = r#"<html><head>
+          <meta name="twitter:data2" content="Mature" />
+        </head><body>
+          <img id="submissionImg"
+               src="//d.furaffinity.net/art/viciouscabaret/stories/1723752310/1723752148.thumbnail.viciouscabaret_dragon_heart_ch_1.rtf.gif" />
+          <div class="submission-controls-upper">
+            <a href="https://d.furaffinity.net/download/art/viciouscabaret/stories/1723752310/1723752148.viciouscabaret_dragon_heart_ch_1.rtf">Download</a>
+          </div>
+          <div class="submission-description-artist"><div class="submission-title"><h2>Story</h2></div></div>
+        </body></html>"#;
+        let out = parser_call(html, "https://www.furaffinity.net/view/57767297/", &data());
+        let ScraperReturn::Data(obj) = &out[0] else {
+            panic!("expected Data, got {:?}", out[0])
+        };
+        let file = obj.files.iter().next().unwrap();
+        let FileSource::Url(url) = file.source.as_ref().unwrap() else {
+            panic!("expected URL source")
+        };
+        assert_eq!(
+            url,
+            "https://d.furaffinity.net/download/art/viciouscabaret/stories/1723752310/1723752148.viciouscabaret_dragon_heart_ch_1.rtf"
+        );
+    }
+
+    #[test]
+    fn story_submission_derives_download_url_from_thumbnail() {
+        // No Download button present: the full file is reconstructed from
+        // the thumbnail preview instead of downloading the `.gif` preview.
+        let html = r#"<html><body>
+          <img id="submissionImg"
+               src="//d.furaffinity.net/art/viciouscabaret/stories/1723752310/1723752148.thumbnail.viciouscabaret_dragon_heart_ch_1.rtf.gif" />
+          <div class="submission-description-artist"><div class="submission-title"><h2>Story</h2></div></div>
+        </body></html>"#;
+        let out = parser_call(html, "https://www.furaffinity.net/view/57767297/", &data());
+        let ScraperReturn::Data(obj) = &out[0] else {
+            panic!("expected Data, got {:?}", out[0])
+        };
+        let file = obj.files.iter().next().unwrap();
+        let FileSource::Url(url) = file.source.as_ref().unwrap() else {
+            panic!("expected URL source")
+        };
+        assert_eq!(
+            url,
+            "https://d.furaffinity.net/download/art/viciouscabaret/stories/1723752310/1723752148.viciouscabaret_dragon_heart_ch_1.rtf"
+        );
+    }
+
+    #[test]
     fn parse_submission_includes_prefixed_tags() {
         // Real markup from https://www.furaffinity.net/view/66885588/ :
         // category/theme/species/user appear as data-tag-name anchors with
@@ -1211,6 +1346,43 @@ mod tests {
         assert_eq!(v, "a=AVAL; b=BVAL");
         // Raw Login params are not forwarded (the downloader skips them).
         assert_eq!(out[0].job.param.len(), 1);
+    }
+
+    #[test]
+    fn cookie_modifiers_dedupes_bloated_header() {
+        // Regression: jobs stored after repeated boots carried the same
+        // cookie pair dozens of times (the manager re-injects the logins on
+        // top of the stored header), and FA answered 400 for the oversized
+        // header. The header must collapse to one `a` and one `b`.
+        let bloated = vec!["a=AVAL; b=BVAL"; 150].join("; ");
+        let entry = ScraperDataReturn {
+            job: PluginJob {
+                site: "furaffinity".into(),
+                param: vec![
+                    ScraperParam::Url(shared_types::Url {
+                        url: "https://www.furaffinity.net/view/59546883/".into(),
+                        local_modifiers: vec![TargetModifier {
+                            target: ModifierTarget::Text,
+                            modifier: DownloadModifiers::Header(("Cookie".into(), bloated)),
+                        }],
+                    }),
+                    ScraperParam::Login(LoginType::Cookie("a".into(), Some("AVAL".into()))),
+                    ScraperParam::Login(LoginType::Cookie("a".into(), Some("AVAL".into()))),
+                    ScraperParam::Login(LoginType::Cookie("b".into(), Some("BVAL".into()))),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let out = url_dump(&entry);
+        assert_eq!(out.len(), 1);
+        let ScraperParam::Url(url) = &out[0].job.param[0] else {
+            panic!("expected Url param")
+        };
+        let DownloadModifiers::Header((_, v)) = &url.local_modifiers[0].modifier else {
+            panic!("expected Cookie header modifier")
+        };
+        assert_eq!(v, "a=AVAL; b=BVAL");
     }
 
     #[test]

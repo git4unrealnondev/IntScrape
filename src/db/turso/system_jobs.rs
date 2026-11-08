@@ -1,10 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+
+use walkdir::WalkDir;
 
 use bytes::Bytes;
 use rayon::prelude::*;
+use turso::Connection;
 use shared_types::{
     DEFAULT_PRIORITY, DbJobRecreation, DbJobsObj, FileInternal, HashesSupported, PluginJob,
     ScraperParam, Url,
@@ -33,6 +36,22 @@ const SOURCE_URL_NAMESPACE: &str = "source_url";
 /// each. The page loop is cheap (an indexed keyset range scan per page), and
 /// the real cost of the walk is the filesystem probe per file either way.
 const REDOWNLOAD_SCAN_PAGE: usize = 512;
+
+/// Files per database round trip for the storage check. Each chunk costs one
+/// batched filename lookup (plus one more for the files that need hashing),
+/// so this is the unit the whole walk is metered in.
+const STORAGE_CHECK_BATCH: usize = 1000;
+
+/// Outcome of one storage-check (cleanup) run.
+#[derive(Default, Debug)]
+pub(crate) struct StorageCheckSummary {
+    checked: usize,
+    already_correct: usize,
+    moved_to_correct_place: usize,
+    hashed: usize,
+    dumpstered: usize,
+    failures: usize,
+}
 
 impl TursoDatabase {
     pub async fn run_system_job(&self, job: &DbJobsObj) -> bool {
@@ -129,51 +148,250 @@ impl TursoDatabase {
         }
     }
 
-    /// Dispatches the `SYSTEM_STORAGE_CHECK_SITE` family by its mode param.
+    /// Dispatches the `SYSTEM_STORAGE_CHECK_SITE` family by its mode param:
     ///
-    /// Only `redownload` is implemented on this backend. The other two modes
-    /// (`StorageCheck` / `StorageCheckFileName`) are CLI-reachable but have no
-    /// turso implementation, so they log rather than silently reporting success.
+    /// - `redownload` — queue recovery jobs for DB files missing from disk.
+    /// - `filename` — cleanup pass that trusts file names only (stored files
+    ///   are named by their SHA-512): known files are moved into place,
+    ///   everything else goes to the dumpster without ever hashing content.
+    /// - default (no param) — cleanup pass that first tries the file name,
+    ///   then hashes whatever the name could not resolve.
     async fn run_storage_check_job(&self, job: &DbJobsObj) -> bool {
         let mode = match job.config.param.first() {
             Some(ScraperParam::Normal(mode)) => mode.clone(),
             _ => String::new(),
         };
 
-        if mode != SYSTEM_STORAGE_CHECK_REDOWNLOAD_MODE {
-            let described = if mode.is_empty() {
-                "<default>".to_string()
-            } else {
-                mode.clone()
-            };
-            log::warn!(
-                "Storage-check system job {} mode {described} is not implemented on the turso \
-                 backend; only '{SYSTEM_STORAGE_CHECK_REDOWNLOAD_MODE}' is. \
-                 ('{SYSTEM_STORAGE_CHECK_FILENAME_MODE}' and the default StorageCheck mode are \
-                 still no-ops.)",
-                job.id,
-            );
-            return false;
-        }
-
-        match self.redownload_missing_files().await {
-            Ok(summary) => {
-                log::info!(
-                    "Redownload system job {} queued {} recovery job(s): {} missing file(s), \
-                     {} without a source URL, {} with no plugin for their URL",
-                    job.id,
-                    summary.queued_jobs,
-                    summary.missing_files,
-                    summary.no_source_url,
-                    summary.no_plugin,
-                );
-                true
+        match mode.as_str() {
+            SYSTEM_STORAGE_CHECK_REDOWNLOAD_MODE => {
+                match self.redownload_missing_files().await {
+                    Ok(summary) => {
+                        log::info!(
+                            "Redownload system job {} queued {} recovery job(s): {} missing file(s), \
+                             {} without a source URL, {} with no plugin for their URL",
+                            job.id,
+                            summary.queued_jobs,
+                            summary.missing_files,
+                            summary.no_source_url,
+                            summary.no_plugin,
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        log::error!("Redownload system job {} failed: {error}", job.id);
+                        false
+                    }
+                }
             }
-            Err(error) => {
-                log::error!("Redownload system job {} failed: {error}", job.id);
+            SYSTEM_STORAGE_CHECK_FILENAME_MODE => self.run_cleanup_job(job, true).await,
+            "" => self.run_cleanup_job(job, false).await,
+            other => {
+                log::warn!(
+                    "Storage-check system job {} has unknown mode {other:?}; ignoring",
+                    job.id,
+                );
                 false
             }
         }
+    }
+
+    async fn run_cleanup_job(&self, job: &DbJobsObj, filename_only: bool) -> bool {
+        match self.storage_check_files(filename_only).await {
+            Ok(_) => true,
+            Err(error) => {
+                log::error!("Storage check system job {} failed: {error}", job.id);
+                false
+            }
+        }
+    }
+
+    /// Cleanup pass over every storage root: files the database knows are
+    /// moved to their correct partitioned place if they are misplaced, and
+    /// files the database does not know are moved into the dumpster (the
+    /// `dumpster` directory next to the default storage location, preserving
+    /// each file's path relative to its storage root).
+    ///
+    /// Stored files are named by their SHA-512, so each file is first checked
+    /// by name — one batched DB lookup per chunk and no hashing at all for
+    /// the (overwhelmingly common) healthy case. Only files the name cannot
+    /// resolve are hashed, and only in `filename_only` mode are they hashed
+    /// never at all: they go straight to the dumpster.
+    pub(crate) async fn storage_check_files(
+        &self,
+        filename_only: bool,
+    ) -> Result<StorageCheckSummary, Box<dyn Error + Send + Sync>> {
+        let conn = self.connect()?;
+        let storage = self.file_storage_get_all(&conn).await?;
+        if storage.is_empty() {
+            log::warn!("Storage check found no storage locations recorded; nothing to check");
+            return Ok(StorageCheckSummary::default());
+        }
+        let (default_base, _) = self.file_download_location_get(&conn).await?;
+        let dumpster_root = default_base.with_file_name("dumpster");
+
+        // Deterministic root order for reproducible walks/logs.
+        let mut roots: Vec<(u64, String)> = storage.into_iter().collect();
+        roots.sort_unstable();
+        let storage_map: HashMap<u64, String> = roots.iter().cloned().collect();
+
+        let mut summary = StorageCheckSummary::default();
+        for (_, root) in &roots {
+            if self.should_exit() {
+                break;
+            }
+            let root_path = Path::new(root);
+            // Skip the dumpster subtree when it happens to live inside the
+            // root being walked, or already-dumped files would be re-dumped.
+            let mut paths: Vec<PathBuf> = WalkDir::new(root_path)
+                .into_iter()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_type().is_file())
+                .map(|entry| entry.path().to_path_buf())
+                .filter(|path| !path.starts_with(&dumpster_root))
+                .collect();
+            paths.sort();
+
+            for chunk in paths.chunks(STORAGE_CHECK_BATCH) {
+                if self.should_exit() {
+                    break;
+                }
+                summary.checked += chunk.len();
+                self.storage_check_chunk(
+                    &conn,
+                    &storage_map,
+                    root_path,
+                    chunk,
+                    filename_only,
+                    &dumpster_root,
+                    &mut summary,
+                )
+                .await?;
+            }
+        }
+
+        log::info!(
+            "Storage check finished: {} checked, {} already correct, {} moved into place, \
+             {} hashed, {} to dumpster, {} failure(s).",
+            summary.checked,
+            summary.already_correct,
+            summary.moved_to_correct_place,
+            summary.hashed,
+            summary.dumpstered,
+            summary.failures,
+        );
+        Ok(summary)
+    }
+
+    async fn storage_check_chunk(
+        &self,
+        conn: &Connection,
+        storage_map: &HashMap<u64, String>,
+        root: &Path,
+        paths: &[PathBuf],
+        filename_only: bool,
+        dumpster_root: &Path,
+        summary: &mut StorageCheckSummary,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        // 1. Filename quick check: one batched lookup for the whole chunk.
+        let stems: Vec<String> = paths
+            .iter()
+            .filter_map(|path| sha512_filename_stem(path))
+            .collect();
+        let by_hash = if stems.is_empty() {
+            HashMap::new()
+        } else {
+            self.lookup_files_by_hash(conn, &stems).await?
+        };
+
+        let mut to_hash: Vec<&PathBuf> = Vec::new();
+        for path in paths {
+            match sha512_filename_stem(path).and_then(|stem| by_hash.get(&stem)) {
+                Some(file) => {
+                    let file = file.clone();
+                    if storage_check_move_to_expected(path, storage_map, &file, filename_only) {
+                        summary.moved_to_correct_place += 1;
+                    } else {
+                        summary.already_correct += 1;
+                    }
+                }
+                None if filename_only => {
+                    if move_to_dumpster(path, root, dumpster_root) {
+                        summary.dumpstered += 1;
+                    } else {
+                        summary.failures += 1;
+                    }
+                }
+                None => to_hash.push(path),
+            }
+        }
+
+        if to_hash.is_empty() {
+            return Ok(());
+        }
+
+        // 2. Hash fallback: hash whatever the name could not resolve, then
+        // batch-lookup the computed hashes the same way.
+        let mut computed: Vec<(&PathBuf, String)> = Vec::new();
+        for path in to_hash {
+            match crate::web::manager::hash_file_sha512(path) {
+                Ok(hash) => {
+                    summary.hashed += 1;
+                    computed.push((path, hash));
+                }
+                Err(error) => {
+                    log::error!(
+                        "Storage check could not hash {}: {error}",
+                        path.display()
+                    );
+                    summary.failures += 1;
+                }
+            }
+        }
+        if computed.is_empty() {
+            return Ok(());
+        }
+        let hashes: Vec<String> = computed.iter().map(|(_, hash)| hash.clone()).collect();
+        let found = self.lookup_files_by_hash(conn, &hashes).await?;
+        for (path, hash) in &computed {
+            match found.get(hash) {
+                Some(file) => {
+                    let file = file.clone();
+                    if storage_check_move_to_expected(path, storage_map, &file, filename_only) {
+                        summary.moved_to_correct_place += 1;
+                    } else {
+                        summary.already_correct += 1;
+                    }
+                }
+                None => {
+                    if move_to_dumpster(path, root, dumpster_root) {
+                        summary.dumpstered += 1;
+                    } else {
+                        summary.failures += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Batched file lookup by SHA-512 digest: primary `File.hash` first,
+    /// then the `SHA512` identifying hash in `FileHashes` for files whose
+    /// primary hash is something else (e.g. slurp-imported rows).
+    async fn lookup_files_by_hash(
+        &self,
+        conn: &Connection,
+        hashes: &[String],
+    ) -> Result<HashMap<String, FileInternal>, Box<dyn Error + Send + Sync>> {
+        let mut out = self.files_get_by_hash(conn, hashes).await?;
+        let keys: Vec<(String, String)> = hashes
+            .iter()
+            .map(|hash| ("SHA512".to_string(), hash.clone()))
+            .collect();
+        for ((_, digest), file) in self.hashes_files_get(conn, &keys).await? {
+            out.entry(digest).or_insert(file);
+        }
+        Ok(out)
     }
 
     /// Queues a plugin scrape job for every file recorded in the database whose
@@ -194,7 +412,7 @@ impl TursoDatabase {
     /// the current second, so a repeated run inserts fresh rows. That matches
     /// the legacy backend's behaviour; suppressing them would need a query the
     /// "no custom SQL" constraint rules out here.
-    async fn redownload_missing_files(
+    pub(crate) async fn redownload_missing_files(
         &self,
     ) -> Result<RedownloadSummary, Box<dyn Error + Send + Sync>> {
         let conn = self.connect()?;
@@ -534,7 +752,7 @@ impl TursoDatabase {
 /// millions of rows, and `agents.md` requires per-item logging to stay out of
 /// these paths.
 #[derive(Default)]
-struct RedownloadSummary {
+pub(crate) struct RedownloadSummary {
     missing_files: u64,
     queued_jobs: u64,
     no_source_url: u64,
@@ -555,6 +773,108 @@ fn file_present_in_storage(file: &FileInternal, roots: &HashMap<u64, String>) ->
     roots
         .values()
         .any(|root| super::file::file_on_disk(file, root).is_some())
+}
+
+/// The file-name stem if it looks like a SHA-512 digest (128 hex chars,
+/// normalised to the uppercase form stored files are named with). Anything
+/// else cannot be a stored file's name and skips the quick check.
+fn sha512_filename_stem(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    if stem.len() == 128 && stem.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(stem.to_ascii_uppercase())
+    } else {
+        None
+    }
+}
+
+/// Where a known file belongs on disk: its storage root, hash-partitioned
+/// exactly like `super::file::file_on_disk` resolves it. Returns `None` for
+/// rows whose hash is too short to partition (legacy short hashes).
+fn expected_storage_path(base: &Path, file: &FileInternal) -> Option<PathBuf> {
+    if file.hash.len() <= 6 {
+        return None;
+    }
+    let mut path = base.to_path_buf();
+    path.push(&file.hash[0..2]);
+    path.push(&file.hash[2..4]);
+    path.push(&file.hash[4..6]);
+    path.push(&file.hash);
+    Some(path.with_added_extension(&file.extension))
+}
+
+/// Moves a file to its correct place if it is misplaced. Returns whether a
+/// move happened; a file already in place (or whose target exists) reports
+/// `false`. Copy-then-remove like the legacy backend, so it works across
+/// filesystems; the target is never overwritten.
+fn storage_check_move_to_expected(
+    path: &Path,
+    storage_map: &HashMap<u64, String>,
+    file: &FileInternal,
+    filename_only: bool,
+) -> bool {
+    let Some(base) = storage_map.get(&file.storage_id) else {
+        log::warn!(
+            "Storage check: no storage root recorded for file {}, leaving {} in place",
+            file.hash,
+            path.display()
+        );
+        return false;
+    };
+    let base = Path::new(base);
+    let target = if filename_only {
+        // The legacy filename mode kept the original file name.
+        if file.hash.len() <= 6 {
+            return false;
+        }
+        let Some(file_name) = path.file_name() else {
+            return false;
+        };
+        base.join(&file.hash[0..2])
+            .join(&file.hash[2..4])
+            .join(&file.hash[4..6])
+            .join(file_name)
+    } else {
+        let Some(target) = expected_storage_path(base, file) else {
+            return false;
+        };
+        target
+    };
+    move_file_to(path, &target)
+}
+
+/// Moves a file the database does not know into the dumpster, preserving
+/// its path relative to its storage root so files from different roots (or
+/// with colliding names) cannot clobber each other.
+fn move_to_dumpster(path: &Path, root: &Path, dumpster_root: &Path) -> bool {
+    let relative = path
+        .strip_prefix(root)
+        .unwrap_or_else(|_| path.file_name().map(Path::new).unwrap_or(path));
+    move_file_to(path, &dumpster_root.join(relative))
+}
+
+/// Copy-then-remove move that never overwrites an existing target.
+/// Returns whether the file was moved.
+fn move_file_to(path: &Path, target: &Path) -> bool {
+    if path == target || !path.exists() || target.exists() {
+        return false;
+    }
+    let Some(parent) = target.parent() else {
+        return false;
+    };
+    if std::fs::create_dir_all(parent).is_ok()
+        && std::fs::copy(path, target).is_ok()
+        && std::fs::remove_file(path).is_ok()
+    {
+        log::info!("Moved file: {} to: {}", path.display(), target.display());
+        true
+    } else {
+        log::error!(
+            "Storage check failed to move {} to {}",
+            path.display(),
+            target.display()
+        );
+        false
+    }
 }
 
 /// Builds the recovery job for one missing file.
@@ -908,22 +1228,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn redownload_job_dispatch_only_implements_the_redownload_mode() {
+    async fn storage_check_job_dispatch_implements_all_modes() {
         let (db, _temp_dir) = new_test_db_with_empty_plugins().await;
 
-        // The CLI can enqueue these, and they have no turso implementation, so
-        // they must report failure rather than silently completing as a no-op.
+        // A fresh DB has no storage locations, so every mode succeeds
+        // trivially (nothing to check / nothing missing).
         assert!(
-            !db.run_storage_check_job(&storage_check_job(None)).await,
-            "the default StorageCheck mode is not implemented"
+            db.run_storage_check_job(&storage_check_job(None)).await,
+            "the default StorageCheck cleanup mode is implemented"
         );
         assert!(
-            !db.run_storage_check_job(&storage_check_job(Some(SYSTEM_STORAGE_CHECK_FILENAME_MODE)))
+            db.run_storage_check_job(&storage_check_job(Some(SYSTEM_STORAGE_CHECK_FILENAME_MODE)))
                 .await,
-            "the filename mode is not implemented"
+            "the filename cleanup mode is implemented"
         );
-        // The implemented mode must succeed (the library is empty, so it queues
-        // nothing) and must not be mistaken for the unimplemented ones.
         assert!(
             db.run_storage_check_job(&storage_check_job(Some(
                 SYSTEM_STORAGE_CHECK_REDOWNLOAD_MODE
@@ -931,5 +1249,149 @@ mod tests {
             .await,
             "the redownload mode is implemented and must report success"
         );
+        // An unknown mode must report failure rather than silently pass.
+        assert!(
+            !db.run_storage_check_job(&storage_check_job(Some("bogus"))).await,
+            "an unknown mode must not report success"
+        );
+    }
+
+    /// Registers a storage root in the DB and returns its id. Also makes it
+    /// the default storage location, so the dumpster lands next to it
+    /// (`<root>/../dumpster`) exactly like in production.
+    async fn register_storage(db: &TursoDatabase, root: &std::path::Path) -> u64 {
+        let conn = db.connect().unwrap();
+        assert!(
+            db.setting_set_sync(&shared_types::DbSettingsObj {
+                name: "SYSTEM_file_location".into(),
+                description: None,
+                num: None,
+                param: Some(root.to_string_lossy().into_owned()),
+            })
+            .await
+        );
+        db.file_storage_location_get_or_create(&conn, &root.to_string_lossy())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn storage_check_dumpsters_unknown_files() {
+        let (db, temp_dir) = new_test_db().await;
+        let root = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&root).unwrap();
+        register_storage(&db, &root).await;
+
+        // One orphan at the root, one nested (relative paths are preserved).
+        std::fs::write(root.join("orphan.png"), b"orphan").unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("deep.bin"), b"deep").unwrap();
+
+        let summary = db
+            .storage_check_files(false)
+            .await
+            .expect("storage check should succeed");
+
+        let dumpster = temp_dir.path().join("dumpster");
+        assert_eq!(summary.dumpstered, 2, "{summary:?}");
+        assert_eq!(
+            std::fs::read(dumpster.join("orphan.png")).unwrap(),
+            b"orphan"
+        );
+        assert_eq!(
+            std::fs::read(dumpster.join("sub").join("deep.bin")).unwrap(),
+            b"deep"
+        );
+        assert!(!root.join("orphan.png").exists());
+        assert!(!root.join("sub").join("deep.bin").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn storage_check_moves_misplaced_known_file_into_place() {
+        let (db, temp_dir) = new_test_db().await;
+        let root = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&root).unwrap();
+        let storage_id = register_storage(&db, &root).await;
+
+        // A known file (128-hex SHA-512 name, uppercase like stored files)
+        // sitting at the root instead of its partitioned place.
+        let hash = "AB".repeat(64);
+        let conn = db.connect().unwrap();
+        db.file_add_bulk(&conn, &[test_file(storage_id, &hash)])
+            .await
+            .unwrap();
+        let misplaced = root.join(format!("{hash}.jpg"));
+        std::fs::write(&misplaced, b"payload").unwrap();
+
+        let summary = db
+            .storage_check_files(false)
+            .await
+            .expect("storage check should succeed");
+
+        let expected = root
+            .join("AB")
+            .join("AB")
+            .join("AB")
+            .join(format!("{hash}.jpg"));
+        assert_eq!(summary.moved_to_correct_place, 1, "{summary:?}");
+        assert_eq!(std::fs::read(&expected).unwrap(), b"payload");
+        assert!(!misplaced.exists());
+        assert!(
+            !temp_dir.path().join("dumpster").exists(),
+            "a known file must never be dumped"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn storage_check_leaves_correctly_placed_file_alone() {
+        let (db, temp_dir) = new_test_db().await;
+        let root = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&root).unwrap();
+        let storage_id = register_storage(&db, &root).await;
+
+        let hash = "CD".repeat(64);
+        let conn = db.connect().unwrap();
+        let file = test_file(storage_id, &hash);
+        db.file_add_bulk(&conn, &[file.clone()]).await.unwrap();
+        let placed = write_file_on_disk(&root, &file);
+
+        let summary = db
+            .storage_check_files(false)
+            .await
+            .expect("storage check should succeed");
+
+        assert_eq!(summary.checked, 1, "{summary:?}");
+        assert_eq!(summary.already_correct, 1, "{summary:?}");
+        assert_eq!(summary.dumpstered, 0, "{summary:?}");
+        assert!(placed.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn storage_check_filename_mode_trusts_names_only() {
+        let (db, temp_dir) = new_test_db().await;
+        let root = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&root).unwrap();
+        register_storage(&db, &root).await;
+
+        // A SHA-512-shaped name that is NOT in the DB, with content whose
+        // real hash is different. Filename mode must dumpster it without
+        // hashing (the name is all it trusts).
+        let fake_hash = "EF".repeat(64);
+        let named = root.join(format!("{fake_hash}.png"));
+        std::fs::write(&named, b"content hashing to something else").unwrap();
+
+        let summary = db
+            .storage_check_files(true)
+            .await
+            .expect("storage check should succeed");
+
+        assert_eq!(summary.hashed, 0, "filename mode must never hash");
+        assert_eq!(summary.dumpstered, 1, "{summary:?}");
+        let dumped = temp_dir.path().join("dumpster").join(format!("{fake_hash}.png"));
+        assert_eq!(
+            std::fs::read(dumped).unwrap(),
+            b"content hashing to something else"
+        );
+        assert!(!named.exists());
     }
 }

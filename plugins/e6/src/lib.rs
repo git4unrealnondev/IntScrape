@@ -1,10 +1,12 @@
 use std::{collections::HashSet, fmt};
 
 use shared_types::{
-    DEFAULT_PRIORITY, FileObject, FileSource, FileTagAction, GenericNamespaceObj, HashesSupported,
-    LoginNeed, LoginType, PluginJob, PluginProperties, PluginTag, RelationContext,
-    ScraperDataReturn, ScraperParam, ScraperReturn, SkipIf, Tag,
+    DEFAULT_PRIORITY, FileObject, FileSource, FileTagAction, GenericNamespaceObj, GlobalCallbacks,
+    HashesSupported, LoginNeed, LoginType, PluginJob, PluginProperties, PluginTag, RelationContext,
+    ScraperDataReturn, ScraperParam, ScraperReturn, SkipIf, StartupThreadType, Tag,
 };
+
+mod csv_import;
 
 pub enum Site {
     E6,
@@ -52,6 +54,12 @@ impl fmt::Display for Site {
 
 #[unsafe(no_mangle)]
 fn get_plugin_info() -> Vec<shared_types::Plugin> {
+    // Both entries declare the Start callback so `on_start` runs no matter
+    // which site the user actually uses; `csv_import::run` guards itself so
+    // the second invocation (one per entry) is a no-op. The CSV dump import
+    // itself is per-site: each site reads its own PLUGIN_<SITE>_CsvImport_*
+    // settings, so E621 and E6AI dumps can be enabled independently.
+    let csv_import_callbacks = vec![GlobalCallbacks::Start(StartupThreadType::Spawn)];
     vec![
         shared_types::Plugin {
             name: "E621".into(),
@@ -61,6 +69,7 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
                 PluginProperties::JobNum(5),
                 PluginProperties::Login((LoginNeed::Optional, LoginType::Api("Put API key first then username. Can find more info here: https://e621.net/api_keys".into(), None) ))
             ],
+            callbacks: csv_import_callbacks.clone(),
             ..Default::default()
         },
         shared_types::Plugin {
@@ -71,9 +80,16 @@ fn get_plugin_info() -> Vec<shared_types::Plugin> {
                 PluginProperties::Sites(vec!["e6ai".into(), "E6AI".into(), "e6ai.com".into()]),
                 PluginProperties::Login((LoginNeed::Optional, LoginType::Api("Put API key first then username.".into(), None) ))
             ],
+            callbacks: csv_import_callbacks,
             ..Default::default()
         },
     ]
+}
+
+/// Runs the (setting-gated, per-site) CSV dump import. See csv_import.rs.
+#[unsafe(no_mangle)]
+pub fn on_start() {
+    csv_import::run();
 }
 
 #[unsafe(no_mangle)]

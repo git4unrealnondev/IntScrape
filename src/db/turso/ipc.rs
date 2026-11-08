@@ -8,8 +8,8 @@
 use std::collections::{HashMap, HashSet};
 
 use shared_types::{
-    DbJobsObj, DbSettingsObj, FileInternal, FileTagAction, GenericNamespaceObj, PluginJob,
-    SearchObj, Tag, TagParents, TagSearch,
+    DbJobsObj, DbSettingsObj, FileAction, FileInternal, FileTagAction, GenericNamespaceObj,
+    PluginJob, SearchObj, Tag, TagParents, TagSearch,
 };
 
 use ipc_macro::export_ipc;
@@ -129,6 +129,38 @@ impl TursoDatabase {
         self.file_hashes_get(&conn, *file_id)
             .await
             .unwrap_or_default()
+    }
+
+    /// Resolves files by their secondary hashes in one bulk lookup, keyed by
+    /// `(algorithm, digest)`. Omits any hash that does not match a known file.
+    /// Used by bulk importers (e.g. the e6 CSV dump importer) that attach
+    /// data to already-downloaded files without re-downloading them.
+    /// Takes plain `(algorithm, digest)` pairs because `HashesSupported`
+    /// is not `Serialize` and cannot cross the IPC boundary.
+    #[ipc(name = "hashes_files_get_bulk", request = "HashesFilesGetBulk")]
+    pub async fn ipc_hashes_files_get_bulk(
+        &self,
+        hashes: &[(String, String)],
+    ) -> HashMap<(String, String), FileInternal> {
+        let Ok(conn) = self.db.connect() else {
+            return HashMap::new();
+        };
+        self.hashes_files_get(&conn, hashes).await.unwrap_or_default()
+    }
+
+    /// Bulk lookup of files by their primary `File.hash`, keyed by hash.
+    /// Complements `hashes_files_get_bulk` for databases whose files store
+    /// the looked-up digest as the primary hash itself (e.g. md5-primary
+    /// rows from older/slurped libraries) rather than only in `FileHashes`.
+    #[ipc(name = "files_get_by_hash", request = "FilesGetByHash")]
+    pub async fn ipc_files_get_by_hash(
+        &self,
+        hashes: &[String],
+    ) -> HashMap<String, FileInternal> {
+        let Ok(conn) = self.db.connect() else {
+            return HashMap::new();
+        };
+        self.files_get_by_hash(&conn, hashes).await.unwrap_or_default()
     }
 
     ///
@@ -786,6 +818,27 @@ impl TursoDatabase {
     pub async fn ipc_jobs_remove(&self, job: &DbJobsObj) -> bool {
         self.job_remove(job).await.is_ok()
     }
+
+    /// Imports one file from a server-side path into the library (copy /
+    /// move / hardlink per `action`), recording it in the DB. Returns an
+    /// empty string on success, otherwise a human-readable error message.
+    ///
+    #[ipc(name = "import_file", request = "ImportFile")]
+    pub async fn ipc_import_file(&self, path: &String, action: &FileAction) -> String {
+        self.import_file(std::path::Path::new(path), *action)
+            .await
+            .err()
+            .unwrap_or_default()
+    }
+
+    /// Runs one CLI command (the words one would type after `intscrape` in a
+    /// terminal) against this database, returning everything the command
+    /// prints. Failures come back as `error: ...` lines.
+    ///
+    #[ipc(name = "run_cli", request = "RunCli")]
+    pub async fn ipc_run_cli(&self, command: &String) -> String {
+        crate::cli::run_cli_command(self, command).await
+    }
 }
 
 #[cfg(test)]
@@ -885,6 +938,72 @@ mod tests {
         assert!(
             relationship_count >= 1,
             "expected the file/tag relationship to be persisted"
+        );
+    }
+
+    /// End-to-end through the IPC import entry point: copying imports the
+    /// file into storage and records it in the DB (findable by MD5), and
+    /// moving removes the source once stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn import_file_ipc_copies_and_moves() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = TursoDatabase::new_with_exit(
+            &temp_dir.path().join("test.db"),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        let storage_dir = temp_dir.path().join("storage");
+        assert!(
+            db.setting_set_sync(&shared_types::DbSettingsObj {
+                name: "SYSTEM_file_location".into(),
+                description: None,
+                num: None,
+                param: Some(storage_dir.to_string_lossy().into_owned()),
+            })
+            .await
+        );
+
+        let contents = b"ipc import test bytes";
+        let source = temp_dir.path().join("copyme.png");
+        std::fs::write(&source, contents).unwrap();
+        assert_eq!(
+            db.ipc_import_file(
+                &source.to_string_lossy().into_owned(),
+                &shared_types::FileAction::Copy,
+            )
+            .await,
+            ""
+        );
+        assert!(source.exists(), "copy should keep the source");
+
+        let md5 = format!("{:x}", md5::compute(contents.as_slice()));
+        let found = db
+            .hashes_files_get_sync(&[shared_types::HashesSupported::Md5(md5)])
+            .await;
+        let file = found
+            .get(&("MD5".to_string(), format!("{:x}", md5::compute(contents.as_slice()))))
+            .expect("imported file should resolve by md5");
+        assert!(file.id.is_some());
+        assert_eq!(file.extension, "png");
+
+        let mover = temp_dir.path().join("moveme.bin");
+        std::fs::write(&mover, b"move me").unwrap();
+        assert_eq!(
+            db.ipc_import_file(
+                &mover.to_string_lossy().into_owned(),
+                &shared_types::FileAction::Move,
+            )
+            .await,
+            ""
+        );
+        assert!(!mover.exists(), "move should remove the source");
+
+        let missing = db
+            .ipc_import_file(&"/definitely/missing".to_string(), &shared_types::FileAction::Copy)
+            .await;
+        assert!(
+            missing.contains("No such file"),
+            "missing file should report an error, got: {missing}"
         );
     }
 }

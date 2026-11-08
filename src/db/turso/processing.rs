@@ -175,7 +175,7 @@ impl TursoDatabase {
     /// writers far less. Retries use jittered exponential backoff (see
     /// `scraper_backoff`) and are capped so a pathological contention storm
     /// cannot spin on the shared tokio runtime forever.
-    async fn process_scraper_chunk_human(
+    pub(in crate::db::turso) async fn process_scraper_chunk_human(
         &self,
         map: HashMap<FileManager, Vec<FileTagAction>>,
     ) -> Result<bool> {

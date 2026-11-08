@@ -4,11 +4,11 @@
 //! re-pointed at turso without a shared-type change.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use shared_types::{
-    DbSettingsObj, FileInternal, FileTagAction, GenericNamespaceObj, HashesSupported, PluginJob,
-    Tag,
+    DbSettingsObj, FileAction, FileInternal, FileManager, FileTagAction, GenericNamespaceObj,
+    HashesSupported, PluginJob, Tag,
 };
 use turso::Result;
 
@@ -140,6 +140,14 @@ impl TursoDatabase {
     }
 
     ///
+    /// The plugin manager the host loaded at startup, if any. Used by the
+    /// CLI runner (`tasks login`) and by system jobs.
+    ///
+    pub fn plugin_manager(&self) -> Option<std::sync::Arc<crate::plugins::PluginManager>> {
+        self.plugin_manager.read().clone()
+    }
+
+    ///
     /// Synchronous wrapper for `file_download_location_get_sync` — used from
     /// non-tokio threads (e.g. the Rayon file processing pool).
     ///
@@ -149,6 +157,109 @@ impl TursoDatabase {
         ext: &str,
     ) -> Option<(PathBuf, u64)> {
         block_on(self.file_download_location_get_sync(hash, ext))
+    }
+
+    ///
+    /// Imports one file from `path` into the library: hashes it, places it at
+    /// its storage location (copy / move / hardlink per `action`), then
+    /// records it in the DB exactly like a downloaded file (SHA-512 primary
+    /// hash plus MD5/SHA1/SHA256 identifying hashes, so hash-based dedupe
+    /// and lookups work). Re-importing the same file is idempotent.
+    ///
+    /// Returns `Err(message)` with a human-readable reason on failure.
+    ///
+    pub async fn import_file(
+        &self,
+        path: &Path,
+        action: FileAction,
+    ) -> std::result::Result<(), String> {
+        use std::fs::File;
+
+        let file = File::open(path).map_err(|error| error.to_string())?;
+        let size_bytes = file.metadata().map_err(|error| error.to_string())?.len();
+        if size_bytes == 0 {
+            return Err("empty file".into());
+        }
+
+        // Hash the whole file in memory (same approach as the CLI importer).
+        let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|error| error.to_string())? };
+        let bytes = bytes::Bytes::from(mmap.to_vec());
+        drop(mmap);
+
+        let hash = |kind: &HashesSupported| crate::web::manager::hash_bytes(&bytes, kind).0;
+        let md5 = hash(&HashesSupported::Md5(String::new()));
+        let sha1 = hash(&HashesSupported::Sha1(String::new()));
+        let sha256 = hash(&HashesSupported::Sha256(String::new()));
+        let sha512 = hash(&HashesSupported::Sha512(String::new()));
+
+        let extension = path
+            .extension()
+            .map(|ext| ext.to_string_lossy().into_owned())
+            .filter(|ext| !ext.is_empty())
+            .unwrap_or_else(|| "bin".to_string());
+
+        let Some((storage_path, storage_id)) = self
+            .file_download_location_get_sync(&sha512, &extension)
+            .await
+        else {
+            return Err("no file storage location configured".into());
+        };
+
+        // Place the file at its storage destination. A file that is already
+        // stored is left alone; the DB insert below is idempotent, so
+        // re-importing the same file is always safe.
+        let already_stored = storage_path.exists()
+            && std::fs::canonicalize(path).ok().as_deref() == std::fs::canonicalize(&storage_path).ok().as_deref();
+        if !already_stored {
+            if !storage_path.exists() {
+                let parent = storage_path
+                    .parent()
+                    .ok_or("storage path has no parent directory")?;
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                match action {
+                    FileAction::Copy => {
+                        std::fs::copy(path, &storage_path).map_err(|error| error.to_string())?;
+                    }
+                    FileAction::Move => {
+                        if std::fs::rename(path, &storage_path).is_err() {
+                            std::fs::copy(path, &storage_path)
+                                .map_err(|error| error.to_string())?;
+                            std::fs::remove_file(path).map_err(|error| error.to_string())?;
+                        }
+                    }
+                    FileAction::HardLink => {
+                        std::fs::hard_link(path, &storage_path)
+                            .map_err(|error| error.to_string())?;
+                    }
+                }
+            } else if matches!(action, FileAction::Move) {
+                // Already stored: a move still means the source goes away.
+                std::fs::remove_file(path).map_err(|error| error.to_string())?;
+            }
+        }
+
+        let file_manager = FileManager {
+            internal: FileInternal {
+                id: None,
+                hash: sha512.clone(),
+                extension,
+                storage_id,
+                size_bytes: Some(size_bytes),
+            },
+            identifying_hashes: vec![
+                HashesSupported::Md5(md5),
+                HashesSupported::Sha1(sha1),
+                HashesSupported::Sha256(sha256),
+                HashesSupported::Sha512(sha512),
+            ],
+        };
+        let mut map = HashMap::new();
+        map.insert(file_manager, Vec::new());
+        if !self.process_scraper_chunk_human(map).await.map_err(|error| error.to_string())? {
+            return Err("database failed to record the imported file".into());
+        }
+
+        Ok(())
     }
 
     ///
@@ -379,14 +490,33 @@ impl TursoDatabase {
     }
 
     ///
-    /// Legacy maintenance action from the SQLite backend. The turso backend has
-    /// no internal-file repair phase, so this is a no-op kept for CLI parity.
+    /// Legacy maintenance action, now backed by the storage-check system job
+    /// implementation: the cleanup modes walk storage and dumpster unknown
+    /// files, `Redownload` queues recovery jobs for files missing from disk,
+    /// and `Print` (list missing files) remains unsupported.
     ///
     pub fn fix_internal_files(
         &self,
-        _action: &crate::cli::cli_structs::CheckFilesEnum,
+        action: &crate::cli::cli_structs::CheckFilesEnum,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        log::warn!("fix_internal_files is not supported on the turso backend");
+        use crate::cli::cli_structs::CheckFilesEnum;
+        match action {
+            CheckFilesEnum::StorageCheck => {
+                block_on(self.storage_check_files(false))
+                    .map_err(|error| format!("storage check failed: {error}"))?;
+            }
+            CheckFilesEnum::StorageCheckFileName => {
+                block_on(self.storage_check_files(true))
+                    .map_err(|error| format!("storage check failed: {error}"))?;
+            }
+            CheckFilesEnum::Redownload => {
+                block_on(self.redownload_missing_files())
+                    .map_err(|error| format!("redownload check failed: {error}"))?;
+            }
+            CheckFilesEnum::Print => {
+                log::warn!("fix_internal_files Print (list missing files) is not supported");
+            }
+        }
         Ok(())
     }
 

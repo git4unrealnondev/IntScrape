@@ -8,6 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 chrono = "0.4.45"
+csv = "1.4"
 json = "0.12.4"
 shared_types = { workspace = true }
 client = { workspace = true }

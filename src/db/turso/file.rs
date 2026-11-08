@@ -134,6 +134,50 @@ impl TursoDatabase {
         Ok(out)
     }
 
+    /// Batched lookup of files by their primary `File.hash` (the SHA-512 of
+    /// their content for everything the downloader/importer wrote), keyed by
+    /// hash. Mirrors the existing-hash resolution inside `file_add_bulk`:
+    /// one `hash IN (...)` statement per `SQL_CHUNK_SIZE` chunk, so a whole
+    /// storage-check batch costs one indexed lookup instead of one per file.
+    pub(in crate::db::turso) async fn files_get_by_hash(
+        &self,
+        conn: &Connection,
+        hashes: &[String],
+    ) -> Result<HashMap<String, FileInternal>> {
+        let mut out = HashMap::new();
+        if hashes.is_empty() {
+            return Ok(out);
+        }
+
+        for chunk in hashes.chunks(SQL_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let params: Vec<Value> = chunk.iter().map(|hash| Value::from(hash.as_str())).collect();
+            let mut rows = conn
+                .query(
+                    format!(
+                        "SELECT id, hash, extension, storage_id, size_bytes
+                         FROM File WHERE hash IN ({placeholders});"
+                    ),
+                    params_from_iter(params),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                let file = FileInternal {
+                    id: Some(row.get(0)?),
+                    hash: row.get(1)?,
+                    extension: row.get(2)?,
+                    storage_id: row.get(3)?,
+                    size_bytes: row.get(4)?,
+                };
+                out.insert(file.hash.clone(), file);
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Gets up to `limit` file rows with `id` strictly greater than `after_id`,
     /// in ascending id order.
     ///

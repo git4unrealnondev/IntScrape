@@ -139,6 +139,53 @@ pub fn get_file_hashes_async(
 > {
     crate::init_data_request_async(crate::SupportedDBRequests::GetFileHashes(file_id))
 }
+/// Resolves files by their secondary hashes in one bulk lookup, keyed by
+/// `(algorithm, digest)`. Omits any hash that does not match a known file.
+/// Used by bulk importers (e.g. the e6 CSV dump importer) that attach
+/// data to already-downloaded files without re-downloading them.
+/// Takes plain `(algorithm, digest)` pairs because `HashesSupported`
+/// is not `Serialize` and cannot cross the IPC boundary.
+pub fn hashes_files_get_bulk(
+    hashes: Vec<(String, String)>,
+) -> Result<HashMap<(String, String), FileInternal>, Box<dyn std::error::Error>> {
+    crate::init_data_request(crate::SupportedDBRequests::HashesFilesGetBulk(hashes))
+}
+/// Resolves files by their secondary hashes in one bulk lookup, keyed by
+/// `(algorithm, digest)`. Omits any hash that does not match a known file.
+/// Used by bulk importers (e.g. the e6 CSV dump importer) that attach
+/// data to already-downloaded files without re-downloading them.
+/// Takes plain `(algorithm, digest)` pairs because `HashesSupported`
+/// is not `Serialize` and cannot cross the IPC boundary.
+pub fn hashes_files_get_bulk_async(
+    hashes: Vec<(String, String)>,
+) -> impl std::future::Future<
+    Output = Result<
+        HashMap<(String, String), FileInternal>,
+        Box<dyn std::error::Error + Send + Sync>,
+    >,
+> {
+    crate::init_data_request_async(crate::SupportedDBRequests::HashesFilesGetBulk(hashes))
+}
+/// Bulk lookup of files by their primary `File.hash`, keyed by hash.
+/// Complements `hashes_files_get_bulk` for databases whose files store
+/// the looked-up digest as the primary hash itself (e.g. md5-primary
+/// rows from older/slurped libraries) rather than only in `FileHashes`.
+pub fn files_get_by_hash(
+    hashes: Vec<String>,
+) -> Result<HashMap<String, FileInternal>, Box<dyn std::error::Error>> {
+    crate::init_data_request(crate::SupportedDBRequests::FilesGetByHash(hashes))
+}
+/// Bulk lookup of files by their primary `File.hash`, keyed by hash.
+/// Complements `hashes_files_get_bulk` for databases whose files store
+/// the looked-up digest as the primary hash itself (e.g. md5-primary
+/// rows from older/slurped libraries) rather than only in `FileHashes`.
+pub fn files_get_by_hash_async(
+    hashes: Vec<String>,
+) -> impl std::future::Future<
+    Output = Result<HashMap<String, FileInternal>, Box<dyn std::error::Error + Send + Sync>>,
+> {
+    crate::init_data_request_async(crate::SupportedDBRequests::FilesGetByHash(hashes))
+}
 ///
 /// Gets all tag ids assocated with a namespace id
 ///
@@ -732,6 +779,39 @@ pub fn jobs_remove_async(
     job: DbJobsObj,
 ) -> impl std::future::Future<Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>> {
     crate::init_data_request_async(crate::SupportedDBRequests::JobsRemove(job))
+}
+/// Imports one file from a server-side path into the library (copy /
+/// move / hardlink per `action`), recording it in the DB. Returns an
+/// empty string on success, otherwise a human-readable error message.
+///
+pub fn import_file(path: String, action: FileAction) -> Result<String, Box<dyn std::error::Error>> {
+    crate::init_data_request(crate::SupportedDBRequests::ImportFile(path, action))
+}
+/// Imports one file from a server-side path into the library (copy /
+/// move / hardlink per `action`), recording it in the DB. Returns an
+/// empty string on success, otherwise a human-readable error message.
+///
+pub fn import_file_async(
+    path: String,
+    action: FileAction,
+) -> impl std::future::Future<Output = Result<String, Box<dyn std::error::Error + Send + Sync>>> {
+    crate::init_data_request_async(crate::SupportedDBRequests::ImportFile(path, action))
+}
+/// Runs one CLI command (the words one would type after `intscrape` in a
+/// terminal) against this database, returning everything the command
+/// prints. Failures come back as `error: ...` lines.
+///
+pub fn run_cli(command: String) -> Result<String, Box<dyn std::error::Error>> {
+    crate::init_data_request(crate::SupportedDBRequests::RunCli(command))
+}
+/// Runs one CLI command (the words one would type after `intscrape` in a
+/// terminal) against this database, returning everything the command
+/// prints. Failures come back as `error: ...` lines.
+///
+pub fn run_cli_async(
+    command: String,
+) -> impl std::future::Future<Output = Result<String, Box<dyn std::error::Error + Send + Sync>>> {
+    crate::init_data_request_async(crate::SupportedDBRequests::RunCli(command))
 }
 /// Returns whether the host application is shutting down.
 ///

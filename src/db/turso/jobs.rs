@@ -7,6 +7,22 @@ use turso::{Connection, Error, Result, Row, Value, params_from_iter};
 use crate::db::{SQL_CHUNK_SIZE, turso::TursoDatabase};
 use crate::helper_functions::get_sys_time_in_secs;
 
+/// Params safe to write to the `Jobs` table.
+///
+/// `ScraperParam::Login` entries are runtime-injected from the settings
+/// store at dispatch time (`DownloadManager::load_logins`); they are not
+/// part of a job's identity. Persisting them meant every retry/recreation
+/// update wrote the injected cookies back to the DB, where the next boot
+/// injected another copy on top — cookie headers grew without bound until
+/// the site rejected the oversized header with `400`.
+fn persistable_params(params: &[ScraperParam]) -> Vec<ScraperParam> {
+    params
+        .iter()
+        .filter(|p| !matches!(p, ScraperParam::Login(_)))
+        .cloned()
+        .collect()
+}
+
 impl TursoDatabase {
     /// Updates an existing job row.
     pub(in crate::db::turso) async fn jobs_update_sql(
@@ -32,7 +48,7 @@ impl TursoDatabase {
                 job.isrunning,
                 serde_json::to_string(&job.config.recreation).unwrap(),
                 job.config.site.clone(),
-                serde_json::to_string(&job.config.param).unwrap(),
+                serde_json::to_string(&persistable_params(&job.config.param)).unwrap(),
                 serde_json::to_string(&job.config.user_data).unwrap(),
                 job.id as i64,
             ),
@@ -177,7 +193,7 @@ impl TursoDatabase {
         conn: &Connection,
         config: &PluginJob,
     ) -> Result<u64> {
-        let param_json = serde_json::to_string(&config.param).unwrap();
+        let param_json = serde_json::to_string(&persistable_params(&config.param)).unwrap();
         let user_data_json = serde_json::to_string(&config.user_data).unwrap();
         let recreation_json = serde_json::to_string(&config.recreation).unwrap();
 
@@ -230,7 +246,9 @@ impl TursoDatabase {
                     serde_json::to_string(&config.recreation).unwrap(),
                 ));
                 params.push(Value::from(config.site.clone()));
-                params.push(Value::from(serde_json::to_string(&config.param).unwrap()));
+                params.push(Value::from(
+                    serde_json::to_string(&persistable_params(&config.param)).unwrap(),
+                ));
                 params.push(Value::from(
                     serde_json::to_string(&config.user_data).unwrap(),
                 ));

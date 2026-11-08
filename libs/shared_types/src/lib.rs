@@ -321,6 +321,18 @@ pub enum HashesSupported {
     ImageHash(String),
 }
 
+/// What to do with a source file when importing it into the library:
+/// copy it into storage (source stays), move it (source is removed), or
+/// hardlink it (source and storage share one inode; same filesystem only).
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, Debug, Deserialize, Serialize, bitcode::Encode, bitcode::Decode,
+)]
+pub enum FileAction {
+    Copy,
+    Move,
+    HardLink,
+}
+
 #[derive(
     Debug, Clone, Eq, Hash, PartialEq, Deserialize, Serialize, bitcode::Encode, bitcode::Decode,
 )]

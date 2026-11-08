@@ -219,6 +219,11 @@ impl TursoDatabase {
         conn: &Connection,
         file_id: u64,
     ) -> Result<HashSet<u64>> {
+        // No namespaces -> no relationship partitions -> no relationships.
+        // (Also avoids binding ?1 against the placeholder-free WHERE 0 source.)
+        if relationship_union_tables(conn).await.is_empty() {
+            return Ok(HashSet::new());
+        }
         let relationship_source = self
             .relationship_union_source(conn, "relationships", Some("file_id = ?1"))
             .await?;
@@ -239,6 +244,10 @@ impl TursoDatabase {
         conn: &Connection,
         tag_id: u64,
     ) -> Result<HashSet<u64>> {
+        // No namespaces -> no relationship partitions -> no relationships.
+        if relationship_union_tables(conn).await.is_empty() {
+            return Ok(HashSet::new());
+        }
         let relationship_source = self
             .relationship_union_source(conn, "relationships", Some("tag_id = ?1"))
             .await?;
@@ -987,6 +996,12 @@ impl TursoDatabase {
         // and every chunk's text, so a multi-chunk lookup still costs one
         // namespace query in total.
         let tables = relationship_union_tables(conn).await;
+        // With no namespaces there are no relationship partitions, so no
+        // relationships can exist. Returning no statements also avoids
+        // binding params against the placeholder-free `WHERE 0` source.
+        if tables.is_empty() {
+            return Ok(out);
+        }
         let batch = pushed_union_batch_size(tables.len());
         for chunk in file_ids.chunks(batch) {
             let predicate = format!("file_id IN ({})", numbered_placeholders(chunk.len()));

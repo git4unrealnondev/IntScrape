@@ -545,6 +545,14 @@ impl Scraper {
                     }
                 };
 
+                // URL only, never the full param debug: local modifiers can
+                // carry a (previously bloated) Cookie header, and dumping
+                // them turned one log line into kilobytes.
+                let param_url = match param {
+                    ScraperParam::Url(u) => u.url.clone(),
+                    ScraperParam::UrlPost(u) => u.url.clone(),
+                    other => format!("{other:?}"),
+                };
                 let (text, source_url) = match text_result {
                     // A param that was never a url. Move on without ending the
                     // job, exactly as before.
@@ -552,7 +560,7 @@ impl Scraper {
                     TextDownload::Success(text, source_url) => (text, source_url),
                     TextDownload::NotFound => {
                         log::warn!(
-                            "Worker: {} JobId: {} -- STOPPING JOB because the url {param:?} returned 404 on all {} attempts.",
+                            "Worker: {} JobId: {} -- STOPPING JOB because the url {param_url} returned 404 on all {} attempts.",
                             plugin_name,
                             job_id,
                             MAX_URL_RETRY,
@@ -564,7 +572,7 @@ impl Scraper {
                     }
                     TextDownload::Failed => {
                         log::error!(
-                            "Worker: {} JobId: {} -- STOPPING JOB because the url {param:?} outlived its retries. It will retry next boot.",
+                            "Worker: {} JobId: {} -- STOPPING JOB because the url {param_url} outlived its retries. It will retry next boot.",
                             plugin_name,
                             job_id,
                         );
@@ -1113,17 +1121,22 @@ impl Scraper {
             // from the job params have to be attached here or gated files
             // (e.g. registered-users-only submissions) will fail.
             let mut request = self.file_client.get(url.clone());
-            let cookies: Vec<String> = self
-                .job
-                .config
-                .param
-                .iter()
-                .filter_map(|p| match p {
-                    ScraperParam::Login(LoginType::Cookie(name, Some(value))) => {
-                        Some(format!("{name}={value}"))
+            // Deduped by cookie name (last wins): jobs persisted before
+            // login params stopped being written to the DB may carry the
+            // same cookie many times over.
+            let mut cookies: Vec<(String, String)> = Vec::new();
+            for p in &self.job.config.param {
+                if let ScraperParam::Login(LoginType::Cookie(name, Some(value))) = p {
+                    if let Some(existing) = cookies.iter_mut().find(|(n, _)| n == name) {
+                        existing.1 = value.clone();
+                    } else {
+                        cookies.push((name.clone(), value.clone()));
                     }
-                    _ => None,
-                })
+                }
+            }
+            let cookies: Vec<String> = cookies
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
                 .collect();
             if !cookies.is_empty() {
                 request = request.header(reqwest::header::COOKIE, cookies.join("; "));
@@ -2055,13 +2068,12 @@ impl DownloadsManager {
                     })
                     .unwrap_or(MAX_CONCURRENT_JOBS);
 
-                // Loads login parameters from db into job
-                let mut job_storage = job_storage.clone();
-                for job in &mut job_storage {
-                    for login in self.load_logins(plugin) {
-                        job.config.param.push(login);
-                    }
-                }
+                // NOTE: login params are injected per-dispatch in
+                // `spawn_scraper`, not here. Injecting them into the stored
+                // job_storage as well stacked a second copy on top of the
+                // dispatch-time copy on every run, and any later
+                // `jobs_update` persisted the duplicates back to the DB, so
+                // login cookies accumulated without bound across boots.
 
                 jobs_guard.insert(
                     plugin.name.clone(),
@@ -2199,7 +2211,21 @@ impl DownloadsManager {
                 let job_id = job.id;
                 let scraper_name = scraper_name.clone();
 
+                // Idempotent: a job that was persisted with its logins
+                // (`jobs_update` used to write them back to the DB) already
+                // carries them, and pushing another copy on every dispatch
+                // is what made cookies accumulate across boots. Replace any
+                // existing entry for the same login (e.g. a cookie of the
+                // same name) with the freshly loaded value instead.
                 for logins in self.load_logins(&plugin) {
+                    let same_login = |existing: &ScraperParam| match (existing, &logins) {
+                        (
+                            ScraperParam::Login(LoginType::Cookie(a, _)),
+                            ScraperParam::Login(LoginType::Cookie(b, _)),
+                        ) => a == b,
+                        _ => existing == &logins,
+                    };
+                    job.config.param.retain(|p| !same_login(p));
                     job.config.param.push(logins);
                 }
 
