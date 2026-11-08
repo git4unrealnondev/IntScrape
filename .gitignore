@@ -3,7 +3,7 @@ plugins_compiled/*
 perf*
 flamegraph*
 **.db*
-log*
+/log*
 files*
 compiled_plugins
 *.json
@@ -12,4 +12,4 @@ thumbnail
 thumbnails*
 *.sh
 dumpster*
-tor-serve
+/tor-serve

@@ -1,0 +1,36 @@
+[package]
+name = "tor-serve"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"] 
+
+[dependencies]
+shared_types = { workspace = true }
+client = { workspace = true }
+anyhow = "1.0.104"
+arti-client = { version = "0.47", features = [
+    "onion-service-service",
+] }
+axum = { version = "0.8.9", features = ["json", "macros", "tracing"] }
+futures = "0.3.34"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+safelog = {  version = "0.10" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+# Pinned to the same versions `arti-client 0.47` resolves. A wildcard here picks
+# up unrelated older lines, which puts two incompatible `tor-cell`/`tor-hsservice`
+# types in the graph and breaks on the first `Connected` conversion.
+tor-cell = {  version = "0.47" }
+tor-hsservice = {  version = "0.47" }
+tor-proto = {  version = "0.47" }
+tower = { version = "0.5.3", features = ["util", "tracing"] }
+tower-http = { version = "0.7.1", features = ["fs"] }
+tracing-subscriber = "0.3.23"
+serde_json = "1.0.151"
+serde = { workspace = true }
+sha2 = "0.11"
+hex = "0.4"
+rand = "0.10"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "query", "rustls"] }
