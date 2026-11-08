@@ -106,6 +106,7 @@ impl IpcServer {
             });
             self.local_servers.lock().unwrap().push(handle);
         }
+
     }
 
     /// Accepts connections on one IPC channel until shutdown. Each connection
@@ -211,6 +212,9 @@ impl IpcServer {
 
 #[cfg(test)]
 mod tests {
+    // Tests intentionally hold the socket lock across await points to
+    // serialize tests that share the same IPC sockets.
+    #![allow(clippy::await_holding_lock)]
     use super::{ACCEPTED_CHANNELS, CHANNEL_CONCURRENCY, IpcServer};
     use crate::db::turso::TursoDatabase;
     use crate::plugins::PluginManager;
@@ -311,6 +315,10 @@ mod tests {
         let (server, _temp_dir) = test_environment().await;
         assert!(all_sockets_ready(), "IPC sockets were not created");
 
+        // Warmup, so socket creation and page-cache effects are not
+        // measured below.
+        let _ = client::should_exit_async().await.unwrap();
+
         // Fire a database write and a lifecycle read concurrently. They travel
         // over separate connections (possibly different channels) and must
         // each complete without blocking the other, matching how independent
@@ -370,7 +378,7 @@ mod tests {
                 .db
                 .connect()
                 .unwrap()
-                .prepare("SELECT id FROM Tags WHERE name = 'red fox'")
+                .prepare_cached("SELECT id FROM Tags WHERE name = 'red fox'")
                 .await
                 .unwrap();
             stmt.query_row(()).await.unwrap().get(0).unwrap()
@@ -413,7 +421,7 @@ mod tests {
                 .db
                 .connect()
                 .unwrap()
-                .prepare("SELECT id FROM Tags WHERE name = 'female'")
+                .prepare_cached("SELECT id FROM Tags WHERE name = 'female'")
                 .await
                 .unwrap();
             stmt.query_row(()).await.unwrap().get(0).unwrap()
@@ -554,6 +562,77 @@ mod tests {
             "    sequential/concurrent = {:.2}x",
             sequential.as_secs_f64() / concurrent.as_secs_f64().max(f64::MIN_POSITIVE)
         );
+
+        drop(server);
+        clean_sockets();
+    }
+
+    /// Concurrency scaling: throughput as a function of how many
+    /// requests are actually in flight at once.
+    ///
+    /// Two request shapes:
+    /// - `SettingsSet` (through the DB write path) — the realistic
+    ///   workload, but Turso writes may serialize, so this measures
+    ///   transport + DB together.
+    /// - `ShouldExit` (handled in `conn_to_function` before any DB
+    ///   dispatch) — transport only, no DB serialization. This is
+    ///   what isolates whether the transport itself is concurrent.
+    ///
+    /// For each concurrency level C, C tasks each issue requests
+    /// sequentially until the level's total budget is exhausted, so
+    /// every level does the same total work. A transport that is
+    /// actually concurrent shows throughput rising with C until it
+    /// hits a cap (server dispatch threads / DB pool / outstanding
+    /// request limit); a serialized one stays flat.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual benchmark: IPC concurrency scaling"]
+    async fn ipc_concurrency_scaling_bench() {
+        let _socket_lock = SOCKET_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let (server, _temp_dir) = test_environment().await;
+        assert!(all_sockets_ready(), "IPC sockets were not created");
+        let total: usize = std::env::var("BENCH_IPC_ITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500);
+
+        // Warmup, so first-call transport setup is not measured.
+        for _ in 0..10 {
+            auto_settings_request().await.unwrap();
+            let _ = client::should_exit_async().await.unwrap();
+        }
+
+        println!("\ntransport=interprocess total={total} requests/level");
+        for (label, use_db) in [("SettingsSet(DB)", true), ("ShouldExit(no DB)", false)] {
+            println!("  {label}:");
+            for concurrency in [1usize, 2, 4, 8, 16, 32, 64] {
+                let per_worker = total.div_ceil(concurrency);
+                let started = Instant::now();
+                let handles: Vec<_> = (0..concurrency)
+                    .map(|_| {
+                        tokio::spawn(async move {
+                            for _ in 0..per_worker {
+                                if use_db {
+                                    let _ = auto_settings_request().await.unwrap();
+                                } else {
+                                    let _ = client::should_exit_async().await.unwrap();
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    handle.await.unwrap();
+                }
+                let elapsed = started.elapsed();
+                let done = per_worker * concurrency;
+                println!(
+                    "    C={concurrency:<3} {done} req in {:>8.2} ms  {:>9.1} req/s  {:>7.3} ms/req",
+                    elapsed.as_secs_f64() * 1000.0,
+                    done as f64 / elapsed.as_secs_f64(),
+                    elapsed.as_secs_f64() * 1000.0 / done as f64,
+                );
+            }
+        }
 
         drop(server);
         clean_sockets();
@@ -908,7 +987,7 @@ mod tests {
     async fn pk_read_ms(db: &Arc<TursoDatabase>, table: &str, id: i64, reps: usize) -> f64 {
         let conn = db.connect().unwrap();
         let mut stmt = conn
-            .prepare(&format!("SELECT id FROM {table} WHERE id = ?1"))
+            .prepare_cached(&format!("SELECT id FROM {table} WHERE id = ?1"))
             .await
             .unwrap();
         // Warm, so the number is execution and not first-touch page faults.

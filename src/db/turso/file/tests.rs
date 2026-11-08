@@ -277,7 +277,7 @@ async fn file_update_batch_writes_every_column() {
     unset.id = None;
     db.file_update_batch(&conn, &[unset]).await.unwrap();
     assert_eq!(
-        conn.query("SELECT COUNT(*) FROM File WHERE hash = 'ignored';", ())
+        conn.query("SELECT COUNT(*) FROM FileHashes WHERE digest = 'ignored';", ())
             .await
             .unwrap()
             .next()
@@ -296,13 +296,19 @@ async fn file_hashes_get_all_sha512_returns_sorted_sha512_only() {
     let (db, _temp_dir) = new_test_db_owned().await;
     let conn = db.connect().unwrap();
 
+    // `file_add_bulk` itself records the SHA-512 digest in FileHashes
+    // (schema v13+), so the bulk list is exactly the digests the files
+    // were added with — in digest order.
+    let sha_b = "b".repeat(128);
+    let sha_a = "a".repeat(128);
+    let sha_c = "c".repeat(128);
     let files = db
         .file_add_bulk(
             &conn,
             &[
-                test_file("file-a", None),
-                test_file("file-b", None),
-                test_file("file-c", None),
+                test_file(&sha_b, None),
+                test_file(&sha_a, None),
+                test_file(&sha_c, None),
             ],
         )
         .await
@@ -310,19 +316,13 @@ async fn file_hashes_get_all_sha512_returns_sorted_sha512_only() {
     let ids = sorted_ids(&files);
     assert_eq!(ids.len(), 3);
 
-    let sha_b = "b".repeat(128);
-    let sha_a = "a".repeat(128);
-    let sha_c = "c".repeat(128);
+    // Other algorithms must not leak into the SHA-512 list, and a duplicate
+    // digest insert must not duplicate the entry (unique index).
     db.file_hashes_add_bulk(
         &conn,
         &[
-            (ids[0], "SHA512", &sha_b),
+            (ids[0], "MD5", "0123456789abcdef0123456789abcdef"),
             (ids[1], "SHA512", &sha_a),
-            (ids[1], "MD5", "0123456789abcdef0123456789abcdef"),
-            (ids[2], "SHA512", &sha_c),
-            // Duplicate digest for a different file: the unique index makes
-            // this a no-op, so it must not appear twice in the bulk list.
-            (ids[2], "SHA512", &sha_a),
         ],
     )
     .await

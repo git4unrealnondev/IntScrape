@@ -7,7 +7,7 @@
 
 /// Current Turso schema version. Bump when a migration is added; opening a
 /// database with a newer schema than this is rejected (see `db::turso`).
-pub const DB_VERSION: u64 = 12;
+pub const DB_VERSION: u64 = 13;
 
 pub mod backup_path;
 pub mod cli;

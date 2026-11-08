@@ -289,6 +289,11 @@ pub enum Request {
 /// Represents a response message from MEGA's API.
 ///
 /// Keep in mind that these message definitions have been somewhat reverse-engineered from MEGA's C++ SDK, and are, therefore, not complete.
+// Variant sizes differ because the largest payloads (e.g. FetchNodes)
+// are inherently large; boxing them would churn every construction
+// and match site in this vendored protocol crate for no measurable
+// gain — responses are short-lived API values.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Response {
     /// An error response.

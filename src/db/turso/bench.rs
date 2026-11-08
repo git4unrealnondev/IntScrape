@@ -42,7 +42,7 @@ mod tests {
 
     use crate::db::SQL_CHUNK_SIZE;
     use crate::db::turso::sql::{parents_insert_sql, parents_params};
-    use crate::db::turso::{TagDb, TursoDatabase};
+    use crate::db::turso::{PooledConnection, TagDb, TursoDatabase};
 
     /// Rows a benchmark seeds unless `BENCH_FILES` says otherwise.
     const DEFAULT_FILES: u64 = 50_000;
@@ -93,7 +93,7 @@ mod tests {
     struct Fixture {
         db: Arc<TursoDatabase>,
         path: PathBuf,
-        conn: Connection,
+        conn: PooledConnection,
         storage_id: u64,
         /// `(file_id, tag_id)` relationships, one source_url tag per file.
         rels: HashSet<(u64, u64)>,
@@ -602,13 +602,10 @@ mod tests {
             .await;
             explain(
                 &conn,
-                &format!(
-                    "SELECT id, hash FROM File WHERE hash IN ({})",
-                    std::iter::repeat_n("?", 8).collect::<Vec<_>>().join(", ")
-                ),
+                "SELECT f.id, fh.digest FROM FileHashes fh JOIN File f ON f.id = fh.file_id WHERE fh.algorithm = 'SHA512' AND fh.digest = ?",
             )
             .await;
-            explain(&conn, "SELECT id, hash, extension, storage_id, size_bytes FROM File WHERE id > 0 ORDER BY id LIMIT 100").await;
+            explain(&conn, "SELECT f.id, fh.digest, f.extension, f.storage_id, f.size_bytes FROM File f LEFT JOIN FileHashes fh ON fh.file_id = f.id AND fh.algorithm = 'SHA512' WHERE f.id > 0 ORDER BY f.id LIMIT 100").await;
 
             // Relationship bulk add: idempotent re-add of an existing set, which
             // is what a re-scrape does, versus a genuinely new set.
@@ -804,7 +801,7 @@ mod tests {
                 relate_tag_id: 1 + ((i / 3 + 7) % tag_count),
                 // A third of the rows exercise the NULL branch of the
                 // `IFNULL(limit_to, -1)` index.
-                limit_to: if i % 3 == 0 {
+                limit_to: if i.is_multiple_of(3) {
                     Some(1 + ((i + 11) % tag_count))
                 } else {
                     None
@@ -1172,7 +1169,7 @@ mod tests {
                 .map(|i| TagParents {
                     tag_id: 1 + (i % tags),
                     relate_tag_id: 1 + ((i / 3 + 7 + table_seed) % tags),
-                    limit_to: if i % 3 == 0 {
+                    limit_to: if i.is_multiple_of(3) {
                         Some(1 + ((i + 11) % tags))
                     } else {
                         None
@@ -1348,7 +1345,7 @@ mod tests {
                 .map(|i| TagParents {
                     tag_id: 1 + (i % tags),
                     relate_tag_id: 1 + ((i / 3 + 7) % tags),
-                    limit_to: if i % 3 == 0 {
+                    limit_to: if i.is_multiple_of(3) {
                         Some(1 + ((i + 11) % tags))
                     } else {
                         None
@@ -1453,7 +1450,7 @@ mod tests {
                 .map(|i| TagParents {
                     tag_id: 1 + (i % tags),
                     relate_tag_id: 1 + ((i / 3 + 7) % tags),
-                    limit_to: if i % 3 == 0 {
+                    limit_to: if i.is_multiple_of(3) {
                         Some(1 + ((i + 11) % tags))
                     } else {
                         None
@@ -1598,7 +1595,7 @@ mod tests {
             TagParents {
                 tag_id: base + slot,
                 relate_tag_id: base + relate,
-                limit_to: if i % 3 == 0 {
+                limit_to: if i.is_multiple_of(3) {
                     Some(base + 1 + (i + 11) % band)
                 } else {
                     None
@@ -1921,7 +1918,7 @@ mod tests {
         let fixture = rt.block_on(Fixture::seed("parents_e2e", 1_000, tags));
         println!("\nBENCH Parents end-to-end: {}", fixture.describe());
         let db = fixture.db.clone();
-        let conn = fixture.conn.clone();
+        let _conn = fixture.conn.clone();
         assert!(
             tags >= 8,
             "BENCH_TAGS must leave room for two disjoint bands"
@@ -1934,7 +1931,7 @@ mod tests {
                 // Non-zero offset from `tag_id`, keeping
                 // `CHECK (tag_id != relate_tag_id)` satisfied.
                 relate_tag_id: 1 + (i + 1 + i / tag_count) % tag_count,
-                limit_to: if i % 3 == 0 {
+                limit_to: if i.is_multiple_of(3) {
                     Some(1 + ((i + 11) % tag_count))
                 } else {
                     None
@@ -2100,7 +2097,7 @@ mod tests {
                 .map(|i| TagParents {
                     tag_id: 1 + (i % tags),
                     relate_tag_id: 1 + (i / 3 + 7) % tags,
-                    limit_to: if i % 3 == 0 {
+                    limit_to: if i.is_multiple_of(3) {
                         Some(1 + (i + 11) % tags)
                     } else {
                         None
@@ -2825,7 +2822,7 @@ mod tests {
                 .map(|i| TagParents {
                     tag_id: 1 + (i % tags),
                     relate_tag_id: 1 + (i / 3 + 7) % tags,
-                    limit_to: if i % 3 == 0 {
+                    limit_to: if i.is_multiple_of(3) {
                         Some(1 + (i + 11) % tags)
                     } else {
                         None
@@ -3209,7 +3206,7 @@ mod tests {
                 .unwrap_or(3)
                 .max(1);
 
-            for round in 0..rounds {
+            for _round in 0..rounds {
                 // Pattern A: the per-call connect every read-side helper does.
                 let t = Instant::now();
                 for probe in 0..PROBES {
@@ -3349,7 +3346,7 @@ mod tests {
                 .map(|i| TagParents {
                     tag_id: 1 + (i / 4 % tags),
                     relate_tag_id: 1 + ((i / 3 + 11) % tags),
-                    limit_to: if i % 3 == 0 {
+                    limit_to: if i.is_multiple_of(3) {
                         Some(1 + ((i + 17) % tags))
                     } else {
                         None

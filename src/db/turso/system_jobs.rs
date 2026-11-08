@@ -282,6 +282,7 @@ impl TursoDatabase {
         Ok(summary)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn storage_check_chunk(
         &self,
         conn: &Connection,
@@ -542,10 +543,12 @@ impl TursoDatabase {
             let mut rows = connection
                 .query(
                     &format!(
-                        "SELECT id, hash, extension, storage_id
-                         FROM File
-                         WHERE size_bytes IS NULL AND hash IS NOT NULL AND id > ?1
-                         ORDER BY id
+                        "SELECT f.id, fh.digest, f.extension, f.storage_id
+                         FROM File f
+                         JOIN FileHashes fh
+                           ON fh.file_id = f.id AND fh.algorithm = 'SHA512'
+                         WHERE f.size_bytes IS NULL AND f.id > ?1
+                         ORDER BY f.id
                          LIMIT {}",
                         SQL_CHUNK_SIZE,
                     ),

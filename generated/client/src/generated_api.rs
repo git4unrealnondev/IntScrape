@@ -5,12 +5,14 @@ use std::collections::{HashMap, HashSet};
 ///
 /// Gets namespace id if it exists
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn namespace_get(name: String) -> Result<Option<u64>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::GetNamespace(name))
 }
 ///
 /// Gets namespace id if it exists
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn namespace_get_async(
     name: String,
 ) -> impl std::future::Future<Output = Result<Option<u64>, Box<dyn std::error::Error + Send + Sync>>>
@@ -20,6 +22,7 @@ pub fn namespace_get_async(
 ///
 /// Gets a list of tags where the tag and limits the number of returnees
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn search_tag_fts(
     tag: String,
     limit: Option<u64>,
@@ -29,6 +32,7 @@ pub fn search_tag_fts(
 ///
 /// Gets a list of tags where the tag and limits the number of returnees
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn search_tag_fts_async(
     tag: String,
     limit: Option<u64>,
@@ -38,6 +42,7 @@ pub fn search_tag_fts_async(
 }
 /// Resolves tag names across namespaces and searches for files matching
 /// every input name, while allowing any tag with that name.
+#[allow(clippy::too_many_arguments)]
 pub fn search_db_files_by_tags(
     tags: Vec<String>,
     limit: Option<u64>,
@@ -46,6 +51,7 @@ pub fn search_db_files_by_tags(
 }
 /// Resolves tag names across namespaces and searches for files matching
 /// every input name, while allowing any tag with that name.
+#[allow(clippy::too_many_arguments)]
 pub fn search_db_files_by_tags_async(
     tags: Vec<String>,
     limit: Option<u64>,
@@ -53,6 +59,7 @@ pub fn search_db_files_by_tags_async(
     crate::init_data_request_async(crate::SupportedDBRequests::SearchFilesByTags(tags, limit))
 }
 /// Resolves tag names across namespaces while preserving boolean groups.
+#[allow(clippy::too_many_arguments)]
 pub fn search_db_files_by_tag_groups(
     and_ids: Vec<u64>,
     and_tags: Vec<String>,
@@ -68,6 +75,7 @@ pub fn search_db_files_by_tag_groups(
     ))
 }
 /// Resolves tag names across namespaces while preserving boolean groups.
+#[allow(clippy::too_many_arguments)]
 pub fn search_db_files_by_tag_groups_async(
     and_ids: Vec<u64>,
     and_tags: Vec<String>,
@@ -85,6 +93,7 @@ pub fn search_db_files_by_tag_groups_async(
 /// Counts the files a boolean tag-group search matches without returning
 /// them. Paged UIs ask for this alongside a `LIMIT`ed page fetch so the
 /// leading pages never carry the whole result set across IPC.
+#[allow(clippy::too_many_arguments)]
 pub fn search_db_files_by_tag_groups_count(
     and_ids: Vec<u64>,
     and_tags: Vec<String>,
@@ -100,6 +109,7 @@ pub fn search_db_files_by_tag_groups_count(
 /// Counts the files a boolean tag-group search matches without returning
 /// them. Paged UIs ask for this alongside a `LIMIT`ed page fetch so the
 /// leading pages never carry the whole result set across IPC.
+#[allow(clippy::too_many_arguments)]
 pub fn search_db_files_by_tag_groups_count_async(
     and_ids: Vec<u64>,
     and_tags: Vec<String>,
@@ -115,23 +125,27 @@ pub fn search_db_files_by_tag_groups_count_async(
 ///
 /// Gets the file path of a fileid
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn get_file_path(file_id: u64) -> Result<Option<String>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::GetFileLocation(file_id))
 }
 ///
 /// Gets the file path of a fileid
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn get_file_path_async(
     file_id: u64,
 ) -> impl std::future::Future<Output = Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>>
 {
     crate::init_data_request_async(crate::SupportedDBRequests::GetFileLocation(file_id))
 }
+#[allow(clippy::too_many_arguments)]
 pub fn get_file_hashes(
     file_id: u64,
 ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::GetFileHashes(file_id))
 }
+#[allow(clippy::too_many_arguments)]
 pub fn get_file_hashes_async(
     file_id: u64,
 ) -> impl std::future::Future<
@@ -145,6 +159,7 @@ pub fn get_file_hashes_async(
 /// list (e.g. the WebUI `/api/v0/file-hashes` endpoint): one IPC round
 /// trip and one indexed scan instead of one round trip and one query per
 /// file. See `file_hashes_get_all_sha512`.
+#[allow(clippy::too_many_arguments)]
 pub fn get_file_hashes_all_sha512() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::GetAllFileHashesSha512())
 }
@@ -154,6 +169,7 @@ pub fn get_file_hashes_all_sha512() -> Result<Vec<String>, Box<dyn std::error::E
 /// list (e.g. the WebUI `/api/v0/file-hashes` endpoint): one IPC round
 /// trip and one indexed scan instead of one round trip and one query per
 /// file. See `file_hashes_get_all_sha512`.
+#[allow(clippy::too_many_arguments)]
 pub fn get_file_hashes_all_sha512_async()
 -> impl std::future::Future<Output = Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>>>
 {
@@ -165,6 +181,7 @@ pub fn get_file_hashes_all_sha512_async()
 /// data to already-downloaded files without re-downloading them.
 /// Takes plain `(algorithm, digest)` pairs because `HashesSupported`
 /// is not `Serialize` and cannot cross the IPC boundary.
+#[allow(clippy::too_many_arguments)]
 pub fn hashes_files_get_bulk(
     hashes: Vec<(String, String)>,
 ) -> Result<HashMap<(String, String), FileInternal>, Box<dyn std::error::Error>> {
@@ -176,6 +193,7 @@ pub fn hashes_files_get_bulk(
 /// data to already-downloaded files without re-downloading them.
 /// Takes plain `(algorithm, digest)` pairs because `HashesSupported`
 /// is not `Serialize` and cannot cross the IPC boundary.
+#[allow(clippy::too_many_arguments)]
 pub fn hashes_files_get_bulk_async(
     hashes: Vec<(String, String)>,
 ) -> impl std::future::Future<
@@ -190,6 +208,7 @@ pub fn hashes_files_get_bulk_async(
 /// Complements `hashes_files_get_bulk` for databases whose files store
 /// the looked-up digest as the primary hash itself (e.g. md5-primary
 /// rows from older/slurped libraries) rather than only in `FileHashes`.
+#[allow(clippy::too_many_arguments)]
 pub fn files_get_by_hash(
     hashes: Vec<String>,
 ) -> Result<HashMap<String, FileInternal>, Box<dyn std::error::Error>> {
@@ -199,6 +218,7 @@ pub fn files_get_by_hash(
 /// Complements `hashes_files_get_bulk` for databases whose files store
 /// the looked-up digest as the primary hash itself (e.g. md5-primary
 /// rows from older/slurped libraries) rather than only in `FileHashes`.
+#[allow(clippy::too_many_arguments)]
 pub fn files_get_by_hash_async(
     hashes: Vec<String>,
 ) -> impl std::future::Future<
@@ -209,6 +229,7 @@ pub fn files_get_by_hash_async(
 ///
 /// Gets all tag ids assocated with a namespace id
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn get_tag_ids_namespace_id(
     namespace_id: u64,
 ) -> Result<HashSet<u64>, Box<dyn std::error::Error>> {
@@ -217,6 +238,7 @@ pub fn get_tag_ids_namespace_id(
 ///
 /// Gets all tag ids assocated with a namespace id
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn get_tag_ids_namespace_id_async(
     namespace_id: u64,
 ) -> impl std::future::Future<Output = Result<HashSet<u64>, Box<dyn std::error::Error + Send + Sync>>>
@@ -226,6 +248,7 @@ pub fn get_tag_ids_namespace_id_async(
 /// Gets tag ids associated with a namespace id, newest-created first.
 /// `limit` bounds how many ids are returned; `None` or a limit of zero
 /// returns every id, matching the unlimited request.
+#[allow(clippy::too_many_arguments)]
 pub fn get_tag_ids_namespace_id_limited(
     namespace_id: u64,
     limit: Option<u64>,
@@ -238,6 +261,7 @@ pub fn get_tag_ids_namespace_id_limited(
 /// Gets tag ids associated with a namespace id, newest-created first.
 /// `limit` bounds how many ids are returned; `None` or a limit of zero
 /// returns every id, matching the unlimited request.
+#[allow(clippy::too_many_arguments)]
 pub fn get_tag_ids_namespace_id_limited_async(
     namespace_id: u64,
     limit: Option<u64>,
@@ -248,10 +272,12 @@ pub fn get_tag_ids_namespace_id_limited_async(
     ))
 }
 /// Gets every tag id in the database.
+#[allow(clippy::too_many_arguments)]
 pub fn get_tag_ids_all() -> Result<HashSet<u64>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::GetTagIDsAll())
 }
 /// Gets every tag id in the database.
+#[allow(clippy::too_many_arguments)]
 pub fn get_tag_ids_all_async()
 -> impl std::future::Future<Output = Result<HashSet<u64>, Box<dyn std::error::Error + Send + Sync>>>
 {
@@ -260,12 +286,14 @@ pub fn get_tag_ids_all_async()
 ///
 /// Gets a file if a tag is associated with it
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn get_tag_file(tag: Tag) -> Result<Option<FileInternal>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::GetTagFile(tag))
 }
 ///
 /// Gets a file if a tag is associated with it
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn get_tag_file_async(
     tag: Tag,
 ) -> impl std::future::Future<
@@ -276,6 +304,7 @@ pub fn get_tag_file_async(
 ///
 /// Gets all `file_ids` with tags that have namespace id
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn get_namespace_file_ids(
     namespace_id: u64,
 ) -> Result<HashSet<u64>, Box<dyn std::error::Error>> {
@@ -286,6 +315,7 @@ pub fn get_namespace_file_ids(
 ///
 /// Gets all `file_ids` with tags that have namespace id
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn get_namespace_file_ids_async(
     namespace_id: u64,
 ) -> impl std::future::Future<Output = Result<HashSet<u64>, Box<dyn std::error::Error + Send + Sync>>>
@@ -297,6 +327,7 @@ pub fn get_namespace_file_ids_async(
 ///
 /// Gets tag ids with a namespace_id associated with a file_id
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn get_tags_filtered(
     file_id: u64,
     namespace_id: u64,
@@ -309,6 +340,7 @@ pub fn get_tags_filtered(
 ///
 /// Gets tag ids with a namespace_id associated with a file_id
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn get_tags_filtered_async(
     file_id: u64,
     namespace_id: u64,
@@ -322,6 +354,7 @@ pub fn get_tags_filtered_async(
 ///
 /// Adds a relationship between a `file_id` and `tag_id`
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn put_tags_to_file(
     file_id: u64,
     tag: Vec<FileTagAction>,
@@ -333,6 +366,7 @@ pub fn put_tags_to_file(
 ///
 /// Adds a relationship between a `file_id` and `tag_id`
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn put_tags_to_file_async(
     file_id: u64,
     tag: Vec<FileTagAction>,
@@ -344,6 +378,7 @@ pub fn put_tags_to_file_async(
 /// Adds tag actions without creating a file/tag relationship.
 ///
 /// This is used by tag callbacks that create structural tag relationships.
+#[allow(clippy::too_many_arguments)]
 pub fn tag_actions_add(
     tag_actions: Vec<FileTagAction>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
@@ -352,12 +387,14 @@ pub fn tag_actions_add(
 /// Adds tag actions without creating a file/tag relationship.
 ///
 /// This is used by tag callbacks that create structural tag relationships.
+#[allow(clippy::too_many_arguments)]
 pub fn tag_actions_add_async(
     tag_actions: Vec<FileTagAction>,
 ) -> impl std::future::Future<Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>> {
     crate::init_data_request_async(crate::SupportedDBRequests::TagActionsAdd(tag_actions))
 }
 /// Adds tags to multiple files in one connection.
+#[allow(clippy::too_many_arguments)]
 pub fn put_tags_to_files(
     tags_by_file: HashMap<u64, Vec<FileTagAction>>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
@@ -366,6 +403,7 @@ pub fn put_tags_to_files(
     ))
 }
 /// Adds tags to multiple files in one connection.
+#[allow(clippy::too_many_arguments)]
 pub fn put_tags_to_files_async(
     tags_by_file: HashMap<u64, Vec<FileTagAction>>,
 ) -> impl std::future::Future<Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>> {
@@ -376,12 +414,14 @@ pub fn put_tags_to_files_async(
 ///
 /// Gets all file ids inside of the db.
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn get_file_ids_all() -> Result<HashSet<u64>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::GetFileListId())
 }
 ///
 /// Gets all file ids inside of the db.
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn get_file_ids_all_async()
 -> impl std::future::Future<Output = Result<HashSet<u64>, Box<dyn std::error::Error + Send + Sync>>>
 {
@@ -390,12 +430,14 @@ pub fn get_file_ids_all_async()
 ///
 /// Gets all tag ids associated with a fileid
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn relationship_get_tagid(file_id: u64) -> Result<HashSet<u64>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::RelationshipGetFileid(file_id))
 }
 ///
 /// Gets all tag ids associated with a fileid
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn relationship_get_tagid_async(
     file_id: u64,
 ) -> impl std::future::Future<Output = Result<HashSet<u64>, Box<dyn std::error::Error + Send + Sync>>>
@@ -403,6 +445,7 @@ pub fn relationship_get_tagid_async(
     crate::init_data_request_async(crate::SupportedDBRequests::RelationshipGetFileid(file_id))
 }
 /// Gets tag relationships for multiple files in one IPC request.
+#[allow(clippy::too_many_arguments)]
 pub fn relationship_get_tagid_many(
     file_ids: HashSet<u64>,
 ) -> Result<HashMap<u64, HashSet<u64>>, Box<dyn std::error::Error>> {
@@ -411,6 +454,7 @@ pub fn relationship_get_tagid_many(
     ))
 }
 /// Gets tag relationships for multiple files in one IPC request.
+#[allow(clippy::too_many_arguments)]
 pub fn relationship_get_tagid_many_async(
     file_ids: HashSet<u64>,
 ) -> impl std::future::Future<
@@ -423,12 +467,14 @@ pub fn relationship_get_tagid_many_async(
 ///
 /// Gets all file ids associated with a tag_id
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn relationship_get_fileid(tag_id: u64) -> Result<HashSet<u64>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::RelationshipGetTagid(tag_id))
 }
 ///
 /// Gets all file ids associated with a tag_id
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn relationship_get_fileid_async(
     tag_id: u64,
 ) -> impl std::future::Future<Output = Result<HashSet<u64>, Box<dyn std::error::Error + Send + Sync>>>
@@ -436,6 +482,7 @@ pub fn relationship_get_fileid_async(
     crate::init_data_request_async(crate::SupportedDBRequests::RelationshipGetTagid(tag_id))
 }
 /// Gets file relationships for multiple tags in one IPC request.
+#[allow(clippy::too_many_arguments)]
 pub fn relationship_get_fileid_many(
     tag_ids: HashSet<u64>,
 ) -> Result<HashMap<u64, HashSet<u64>>, Box<dyn std::error::Error>> {
@@ -444,6 +491,7 @@ pub fn relationship_get_fileid_many(
     ))
 }
 /// Gets file relationships for multiple tags in one IPC request.
+#[allow(clippy::too_many_arguments)]
 pub fn relationship_get_fileid_many_async(
     tag_ids: HashSet<u64>,
 ) -> impl std::future::Future<
@@ -454,6 +502,7 @@ pub fn relationship_get_fileid_many_async(
     ))
 }
 /// Gets files whose tag is the related parent of the supplied structural tag.
+#[allow(clippy::too_many_arguments)]
 pub fn relationship_get_parent_fileid(
     tag_id: u64,
 ) -> Result<HashSet<u64>, Box<dyn std::error::Error>> {
@@ -462,6 +511,7 @@ pub fn relationship_get_parent_fileid(
     ))
 }
 /// Gets files whose tag is the related parent of the supplied structural tag.
+#[allow(clippy::too_many_arguments)]
 pub fn relationship_get_parent_fileid_async(
     tag_id: u64,
 ) -> impl std::future::Future<Output = Result<HashSet<u64>, Box<dyn std::error::Error + Send + Sync>>>
@@ -471,12 +521,14 @@ pub fn relationship_get_parent_fileid_async(
     ))
 }
 /// Gets every parent relation declared by a child tag.
+#[allow(clippy::too_many_arguments)]
 pub fn parent_relationships_get(
     tag_id: u64,
 ) -> Result<Vec<TagParents>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::ParentRelationshipsGet(tag_id))
 }
 /// Gets every parent relation declared by a child tag.
+#[allow(clippy::too_many_arguments)]
 pub fn parent_relationships_get_async(
     tag_id: u64,
 ) -> impl std::future::Future<Output = Result<Vec<TagParents>, Box<dyn std::error::Error + Send + Sync>>>
@@ -484,6 +536,7 @@ pub fn parent_relationships_get_async(
     crate::init_data_request_async(crate::SupportedDBRequests::ParentRelationshipsGet(tag_id))
 }
 /// Gets parent relations for multiple child tags in one IPC request.
+#[allow(clippy::too_many_arguments)]
 pub fn parent_relationships_get_many(
     tag_ids: HashSet<u64>,
 ) -> Result<HashMap<u64, Vec<TagParents>>, Box<dyn std::error::Error>> {
@@ -492,6 +545,7 @@ pub fn parent_relationships_get_many(
     ))
 }
 /// Gets parent relations for multiple child tags in one IPC request.
+#[allow(clippy::too_many_arguments)]
 pub fn parent_relationships_get_many_async(
     tag_ids: HashSet<u64>,
 ) -> impl std::future::Future<
@@ -502,6 +556,7 @@ pub fn parent_relationships_get_many_async(
     ))
 }
 /// Gets every child relation that points at a parent tag.
+#[allow(clippy::too_many_arguments)]
 pub fn child_relationships_get(
     relate_tag_id: u64,
 ) -> Result<Vec<TagParents>, Box<dyn std::error::Error>> {
@@ -510,6 +565,7 @@ pub fn child_relationships_get(
     ))
 }
 /// Gets every child relation that points at a parent tag.
+#[allow(clippy::too_many_arguments)]
 pub fn child_relationships_get_async(
     relate_tag_id: u64,
 ) -> impl std::future::Future<Output = Result<Vec<TagParents>, Box<dyn std::error::Error + Send + Sync>>>
@@ -522,6 +578,7 @@ pub fn child_relationships_get_async(
 /// supplied tag — the reverse index of a qualified relationship. Rows are
 /// `(tag_id -> relate_tag_id)` pairs that are only meaningful in the
 /// context of that limit tag.
+#[allow(clippy::too_many_arguments)]
 pub fn limited_child_relationships_get(
     limit_tag_id: u64,
 ) -> Result<Vec<TagParents>, Box<dyn std::error::Error>> {
@@ -533,6 +590,7 @@ pub fn limited_child_relationships_get(
 /// supplied tag — the reverse index of a qualified relationship. Rows are
 /// `(tag_id -> relate_tag_id)` pairs that are only meaningful in the
 /// context of that limit tag.
+#[allow(clippy::too_many_arguments)]
 pub fn limited_child_relationships_get_async(
     limit_tag_id: u64,
 ) -> impl std::future::Future<Output = Result<Vec<TagParents>, Box<dyn std::error::Error + Send + Sync>>>
@@ -544,6 +602,7 @@ pub fn limited_child_relationships_get_async(
 /// Gets the child-parent relations qualified by any of the supplied
 /// limit tags in one IPC request. This is the bulk form of
 /// `limited_child_relationships_get`; results are grouped by limit tag.
+#[allow(clippy::too_many_arguments)]
 pub fn limited_child_relationships_get_many(
     limit_tag_ids: HashSet<u64>,
 ) -> Result<HashMap<u64, Vec<TagParents>>, Box<dyn std::error::Error>> {
@@ -554,6 +613,7 @@ pub fn limited_child_relationships_get_many(
 /// Gets the child-parent relations qualified by any of the supplied
 /// limit tags in one IPC request. This is the bulk form of
 /// `limited_child_relationships_get`; results are grouped by limit tag.
+#[allow(clippy::too_many_arguments)]
 pub fn limited_child_relationships_get_many_async(
     limit_tag_ids: HashSet<u64>,
 ) -> impl std::future::Future<
@@ -564,6 +624,7 @@ pub fn limited_child_relationships_get_many_async(
     )
 }
 /// Gets child relations for multiple parent tags in one IPC request.
+#[allow(clippy::too_many_arguments)]
 pub fn child_relationships_get_many(
     tag_ids: HashSet<u64>,
 ) -> Result<HashMap<u64, Vec<TagParents>>, Box<dyn std::error::Error>> {
@@ -572,6 +633,7 @@ pub fn child_relationships_get_many(
     ))
 }
 /// Gets child relations for multiple parent tags in one IPC request.
+#[allow(clippy::too_many_arguments)]
 pub fn child_relationships_get_many_async(
     tag_ids: HashSet<u64>,
 ) -> impl std::future::Future<
@@ -582,6 +644,7 @@ pub fn child_relationships_get_many_async(
     ))
 }
 /// Gets one exact child-parent relation, including its optional limit tag.
+#[allow(clippy::too_many_arguments)]
 pub fn parent_relationship_get(
     tag_id: u64,
     relate_tag_id: u64,
@@ -592,6 +655,7 @@ pub fn parent_relationship_get(
     ))
 }
 /// Gets one exact child-parent relation, including its optional limit tag.
+#[allow(clippy::too_many_arguments)]
 pub fn parent_relationship_get_async(
     tag_id: u64,
     relate_tag_id: u64,
@@ -606,6 +670,7 @@ pub fn parent_relationship_get_async(
 ///
 /// Adds tags into db in a bulk manner
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn get_tag_id_bulk(
     tags: HashSet<u64>,
 ) -> Result<HashMap<u64, Tag>, Box<dyn std::error::Error>> {
@@ -614,6 +679,7 @@ pub fn get_tag_id_bulk(
 ///
 /// Adds tags into db in a bulk manner
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn get_tag_id_bulk_async(
     tags: HashSet<u64>,
 ) -> impl std::future::Future<Output = Result<HashMap<u64, Tag>, Box<dyn std::error::Error + Send + Sync>>>
@@ -623,12 +689,14 @@ pub fn get_tag_id_bulk_async(
 ///
 /// Marks a url as being dead in the db
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn dead_url_add(dead_url: String) -> Result<bool, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::AddDeadUrl(dead_url))
 }
 ///
 /// Marks a url as being dead in the db
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn dead_url_add_async(
     dead_url: String,
 ) -> impl std::future::Future<Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>> {
@@ -637,6 +705,7 @@ pub fn dead_url_add_async(
 ///
 /// Checks if a list of urls are dead
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn dead_url_get(
     dead_urls: Vec<String>,
 ) -> Result<HashMap<String, bool>, Box<dyn std::error::Error>> {
@@ -645,6 +714,7 @@ pub fn dead_url_get(
 ///
 /// Checks if a list of urls are dead
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn dead_url_get_async(
     dead_urls: Vec<String>,
 ) -> impl std::future::Future<
@@ -656,6 +726,7 @@ pub fn dead_url_get_async(
 /// Resolves downloaded source URLs to one representative file id each, so
 /// UIs can link URLs in text back to the actual files on disk.
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn source_url_file_ids_get(
     urls: Vec<String>,
 ) -> Result<Vec<(String, u64)>, Box<dyn std::error::Error>> {
@@ -665,6 +736,7 @@ pub fn source_url_file_ids_get(
 /// Resolves downloaded source URLs to one representative file id each, so
 /// UIs can link URLs in text back to the actual files on disk.
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn source_url_file_ids_get_async(
     urls: Vec<String>,
 ) -> impl std::future::Future<
@@ -675,12 +747,14 @@ pub fn source_url_file_ids_get_async(
 ///
 /// Adds a namespace into the db
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn namespace_set(namespace: GenericNamespaceObj) -> Result<u64, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::SetNamespace(namespace))
 }
 ///
 /// Adds a namespace into the db
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn namespace_set_async(
     namespace: GenericNamespaceObj,
 ) -> impl std::future::Future<Output = Result<u64, Box<dyn std::error::Error + Send + Sync>>> {
@@ -689,6 +763,7 @@ pub fn namespace_set_async(
 ///
 /// Human written tag searching layer
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn search_db_files(
     search: SearchObj,
     limit: Option<u64>,
@@ -698,6 +773,7 @@ pub fn search_db_files(
 ///
 /// Human written tag searching layer
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn search_db_files_async(
     search: SearchObj,
     limit: Option<u64>,
@@ -705,10 +781,12 @@ pub fn search_db_files_async(
     crate::init_data_request_async(crate::SupportedDBRequests::SearchFiles(search, limit))
 }
 /// A sync function to get a function
+#[allow(clippy::too_many_arguments)]
 pub fn setting_get(name: String) -> Result<Option<DbSettingsObj>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::SettingsGetName(name))
 }
 /// A sync function to get a function
+#[allow(clippy::too_many_arguments)]
 pub fn setting_get_async(
     name: String,
 ) -> impl std::future::Future<
@@ -719,12 +797,14 @@ pub fn setting_get_async(
 ///
 /// Returns every setting in the database.
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn settings_list() -> Result<Vec<DbSettingsObj>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::SettingsList())
 }
 ///
 /// Returns every setting in the database.
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn settings_list_async() -> impl std::future::Future<
     Output = Result<Vec<DbSettingsObj>, Box<dyn std::error::Error + Send + Sync>>,
 > {
@@ -733,12 +813,14 @@ pub fn settings_list_async() -> impl std::future::Future<
 ///
 /// Sets the setting in the db. Updates it if the setting already exists
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn setting_set(obj: DbSettingsObj) -> Result<bool, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::SettingsSet(obj))
 }
 ///
 /// Sets the setting in the db. Updates it if the setting already exists
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn setting_set_async(
     obj: DbSettingsObj,
 ) -> impl std::future::Future<Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>> {
@@ -747,12 +829,14 @@ pub fn setting_set_async(
 ///
 /// Adds job into db
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn jobs_add_single(job: PluginJob) -> Result<u64, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::JobsAddSingle(job))
 }
 ///
 /// Adds job into db
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn jobs_add_single_async(
     job: PluginJob,
 ) -> impl std::future::Future<Output = Result<u64, Box<dyn std::error::Error + Send + Sync>>> {
@@ -761,12 +845,14 @@ pub fn jobs_add_single_async(
 ///
 /// Gets every job in the database, highest-priority first.
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn jobs_get_all() -> Result<Vec<DbJobsObj>, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::JobsGetAll())
 }
 ///
 /// Gets every job in the database, highest-priority first.
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn jobs_get_all_async()
 -> impl std::future::Future<Output = Result<Vec<DbJobsObj>, Box<dyn std::error::Error + Send + Sync>>>
 {
@@ -775,12 +861,14 @@ pub fn jobs_get_all_async()
 ///
 /// Updates an existing job's config.
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn jobs_update(job: DbJobsObj) -> Result<bool, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::JobsUpdate(job))
 }
 ///
 /// Updates an existing job's config.
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn jobs_update_async(
     job: DbJobsObj,
 ) -> impl std::future::Future<Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>> {
@@ -789,12 +877,14 @@ pub fn jobs_update_async(
 ///
 /// Removes a job from the database.
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn jobs_remove(job: DbJobsObj) -> Result<bool, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::JobsRemove(job))
 }
 ///
 /// Removes a job from the database.
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn jobs_remove_async(
     job: DbJobsObj,
 ) -> impl std::future::Future<Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>> {
@@ -804,6 +894,7 @@ pub fn jobs_remove_async(
 /// move / hardlink per `action`), recording it in the DB. Returns an
 /// empty string on success, otherwise a human-readable error message.
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn import_file(path: String, action: FileAction) -> Result<String, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::ImportFile(path, action))
 }
@@ -811,6 +902,7 @@ pub fn import_file(path: String, action: FileAction) -> Result<String, Box<dyn s
 /// move / hardlink per `action`), recording it in the DB. Returns an
 /// empty string on success, otherwise a human-readable error message.
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn import_file_async(
     path: String,
     action: FileAction,
@@ -821,6 +913,7 @@ pub fn import_file_async(
 /// terminal) against this database, returning everything the command
 /// prints. Failures come back as `error: ...` lines.
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn run_cli(command: String) -> Result<String, Box<dyn std::error::Error>> {
     crate::init_data_request(crate::SupportedDBRequests::RunCli(command))
 }
@@ -828,6 +921,7 @@ pub fn run_cli(command: String) -> Result<String, Box<dyn std::error::Error>> {
 /// terminal) against this database, returning everything the command
 /// prints. Failures come back as `error: ...` lines.
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn run_cli_async(
     command: String,
 ) -> impl std::future::Future<Output = Result<String, Box<dyn std::error::Error + Send + Sync>>> {

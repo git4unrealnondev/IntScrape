@@ -15,7 +15,9 @@ fn it_creates_thumbnails_for_mp4() {
         Ok(thumbnail) => assert!(!thumbnail.is_empty()),
         Err(e) => match e {
             ThumbError::Unsupported(_) => {
-                assert!(true, "ffmpeg is not installed");
+                // ffmpeg is not installed in this environment;
+                // thumbnails cannot be created, so this is a pass.
+                eprintln!("ffmpeg not installed, skipping thumbnail creation check");
             }
             e => {
                 panic!("failed to create thumbnails {e}");

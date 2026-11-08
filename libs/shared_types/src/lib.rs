@@ -21,6 +21,80 @@ pub struct CVec<T> {
     pub cap: usize,
 }
 
+/// Serialized plugin-call input for `parser_call`: the scraped page text,
+/// the URL it came from, and the job-scraper data the plugin works from.
+/// Plugins receive this as bitcode bytes (see the `plugin_ffi` helpers
+/// below) instead of a `&ScraperDataReturn` reference, whose owned fields
+/// have no stable C ABI.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+pub struct ParserCallInput {
+    pub text: String,
+    pub source_url: String,
+    pub data: ScraperDataReturn,
+}
+
+/// Helpers for the plugin FFI boundary.
+///
+/// Every value that crosses from host to plugin (or back) is serialized
+/// with bitcode into an owned byte buffer (`CVec<u8>`), never a Rust
+/// `Vec`/`HashMap`/`String` or a reference to a struct containing them.
+/// Those types have no stable C ABI — their layout depends on the exact
+/// rustc version and allocator — so passing them by value across the
+/// `libloading` boundary was unsound in principle and only worked because
+/// host and plugins happen to be built together. Byte buffers are the
+/// only thing with a well-defined layout, and bitcode is already the
+/// wire format for host↔client IPC, so plugins speak one format.
+///
+/// Ownership mirrors `CVec`: the producer leaks the buffer into the
+/// `CVec`, and the consumer reconstructs (and frees) it with
+/// `CVec::into_vec`. Both sides are built with the default system
+/// allocator, which is what makes that reconstruction valid.
+pub mod plugin_ffi {
+    use super::CVec;
+
+    /// Serialize a plugin-boundary value into an owned byte buffer to
+    /// hand across the FFI boundary.
+    pub fn encode<T: bitcode::Encode>(value: &T) -> CVec<u8> {
+        CVec::from_vec(bitcode::encode(value))
+    }
+
+    /// Decode a plugin-boundary value from a borrowed input buffer.
+    /// Returns `None` on decode failure instead of panicking, so plugin
+    /// wrappers can return an empty result.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee `ptr..ptr+len` is valid for the call
+    /// (the host's encoded buffer outlives the call, by construction),
+    /// and that the bytes are a valid bitcode encoding of `T` if they
+    /// are to be decoded (garbage bytes yield `None`, not UB, unless
+    /// they form a structurally valid encoding of a different value).
+    pub unsafe fn decode<T: for<'de> bitcode::Decode<'de>>(
+        ptr: *const u8,
+        len: usize,
+    ) -> Option<T> {
+        if ptr.is_null() || len == 0 {
+            return None;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        bitcode::decode(bytes).ok()
+    }
+
+    /// Take ownership of a returned byte buffer and decode the value,
+    /// freeing the plugin-allocated buffer in the process.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must be a buffer previously created by `CVec::from_vec`
+    /// (i.e. from a leaked `Vec` built with the same allocator), so
+    /// that reconstructing the `Vec` from its raw parts is valid and
+    /// the buffer is not aliased or double-freed.
+    pub unsafe fn take<T: for<'de> bitcode::Decode<'de>>(buf: CVec<u8>) -> Option<T> {
+        let bytes = unsafe { buf.into_vec() };
+        bitcode::decode(&bytes).ok()
+    }
+}
+
 impl<T> CVec<T> {
     /// Convert a standard Vec into an FFI safe structure (Leaks the vec memory safely)
     pub fn from_vec(mut v: Vec<T>) -> Self {
@@ -33,6 +107,13 @@ impl<T> CVec<T> {
     }
 
     /// Reconstruct the standard Vec (Takes back ownership to read or free it)
+    ///
+    /// # Safety
+    ///
+    /// `self` must have been created by `CVec::from_vec` from a leaked
+    /// `Vec` built with the same allocator, with no other aliases to
+    /// the buffer, so reconstructing the `Vec` from its raw parts is
+    /// valid and it will not be double-freed.
     pub unsafe fn into_vec(self) -> Vec<T> {
         if self.ptr.is_null() {
             vec![]
@@ -168,7 +249,7 @@ pub struct PluginJob {
 ///
 /// Used as a return from a plugin when doing text scraping
 ///
-#[derive(Clone, Default, PartialEq, Debug)]
+#[derive(Clone, Default, PartialEq, Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub enum ScraperReturn {
     // Valid data from the system
     Data(ScraperObject),
@@ -182,7 +263,7 @@ pub enum ScraperReturn {
     // Sends job back into queue with x waiting time in seconds
     RetryLater(u64),
 }
-#[derive(Default, Clone, PartialEq, Debug)]
+#[derive(Default, Clone, PartialEq, Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct ScraperObject {
     pub files: HashSet<FileObject>,
     pub tags: HashSet<PluginTag>,
@@ -191,7 +272,7 @@ pub struct ScraperObject {
 }
 
 /// Gets used for the on_download callback return
-#[derive(Default)]
+#[derive(Default, Clone, PartialEq, Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct CallbackReturn {
     pub tags: HashSet<FileTagAction>,
     pub jobs: HashSet<ScraperDataReturn>,
@@ -237,7 +318,7 @@ pub struct FileTagAction {
 
 /// Represents one file
 /// Current version of FileObject
-#[derive(Default, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Default, Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct FileObject {
     pub source: Option<FileSource>,
     // Hash of file
@@ -291,13 +372,13 @@ pub struct TagSearch {
     pub count: u64,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub enum FileSource {
     Url(String),
     Bytes(Vec<u8>),
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Deserialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 #[cfg_attr(feature = "strum", derive(strum_macros::EnumIter))]
 pub enum HashesSupported {
     Md5(String),
@@ -340,14 +421,13 @@ pub struct DbJobsObj {
     pub config: PluginJob,
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Default, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Default, Eq, Hash, PartialEq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct ScraperDataReturn {
     pub job: PluginJob,
     pub skip_conditions: Vec<SkipIf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub enum SkipIf {
     // If a relationship between any file and tag exists.
     FileTagRelationship(Tag),
@@ -363,8 +443,7 @@ pub enum SkipIf {
     // Skips job if a relate_tag_id and limit_to exists
     ParentsRelateLimitto((Tag, Tag)),
 }
-#[repr(C)]
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Default)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Default, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct Plugin {
     /// Name of the site (human readable plz)
     pub name: String,
@@ -385,8 +464,7 @@ pub struct Plugin {
     pub properties: Vec<PluginProperties>,
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub enum PluginProperties {
     /// Ratelimit number of tokens per time
     Ratelimit(u32, Duration),
@@ -501,7 +579,7 @@ pub enum LoginType {
 /// Data storage for the login type needed to determine if we have to use this to access a site or
 /// if its just a nice to have
 ///
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Default)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Default, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub enum LoginNeed {
     Required,
     #[default]
@@ -529,7 +607,7 @@ pub struct LoginUsernameOrPassword {
     pub password: Secret<String>,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub enum GlobalCallbacks {
     // Ran when a file is downloaded
     Download,
@@ -598,7 +676,7 @@ pub enum CallbackCustomData {
     VCallback,
 }
 
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Ord, PartialOrd)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Ord, PartialOrd, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub enum StartupThreadType {
     // Runs plugin and waits until it finished
     Inline,
@@ -608,7 +686,7 @@ pub enum StartupThreadType {
     SpawnInline,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub enum SearchType {
     String(String),
     Regex(String),

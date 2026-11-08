@@ -66,10 +66,14 @@ use request::{PageKind, key, request_from_params};
 
 /// Plugin registration, read once by the host at startup.
 #[unsafe(no_mangle)]
-fn get_plugin_info() -> shared_types::CVec<Plugin> {
-    // The host consumes this via `CVec::into_vec` (see `src/plugins.rs`).
-    // The inner helper keeps the original `Vec` body unchanged.
-    shared_types::CVec::from_vec(get_plugin_info_impl())
+fn get_plugin_info() -> shared_types::CVec<u8> {
+    // The host consumes this via `plugin_ffi::take` (see `src/plugins.rs`):
+    // a bitcode encoding of `Vec<Plugin>` in an owned byte buffer.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(get_plugin_info_impl));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&Vec::<shared_types::Plugin>::new()),
+    }
 }
 
 pub fn get_plugin_info_impl() -> Vec<Plugin> {
@@ -119,7 +123,30 @@ pub fn get_plugin_info_impl() -> Vec<Plugin> {
 /// host's per-param loop simply finds no url to fetch, and `parser_call` does
 /// the requesting itself.
 #[unsafe(no_mangle)]
-pub fn url_dump(scraperdata: &ScraperDataReturn) -> Vec<ScraperDataReturn> {
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn url_dump(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(data) = (unsafe {
+            shared_types::plugin_ffi::decode::<shared_types::ScraperDataReturn>(req, req_len)
+        }) else {
+            return Vec::new();
+        };
+        url_dump_impl(&data)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&Vec::<shared_types::ScraperDataReturn>::new()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub fn url_dump_impl(scraperdata: &ScraperDataReturn) -> Vec<ScraperDataReturn> {
     let job = &scraperdata.job;
 
     // A continuation or a spawned gallery already knows exactly what it wants.
@@ -188,11 +215,10 @@ fn first_term(job: &shared_types::PluginJob) -> Option<String> {
 
     // Fall back to a url's identifying segment.
     for param in &job.param {
-        if let shared_types::ScraperParam::Url(url) = param {
-            if let Some(term) = term_from_url(&url.url) {
+        if let shared_types::ScraperParam::Url(url) = param
+            && let Some(term) = term_from_url(&url.url) {
                 return Some(term);
             }
-        }
     }
 
     None
@@ -232,7 +258,34 @@ fn term_from_url(url: &str) -> Option<String> {
 
 /// Fetches the page this job describes and turns it into files, tags and jobs.
 #[unsafe(no_mangle)]
-pub fn parser_call(
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn parser_call(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(input) = (unsafe {
+            shared_types::plugin_ffi::decode::<shared_types::ParserCallInput>(req, req_len)
+        }) else {
+            return vec![shared_types::ScraperReturn::Stop(
+                "undecodable parser_call request".to_string(),
+            )];
+        };
+        parser_call_impl(&input.text, &input.source_url, &input.data)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&vec![shared_types::ScraperReturn::Stop(
+            "plugin panicked".to_string(),
+        )]),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub fn parser_call_impl(
     text_input: &str,
     _source_url: &str,
     scraperdata: &ScraperDataReturn,
@@ -385,11 +438,13 @@ fn fetch_listing(
     Ok(harvest)
 }
 
+type ListingRequest = (String, Vec<(&'static str, String)>);
+
 /// Builds the endpoint path and query for a listing kind.
 fn listing_request(
     kind: PageKind,
     user_data: &std::collections::BTreeMap<String, String>,
-) -> Result<(String, Vec<(&'static str, String)>), ApiFailure> {
+) -> Result<ListingRequest, ApiFailure> {
     let search = user_data.get(key::SEARCH).cloned();
     let order = user_data
         .get(key::ORDER)
@@ -525,7 +580,7 @@ mod tests {
 
     #[test]
     fn url_dump_seeds_the_first_listing_page() {
-        let out = url_dump(&job(vec![normal("anal")]));
+        let out = url_dump_impl(&job(vec![normal("anal")]));
         assert_eq!(out.len(), 1);
         let data = user_data_of(&out[0]);
         assert_eq!(data.get(key::KIND).map(String::as_str), Some("listing"));
@@ -536,22 +591,22 @@ mod tests {
 
     #[test]
     fn url_dump_strips_prefixes_into_the_right_slot() {
-        let data = user_data_of(&url_dump(&job(vec![normal("user:somebody")]))[0]);
+        let data = user_data_of(&url_dump_impl(&job(vec![normal("user:somebody")]))[0]);
         assert_eq!(data.get(key::KIND).map(String::as_str), Some("user"));
         assert_eq!(data.get(key::USER).map(String::as_str), Some("somebody"));
 
-        let data = user_data_of(&url_dump(&job(vec![normal("niche:solo")]))[0]);
+        let data = user_data_of(&url_dump_impl(&job(vec![normal("niche:solo")]))[0]);
         assert_eq!(data.get(key::KIND).map(String::as_str), Some("niche"));
         assert_eq!(data.get(key::SEARCH).map(String::as_str), Some("solo"));
 
-        let data = user_data_of(&url_dump(&job(vec![normal("gif:Abc123")]))[0]);
+        let data = user_data_of(&url_dump_impl(&job(vec![normal("gif:Abc123")]))[0]);
         assert_eq!(data.get(key::KIND).map(String::as_str), Some("gif"));
         assert_eq!(data.get(key::GIF_ID).map(String::as_str), Some("Abc123"));
     }
 
     #[test]
     fn url_dump_reads_a_site_url() {
-        let out = url_dump(&job(vec![shared_types::ScraperParam::Url(
+        let out = url_dump_impl(&job(vec![shared_types::ScraperParam::Url(
             shared_types::Url {
                 url: "https://www.redgifs.com/watch/ShrillCourageousComet".to_string(),
                 ..Default::default()
@@ -572,7 +627,7 @@ mod tests {
         user_data.insert(key::SEARCH.to_string(), "anal".to_string());
         user_data.insert(key::PAGE.to_string(), "4".to_string());
 
-        let out = url_dump(&ScraperDataReturn {
+        let out = url_dump_impl(&ScraperDataReturn {
             job: shared_types::PluginJob {
                 site: request::SITE.to_string(),
                 user_data,
@@ -589,8 +644,8 @@ mod tests {
 
     #[test]
     fn url_dump_produces_nothing_for_an_unusable_job() {
-        assert!(url_dump(&job(Vec::new())).is_empty());
-        assert!(url_dump(&job(vec![normal("gif:not a valid id")])).is_empty());
+        assert!(url_dump_impl(&job(Vec::new())).is_empty());
+        assert!(url_dump_impl(&job(vec![normal("gif:not a valid id")])).is_empty());
     }
 
     #[test]
@@ -635,7 +690,7 @@ mod tests {
 
     #[test]
     fn parser_call_returns_nothing_without_a_kind() {
-        let out = parser_call("", "", &job(Vec::new()));
+        let out = parser_call_impl("", "", &job(Vec::new()));
         assert!(matches!(out[0], shared_types::ScraperReturn::Nothing));
     }
 

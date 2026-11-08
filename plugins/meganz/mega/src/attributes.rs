@@ -30,7 +30,7 @@ impl NodeAttributes {
         // Public-folder responses may contain entries for which a candidate
         // key is not valid. Reject malformed ciphertext instead of allowing
         // the parser to panic while probing keys.
-        if buffer.len() < 16 || buffer.len() % 16 != 0 {
+        if buffer.len() < 16 || !buffer.len().is_multiple_of(16) {
             return Err(crate::Error::InvalidResponseFormat);
         }
 
@@ -63,7 +63,7 @@ impl NodeAttributes {
         json::to_writer(&mut buffer, self)?;
 
         let padding_len = (16 - buffer.len() % 16) % 16;
-        buffer.extend(std::iter::repeat(b'\0').take(padding_len));
+        buffer.extend(std::iter::repeat_n(b'\0', padding_len));
 
         let mut cbc = cbc::Encryptor::<Aes128>::new(file_key.into(), &<_>::default());
         for chunk in buffer.chunks_exact_mut(16) {

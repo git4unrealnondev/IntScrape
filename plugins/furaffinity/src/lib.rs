@@ -6,7 +6,7 @@ use std::{
 use scraper::{Html, Selector};
 use shared_types::{
     DEFAULT_PRIORITY, DownloadModifiers, FileObject, FileSource, FileTagAction,
-    GenericNamespaceObj, LoginNeed, LoginType, ModifierTarget, PluginJob, PluginProperties,
+    GenericNamespaceObj, LoginNeed, LoginType, ModifierTarget, PluginProperties,
     PluginTag, RelationContext, ScraperDataReturn, ScraperParam, ScraperReturn, Tag,
     TargetModifier,
 };
@@ -15,10 +15,14 @@ use url::Url;
 const SITE_ROOT: &str = "www.furaffinity.net";
 
 #[unsafe(no_mangle)]
-fn get_plugin_info() -> shared_types::CVec<shared_types::Plugin> {
-    // The host consumes this via `CVec::into_vec` (see `src/plugins.rs`).
-    // The inner helper keeps the original `Vec` body unchanged.
-    shared_types::CVec::from_vec(get_plugin_info_impl())
+fn get_plugin_info() -> shared_types::CVec<u8> {
+    // The host consumes this via `plugin_ffi::take` (see `src/plugins.rs`):
+    // a bitcode encoding of `Vec<Plugin>` in an owned byte buffer.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(get_plugin_info_impl));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&Vec::<shared_types::Plugin>::new()),
+    }
 }
 
 fn get_plugin_info_impl() -> Vec<shared_types::Plugin> {
@@ -199,7 +203,30 @@ fn form_encode(s: &str) -> String {
 }
 
 #[unsafe(no_mangle)]
-pub fn url_dump(
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn url_dump(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(data) = (unsafe {
+            shared_types::plugin_ffi::decode::<shared_types::ScraperDataReturn>(req, req_len)
+        }) else {
+            return Vec::new();
+        };
+        url_dump_impl(&data)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&Vec::<shared_types::ScraperDataReturn>::new()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub fn url_dump_impl(
     scraperdata: &shared_types::ScraperDataReturn,
 ) -> Vec<shared_types::ScraperDataReturn> {
     let mut out = Vec::new();
@@ -253,7 +280,34 @@ pub fn url_dump(
 }
 
 #[unsafe(no_mangle)]
-pub fn parser_call(
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn parser_call(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(input) = (unsafe {
+            shared_types::plugin_ffi::decode::<shared_types::ParserCallInput>(req, req_len)
+        }) else {
+            return vec![shared_types::ScraperReturn::Stop(
+                "undecodable parser_call request".to_string(),
+            )];
+        };
+        parser_call_impl(&input.text, &input.source_url, &input.data)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&vec![shared_types::ScraperReturn::Stop(
+            "plugin panicked".to_string(),
+        )]),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub fn parser_call_impl(
     text_input: &str,
     source_url: &str,
     scraperdata: &shared_types::ScraperDataReturn,
@@ -849,6 +903,7 @@ fn finalize(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared_types::PluginJob;
 
     // Minimal stand-in for a real /view/ page: same selectors and shape as
     // https://www.furaffinity.net/view/66953097/
@@ -906,7 +961,7 @@ mod tests {
 
     #[test]
     fn parse_submission_page() {
-        let out = parser_call(
+        let out = parser_call_impl(
             SUBMISSION_HTML,
             "https://www.furaffinity.net/view/66953097/",
             &data(),
@@ -987,7 +1042,7 @@ mod tests {
           </div>
           <div class="submission-description-artist"><div class="submission-title"><h2>Story</h2></div></div>
         </body></html>"#;
-        let out = parser_call(html, "https://www.furaffinity.net/view/57767297/", &data());
+        let out = parser_call_impl(html, "https://www.furaffinity.net/view/57767297/", &data());
         let ScraperReturn::Data(obj) = &out[0] else {
             panic!("expected Data, got {:?}", out[0])
         };
@@ -1010,7 +1065,7 @@ mod tests {
                src="//d.furaffinity.net/art/viciouscabaret/stories/1723752310/1723752148.thumbnail.viciouscabaret_dragon_heart_ch_1.rtf.gif" />
           <div class="submission-description-artist"><div class="submission-title"><h2>Story</h2></div></div>
         </body></html>"#;
-        let out = parser_call(html, "https://www.furaffinity.net/view/57767297/", &data());
+        let out = parser_call_impl(html, "https://www.furaffinity.net/view/57767297/", &data());
         let ScraperReturn::Data(obj) = &out[0] else {
             panic!("expected Data, got {:?}", out[0])
         };
@@ -1054,7 +1109,7 @@ mod tests {
             <span class="tags"><span><a href="javascript:void(0);" data-tag-name="s_unspecified_any" class="tag-block"></a><span class="tag-invalid">s_unspecified_any</span></span></span>
           </div></div>
         </body></html>"#;
-        let out = parser_call(html, "https://www.furaffinity.net/view/66885588/", &data());
+        let out = parser_call_impl(html, "https://www.furaffinity.net/view/66885588/", &data());
         let ScraperReturn::Data(obj) = &out[0] else {
             panic!("expected Data, got {:?}", out[0])
         };
@@ -1093,7 +1148,7 @@ mod tests {
 
     #[test]
     fn parse_listing_page() {
-        let out = parser_call(
+        let out = parser_call_impl(
             LISTING_HTML,
             "https://www.furaffinity.net/gallery/yggiiggy/",
             &data(),
@@ -1154,16 +1209,16 @@ mod tests {
 
         // One job per input, never 250 pages of search/gallery fan-out.
         assert_eq!(
-            url_dump(&mk(url("https://www.furaffinity.net/view/66953097/"))).len(),
+            url_dump_impl(&mk(url("https://www.furaffinity.net/view/66953097/"))).len(),
             1
         );
         assert_eq!(
-            url_dump(&mk(url("https://www.furaffinity.net/gallery/yggiiggy/"))).len(),
+            url_dump_impl(&mk(url("https://www.furaffinity.net/gallery/yggiiggy/"))).len(),
             1
         );
-        assert_eq!(url_dump(&mk(ScraperParam::Normal("avian".into()))).len(), 1);
+        assert_eq!(url_dump_impl(&mk(ScraperParam::Normal("avian".into()))).len(), 1);
 
-        let out = url_dump(&mk(url("https://www.furaffinity.net/view/66953097")));
+        let out = url_dump_impl(&mk(url("https://www.furaffinity.net/view/66953097")));
         assert_eq!(out[0].job.param.len(), 1);
         assert!(matches!(
             &out[0].job.param[0],
@@ -1177,7 +1232,7 @@ mod tests {
             shared_types::SkipIf::FileTagRelationship(_)
         ));
 
-        let out = url_dump(&mk(url("https://www.furaffinity.net/gallery/yggiiggy/")));
+        let out = url_dump_impl(&mk(url("https://www.furaffinity.net/gallery/yggiiggy/")));
         assert_eq!(out[0].job.priority, LISTING_PRIORITY);
         // Listing pages have no visited checker, so they always re-run.
         assert!(out[0].skip_conditions.is_empty());
@@ -1192,11 +1247,11 @@ mod tests {
             "https://www.furaffinity.net/user/yggiiggy/",
             "https://www.furaffinity.net/search/?q=avian",
         ] {
-            let out = url_dump(&mk(url(listing)));
+            let out = url_dump_impl(&mk(url(listing)));
             assert_eq!(out.len(), 1, "{listing}");
             assert!(out[0].skip_conditions.is_empty(), "{listing}");
         }
-        let out = url_dump(&mk(ScraperParam::Normal("avian".into())));
+        let out = url_dump_impl(&mk(ScraperParam::Normal("avian".into())));
         assert_eq!(out.len(), 1);
         assert!(out[0].skip_conditions.is_empty());
     }
@@ -1233,7 +1288,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let out = url_dump(&entry);
+        let out = url_dump_impl(&entry);
         assert_eq!(out.len(), 1);
         let ScraperParam::Url(url) = &out[0].job.param[0] else {
             panic!("expected Url param")
@@ -1274,7 +1329,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let out = url_dump(&entry);
+        let out = url_dump_impl(&entry);
         assert_eq!(out.len(), 1);
         let ScraperParam::Url(url) = &out[0].job.param[0] else {
             panic!("expected Url param")
@@ -1293,7 +1348,7 @@ mod tests {
             The owner of this page has elected to make it available to registered users only.
             To view the contents of this page please log in or create an account.
             </div></body></html>"#;
-        let out = parser_call(html, "https://www.furaffinity.net/view/66953097/", &data());
+        let out = parser_call_impl(html, "https://www.furaffinity.net/view/66953097/", &data());
         assert!(
             matches!(out[0], ScraperReturn::Stop(_)),
             "expected Stop, got {:?}",

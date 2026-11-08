@@ -56,6 +56,7 @@ impl TursoDatabase {
     }
 
     /// Resolves tag names across namespaces while preserving boolean groups.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::db::turso) async fn search_db_files_by_tag_groups(
         &self,
         conn: &Connection,
@@ -91,6 +92,7 @@ impl TursoDatabase {
     /// keeps the O(result) walk inside the database (a plain index-order
     /// aggregation, no rows shipped) instead of sending the full result set
     /// across IPC for a client-side `len()`.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::db::turso) async fn search_db_files_by_tag_groups_count(
         &self,
         conn: &Connection,

@@ -39,7 +39,7 @@ async fn run(
         })
     };
 
-    mega.upload_thumbnail(&node, size, reader.compat()).await?;
+    mega.upload_thumbnail(node, size, reader.compat()).await?;
 
     bar.finish_with_message("thumbnail uploaded !");
 

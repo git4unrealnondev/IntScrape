@@ -33,6 +33,7 @@ mod bench;
 mod ipc;
 mod migrations;
 
+#[allow(dead_code)]
 const TAG_CACHE_LIMIT: usize = 100_000;
 
 /// Process-global slurp liveness, mirrored from [`TursoDatabase::set_slurping`]
@@ -74,6 +75,104 @@ pub struct TursoDatabase {
     /// count deltas are deferred out of the phases' write transactions and
     /// folded in one short transaction at a time through this lock.
     tag_count_lock: Arc<Mutex<()>>,
+    /// Next unused `File` id. Since schema v13 the SHA-512 digest lives in
+    /// `FileHashes`, so `file_add_bulk` no longer has `File.hash`'s UNIQUE
+    /// constraint to arbitrate dedupe races or to correlate a newly inserted
+    /// row with its hash via `RETURNING` — it assigns ids itself from this
+    /// counter (initialised from `MAX(id)` at boot) and inserts the
+    /// `FileHashes` row with the same id in the caller's transaction.
+    next_file_id: std::sync::atomic::AtomicU64,
+    /// Pool of reusable Turso connections (see `ConnectionPool`).
+    connection_pool: Arc<ConnectionPool>,
+}
+
+/// Pool of idle Turso connections, checked out by
+/// [`TursoDatabase::connect`] and returned on drop.
+///
+/// Most DB traffic is small requests (one point lookup per IPC call), and
+/// opening a fresh Turso connection per request (~230µs measured for
+/// connect+trivial query) plus re-preparing every statement dominated
+/// those paths. Reusing connections also keeps Turso's per-connection
+/// statement cache (`prepare_cached`) warm across requests. The pool
+/// never blocks: a checkout with an empty pool creates a new connection,
+/// so the pool grows to peak concurrency and then reuses. A connection
+/// returned with an open transaction is discarded rather than pooled —
+/// a pooled connection must never carry a dangling transaction into its
+/// next user.
+struct ConnectionPool {
+    idle: std::sync::Mutex<Vec<turso::Connection>>,
+    max_idle: usize,
+    db: turso::Database,
+}
+
+impl ConnectionPool {
+    fn checkout(&self) -> Option<turso::Connection> {
+        self.idle.lock().ok()?.pop()
+    }
+
+    fn checkin(&self, conn: turso::Connection) {
+        if self.max_idle == 0 {
+            return;
+        }
+        // Only autocommit-clean connections are reusable. Anything else
+        // (dangling transaction, busy statement) is dropped for real.
+        if !matches!(conn.is_autocommit(), Ok(true)) {
+            return;
+        }
+        if let Ok(mut idle) = self.idle.lock()
+            && idle.len() < self.max_idle
+        {
+            idle.push(conn);
+        }
+    }
+
+    /// Drops every idle pooled connection. Journal-mode changes are
+    /// database-wide and can be rejected while other connections hold
+    /// the database open, so mode switches drain first (checked-out
+    /// connections are unaffected — they simply won't be pooled again
+    /// until they next check in).
+    fn drain_idle(&self) {
+        if let Ok(mut idle) = self.idle.lock() {
+            idle.clear();
+        }
+    }
+
+    fn new_connection(&self) -> Result<turso::Connection> {
+        let conn = self.db.connect()?;
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(1));
+        Ok(conn)
+    }
+}
+
+/// A pooled Turso connection. Derefs to `turso::Connection` so existing
+/// call sites (`query`, `prepare_cached`, `transaction_with_behavior`,
+/// passing `&conn` where `&Connection` is expected) work unchanged.
+/// Dropping it returns it to the pool (see `ConnectionPool::checkin`).
+pub struct PooledConnection {
+    conn: Option<turso::Connection>,
+    pool: Arc<ConnectionPool>,
+}
+
+impl std::ops::Deref for PooledConnection {
+    type Target = turso::Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.conn.as_ref().expect("PooledConnection used after take")
+    }
+}
+
+impl std::ops::DerefMut for PooledConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.conn.as_mut().expect("PooledConnection used after take")
+    }
+}
+
+impl Drop for PooledConnection {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.pool.checkin(conn);
+        }
+    }
 }
 
 impl TursoDatabase {
@@ -216,6 +315,10 @@ impl TursoDatabase {
     /// change; returning false lets the caller keep running (under the
     /// previous mode) rather than abort.
     pub(in crate::db::turso) async fn try_set_journal_mode(&self, mode: &str) -> bool {
+        // Idle pooled connections hold the database open and can make the
+        // database-wide pragma fail; drop them first so the change only
+        // has to contend with connections actually in use.
+        self.connection_pool.drain_idle();
         let Ok(conn) = self.connect() else {
             return false;
         };
@@ -235,10 +338,32 @@ impl TursoDatabase {
         }
     }
 
-    /// Opens a Turso connection without installing a busy handler. Transaction
-    /// conflicts are handled by the operation that owns the transaction.
-    pub(crate) fn connect(&self) -> Result<turso::Connection> {
-        self.db.connect()
+    /// Checks out a pooled Turso connection (see `ConnectionPool`), with a
+    /// short busy timeout installed on new connections.
+    ///
+    /// Without a busy handler, an `IMMEDIATE` writer that meets another
+    /// writer's lock fails instantly with `Busy`, and callers either abort
+    /// the operation or (via `retry_mvcc`) re-run the whole transaction
+    /// from scratch — expensive for the large phase transactions. A 1s
+    /// busy timeout makes the engine wait in place for the lock instead,
+    /// which is far cheaper than a rerun under congestion. MVCC snapshot
+    /// conflicts (`BusySnapshot`, the `Concurrent` path) are a different
+    /// error and are still surfaced to `retry_mvcc` for handling.
+    ///
+    /// Idle pool size defaults to 32 (matching the IPC concurrency cap)
+    /// and can be overridden with `INTSCRAPE_DB_POOL_SIZE` (`0` disables
+    /// pooling, restoring connect-per-request).
+    pub(crate) fn connect(&self) -> Result<PooledConnection> {
+        if let Some(conn) = self.connection_pool.checkout() {
+            return Ok(PooledConnection {
+                conn: Some(conn),
+                pool: Arc::clone(&self.connection_pool),
+            });
+        }
+        Ok(PooledConnection {
+            conn: Some(self.connection_pool.new_connection()?),
+            pool: Arc::clone(&self.connection_pool),
+        })
     }
 
     /// Creates a db at the path
@@ -258,6 +383,19 @@ impl TursoDatabase {
             //.experimental_without_rowid(true)
             .experimental_materialized_views(true)
             .experimental_index_method(true)
+            // At production scale (millions of files/relationships) the
+            // MVCC logical log is the main SSD-write amplifier. Without
+            // this flag, MVCC checkpoints are forced to Truncate mode,
+            // which stalls/fails while readers hold snapshots (exactly
+            // the congested case: slurp/backup checkpoints running
+            // alongside live IPC readers). With it, Passive checkpoints
+            // can reclaim already-committed log segments while readers
+            // are active, so the existing wal_checkpoint calls (shutdown,
+            // slurp batches, backups) keep working under load. This is
+            // the flag Turso's own checkpoint benchmarks use; in a
+            // no-reader test it is neutral, its benefit is under
+            // concurrent readers.
+            .experimental_mvcc_passive_checkpoint(true)
             .build()
             .await
             .unwrap();
@@ -295,6 +433,21 @@ impl TursoDatabase {
             }
         }
 
+        // Initialise the file-id counter from the current maximum. A fresh
+        // database has no `File` table yet (created just below), in which
+        // case the query fails and the counter correctly starts at 1.
+        let mut next_file_id_value: u64 = 1;
+        if let Ok(conn) = db.connect()
+            && let Ok(mut rows) = conn
+                .query("SELECT COALESCE(MAX(id), 0) FROM File;", ())
+                .await
+            && let Ok(Some(row)) = rows.next().await
+            && let Ok(max) = row.get::<i64>(0)
+        {
+            next_file_id_value = (max.max(0) as u64) + 1;
+        }
+
+        let db_for_pool = db.clone();
         let out = TursoDatabase {
             db,
             db_path: db_path.to_string_lossy().to_string(),
@@ -308,6 +461,15 @@ impl TursoDatabase {
             ipc_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ipc_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tag_count_lock: Arc::new(Mutex::new(())),
+            next_file_id: std::sync::atomic::AtomicU64::new(next_file_id_value),
+            connection_pool: Arc::new(ConnectionPool {
+                idle: std::sync::Mutex::new(Vec::new()),
+                max_idle: std::env::var("INTSCRAPE_DB_POOL_SIZE")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(32),
+                db: db_for_pool,
+            }),
         };
 
         if create_db {
@@ -468,6 +630,9 @@ impl TursoDatabase {
                 }
                 11 => {
                     self.update_db_11_to_12(&conn).await?;
+                }
+                12 => {
+                    self.update_db_12_to_13(&conn).await?;
                 }
                 _ => {
                     return Err(turso::Error::Error(format!(

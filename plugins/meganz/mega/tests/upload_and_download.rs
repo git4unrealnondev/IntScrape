@@ -9,6 +9,7 @@ use rand::distributions::{Alphanumeric, DistString};
 pub const BASE_PATH: &str = "/Root/mega-rs-tests";
 
 #[tokio::test]
+#[ignore = "live MEGA API test: requires MEGA_EMAIL/MEGA_PASSWORD (and MEGA_PUBLIC_URL where applicable); run with --ignored"]
 async fn upload_and_download_test() {
     let email = env::var("MEGA_EMAIL").expect("missing MEGA_EMAIL environment variable");
     let password = env::var("MEGA_PASSWORD").expect("missing MEGA_PASSWORD environment variable");

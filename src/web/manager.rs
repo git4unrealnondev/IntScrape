@@ -283,10 +283,12 @@ struct PageDedup<'a> {
 struct InternalStorage {
     plugin: Plugin,
     job_storage: Vec<DbJobsObj>,
+    #[allow(dead_code)]
     completed_job_storage: Vec<DbJobsObj>,
     ratelimiter: Arc<RatelimitManager>,
     job_limiter: Arc<PrioritySemaphore>,
     //Stores file urls that we're downloading
+    #[allow(dead_code)]
     file_urls: HashSet<String>,
 }
 
@@ -928,7 +930,7 @@ impl Scraper {
                             job.isrunning = false;
                             job.config.time = helper_functions::get_sys_time_in_secs();
                             job.config.reptime = later_duration;
-                            self.download_manager.db.jobs_update(&job).await;
+                            let _ = self.download_manager.db.jobs_update(&job).await;
                             should_remove_job.store(false, std::sync::atomic::Ordering::Relaxed);
                             break 'scraperloop;
                         }
@@ -1055,7 +1057,7 @@ impl Scraper {
                 job.config.recreation = Some(DbJobRecreation::AlwaysTime(timestamp, Some(count)));
             }
 
-            self.download_manager.db.jobs_update(&job).await;
+            let _ = self.download_manager.db.jobs_update(&job).await;
             return true;
         }
         false
@@ -1083,7 +1085,7 @@ impl Scraper {
     async fn download_file(
         self: Arc<Self>,
         file_url: &str,
-        hash: &Vec<HashesSupported>,
+        hash: &[HashesSupported],
         temp_dir: &std::path::Path,
     ) -> Option<DownloadedFile> {
         let mut cnt = 0;
@@ -1452,8 +1454,7 @@ impl Scraper {
                 FileSource::Url(file_url) => Some(file_url),
                 FileSource::Bytes(_) => None,
             })
-        {
-            if let Some(source_status) = dedup.source_files.get(file_url) {
+            && let Some(source_status) = dedup.source_files.get(file_url) {
                 if source_status.dead {
                     info!(
                         "Scraper: {} JobId: {} Skipping dead URL: {}",
@@ -1478,7 +1479,6 @@ impl Scraper {
                 );
                 return Ok(Some(FileReturn::File(file_internal.clone().into())));
             }
-        }
 
         // Associates file hashes with a file object
         for hash in file.hash.iter().filter(|_| !is_redownload) {
@@ -1581,7 +1581,7 @@ impl Scraper {
                             return Ok(None);
                         }
                         let mut temp_file = tempfile::NamedTempFile::new_in(temp_dir())?;
-                        temp_file.write_all(&file_bytes)?;
+                        temp_file.write_all(file_bytes)?;
                         (TrackedFile::Temp(temp_file), None)
                     }
                 }
@@ -1924,19 +1924,18 @@ impl DownloadsManager {
         let mut out = Vec::new();
 
         for property in &plugin.properties {
-            if let PluginProperties::Login((_loginneed, logintype)) = property {
-                if let LoginType::Cookie(name, _) = logintype {
-                    if let Some(api_key) = self.db.setting_get_sync_blocking(&format!(
+            if let PluginProperties::Login((_loginneed, logintype)) = property
+                && let LoginType::Cookie(name, _) = logintype
+                    && let Some(api_key) = self.db.setting_get_sync_blocking(&format!(
                         "PLUGIN_{}_{}_COOKIE",
                         plugin.name, name
-                    )) {
-                        out.push(ScraperParam::Login(LoginType::Cookie(
-                            name.clone(),
-                            Some(api_key.param.clone().unwrap_or_default()),
-                        )));
-                    }
+                    ))
+                {
+                    out.push(ScraperParam::Login(LoginType::Cookie(
+                        name.clone(),
+                        Some(api_key.param.clone().unwrap_or_default()),
+                    )));
                 }
-            }
         }
 
         if let Some(api_key) = self
@@ -1965,7 +1964,7 @@ impl DownloadsManager {
         if let Some(internal_storage) = self.jobs.write().await.get_mut(&plugin.name) {
             internal_storage.job_storage.retain(|f| f.id != job.id);
             if should_remove_db {
-                self.db.job_remove(job).await;
+                let _ = self.db.job_remove(job).await;
             }
             if internal_storage.job_storage.is_empty() {
                 remove_plugin = true;
@@ -2249,7 +2248,7 @@ impl DownloadsManager {
                         let mut retry_job = scraper.job.clone();
                         retry_job.isrunning = false;
                         retry_job.config.time = get_sys_time_in_secs();
-                        scraper.download_manager.db.jobs_update(&retry_job).await;
+                        let _ = scraper.download_manager.db.jobs_update(&retry_job).await;
                     }
                 });
             } else {

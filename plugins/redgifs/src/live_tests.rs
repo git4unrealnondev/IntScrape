@@ -13,10 +13,6 @@
 use super::*;
 use parse::Options;
 
-fn parse(input: &str) -> json::JsonValue {
-    json::parse(input).unwrap()
-}
-
 /// A listing page, or `None` when the api cannot be reached.
 fn live_listing(term: &str) -> Option<Vec<json::JsonValue>> {
     let mut user_data = std::collections::BTreeMap::new();

@@ -96,7 +96,7 @@ async fn slurp_source_keyset_indexed(source: &Connection, table: &str) -> Option
     let mut pk_columns: Vec<(u64, String)> = Vec::new();
     {
         let mut stmt = source
-            .prepare(&format!("PRAGMA table_info(\"{table}\")"))
+            .prepare_cached(&format!("PRAGMA table_info(\"{table}\")"))
             .await
             .ok()?;
         let mut rows = stmt.query(()).await.ok()?;
@@ -121,7 +121,7 @@ async fn slurp_source_keyset_indexed(source: &Connection, table: &str) -> Option
 
     // Explicit indexes: check each one's leading columns.
     let mut stmt = source
-        .prepare(
+        .prepare_cached(
             "SELECT name FROM sqlite_master
              WHERE type = 'index' AND lower(tbl_name) = lower(?1)",
         )
@@ -140,7 +140,7 @@ async fn slurp_source_keyset_indexed(source: &Connection, table: &str) -> Option
 /// Whether a single index's leading columns are (file_id, tag_id).
 async fn slurp_index_leading_keyset_columns(source: &Connection, index: &str) -> bool {
     let mut stmt = match source
-        .prepare(&format!("PRAGMA index_info(\"{index}\")"))
+        .prepare_cached(&format!("PRAGMA index_info(\"{index}\")"))
         .await
     {
         Ok(stmt) => stmt,
@@ -397,15 +397,14 @@ impl TursoDatabase {
             drops.push('\n');
         }
 
-        if !drops.is_empty() {
-            if let Err(error) = sqlite3_cli(&[&copy_str, &drops]) {
+        if !drops.is_empty()
+            && let Err(error) = sqlite3_cli(&[&copy_str, &drops]) {
                 let _ = std::fs::remove_file(&copy);
                 return Err(turso::Error::ConversionFailure(format!(
                     "sqlite3 schema sanitization of {} failed: {error}",
                     copy.display()
                 )));
             }
-        }
 
         Ok(SlurpSourceTemp { path: copy })
     }
@@ -482,7 +481,7 @@ impl TursoDatabase {
         let source_key = slurp_source_key(source_path);
         {
             let mut stmt = conn
-                .prepare(&format!(
+                .prepare_cached(&format!(
                     "SELECT source_key FROM {SLURP_CHECKPOINT_TABLE}
                      WHERE stage = 'meta'"
                 ))
@@ -522,7 +521,7 @@ impl TursoDatabase {
         let mut namespace_set: HashSet<GenericNamespaceObj> = HashSet::new();
         {
             let mut stmt = source
-                .prepare("SELECT id, name, description FROM Namespace")
+                .prepare_cached("SELECT id, name, description FROM Namespace")
                 .await?;
             let mut rows = stmt.query(()).await?;
             while let Some(row) = rows.next().await? {
@@ -564,7 +563,7 @@ impl TursoDatabase {
         let mut source_storage_ids = HashMap::new();
         conn.execute("BEGIN IMMEDIATE", ()).await?;
         let mut locations = source
-            .prepare("SELECT id, location FROM FileStorageLocations")
+            .prepare_cached("SELECT id, location FROM FileStorageLocations")
             .await?;
         let mut location_rows = locations.query(()).await?;
         while let Some(row) = location_rows.next().await? {
@@ -607,7 +606,7 @@ impl TursoDatabase {
             // name, so a leftover Tags_old is the last good copy of Tags.
             {
                 let mut check = conn
-                    .prepare(
+                    .prepare_cached(
                         "SELECT EXISTS(
                              SELECT 1 FROM sqlite_master
                              WHERE type = 'table' AND name = ?1
@@ -632,7 +631,7 @@ impl TursoDatabase {
             let mut tags_map_loaded = 0_usize;
             if tags_resume.last_tag_id > 0 {
                 let mut stmt = conn
-                    .prepare(&format!(
+                    .prepare_cached(&format!(
                         "SELECT source_id, target_id FROM {SLURP_TAG_MAP_TABLE}"
                     ))
                     .await?;
@@ -659,7 +658,7 @@ impl TursoDatabase {
             // Only a destination that already owns tags needs the per-batch
             // "exists?" lookup; an empty Tags table has nothing to resolve.
             let has_existing_tags: bool = {
-                let mut stmt = conn.prepare("SELECT EXISTS(SELECT 1 FROM Tags)").await?;
+                let mut stmt = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM Tags)").await?;
                 let exists: i64 = stmt.query_row(()).await?.get(0)?;
                 exists != 0
             };
@@ -737,7 +736,7 @@ impl TursoDatabase {
             // auto-assignment behaviour.
             let mut next_insert_id: i64 = {
                 let mut stmt = conn
-                    .prepare("SELECT COALESCE(MAX(id), 0) FROM Tags")
+                    .prepare_cached("SELECT COALESCE(MAX(id), 0) FROM Tags")
                     .await?;
                 stmt.query_row(()).await?.get(0)?
             };
@@ -749,7 +748,7 @@ impl TursoDatabase {
                 // straight into canonical Tags, so this attempt creates the
                 // staging table fresh below and starts from canonical's max.
                 let mut exists = conn
-                    .prepare(
+                    .prepare_cached(
                         "SELECT EXISTS(
                              SELECT 1 FROM sqlite_schema
                              WHERE type = 'table' AND name = 'Tags_slurp'
@@ -759,7 +758,7 @@ impl TursoDatabase {
                 let has_staging: i64 = exists.query_row(()).await?.get(0)?;
                 if has_staging != 0 {
                     let mut stmt = conn
-                        .prepare("SELECT COALESCE(MAX(id), 0) FROM Tags_slurp")
+                        .prepare_cached("SELECT COALESCE(MAX(id), 0) FROM Tags_slurp")
                         .await?;
                     let staged_max: i64 = stmt.query_row(()).await?.get(0)?;
                     next_insert_id = next_insert_id.max(staged_max);
@@ -770,7 +769,7 @@ impl TursoDatabase {
             loop {
                 let batch_started = Instant::now();
                 let mut stmt = source
-                    .prepare(
+                    .prepare_cached(
                         "SELECT s.id, s.name, n.name, n.description
                          FROM Tags s
                          JOIN Namespace n ON n.id = s.namespace
@@ -884,7 +883,7 @@ impl TursoDatabase {
                 // can have completed the swap before crashing later, leaving
                 // Tags_slurp renamed into canonical Tags.
                 let mut exists = conn
-                    .prepare(
+                    .prepare_cached(
                         "SELECT EXISTS(
                              SELECT 1 FROM sqlite_schema
                              WHERE type = 'table' AND name = 'Tags_slurp'
@@ -893,7 +892,7 @@ impl TursoDatabase {
                     .await?;
                 let has_staging: i64 = exists.query_row(()).await?.get(0)?;
                 if has_staging != 0 {
-                    let mut stmt = conn.prepare("SELECT COUNT(*) FROM Tags_slurp").await?;
+                    let mut stmt = conn.prepare_cached("SELECT COUNT(*) FROM Tags_slurp").await?;
                     stmt.query_row(()).await?.get::<i64>(0)? as usize
                 } else {
                     0
@@ -937,7 +936,7 @@ impl TursoDatabase {
                 let copy_started = Instant::now();
                 let max_copy_id: i64 = {
                     let mut stmt = conn
-                        .prepare("SELECT COALESCE(MAX(rowid), 0) FROM Tags")
+                        .prepare_cached("SELECT COALESCE(MAX(rowid), 0) FROM Tags")
                         .await?;
                     let mut rows = stmt.query(()).await?;
                     rows.next()
@@ -987,7 +986,7 @@ impl TursoDatabase {
         {
             let file_schema: String = {
                 let mut stmt = source
-                    .prepare(
+                    .prepare_cached(
                         "SELECT sql FROM sqlite_master
                          WHERE type = 'table' AND lower(name) = 'file'",
                     )
@@ -1014,7 +1013,7 @@ impl TursoDatabase {
             let mut files_map_loaded = 0_usize;
             if files_resume.last_file_id > 0 {
                 let mut stmt = conn
-                    .prepare(&format!(
+                    .prepare_cached(&format!(
                         "SELECT source_id, target_id FROM {SLURP_FILE_MAP_TABLE}"
                     ))
                     .await?;
@@ -1042,14 +1041,15 @@ impl TursoDatabase {
                      ORDER BY f.id
                      LIMIT ?2"
                 );
-                let mut stmt = source.prepare(&file_query).await?;
+                let mut stmt = source.prepare_cached(&file_query).await?;
                 let mut rows = stmt
                     .query([
                         keyset_bound(first_file_pass, last_file_id),
                         (SQL_CHUNK_SIZE * 8) as i64,
                     ])
                     .await?;
-                let mut batch: Vec<(u64, String, String, Option<u64>, Option<u64>)> = Vec::new();
+                type SlurpBatchRow = (u64, String, String, Option<u64>, Option<u64>);
+                let mut batch: Vec<SlurpBatchRow> = Vec::new();
                 while let Some(row) = rows.next().await? {
                     batch.push((
                         row.get(0)?,
@@ -1151,7 +1151,7 @@ impl TursoDatabase {
         {
             let has_file_hashes: bool = {
                 let mut stmt = source
-                    .prepare(
+                    .prepare_cached(
                         "SELECT EXISTS(
                              SELECT 1 FROM sqlite_master
                              WHERE type = 'table' AND lower(name) = 'filehashes'
@@ -1174,7 +1174,7 @@ impl TursoDatabase {
                 loop {
                     let batch_started = Instant::now();
                     let mut stmt = source
-                        .prepare(
+                        .prepare_cached(
                             "SELECT h.file_id, h.algorithm, h.digest
                              FROM FileHashes h
                              WHERE h.file_id > ?1
@@ -1257,7 +1257,7 @@ impl TursoDatabase {
         {
             let source_table_exists = async |name: &str| -> Result<bool> {
                 let mut stmt = source
-                    .prepare(
+                    .prepare_cached(
                         "SELECT 1 FROM sqlite_master
                          WHERE type = 'table' AND lower(name) = lower(?1)",
                     )
@@ -1280,7 +1280,7 @@ impl TursoDatabase {
             // imports, so its absence here always means a crashed recount.)
             let mut covering_dropped = {
                 let mut stmt = conn
-                    .prepare(
+                    .prepare_cached(
                         "SELECT EXISTS(
                              SELECT 1 FROM sqlite_master
                              WHERE type = 'index' AND name = 'idx_tags_count_covering'
@@ -1307,7 +1307,7 @@ impl TursoDatabase {
             let mut pending_recount: HashSet<u64> = HashSet::new();
             {
                 let mut stmt = conn
-                    .prepare("SELECT namespace FROM _slurp_pending_recount")
+                    .prepare_cached("SELECT namespace FROM _slurp_pending_recount")
                     .await?;
                 let mut rows = stmt.query(()).await?;
                 while let Some(row) = rows.next().await? {
@@ -1320,7 +1320,7 @@ impl TursoDatabase {
             let mut partition_source_ids = HashSet::new();
             {
                 let mut stmt = source
-                    .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+                    .prepare_cached("SELECT name FROM sqlite_master WHERE type = 'table'")
                     .await?;
                 let mut rows = stmt.query(()).await?;
                 while let Some(row) = rows.next().await? {
@@ -1367,7 +1367,7 @@ impl TursoDatabase {
             // drop/rebuild and recount paths must fire for them too.
             let tag_map_nonempty: bool = {
                 let mut stmt = conn
-                    .prepare(&format!(
+                    .prepare_cached(&format!(
                         "SELECT EXISTS(SELECT 1 FROM {SLURP_TAG_MAP_TABLE})"
                     ))
                     .await?;
@@ -1412,8 +1412,8 @@ impl TursoDatabase {
                 // the ~9.5 h relationship-stage bottleneck. Adding
                 // `CREATE INDEX ... ON <table>(file_id, tag_id)` to the source
                 // (or a local copy of it) makes the scan index-driven.
-                if let Some(indexed) = slurp_source_keyset_indexed(&source, &partition).await {
-                    if !indexed {
+                if let Some(indexed) = slurp_source_keyset_indexed(source, &partition).await
+                    && !indexed {
                         log::warn!(
                             "Slurp: source table {partition} has no (file_id, tag_id) index; \
                              the keyset scan re-scans the whole table per batch. Add \
@@ -1421,7 +1421,6 @@ impl TursoDatabase {
                              ON {partition}(file_id, tag_id)` to the source (or a copy of it)."
                         );
                     }
-                }
                 // Resume: a partition whose scan already reached its natural
                 // end (empty batch) with its recount and index restore
                 // finished is skipped whole by a re-run; one cut short by a
@@ -1443,7 +1442,7 @@ impl TursoDatabase {
                     // ~40 s per keyset position on sources that re-scan the whole
                     // partition (see SLURP_RELATIONSHIP_*).
                     let mut source_scan = source
-                        .prepare(&format!(
+                        .prepare_cached(&format!(
                             "SELECT r.file_id, r.tag_id
                              FROM {} r
                              WHERE r.file_id > ?1 OR (r.file_id = ?1 AND r.tag_id > ?2)
@@ -1588,8 +1587,8 @@ impl TursoDatabase {
             if !legacy_namespaces.is_empty() {
                 let target_by_source_namespace: HashMap<u64, u64> =
                     legacy_namespaces.iter().copied().collect();
-                if let Some(indexed) = slurp_source_keyset_indexed(&source, "Relationship").await {
-                    if !indexed {
+                if let Some(indexed) = slurp_source_keyset_indexed(source, "Relationship").await
+                    && !indexed {
                         log::warn!(
                             "Slurp: source table Relationship has no (file_id, tag_id) \
                              index; the keyset scan re-scans the whole table per batch. \
@@ -1597,7 +1596,6 @@ impl TursoDatabase {
                              ON Relationship(file_id, tag_id)` to the source (or a copy of it)."
                         );
                     }
-                }
                 // Only cold imports tear the file_id indexes down; see the
                 // partition path for the rationale.
                 if cold_import {
@@ -1631,7 +1629,7 @@ impl TursoDatabase {
                     // Prepared once for the whole legacy pass (see the partition
                     // path for why re-preparing per batch is pure overhead).
                     let mut source_scan = source
-                        .prepare(
+                        .prepare_cached(
                             "SELECT r.file_id, r.tag_id, t.namespace
                              FROM Relationship r
                              JOIN Tags t ON t.id = r.tag_id
@@ -1807,7 +1805,7 @@ impl TursoDatabase {
         // Parents.
         {
             let mut parents = source
-                .prepare("SELECT tag_id, relate_tag_id, limit_to FROM Parents")
+                .prepare_cached("SELECT tag_id, relate_tag_id, limit_to FROM Parents")
                 .await?;
             let mut rows = parents.query(()).await?;
 
@@ -1840,7 +1838,7 @@ impl TursoDatabase {
                 // `name = 'Parents'` matches nothing and the recovery branch
                 // would never fire.
                 let mut check = conn
-                    .prepare(
+                    .prepare_cached(
                         "SELECT EXISTS(
                              SELECT 1 FROM sqlite_schema
                              WHERE type = 'table' AND LOWER(name) = LOWER(?1)
@@ -1937,7 +1935,7 @@ impl TursoDatabase {
         // Rust-Hydrus-style schemas (`Manager`/`UserData`/optional `priority`).
         let has_jobs: bool = {
             let mut stmt = source
-                .prepare(
+                .prepare_cached(
                     "SELECT EXISTS(
                          SELECT 1 FROM sqlite_master
                          WHERE type = 'table' AND lower(name) = 'jobs'
@@ -2179,7 +2177,7 @@ impl TursoDatabase {
     async fn slurp_jobs(&self, conn: &Connection, source: &Connection) -> Result<()> {
         let mut columns = HashSet::new();
         {
-            let mut stmt = source.prepare("PRAGMA table_info(\"Jobs\")").await?;
+            let mut stmt = source.prepare_cached("PRAGMA table_info(\"Jobs\")").await?;
             let mut rows = stmt.query(()).await?;
             while let Some(row) = rows.next().await? {
                 columns.insert(row.get::<String>(1)?);
@@ -2221,7 +2219,7 @@ impl TursoDatabase {
             "SELECT time, reptime, {priority_expr}, {recreation_expr}, site, param, {user_data_expr}
              FROM Jobs ORDER BY id"
         );
-        let mut stmt = source.prepare(&select).await?;
+        let mut stmt = source.prepare_cached(&select).await?;
         let mut rows = stmt.query(()).await?;
 
         let mut copied = 0_u64;
@@ -2305,7 +2303,7 @@ struct SlurpStageCheckpoint {
 async fn slurp_checkpoint_load(conn: &Connection) -> Result<HashMap<String, SlurpStageCheckpoint>> {
     let mut out = HashMap::new();
     let mut stmt = conn
-        .prepare(&format!(
+        .prepare_cached(&format!(
             "SELECT stage, finished, last_file_id, last_tag_id
              FROM {SLURP_CHECKPOINT_TABLE}
              WHERE stage != 'meta'"

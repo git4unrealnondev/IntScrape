@@ -55,8 +55,10 @@ fn id_in_clause(first_bind: usize, rows: usize) -> String {
         .join(", ")
 }
 
+#[allow(dead_code)]
 impl TursoDatabase {
-    /// Gets a file row by id.
+    /// Gets a file row by id. `hash` is the file's SHA-512 digest from
+    /// `FileHashes` (empty when the file has no recorded SHA-512).
     pub(in crate::db::turso) async fn file_get(
         &self,
         conn: &Connection,
@@ -64,7 +66,11 @@ impl TursoDatabase {
     ) -> Result<FileInternal> {
         let mut rows = conn
             .query(
-                "SELECT id, hash, extension, storage_id, size_bytes FROM File WHERE id = ?1 LIMIT 1",
+                "SELECT f.id, fh.digest, f.extension, f.storage_id, f.size_bytes
+                 FROM File f
+                 LEFT JOIN FileHashes fh
+                   ON fh.file_id = f.id AND fh.algorithm = 'SHA512'
+                 WHERE f.id = ?1 LIMIT 1",
                 (*file_id as i64,),
             )
             .await?;
@@ -76,7 +82,7 @@ impl TursoDatabase {
 
         Ok(FileInternal {
             id: Some(row.get(0)?),
-            hash: row.get(1)?,
+            hash: row.get::<Option<String>>(1)?.unwrap_or_default(),
             extension: row.get(2)?,
             storage_id: row.get(3)?,
             size_bytes: row.get(4)?,
@@ -111,8 +117,11 @@ impl TursoDatabase {
             let mut rows = conn
                 .query(
                     format!(
-                        "SELECT id, hash, extension, storage_id, size_bytes
-                         FROM File WHERE id IN ({placeholders});"
+                        "SELECT f.id, fh.digest, f.extension, f.storage_id, f.size_bytes
+                         FROM File f
+                         LEFT JOIN FileHashes fh
+                           ON fh.file_id = f.id AND fh.algorithm = 'SHA512'
+                         WHERE f.id IN ({placeholders});"
                     ),
                     params_from_iter(params),
                 )
@@ -122,7 +131,7 @@ impl TursoDatabase {
                     row.get::<u64>(0)?,
                     FileInternal {
                         id: Some(row.get(0)?),
-                        hash: row.get(1)?,
+                        hash: row.get::<Option<String>>(1)?.unwrap_or_default(),
                         extension: row.get(2)?,
                         storage_id: row.get(3)?,
                         size_bytes: row.get(4)?,
@@ -134,11 +143,18 @@ impl TursoDatabase {
         Ok(out)
     }
 
-    /// Batched lookup of files by their primary `File.hash` (the SHA-512 of
-    /// their content for everything the downloader/importer wrote), keyed by
-    /// hash. Mirrors the existing-hash resolution inside `file_add_bulk`:
-    /// one `hash IN (...)` statement per `SQL_CHUNK_SIZE` chunk, so a whole
-    /// storage-check batch costs one indexed lookup instead of one per file.
+    /// Batched lookup of files by SHA-512 digest (from `FileHashes`),
+    /// keyed by hash.
+    ///
+    /// Digests are resolved one point query per digest (prepared once),
+    /// then the found ids go through `file_get_bulk`. A single
+    /// `digest IN (...)` statement would be one indexed lookup per chunk
+    /// in SQLite, but Turso's planner does not seek on
+    /// `(algorithm, digest)` for an IN list — it scans every SHA-512 row
+    /// (~70s per 4600-digest chunk at 1M rows, measured). Point queries
+    /// on the unique index cost the same as the old `File.hash IN (...)`
+    /// seeks (~3.7µs per digest, measured). See `lookup_sha512` in
+    /// `file_add_bulk`, which has the same constraint.
     pub(in crate::db::turso) async fn files_get_by_hash(
         &self,
         conn: &Connection,
@@ -149,29 +165,32 @@ impl TursoDatabase {
             return Ok(out);
         }
 
-        for chunk in hashes.chunks(SQL_CHUNK_SIZE) {
-            let placeholders = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let params: Vec<Value> = chunk.iter().map(|hash| Value::from(hash.as_str())).collect();
-            let mut rows = conn
-                .query(
-                    format!(
-                        "SELECT id, hash, extension, storage_id, size_bytes
-                         FROM File WHERE hash IN ({placeholders});"
-                    ),
-                    params_from_iter(params),
-                )
-                .await?;
+        // digest -> file_id, one cached point query per digest.
+        let mut by_digest: HashMap<String, u64> = HashMap::new();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT file_id FROM FileHashes WHERE algorithm = 'SHA512' AND digest = ?1",
+            )
+            .await?;
+        for digest in hashes {
+            if digest.is_empty() {
+                continue;
+            }
+            let mut rows = stmt.query((digest.as_str(),)).await?;
             while let Some(row) = rows.next().await? {
-                let file = FileInternal {
-                    id: Some(row.get(0)?),
-                    hash: row.get(1)?,
-                    extension: row.get(2)?,
-                    storage_id: row.get(3)?,
-                    size_bytes: row.get(4)?,
-                };
-                out.insert(file.hash.clone(), file);
+                by_digest.insert(digest.clone(), row.get::<i64>(0)? as u64);
+            }
+        }
+
+        if by_digest.is_empty() {
+            return Ok(out);
+        }
+
+        let ids: Vec<u64> = by_digest.values().copied().collect();
+        let files = self.file_get_bulk(conn, &ids).await?;
+        for (digest, id) in by_digest {
+            if let Some(file) = files.get(&id) {
+                out.insert(digest, file.clone());
             }
         }
 
@@ -197,15 +216,18 @@ impl TursoDatabase {
         }
         let mut rows = conn
             .query(
-                "SELECT id, hash, extension, storage_id, size_bytes
-                 FROM File WHERE id > ?1 ORDER BY id LIMIT ?2;",
+                "SELECT f.id, fh.digest, f.extension, f.storage_id, f.size_bytes
+                 FROM File f
+                 LEFT JOIN FileHashes fh
+                   ON fh.file_id = f.id AND fh.algorithm = 'SHA512'
+                 WHERE f.id > ?1 ORDER BY f.id LIMIT ?2;",
                 (after_id as i64, limit as i64),
             )
             .await?;
         while let Some(row) = rows.next().await? {
             out.push(FileInternal {
                 id: Some(row.get(0)?),
-                hash: row.get(1)?,
+                hash: row.get::<Option<String>>(1)?.unwrap_or_default(),
                 extension: row.get(2)?,
                 storage_id: row.get(3)?,
                 size_bytes: row.get(4)?,
@@ -330,11 +352,10 @@ impl TursoDatabase {
         let file_storage_map = self.file_storage_get_all(conn).await?;
 
         for base_path in file_storage_map.values() {
-            if let Some(good_path) = file_on_disk(&file, base_path) {
-                if let Ok(final_path) = good_path.canonicalize() {
+            if let Some(good_path) = file_on_disk(&file, base_path)
+                && let Ok(final_path) = good_path.canonicalize() {
                     return Ok(Some(final_path.to_string_lossy().to_string()));
                 }
-            }
         }
 
         Ok(None)
@@ -439,7 +460,8 @@ impl TursoDatabase {
         Ok((std::path::PathBuf::from(target_location), path_id))
     }
 
-    /// Updates the hash, extension, and storage id of a batch of files.
+    /// Updates the extension and storage id of a batch of files, and
+    /// replaces their SHA-512 digest in `FileHashes` when `hash` is set.
     ///
     /// One statement per `SQL_CHUNK_SIZE` rows instead of one per file. As
     /// before, a file whose `id` is unset binds NULL and matches nothing.
@@ -448,13 +470,12 @@ impl TursoDatabase {
         conn: &Connection,
         files: &[FileInternal],
     ) -> Result<()> {
-        const COLUMNS: [&str; 3] = ["hash", "extension", "storage_id"];
+        const COLUMNS: [&str; 2] = ["extension", "storage_id"];
 
         for chunk in files.chunks(SQL_CHUNK_SIZE) {
-            let mut params: Vec<Value> = Vec::with_capacity(chunk.len() * 4);
+            let mut params: Vec<Value> = Vec::with_capacity(chunk.len() * 3);
             for file in chunk {
                 params.push(Value::from(file.id.map(|id| id as i64)));
-                params.push(Value::from(file.hash.as_str()));
                 params.push(Value::from(file.extension.as_str()));
                 params.push(Value::from(file.storage_id as i64));
             }
@@ -468,6 +489,38 @@ impl TursoDatabase {
                 params_from_iter(params),
             )
             .await?;
+
+            // Replace the SHA-512 digest: delete the old row and bulk-insert
+            // the new one (`file_hashes_add_bulk` is INSERT OR IGNORE, which
+            // would keep the old digest on the primary key).
+            let with_id: Vec<&FileInternal> =
+                chunk.iter().filter(|file| file.id.is_some()).collect();
+            if !with_id.is_empty() {
+                let placeholders = std::iter::repeat_n("?", with_id.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let params: Vec<Value> = with_id
+                    .iter()
+                    .map(|file| Value::from(file.id.unwrap() as i64))
+                    .collect();
+                conn.execute(
+                    format!(
+                        "DELETE FROM FileHashes WHERE algorithm = 'SHA512'
+                         AND file_id IN ({placeholders});"
+                    ),
+                    params_from_iter(params),
+                )
+                .await?;
+
+                let tuples: Vec<(u64, &str, &str)> = with_id
+                    .iter()
+                    .filter(|file| !file.hash.is_empty())
+                    .map(|file| (file.id.unwrap(), "SHA512", file.hash.as_str()))
+                    .collect();
+                if !tuples.is_empty() {
+                    self.file_hashes_add_bulk(conn, &tuples).await?;
+                }
+            }
         }
 
         Ok(())
@@ -513,32 +566,33 @@ impl TursoDatabase {
             return Ok(out);
         }
 
+        // One cached point query per (algorithm, digest), not a tuple-IN
+        // statement: Turso's planner does not seek on `(algorithm, digest)`
+        // for a tuple IN list — it scans (measured >60s per 4600-pair
+        // chunk at 1M rows). Point queries use the unique index directly
+        // (~3.7µs each, measured). See `lookup_sha512` in `file_add_bulk`.
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT file_id FROM FileHashes WHERE algorithm = ?1 AND digest = ?2",
+            )
+            .await?;
         for chunk in hashes.chunks(SQL_CHUNK_SIZE) {
-            let placeholders = std::iter::repeat_n("(?, ?)", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                "SELECT file_id, algorithm, digest FROM FileHashes WHERE (algorithm, digest) IN ({placeholders});"
-            );
-            let mut params = Vec::with_capacity(chunk.len() * 2);
-            for (algorithm, digest) in chunk {
-                params.push(Value::from(algorithm.as_str()));
-                params.push(Value::from(digest.as_str()));
-            }
-
             // Drain the chunk's matches first, then fetch every matched file in
             // one batched pass. The old loop called `file_get` per matched row,
             // so a chunk resolving 4.6k hashes issued 4.6k extra point queries
             // against `File` on top of the batched `FileHashes` lookup — and
             // `hashes_files_get_sync` is the per-job dedupe lookup, so that
             // landed on the scrape hot path.
-            let mut rows = conn.query(&sql, params_from_iter(params)).await?;
             let mut matched: Vec<(String, String, u64)> = Vec::with_capacity(chunk.len());
-            while let Some(row) = rows.next().await? {
-                let file_id: u64 = row.get(0)?;
-                let algorithm: String = row.get(1)?;
-                let digest: String = row.get(2)?;
-                matched.push((algorithm, digest, file_id));
+            for (algorithm, digest) in chunk {
+                let mut rows = stmt.query((algorithm.as_str(), digest.as_str())).await?;
+                while let Some(row) = rows.next().await? {
+                    matched.push((
+                        algorithm.clone(),
+                        digest.clone(),
+                        row.get::<i64>(0)? as u64,
+                    ));
+                }
             }
 
             if matched.is_empty() {

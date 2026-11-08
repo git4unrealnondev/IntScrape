@@ -7,6 +7,7 @@ use turso::{Connection, Result, Value, params_from_iter};
 use crate::db::SQL_CHUNK_SIZE;
 use crate::db::turso::TursoDatabase;
 
+#[allow(dead_code)]
 impl TursoDatabase {
     /// Gets all `tag_ids` associated with a namespace id.
     pub(in crate::db::turso) async fn tag_id_get_namespace_id(

@@ -162,7 +162,7 @@ fn column_index(headers: &csv::StringRecord, name: &str) -> Option<usize> {
     headers.iter().position(|header| header.trim() == name)
 }
 
-fn field<'a>(record: &'a csv::StringRecord, index: Option<usize>) -> &'a str {
+fn field(record: &csv::StringRecord, index: Option<usize>) -> &str {
     index.and_then(|i| record.get(i)).unwrap_or("")
 }
 

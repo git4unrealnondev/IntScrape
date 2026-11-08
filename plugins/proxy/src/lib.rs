@@ -454,7 +454,30 @@ fn state_json(reg: &Registry) -> String {
 ///
 /// The caller must pass `data_name: ["site"]` with a `String` value.
 #[unsafe(no_mangle)]
-fn proxy_get_proxy(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn proxy_get_proxy(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(callback) = (unsafe {
+            shared_types::plugin_ffi::decode::<shared_types::CallbackInfoInput>(req, req_len)
+        }) else {
+            return std::collections::HashMap::new();
+        };
+        proxy_get_proxy_impl(&callback)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<String, shared_types::CallbackCustomDataReturning>::new()),
+    }
+}
+
+#[unsafe(no_mangle)]
+fn proxy_get_proxy_impl(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
     let site = input_string(callback, "site");
     let mut map = HashMap::new();
 
@@ -488,7 +511,30 @@ fn proxy_get_proxy(callback: &CallbackInfoInput) -> HashMap<String, CallbackCust
 /// The caller must pass `data_name: ["site"]` with a `String` value. `state` is
 /// a JSON object shaped `{ "proxies": [...], "sites": [...] }`.
 #[unsafe(no_mangle)]
-fn proxy_get_state(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn proxy_get_state(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(callback) = (unsafe {
+            shared_types::plugin_ffi::decode::<shared_types::CallbackInfoInput>(req, req_len)
+        }) else {
+            return std::collections::HashMap::new();
+        };
+        proxy_get_state_impl(&callback)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<String, shared_types::CallbackCustomDataReturning>::new()),
+    }
+}
+
+#[unsafe(no_mangle)]
+fn proxy_get_state_impl(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
     let site = input_string(callback, "site");
     let mut map = HashMap::new();
 
@@ -520,7 +566,30 @@ fn proxy_get_state(callback: &CallbackInfoInput) -> HashMap<String, CallbackCust
 /// Entries that fail to parse are dropped rather than rejecting the whole list,
 /// so one bad row cannot make the list uneditable.
 #[unsafe(no_mangle)]
-fn proxy_set_list(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn proxy_set_list(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(callback) = (unsafe {
+            shared_types::plugin_ffi::decode::<shared_types::CallbackInfoInput>(req, req_len)
+        }) else {
+            return std::collections::HashMap::new();
+        };
+        proxy_set_list_impl(&callback)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<String, shared_types::CallbackCustomDataReturning>::new()),
+    }
+}
+
+#[unsafe(no_mangle)]
+fn proxy_set_list_impl(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
     let raw = input_string(callback, "list");
     let preserve = input_u64(callback, "preserve_ratings", 1) == 1;
 
@@ -562,7 +631,30 @@ fn proxy_set_list(callback: &CallbackInfoInput) -> HashMap<String, CallbackCusto
 /// The caller must pass `data_name: ["proxy_url"]` with a `String`. `removed` is
 /// `1` when an entry matched, `0` otherwise.
 #[unsafe(no_mangle)]
-fn proxy_remove(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn proxy_remove(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(callback) = (unsafe {
+            shared_types::plugin_ffi::decode::<shared_types::CallbackInfoInput>(req, req_len)
+        }) else {
+            return std::collections::HashMap::new();
+        };
+        proxy_remove_impl(&callback)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<String, shared_types::CallbackCustomDataReturning>::new()),
+    }
+}
+
+#[unsafe(no_mangle)]
+fn proxy_remove_impl(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
     let proxy_url = input_string(callback, "proxy_url");
     let mut map = HashMap::new();
 
@@ -587,7 +679,30 @@ fn proxy_remove(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomD
 /// The caller must pass `data_name: ["sites"]` with a `String` holding a JSON
 /// array of `{site, retry_after_secs, last_probe}`.
 #[unsafe(no_mangle)]
-fn proxy_set_sites(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn proxy_set_sites(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(callback) = (unsafe {
+            shared_types::plugin_ffi::decode::<shared_types::CallbackInfoInput>(req, req_len)
+        }) else {
+            return std::collections::HashMap::new();
+        };
+        proxy_set_sites_impl(&callback)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<String, shared_types::CallbackCustomDataReturning>::new()),
+    }
+}
+
+#[unsafe(no_mangle)]
+fn proxy_set_sites_impl(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
     let raw = input_string(callback, "sites");
     let mut map = HashMap::new();
 
@@ -616,7 +731,30 @@ fn proxy_set_sites(callback: &CallbackInfoInput) -> HashMap<String, CallbackCust
 /// button. Each entry is probed in turn, so a slow proxy costs its own timeout
 /// and the round takes roughly the sum of the per-proxy timeouts.
 #[unsafe(no_mangle)]
-fn proxy_test(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn proxy_test(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(callback) = (unsafe {
+            shared_types::plugin_ffi::decode::<shared_types::CallbackInfoInput>(req, req_len)
+        }) else {
+            return std::collections::HashMap::new();
+        };
+        proxy_test_impl(&callback)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<String, shared_types::CallbackCustomDataReturning>::new()),
+    }
+}
+
+#[unsafe(no_mangle)]
+fn proxy_test_impl(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
     let url = input_string(callback, "url");
     let site = input_string(callback, "site");
     let timeout_ms = input_u64(callback, "timeout_ms", DEFAULT_TIMEOUT_MS);
@@ -679,7 +817,30 @@ fn proxy_test(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDat
 /// optional and fall back to [`DEFAULT_TIMEOUT_MS`] and
 /// [`DEFAULT_RETRY_AFTER_SECS`].
 #[unsafe(no_mangle)]
-fn proxy_request(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn proxy_request(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(callback) = (unsafe {
+            shared_types::plugin_ffi::decode::<shared_types::CallbackInfoInput>(req, req_len)
+        }) else {
+            return std::collections::HashMap::new();
+        };
+        proxy_request_impl(&callback)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<String, shared_types::CallbackCustomDataReturning>::new()),
+    }
+}
+
+#[unsafe(no_mangle)]
+fn proxy_request_impl(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
     let url = input_string(callback, "url");
     let site = input_string(callback, "site");
     let timeout_ms = input_u64(callback, "timeout_ms", DEFAULT_TIMEOUT_MS);
@@ -759,7 +920,30 @@ fn proxy_request(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustom
 /// `found` (0 when the URL is not in the list, in which case nothing was scored)
 /// and `rating`.
 #[unsafe(no_mangle)]
-fn proxy_report(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn proxy_report(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(callback) = (unsafe {
+            shared_types::plugin_ffi::decode::<shared_types::CallbackInfoInput>(req, req_len)
+        }) else {
+            return std::collections::HashMap::new();
+        };
+        proxy_report_impl(&callback)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<String, shared_types::CallbackCustomDataReturning>::new()),
+    }
+}
+
+#[unsafe(no_mangle)]
+fn proxy_report_impl(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
     let proxy_url = input_string(callback, "proxy_url");
     let site = input_string(callback, "site");
     let success = input_u64(callback, "success", 0) == 1;
@@ -849,10 +1033,14 @@ fn attempt_request(
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-fn get_plugin_info() -> shared_types::CVec<shared_types::Plugin> {
-    // The host consumes this via `CVec::into_vec` (see `src/plugins.rs`).
-    // The inner helper keeps the original `Vec` body unchanged.
-    shared_types::CVec::from_vec(get_plugin_info_impl())
+fn get_plugin_info() -> shared_types::CVec<u8> {
+    // The host consumes this via `plugin_ffi::take` (see `src/plugins.rs`):
+    // a bitcode encoding of `Vec<Plugin>` in an owned byte buffer.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(get_plugin_info_impl));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&Vec::<shared_types::Plugin>::new()),
+    }
 }
 
 fn get_plugin_info_impl() -> Vec<shared_types::Plugin> {
@@ -939,7 +1127,14 @@ fn get_plugin_info_impl() -> Vec<shared_types::Plugin> {
 }
 
 #[unsafe(no_mangle)]
-fn on_start() {
+pub fn on_start() {
+    // A panicking plugin must not unwind across the FFI boundary into the
+    // host (which builds with panic = "abort").
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(on_start_impl));
+}
+
+#[unsafe(no_mangle)]
+fn on_start_impl() {
     let proxies = with_registry(false, |reg| reg.proxies.clone());
     let sites = with_registry(false, |reg| reg.sites.clone());
 

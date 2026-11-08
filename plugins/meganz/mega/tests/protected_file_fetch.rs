@@ -5,6 +5,7 @@
 use std::env;
 
 #[tokio::test]
+#[ignore = "live MEGA API test: requires MEGA_EMAIL/MEGA_PASSWORD (and MEGA_PUBLIC_URL where applicable); run with --ignored"]
 async fn protected_url_fetch_test() {
     let protected_url =
         env::var("MEGA_PROTECTED_URL").expect("missing MEGA_PROTECTED_URL environment variable");

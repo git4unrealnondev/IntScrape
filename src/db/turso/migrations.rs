@@ -66,7 +66,7 @@ DROP TABLE Parents_old;
         // must only be dropped when it is actually attached to `Tags`.
         let stray_on_tags: i64 = {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT EXISTS(
                          SELECT 1 FROM sqlite_master
                          WHERE type = 'index'
@@ -234,6 +234,78 @@ DROP TABLE Parents_old;
                 name: "SYSTEM_VERSION".to_string(),
                 description: None,
                 num: Some(11),
+                param: None,
+            },
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Updates the db from version 12 to 13.
+    ///
+    /// Moves the SHA-512 digest off `File` (where it was stored as the
+    /// `hash` column, duplicated in `FileHashes` under `SHA512`) and onto
+    /// `FileHashes` alone, keyed by `file_id`:
+    ///
+    /// 1. Backfill missing `SHA512` rows from `File.hash` (files whose
+    ///    digest was already recorded are untouched; `NULL`/empty hashes
+    ///    have no digest to backfill and stay hash-less, exactly as before).
+    /// 2. Rebuild `File` without the column. `ALTER TABLE ... DROP COLUMN`
+    ///    cannot be used here (Turso rejects dropping a `UNIQUE` column),
+    ///    and renaming `File` first would repoint `FileHashes`' foreign
+    ///    key at the old name, so the new table is created first, filled,
+    ///    then the old one dropped and the new one renamed into place —
+    ///    `FileHashes`' `REFERENCES File(id)` text resolves to the new
+    ///    table throughout (foreign-key enforcement is off in this
+    ///    backend, so the brief dangling window is inert).
+    /// 3. No explicit indexes existed on the old `File` besides the hash
+    ///    unique autoindex (removed with the column, by design), so there
+    ///    is nothing to recreate.
+    pub(in crate::db) async fn update_db_12_to_13(&self, conn: &Connection) -> Result<()> {
+        log::info!(
+            "Migration 12->13: moving File.hash into FileHashes (SHA512) and dropping the column."
+        );
+        // A database created fresh by a v13 binary and then pinned back to
+        // v12 for testing already has the new shape: there is no `hash`
+        // column to move. Detect that instead of failing on every boot
+        // migration step that runs through 12 -> 13.
+        let has_hash_column: bool = {
+            let mut stmt = conn
+                .prepare("SELECT EXISTS(SELECT 1 FROM pragma_table_info('File') WHERE name = 'hash');")
+                .await?;
+            stmt.query_row(()).await?.get::<bool>(0)?
+        };
+        if has_hash_column {
+            conn.execute_batch(
+                "INSERT OR IGNORE INTO FileHashes (file_id, algorithm, digest)
+                 SELECT id, 'SHA512', hash FROM File
+                 WHERE hash IS NOT NULL AND hash <> '';",
+            )
+            .await?;
+
+            conn.execute_batch(
+                "CREATE TABLE File_new
+                 (id INTEGER PRIMARY KEY NOT NULL,
+                  extension TEXT,
+                  storage_id INTEGER,
+                  size_bytes INTEGER,
+                  FOREIGN KEY (storage_id) REFERENCES FileStorageLocations(id)
+                      ON DELETE CASCADE ON UPDATE CASCADE);
+                 INSERT INTO File_new (id, extension, storage_id, size_bytes)
+                     SELECT id, extension, storage_id, size_bytes FROM File;
+                 DROP TABLE File;
+                 ALTER TABLE File_new RENAME TO File;",
+            )
+            .await?;
+        }
+
+        self.setting_set(
+            conn,
+            shared_types::DbSettingsObj {
+                name: "SYSTEM_VERSION".to_string(),
+                description: None,
+                num: Some(13),
                 param: None,
             },
         )

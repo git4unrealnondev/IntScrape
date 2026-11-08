@@ -27,6 +27,7 @@ pub struct PluginManager {
     storage_libs: RwLock<HashMap<String, Arc<Library>>>,
     db: Arc<TursoDatabase>,
     threads: RwLock<Vec<JoinHandle<()>>>,
+    #[allow(dead_code)]
     should_exit: Arc<AtomicBool>,
     regex_tags_cache: RwLock<HashMap<Tag, u64>>,
     regex_cache: RwLock<HashMap<String, Arc<Regex>>>,
@@ -258,11 +259,12 @@ impl PluginManager {
     ///
     fn get_info(&self, lib: &Library, path: PathBuf) -> Option<Vec<shared_types::Plugin>> {
         info!("Trying to load library at path: {}", path.to_string_lossy());
-        // Plugins export `get_plugin_info` returning the `#[repr(C)]`
-        // `CVec<Plugin>` container (see `shared_types::CVec`), not a Rust
-        // `Vec` directly, so the host does not depend on the `Vec` layout.
+        // Plugins export `get_plugin_info` returning an owned byte buffer
+        // (`CVec<u8>`, see `shared_types::plugin_ffi`) containing the
+        // bitcode encoding of `Vec<Plugin>`, not a Rust `Vec` directly,
+        // so the host does not depend on the `Vec`/struct layout.
         let temp: libloading::Symbol<
-            unsafe extern "C" fn() -> shared_types::CVec<shared_types::Plugin>,
+            unsafe extern "C" fn() -> shared_types::CVec<u8>,
         > = match unsafe { lib.get(b"get_plugin_info") } {
             Err(_) => {
                 error!(
@@ -273,7 +275,7 @@ impl PluginManager {
             }
             Ok(lib) => lib,
         };
-        unsafe { Some(temp().into_vec()) }
+        unsafe { shared_types::plugin_ffi::take(temp()) }
     }
 
     ///
@@ -309,13 +311,19 @@ impl PluginManager {
         scraper: &shared_types::Plugin,
     ) -> Result<Vec<shared_types::ScraperDataReturn>, libloading::Error> {
         if let Some(lib) = self.storage_libs.read().get(&scraper.name) {
+            // Plugin boundary is serialized bytes (see
+            // `shared_types::plugin_ffi`): the request is bitcode-encoded
+            // on the host, the plugin decodes it, and returns its result
+            // as encoded bytes which the host decodes here.
             let temp: libloading::Symbol<
-                unsafe extern "C" fn(
-                    &shared_types::ScraperDataReturn,
-                ) -> Vec<shared_types::ScraperDataReturn>,
+                unsafe extern "C" fn(*const u8, usize) -> shared_types::CVec<u8>,
             > = unsafe { lib.get(b"url_dump\0")? };
 
-            return Ok(unsafe { temp(scraperdata) });
+            let request = shared_types::plugin_ffi::encode(scraperdata);
+            let response = unsafe { temp(request.ptr, request.len) };
+            return Ok(
+                unsafe { shared_types::plugin_ffi::take(response) }.unwrap_or_default(),
+            );
         }
         Err(libloading::Error::FreeLibraryUnknown)
     }
@@ -331,12 +339,9 @@ impl PluginManager {
         scraper: &Plugin,
     ) -> Vec<shared_types::ScraperReturn> {
         if let Some(scraper_library) = self.storage_libs.read().get(&scraper.name) {
+            // See `url_dump`: serialized bytes on both sides of the call.
             let temp: libloading::Symbol<
-                unsafe extern "C" fn(
-                    &str,
-                    &str,
-                    &shared_types::ScraperDataReturn,
-                ) -> Vec<shared_types::ScraperReturn>,
+                unsafe extern "C" fn(*const u8, usize) -> shared_types::CVec<u8>,
             > = {
                 unsafe {
                     match scraper_library.get(b"parser_call") {
@@ -349,7 +354,17 @@ impl PluginManager {
                     }
                 }
             };
-            unsafe { temp(url_output, source_url, scraperdata) }
+            let request = shared_types::plugin_ffi::encode(&shared_types::ParserCallInput {
+                text: url_output.to_string(),
+                source_url: source_url.to_string(),
+                data: scraperdata.clone(),
+            });
+            let response = unsafe { temp(request.ptr, request.len) };
+            unsafe { shared_types::plugin_ffi::take(response) }.unwrap_or_else(|| {
+                vec![shared_types::ScraperReturn::Stop(
+                    "Parser returned undecodable data".to_string(),
+                )]
+            })
         } else {
             vec![shared_types::ScraperReturn::Nothing]
         }
@@ -395,8 +410,11 @@ impl PluginManager {
                 .into_iter()
                 .map(|(plugin_name, library)| {
                     scope.spawn(move || {
+                        // Input is raw file bytes (ptr+len is a sound C
+                        // ABI for a byte slice the plugin does not retain);
+                        // the return is serialized (see `plugin_ffi`).
                         let callback: libloading::Symbol<
-                            unsafe extern "C" fn(&[u8]) -> CallbackReturn,
+                            unsafe extern "C" fn(*const u8, usize) -> shared_types::CVec<u8>,
                         > = unsafe {
                             match library.get(b"on_download") {
                                 Err(error) => {
@@ -409,7 +427,8 @@ impl PluginManager {
                             }
                         };
 
-                        Some(unsafe { callback(data) })
+                        let response = unsafe { callback(data.as_ptr(), data.len()) };
+                        unsafe { shared_types::plugin_ffi::take::<CallbackReturn>(response) }
                     })
                 })
                 .collect();
@@ -527,9 +546,11 @@ impl PluginManager {
                             continue;
                         };
 
-                        // ABI: on_regex(matched, full_tag, tag_source, tag_source_id).
+                        // ABI (serialized): on_regex takes a bitcode-encoded
+                        // (matched, full_tag, tag_source, tag_source_id)
+                        // tuple and returns an encoded CallbackReturn.
                         let callback: libloading::Symbol<
-                            unsafe extern "C" fn(&str, &str, &Tag, u64) -> CallbackReturn,
+                            unsafe extern "C" fn(*const u8, usize) -> shared_types::CVec<u8>,
                         > = unsafe {
                             match lib.get(b"on_regex") {
                                 Err(error) => {
@@ -543,8 +564,17 @@ impl PluginManager {
                         };
 
                         // The source is the full tag object; source_id is its database ID.
-                        let return_data = unsafe {
-                            callback(regex_match, &regex_tag.name, regex_tag, *source_id)
+                        let request = shared_types::plugin_ffi::encode(&(
+                            regex_match.to_string(),
+                            regex_tag.name.clone(),
+                            regex_tag.clone(),
+                            *source_id,
+                        ));
+                        let response = unsafe { callback(request.ptr, request.len) };
+                        let Some(return_data) =
+                            (unsafe { shared_types::plugin_ffi::take::<CallbackReturn>(response) })
+                        else {
+                            continue;
                         };
 
                         if !return_data.tags.is_empty()
@@ -599,11 +629,9 @@ impl PluginManager {
         {
             for plugin_name in plugin_name_list {
                 if let Some(lib) = self.storage_libs.read().get(plugin_name) {
+                    // Serialized bytes on both sides (see `plugin_ffi`).
                     let temp: libloading::Symbol<
-                        unsafe extern "C" fn(
-                            &CallbackInfoInput,
-                        )
-                            -> HashMap<String, CallbackCustomDataReturning>,
+                        unsafe extern "C" fn(*const u8, usize) -> shared_types::CVec<u8>,
                     > = {
                         unsafe {
                             match lib.get(func_name) {
@@ -618,8 +646,13 @@ impl PluginManager {
                         }
                     };
 
-                    let return_data = unsafe { temp(callback_info) };
-                    out.extend(return_data);
+                    let request = shared_types::plugin_ffi::encode(callback_info);
+                    let response = unsafe { temp(request.ptr, request.len) };
+                    if let Some(return_data) =
+                        unsafe { shared_types::plugin_ffi::take::<HashMap<String, CallbackCustomDataReturning>>(response) }
+                    {
+                        out.extend(return_data);
+                    }
                 }
             }
         }

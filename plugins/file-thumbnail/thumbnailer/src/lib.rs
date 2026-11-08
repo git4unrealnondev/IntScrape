@@ -19,7 +19,7 @@ use file_format::{FileFormat, Kind};
 use image::{DynamicImage, EncodableLayout, GenericImageView, ImageFormat};
 pub use size::ThumbnailSize;
 use std::{
-    io::{self, BufRead, ErrorKind, Seek, Write},
+    io::{self, BufRead, Seek, Write},
     path::Path,
     sync::Once,
     time::Duration,
@@ -180,8 +180,7 @@ fn create_thumbnails_dynamic_in<R: BufRead + Seek>(
                 .thread_count(4)
                 .build()
                 .map_err(|error| {
-                    ThumbError::IO(io::Error::new(
-                        ErrorKind::Other,
+                    ThumbError::IO(io::Error::other(
                         format!(
                             "Failed to load video at {}: {}",
                             video_file_path.display(),
@@ -343,7 +342,8 @@ mod tests {
             cfg.alpha_quality = 50;
         };
 
-        let variants: Vec<(&str, Box<dyn Fn(&mut webp::WebPConfig)>)> = vec![
+        type WebpVariant = (&'static str, Box<dyn Fn(&mut webp::WebPConfig)>);
+        let variants: Vec<WebpVariant> = vec![
             ("baseline (pass=10, thread=0)", Box::new(|_| {})),
             (
                 "thread_level=1",

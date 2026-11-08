@@ -360,11 +360,13 @@ fn write_client_file(path: &str, methods: &[(ImplItemFn, IpcOptions, bool)]) -> 
         let async_request = quote! { crate::SupportedDBRequests::#variant(#(#names),*) };
         quote! {
             #(#docs)*
+            #[allow(clippy::too_many_arguments)] // generated from the DB method signature
             pub fn #name(#(#definitions),*) -> #ret {
                 crate::init_data_request(#request)
             }
 
             #(#docs)*
+            #[allow(clippy::too_many_arguments)] // generated from the DB method signature
             pub fn #async_name(#(#definitions),*) -> impl std::future::Future<Output = #async_ret> {
                 crate::init_data_request_async(#async_request)
             }

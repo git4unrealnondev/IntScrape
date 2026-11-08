@@ -425,7 +425,7 @@ async fn storage_check_leaves_correctly_placed_file_alone() {
     let hash = "CD".repeat(64);
     let conn = db.connect().unwrap();
     let file = test_file(storage_id, &hash);
-    db.file_add_bulk(&conn, &[file.clone()]).await.unwrap();
+    db.file_add_bulk(&conn, std::slice::from_ref(&file)).await.unwrap();
     let placed = write_file_on_disk(&root, &file);
 
     let summary = db

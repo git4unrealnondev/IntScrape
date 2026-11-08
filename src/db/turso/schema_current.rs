@@ -22,19 +22,20 @@ const FTS_SHADOW_MARKER_NAME: &str = "fts_shadow_schema";
 
 impl TursoDatabase {
     /// Creates the file tables.
+    ///
+    /// A file's SHA-512 digest is *not* stored on `File` anymore (removed
+    /// in schema v13): it lives in `FileHashes` under algorithm `SHA512`,
+    /// keyed by `file_id`. Keeping it in both places duplicated 128 bytes
+    /// plus a unique-index write per file at millions-of-files scale, and
+    /// the two copies could drift. `FileInternal.hash` in memory is the
+    /// SHA-512 digest, populated on read by joining `FileHashes`.
     pub(in crate::db::turso) async fn table_create_file(&self, conn: &Connection) {
-        conn.execute_batch("
-CREATE TABLE File 
-            (id INTEGER PRIMARY KEY  NOT NULL, 
-            hash TEXT UNIQUE, 
-            extension TEXT, 
-            storage_id INTEGER, 
-            size_bytes INTEGER
-
-            CHECK (
-                (hash IS NOT NULL AND extension IS NOT NULL) OR
-                (hash IS NULL AND extension IS NULL)
-            ),
+        let _ = conn.execute_batch("
+CREATE TABLE File
+            (id INTEGER PRIMARY KEY  NOT NULL,
+            extension TEXT,
+            storage_id INTEGER,
+            size_bytes INTEGER,
 
             FOREIGN KEY (storage_id) REFERENCES FileStorageLocations(id) ON DELETE CASCADE ON UPDATE CASCADE
             );
@@ -44,13 +45,12 @@ CREATE TABLE File
 
     /// Retires indexes that duplicate one the schema already creates.
     ///
-    /// `File.hash` and `Namespace.name` are both declared `UNIQUE`, so SQLite
-    /// already builds a unique index for each. The `CREATE INDEX idx_file_hash
-    /// ON File (hash)` / `CREATE INDEX idx_namespace ON Namespace (name)`
-    /// statements that used to sit alongside them added a second, byte-identical
+    /// `Namespace.name` is declared `UNIQUE`, so SQLite already builds a
+    /// unique index for it. The `CREATE INDEX idx_namespace ON Namespace
+    /// (name)` statement that used to sit alongside it added a second, byte-identical
     /// b-tree that the planner never selects — `EXPLAIN QUERY PLAN` resolves both
-    /// lookups to `sqlite_autoindex_File_1` / `sqlite_autoindex_Namespace_1` —
-    /// while every `File` insert and every hash `UPDATE` paid to maintain it.
+    /// lookups to `sqlite_autoindex_Namespace_1` —
+    /// while every `Namespace` insert paid to maintain it.
     ///
     /// Dropped by `update_db_8_to_9` rather than from the create path, so a
     /// database that already carried them gets them retired on upgrade instead
@@ -68,12 +68,12 @@ CREATE TABLE File
     }
 
     pub(in crate::db::turso) async fn table_create_filestoragelocations(&self, conn: &Connection) {
-        conn.execute_batch("CREATE TABLE FileStorageLocations (id INTEGER PRIMARY KEY , location TEXT NOT NULL UNIQUE);").await;
+        let _ = conn.execute_batch("CREATE TABLE FileStorageLocations (id INTEGER PRIMARY KEY , location TEXT NOT NULL UNIQUE);").await;
     }
 
     /// Creates the filehash table
     pub(in crate::db::turso) async fn table_create_filehash(&self, conn: &Connection) {
-        conn.execute_batch(
+        let _ = conn.execute_batch(
             "
 CREATE TABLE FileHashes (
     file_id INTEGER NOT NULL,
@@ -95,7 +95,7 @@ CREATE UNIQUE INDEX idx_file_hashes_algorithm_digest ON FileHashes (algorithm, d
     }
 
     pub(in crate::db::turso) async fn table_create_jobs(&self, conn: &Connection) {
-        conn.execute_batch(
+        let _ = conn.execute_batch(
             "
 CREATE TABLE Jobs (
     id INTEGER PRIMARY KEY  NOT NULL, 
@@ -115,7 +115,7 @@ CREATE INDEX idx_jobs_ready_priority ON Jobs (site, is_running, priority DESC, t
         .await;
     }
     pub(in crate::db::turso) async fn table_create_namespace(&self, conn: &Connection) {
-        conn.execute_batch(
+        let _ = conn.execute_batch(
             "
 CREATE TABLE Namespace (
     id INTEGER PRIMARY KEY , 
@@ -205,7 +205,7 @@ CREATE UNIQUE INDEX idx_unique_parents ON Parents (tag_id, relate_tag_id, limit_
     }
 
     pub(in crate::db::turso) async fn table_create_tags(&self, conn: &Connection) {
-        conn.execute_batch(
+        let _ = conn.execute_batch(
             "
 CREATE TABLE IF NOT EXISTS Tags (
     id INTEGER PRIMARY KEY , 
@@ -227,7 +227,7 @@ CREATE INDEX IF NOT EXISTS idx_tags_namespace ON Tags (namespace);
 
     /// Creates the most current tags popular table
     pub(in crate::db::turso) async fn table_create_tags_popular(&self, conn: &Connection) {
-        self.table_create_tags_popular_v1(conn).await;
+        let _ = self.table_create_tags_popular_v1(conn).await;
     }
 
     pub(in crate::db::turso) async fn table_create_tags_popular_v1(
@@ -474,7 +474,7 @@ CREATE TABLE IF NOT EXISTS Tags_Popular (
     }
 
     pub(in crate::db::turso) async fn table_create_dead_urls(&self, conn: &Connection) {
-        conn.execute_batch(
+        let _ = conn.execute_batch(
             "
 CREATE TABLE dead_urls (url TEXT PRIMARY KEY);
 ",
@@ -483,7 +483,7 @@ CREATE TABLE dead_urls (url TEXT PRIMARY KEY);
     }
 
     pub(in crate::db::turso) async fn table_create_settings(&self, conn: &Connection) {
-        conn.execute_batch(
+        let _ = conn.execute_batch(
             "
 CREATE TABLE Settings (
     name TEXT PRIMARY KEY,

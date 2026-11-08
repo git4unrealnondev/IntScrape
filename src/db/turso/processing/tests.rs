@@ -441,23 +441,25 @@ async fn boot_migrates_legacy_parents_index_set() {
 /// tag-insert statement (the `save metas` line in the log). The boot-time
 /// ensure must drop it and leave exactly one FTS index, on the shadow,
 /// with search still working.
-/// The 8 -> 9 migration must retire `idx_file_hash` / `idx_namespace`, which
-/// duplicated the indexes the `UNIQUE` constraints already create, and must
-/// leave lookups and the uniqueness enforcement intact.
+/// The 8 -> 9 migration must retire `idx_namespace` (and `idx_file_hash`,
+/// which since schema v13 cannot exist anymore because `File.hash` is gone
+/// — dropping it is then a no-op), which duplicated the index the `UNIQUE`
+/// constraint already creates, and must leave lookups and the uniqueness
+/// enforcement intact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn migration_8_to_9_drops_indexes_that_duplicate_unique_columns() {
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("redundant_indexes.db");
     let should_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Build a v8-shaped database: both redundant indexes present, version
-    // pinned to 8 so the upgrade loop runs the 8 -> 9 step.
+    // Build a v8-shaped database: the redundant namespace index present
+    // (`idx_file_hash` cannot be recreated since v13 removed `File.hash`),
+    // version pinned to 8 so the upgrade loop runs the 8 -> 9 step.
     let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
     {
         let conn = db.connect().unwrap();
         conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_file_hash ON File (hash);
-             CREATE INDEX IF NOT EXISTS idx_namespace ON Namespace (name);
+            "CREATE INDEX IF NOT EXISTS idx_namespace ON Namespace (name);
              UPDATE Settings SET num = 8 WHERE name = 'SYSTEM_VERSION';",
         )
         .await
@@ -470,7 +472,7 @@ async fn migration_8_to_9_drops_indexes_that_duplicate_unique_columns() {
     let db = TursoDatabase::new_with_exit(&db_path, should_exit).await;
     let conn = db.connect().unwrap();
 
-    for name in ["idx_file_hash", "idx_namespace"] {
+    for name in ["idx_namespace"] {
         let present: i64 = conn
             .query(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master
@@ -516,14 +518,21 @@ async fn migration_8_to_9_drops_indexes_that_duplicate_unique_columns() {
     .await
     .unwrap();
     conn.execute(
-        "INSERT INTO File (hash, extension, storage_id) VALUES ('abc123', 'jpg', NULL);",
+        "INSERT INTO File (extension, storage_id) VALUES ('jpg', NULL);",
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO FileHashes (file_id, algorithm, digest)
+         SELECT id, 'SHA512', 'abc123' FROM File;",
         (),
     )
     .await
     .unwrap();
 
     let by_hash: i64 = conn
-        .query("SELECT COUNT(*) FROM File WHERE hash = 'abc123';", ())
+        .query("SELECT COUNT(*) FROM FileHashes WHERE algorithm = 'SHA512' AND digest = 'abc123';", ())
         .await
         .unwrap()
         .next()
@@ -547,15 +556,120 @@ async fn migration_8_to_9_drops_indexes_that_duplicate_unique_columns() {
     assert_eq!(by_ns, 1, "namespace lookup must still resolve");
 
     // The UNIQUE constraints must still be enforced, which is what proves
-    // the surviving index is the real one.
+    // the surviving index is the real one. Since schema v13 the digest
+    // lives in FileHashes, so its (algorithm, digest) unique index is
+    // what rejects a duplicate.
     assert!(
         conn.execute(
-            "INSERT INTO File (hash, extension, storage_id) VALUES ('abc123', 'png', NULL);",
+            "INSERT INTO FileHashes (file_id, algorithm, digest)
+             SELECT 999999, 'SHA512', 'abc123';",
             (),
         )
         .await
         .is_err(),
         "the UNIQUE constraint must still reject a duplicate hash"
+    );
+}
+
+/// The 12 -> 13 migration moves the SHA-512 digest off `File` into
+/// `FileHashes`: digests are backfilled, the column is gone, and every
+/// read path that used to read `File.hash` now resolves through
+/// `FileHashes`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_12_to_13_moves_file_hash_into_filehashes() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("file_hash_move.db");
+    let should_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let sha_a = "a".repeat(128);
+    let sha_b = "b".repeat(128);
+
+    // Bake a v12-shaped File table (with the hash column) onto the fresh
+    // database, pin the version to 12, and reboot into the migration.
+    let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+    {
+        let conn = db.connect().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE File_v12 (
+                 id INTEGER PRIMARY KEY NOT NULL,
+                 hash TEXT UNIQUE,
+                 extension TEXT,
+                 storage_id INTEGER,
+                 size_bytes INTEGER);
+             INSERT INTO File_v12 (id, extension, storage_id, size_bytes)
+                 VALUES (1, 'jpg', 1, 10), (2, 'png', 1, 20);",
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE File_v12 SET hash = ?1 WHERE id = 1;",
+            (sha_a.clone(),),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE File_v12 SET hash = ?1 WHERE id = 2;",
+            (sha_b.clone(),),
+        )
+        .await
+        .unwrap();
+        conn.execute_batch(
+            "DROP TABLE File;
+             ALTER TABLE File_v12 RENAME TO File;
+             UPDATE Settings SET num = 12 WHERE name = 'SYSTEM_VERSION';",
+        )
+        .await
+        .unwrap();
+    }
+    db.shutdown().await;
+    drop(db);
+
+    let db = TursoDatabase::new_with_exit(&db_path, should_exit).await;
+    let conn = db.connect().unwrap();
+
+    let version: i64 = conn
+        .query(
+            "SELECT num FROM Settings WHERE name = 'SYSTEM_VERSION';",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(version as u64, crate::DB_VERSION);
+
+    // The hash column is gone from the rebuilt table.
+    let has_hash: i64 = conn
+        .query(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('File') WHERE name = 'hash');",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(has_hash, 0, "File.hash must be dropped by 12 -> 13");
+
+    // Digests were backfilled into FileHashes and read paths resolve them.
+    let file = db.file_get(&conn, &1).await.unwrap();
+    assert_eq!(file.hash, sha_a);
+    assert_eq!(file.extension, "jpg");
+    let by_hash = db
+        .files_get_by_hash(&conn, std::slice::from_ref(&sha_b))
+        .await
+        .unwrap();
+    assert_eq!(by_hash[&sha_b].id, Some(2));
+    assert_eq!(
+        db.file_hashes_get_all_sha512(&conn).await.unwrap(),
+        vec![sha_a, sha_b]
     );
 }
 
@@ -1096,7 +1210,7 @@ fn fts_shadow_write_path_throughput_bench() {
 #[test]
 #[ignore = "manual benchmark: end-to-end scraper chunk persist on RAM-backed storage"]
 fn scraper_chunk_persist_throughput_bench() {
-    use shared_types::{PluginTag, TagType};
+    
 
     let db_path = if std::path::Path::new("/dev/shm").exists() {
         std::path::PathBuf::from("/dev/shm")
@@ -1125,7 +1239,7 @@ fn scraper_chunk_persist_throughput_bench() {
             description: None,
         };
         // 200 files x 24 tags (20 popular + 4 brand-new) each.
-        let (map, file_list, all_tags) = bench_chunk_map(storage_id, popular_count, 200, 0, &ns);
+        let (map, _file_list, _all_tags) = bench_chunk_map(storage_id, popular_count, 200, 0, &ns);
 
         // Fresh chunk (all 200 files new).
         let entries = map.len();
@@ -1967,7 +2081,7 @@ async fn redgifs_shaped_tags_persist_the_uploader_and_gallery_graph() {
         operation: TagOperation::Add,
         tags: structural.clone(),
     };
-    assert!(db.tag_actions_add(&[structural_action.clone()]).await);
+    assert!(db.tag_actions_add(std::slice::from_ref(&structural_action)).await);
 
     // Files carry the identity tags so a download stays searchable through
     // its uploader and gallery.

@@ -211,10 +211,8 @@ fn relationship_write_path_scale_bench() {
 
         // Sanity: the plan must still be a covering-index seek per tag, and
         // must not degrade into a partition scan.
-        let mut del_conn = db.connect().unwrap();
-        let sql = format!(
-            "DELETE FROM Relationship_1 WHERE tag_id = ? AND file_id IN (?, ?) RETURNING tag_id"
-        );
+        let del_conn = db.connect().unwrap();
+        let sql = "DELETE FROM Relationship_1 WHERE tag_id = ? AND file_id IN (?, ?) RETURNING tag_id".to_string();
         let mut rows = del_conn
             .query(
                 &format!("EXPLAIN QUERY PLAN {sql}"),
@@ -434,7 +432,7 @@ async fn self_unfiltered_source(conn: &Connection) -> String {
     )
 }
 
-async fn tag_count(db: &TursoDatabase, conn: &Connection, tag_id: u64) -> i64 {
+async fn tag_count(_db: &TursoDatabase, conn: &Connection, tag_id: u64) -> i64 {
     let mut rows = conn
         .query("SELECT count FROM Tags WHERE id = ?1;", (tag_id as i64,))
         .await

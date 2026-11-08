@@ -6,6 +6,7 @@ use turso::{Connection, Result, Value, params_from_iter};
 use crate::db::SQL_CHUNK_SIZE;
 use crate::db::turso::TursoDatabase;
 
+#[allow(dead_code)]
 impl TursoDatabase {
     /// Adds the `source_url` namespace if it doesn't exist, returning its id.
     pub(in crate::db::turso) async fn namespace_sourceurl_get(

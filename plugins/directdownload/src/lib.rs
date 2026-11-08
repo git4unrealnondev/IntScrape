@@ -40,10 +40,14 @@ const NS_SOURCE_URL: &str = "source_url";
 static URL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(URL_REGEX).unwrap());
 
 #[unsafe(no_mangle)]
-fn get_plugin_info() -> shared_types::CVec<Plugin> {
-    // The host consumes this via `CVec::into_vec` (see `src/plugins.rs`).
-    // The inner helper keeps the original `Vec` body unchanged.
-    shared_types::CVec::from_vec(get_plugin_info_impl())
+fn get_plugin_info() -> shared_types::CVec<u8> {
+    // The host consumes this via `plugin_ffi::take` (see `src/plugins.rs`):
+    // a bitcode encoding of `Vec<Plugin>` in an owned byte buffer.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(get_plugin_info_impl));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&Vec::<shared_types::Plugin>::new()),
+    }
 }
 
 fn get_plugin_info_impl() -> Vec<Plugin> {
@@ -114,7 +118,31 @@ fn owned_by_plugin(url: &str) -> bool {
 }
 
 #[unsafe(no_mangle)]
-fn on_regex(
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn on_regex(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        type OnRegexInput = (String, String, shared_types::Tag, u64);
+        let Some((matched, full_tag, tag_source, tag_source_id)) = (unsafe {
+            shared_types::plugin_ffi::decode::<OnRegexInput>(req, req_len)
+        }) else {
+            return shared_types::CallbackReturn::default();
+        };
+        on_regex_impl(&matched, &full_tag, &tag_source, tag_source_id)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&shared_types::CallbackReturn::default()),
+    }
+}
+
+#[unsafe(no_mangle)]
+fn on_regex_impl(
     matched: &str,
     _full_tag: &str,
     tag_source: &Tag,
@@ -150,7 +178,30 @@ fn on_regex(
 /// queued via `on_regex`), so the job simply passes through unchanged, the same
 /// way MEGA's passthrough branch works.
 #[unsafe(no_mangle)]
-pub fn url_dump(data: &ScraperDataReturn) -> Vec<ScraperDataReturn> {
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn url_dump(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(data) = (unsafe {
+            shared_types::plugin_ffi::decode::<shared_types::ScraperDataReturn>(req, req_len)
+        }) else {
+            return Vec::new();
+        };
+        url_dump_impl(&data)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&Vec::<shared_types::ScraperDataReturn>::new()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub fn url_dump_impl(data: &ScraperDataReturn) -> Vec<ScraperDataReturn> {
     vec![data.clone()]
 }
 
@@ -177,7 +228,14 @@ fn queued_job(url: &str) -> PluginJob {
 }
 
 #[unsafe(no_mangle)]
-fn on_start() {
+pub fn on_start() {
+    // A panicking plugin must not unwind across the FFI boundary into the
+    // host (which builds with panic = "abort").
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(on_start_impl));
+}
+
+#[unsafe(no_mangle)]
+fn on_start_impl() {
     if let Err(error) = handle_on_start() {
         let _ = client::log_silent(format!("DIRECT: startup tag scan failed: {error}"));
     }
@@ -206,7 +264,7 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
             if owned_by_plugin(&url) || !queued.insert(url.clone()) {
                 continue;
             }
-            let callback_return = on_regex(&url, &tag.name, tag, *tag_id);
+            let callback_return = on_regex_impl(&url, &tag.name, tag, *tag_id);
             for job in callback_return.jobs {
                 if let Err(error) = client::jobs_add_single(job.job) {
                     failures += 1;
@@ -238,7 +296,34 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
 /// fetches the body; the url gets tagged on the file itself.
 ///
 #[unsafe(no_mangle)]
-pub fn parser_call(
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn parser_call(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(input) = (unsafe {
+            shared_types::plugin_ffi::decode::<shared_types::ParserCallInput>(req, req_len)
+        }) else {
+            return vec![shared_types::ScraperReturn::Stop(
+                "undecodable parser_call request".to_string(),
+            )];
+        };
+        parser_call_impl(&input.text, &input.source_url, &input.data)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&vec![shared_types::ScraperReturn::Stop(
+            "plugin panicked".to_string(),
+        )]),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub fn parser_call_impl(
     _text_input: &str,
     source_url: &str,
     _scraperdata: &ScraperDataReturn,

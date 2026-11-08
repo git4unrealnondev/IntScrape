@@ -16,6 +16,7 @@ fn job_json<T: serde::Serialize>(value: &T) -> Result<String> {
 }
 use crate::helper_functions::get_sys_time_in_secs;
 
+#[allow(dead_code)]
 impl TursoDatabase {
     /// Updates an existing job row.
     pub(in crate::db::turso) async fn jobs_update_sql(
@@ -191,7 +192,7 @@ impl TursoDatabase {
         let recreation_json = job_json(&config.recreation)?;
 
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "INSERT INTO Jobs (time, reptime, priority, recreation, site, param, user_data)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(time, reptime, site, param) DO UPDATE SET

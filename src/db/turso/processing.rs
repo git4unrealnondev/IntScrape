@@ -450,14 +450,13 @@ impl TursoDatabase {
                 // Current database state for this file: Namespace -> tag ids.
                 if let Some(current_tag_ids) = current_file_relationships.get(&file_id) {
                     for &tag_id in current_tag_ids {
-                        if let Some(ns_name) = tag_id_to_ns_name.get(&tag_id) {
-                            if ns_name != "source_url" && !ns_name.is_empty() {
+                        if let Some(ns_name) = tag_id_to_ns_name.get(&tag_id)
+                            && ns_name != "source_url" && !ns_name.is_empty() {
                                 current_ns_tags
                                     .entry(ns_name.as_str())
                                     .or_default()
                                     .insert(tag_id);
                             }
-                        }
                     }
                 }
 
@@ -659,8 +658,11 @@ impl TursoDatabase {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT id, hash, extension, storage_id, size_bytes
-                 FROM File WHERE id IN ({placeholders});"
+                "SELECT f.id, fh.digest, f.extension, f.storage_id, f.size_bytes
+                 FROM File f
+                 LEFT JOIN FileHashes fh
+                   ON fh.file_id = f.id AND fh.algorithm = 'SHA512'
+                 WHERE f.id IN ({placeholders});"
             );
             let params: Vec<Value> = file_ids.iter().map(|id| Value::from(*id as i64)).collect();
             if let Ok(mut rows) = conn.query(&sql, params_from_iter(params)).await {

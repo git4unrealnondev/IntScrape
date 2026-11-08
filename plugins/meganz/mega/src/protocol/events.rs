@@ -64,6 +64,9 @@ pub struct NodeDeletedEventResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// Upstream protocol type kept for completeness; no current code
+// constructs it, so it would otherwise be flagged as dead.
+#[allow(dead_code)]
 pub struct UnknownEventResponse {
     #[serde(flatten)]
     pub other: HashMap<String, json::Value>,

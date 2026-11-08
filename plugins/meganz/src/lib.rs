@@ -192,6 +192,7 @@ fn collect_file_nodes(nodes: &Nodes, node: &Node, output: &mut Vec<String>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // internal helper; args are the mega client + request context
 async fn collect_files(
     client: &Client,
     nodes: &Nodes,
@@ -351,7 +352,7 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
     {
         for matched in url_regex.find_iter(&tag.name) {
             dbg!(&matched.as_str(), &tag.name, &tag, &tag_id);
-            let callback_return = on_regex(matched.as_str(), &tag.name, tag, *tag_id);
+            let callback_return = on_regex_impl(matched.as_str(), &tag.name, tag, *tag_id);
             let tag_actions = callback_return.tags.into_iter().collect::<Vec<_>>();
             if !tag_actions.is_empty() && !client::tag_actions_add(tag_actions)? {
                 return Err("failed to persist MEGA source tag relationship".into());
@@ -373,14 +374,45 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
 }
 
 #[unsafe(no_mangle)]
-fn on_start() {
+pub fn on_start() {
+    // A panicking plugin must not unwind across the FFI boundary into the
+    // host (which builds with panic = "abort").
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(on_start_impl));
+}
+
+#[unsafe(no_mangle)]
+fn on_start_impl() {
     if let Err(error) = handle_on_start() {
         let _ = client::log_silent(format!("MEGA: startup tag scan failed: {error}"));
     }
 }
 
 #[unsafe(no_mangle)]
-fn on_regex(
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn on_regex(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        type OnRegexInput = (String, String, shared_types::Tag, u64);
+        let Some((matched, full_tag, tag_source, tag_source_id)) = (unsafe {
+            shared_types::plugin_ffi::decode::<OnRegexInput>(req, req_len)
+        }) else {
+            return shared_types::CallbackReturn::default();
+        };
+        on_regex_impl(&matched, &full_tag, &tag_source, tag_source_id)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&shared_types::CallbackReturn::default()),
+    }
+}
+
+#[unsafe(no_mangle)]
+fn on_regex_impl(
     matched: &str,
     _full_tag: &str,
     tag_source: &Tag,
@@ -430,10 +462,14 @@ fn on_regex(
 }
 
 #[unsafe(no_mangle)]
-fn get_plugin_info() -> shared_types::CVec<shared_types::Plugin> {
-    // The host consumes this via `CVec::into_vec` (see `src/plugins.rs`).
-    // The inner helper keeps the original `Vec` body unchanged.
-    shared_types::CVec::from_vec(get_plugin_info_impl())
+fn get_plugin_info() -> shared_types::CVec<u8> {
+    // The host consumes this via `plugin_ffi::take` (see `src/plugins.rs`):
+    // a bitcode encoding of `Vec<Plugin>` in an owned byte buffer.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(get_plugin_info_impl));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&Vec::<shared_types::Plugin>::new()),
+    }
 }
 
 fn get_plugin_info_impl() -> Vec<shared_types::Plugin> {
@@ -458,7 +494,30 @@ fn get_plugin_info_impl() -> Vec<shared_types::Plugin> {
 }
 
 #[unsafe(no_mangle)]
-pub fn url_dump(data: &ScraperDataReturn) -> Vec<ScraperDataReturn> {
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn url_dump(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(data) = (unsafe {
+            shared_types::plugin_ffi::decode::<shared_types::ScraperDataReturn>(req, req_len)
+        }) else {
+            return Vec::new();
+        };
+        url_dump_impl(&data)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&Vec::<shared_types::ScraperDataReturn>::new()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub fn url_dump_impl(data: &ScraperDataReturn) -> Vec<ScraperDataReturn> {
     if let Some(url) = public_url(&data.job.param) {
         if let Ok(dead) = client::dead_url_get(vec![url.clone()])
             && dead.get(&url).is_some_and(|x| *x)
@@ -472,7 +531,35 @@ pub fn url_dump(data: &ScraperDataReturn) -> Vec<ScraperDataReturn> {
 }
 
 #[unsafe(no_mangle)]
-pub fn parser_call(_text: &str, source_url: &str, data: &ScraperDataReturn) -> Vec<ScraperReturn> {
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn parser_call(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(input) = (unsafe {
+            shared_types::plugin_ffi::decode::<shared_types::ParserCallInput>(req, req_len)
+        }) else {
+            return vec![shared_types::ScraperReturn::Stop(
+                "undecodable parser_call request".to_string(),
+            )];
+        };
+        parser_call_impl(&input.text, &input.source_url, &input.data)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&vec![shared_types::ScraperReturn::Stop(
+            "plugin panicked".to_string(),
+        )]),
+    }
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::type_complexity)]
+pub fn parser_call_impl(_text: &str, source_url: &str, data: &ScraperDataReturn) -> Vec<ScraperReturn> {
     let Some(url) = public_url(&data.job.param) else {
         return vec![ScraperReturn::Nothing];
     };
@@ -747,6 +834,40 @@ fn is_socks(candidate: &str) -> bool {
     )
 }
 
+/// Tells the `proxy` plugin how the request went so the ranking learns from it.
+fn report_proxy(route: &ProxyRoute, success: bool) {
+    let _ = proxy_plugin_call(
+        "proxy_report",
+        vec![
+            (
+                "proxy_url",
+                CallbackCustomDataReturning::String(route.url.clone()),
+            ),
+            (
+                "site",
+                CallbackCustomDataReturning::String(SITE.to_string()),
+            ),
+            (
+                "success",
+                CallbackCustomDataReturning::U64(u64::from(success)),
+            ),
+        ],
+    );
+}
+
+/// Whether a failure is the proxy's fault rather than MEGA's.
+///
+/// Only transport-level trouble counts against a proxy. A blocked folder, an
+/// exceeded quota or a malformed link all mean the request arrived and got an
+/// answer back, so the proxy did its job and reporting a failure there would
+/// retire a good proxy over something MEGA decided.
+fn is_transport_error(error: &(dyn Error + 'static)) -> bool {
+    matches!(
+        error.downcast_ref::<mega::Error>(),
+        Some(mega::Error::ReqwestError { .. } | mega::Error::MaxRetriesReached)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_socks;
@@ -839,38 +960,4 @@ mod tests {
             }
         }
     }
-}
-
-/// Tells the `proxy` plugin how the request went so the ranking learns from it.
-fn report_proxy(route: &ProxyRoute, success: bool) {
-    let _ = proxy_plugin_call(
-        "proxy_report",
-        vec![
-            (
-                "proxy_url",
-                CallbackCustomDataReturning::String(route.url.clone()),
-            ),
-            (
-                "site",
-                CallbackCustomDataReturning::String(SITE.to_string()),
-            ),
-            (
-                "success",
-                CallbackCustomDataReturning::U64(u64::from(success)),
-            ),
-        ],
-    );
-}
-
-/// Whether a failure is the proxy's fault rather than MEGA's.
-///
-/// Only transport-level trouble counts against a proxy. A blocked folder, an
-/// exceeded quota or a malformed link all mean the request arrived and got an
-/// answer back, so the proxy did its job and reporting a failure there would
-/// retire a good proxy over something MEGA decided.
-fn is_transport_error(error: &(dyn Error + 'static)) -> bool {
-    matches!(
-        error.downcast_ref::<mega::Error>(),
-        Some(mega::Error::ReqwestError { .. } | mega::Error::MaxRetriesReached)
-    )
 }

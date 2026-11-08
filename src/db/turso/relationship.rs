@@ -147,6 +147,7 @@ pub(in crate::db::turso) fn numbered_placeholders(count: usize) -> String {
     out
 }
 
+#[allow(dead_code)]
 impl TursoDatabase {
     /// Builds the inlined `SELECT file_id, tag_id FROM Relationship_x UNION ALL ...`
     /// source that spans every namespace's relationship partition.

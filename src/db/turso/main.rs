@@ -3,6 +3,7 @@ use turso::{Connection, Result};
 use crate::db::turso::TursoDatabase;
 use shared_types::*;
 
+#[allow(dead_code)]
 impl TursoDatabase {
     /// Gets a namespace id, using the cache and falling back to the db.
     pub(in crate::db::turso) async fn namespace_get(
@@ -61,6 +62,7 @@ impl TursoDatabase {
 
 impl TursoDatabase {
     /// Sets a namespace into the db
+    #[allow(dead_code)] // kept as DB-layer API; no current caller
     pub(in crate::db::turso) async fn namespace_set(
         &self,
         conn: &Connection,
@@ -70,15 +72,16 @@ impl TursoDatabase {
             return ns_id;
         }
 
-        conn.execute(
-            "INSERT INTO Namespace (name, description) VALUES (?1, ?2);",
-            (ns.name.as_str(), ns.description),
-        )
-        .await;
+        let _ = conn
+            .execute(
+                "INSERT INTO Namespace (name, description) VALUES (?1, ?2);",
+                (ns.name.as_str(), ns.description),
+            )
+            .await;
 
         let ns_id = conn.last_insert_rowid() as u64;
 
-        self.namespace_set_cache(ns_id, ns.name);
+        self.namespace_set_cache(ns_id, ns.name).await;
 
         ns_id
     }

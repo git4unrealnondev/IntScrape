@@ -556,9 +556,9 @@ async fn slurp_streams_legacy_relationship_table_once() {
     let mut rows = conn
         .query(
             format!(
-                "SELECT f.hash, t.name
+                "SELECT fh.digest, t.name
                  FROM Relationship_{species_id} r
-                 JOIN File f ON f.id = r.file_id
+                 JOIN FileHashes fh ON fh.file_id = r.file_id AND fh.algorithm = 'SHA512'
                  JOIN Tags t ON t.id = r.tag_id
                  ORDER BY t.name;"
             ),
@@ -581,9 +581,9 @@ async fn slurp_streams_legacy_relationship_table_once() {
     let mut rows = conn
         .query(
             format!(
-                "SELECT f.hash, t.name
+                "SELECT fh.digest, t.name
                  FROM Relationship_{artist_id} r
-                 JOIN File f ON f.id = r.file_id
+                 JOIN FileHashes fh ON fh.file_id = r.file_id AND fh.algorithm = 'SHA512'
                  JOIN Tags t ON t.id = r.tag_id;"
             ),
             (),
@@ -1687,9 +1687,12 @@ async fn slurp_resume_reimports_hash_tail() {
         .query("SELECT COUNT(*) FROM FileHashes;", ())
         .await
         .unwrap();
+    // 4 imported rows (MD5/SHA1 per file) plus one SHA512 row per file
+    // recorded by `file_add_bulk` from the source `File.hash` (schema v13
+    // stores the digest only in FileHashes).
     assert_eq!(
         rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
-        4
+        6
     );
 
     // Simulate a crash after file 1's hashes committed: the resume must
@@ -1739,7 +1742,7 @@ async fn slurp_resume_reimports_hash_tail() {
         .unwrap();
     assert_eq!(
         rows.next().await.unwrap().unwrap().get::<u64>(0).unwrap(),
-        4,
+        6,
         "resumed hash stage must keep every row"
     );
 }
@@ -1774,11 +1777,10 @@ async fn slurp_diagnoses_missing_keyset_index() {
          INSERT INTO Relationship_x (file_id, tag_id) VALUES (1, 2);",
     )
     .await;
-    assert_eq!(
-        slurp_source_keyset_indexed(&conn, "Relationship_x")
+    assert!(
+        !slurp_source_keyset_indexed(&conn, "Relationship_x")
             .await
             .unwrap(),
-        false,
         "a (tag_id, file_id) PK does not serve the (file_id, tag_id) keyset"
     );
     conn.execute(
@@ -1787,11 +1789,10 @@ async fn slurp_diagnoses_missing_keyset_index() {
     )
     .await
     .unwrap();
-    assert_eq!(
+    assert!(
         slurp_source_keyset_indexed(&conn, "Relationship_x")
             .await
             .unwrap(),
-        true,
         "an explicit (file_id, tag_id) index must be detected"
     );
 
@@ -1801,11 +1802,10 @@ async fn slurp_diagnoses_missing_keyset_index() {
              PRIMARY KEY (file_id, tag_id)) WITHOUT ROWID;",
     )
     .await;
-    assert_eq!(
+    assert!(
         slurp_source_keyset_indexed(&conn, "Relationship_y")
             .await
             .unwrap(),
-        true,
         "a clustered (file_id, tag_id) PK must be detected"
     );
 }

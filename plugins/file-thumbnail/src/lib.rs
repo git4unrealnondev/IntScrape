@@ -153,7 +153,14 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
 }
 
 #[unsafe(no_mangle)]
-fn on_start() {
+pub fn on_start() {
+    // A panicking plugin must not unwind across the FFI boundary into the
+    // host (which builds with panic = "abort").
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(on_start_impl));
+}
+
+#[unsafe(no_mangle)]
+fn on_start_impl() {
     if let Ok(thumbnail_path) = process_thumb_location() {
         let _ = client::log_silent(format!(
             "{PLUGIN_NAME}: Will download thumbnails to: {}",
@@ -165,7 +172,30 @@ fn on_start() {
 }
 
 #[unsafe(no_mangle)]
-fn file_thumbnail_generate_thumbnail_fid(
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn file_thumbnail_generate_thumbnail_fid(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(callback) = (unsafe {
+            shared_types::plugin_ffi::decode::<shared_types::CallbackInfoInput>(req, req_len)
+        }) else {
+            return std::collections::HashMap::new();
+        };
+        file_thumbnail_generate_thumbnail_fid_impl(&callback)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<String, shared_types::CallbackCustomDataReturning>::new()),
+    }
+}
+
+#[unsafe(no_mangle)]
+fn file_thumbnail_generate_thumbnail_fid_impl(
     callback: &shared_types::CallbackInfoInput,
 ) -> HashMap<String, shared_types::CallbackCustomDataReturning> {
     let mut out = HashMap::new();
@@ -261,10 +291,14 @@ fn thumbnail_path(base: &Path, hash: &str) -> Option<PathBuf> {
 }
 
 #[unsafe(no_mangle)]
-fn get_plugin_info() -> shared_types::CVec<shared_types::Plugin> {
-    // The host consumes this via `CVec::into_vec` (see `src/plugins.rs`).
-    // The inner helper keeps the original `Vec` body unchanged.
-    shared_types::CVec::from_vec(get_plugin_info_impl())
+fn get_plugin_info() -> shared_types::CVec<u8> {
+    // The host consumes this via `plugin_ffi::take` (see `src/plugins.rs`):
+    // a bitcode encoding of `Vec<Plugin>` in an owned byte buffer.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(get_plugin_info_impl));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&Vec::<shared_types::Plugin>::new()),
+    }
 }
 
 fn get_plugin_info_impl() -> Vec<shared_types::Plugin> {
@@ -324,7 +358,32 @@ fn process_thumb_location() -> Result<PathBuf, Box<dyn Error>> {
 }
 
 #[unsafe(no_mangle)]
-fn on_download(bytes: &[u8]) -> CallbackReturn {
+/// # Safety
+///
+/// Called by the host via `libloading` with a bitcode-encoded buffer
+/// that outlives the call (see `shared_types::plugin_ffi::decode`);
+/// `req..req + req_len` must be valid for the call. The wrapper
+/// null-checks, decodes inside `catch_unwind`, and returns an empty
+/// result on failure instead of panicking.
+pub unsafe extern "C" fn on_download(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Raw file bytes: ptr+len is the C ABI for a byte slice the
+        // plugin must not retain beyond the call.
+        let bytes = if req.is_null() {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(req, req_len) }
+        };
+        on_download_impl(bytes)
+    }));
+    match result {
+        Ok(value) => shared_types::plugin_ffi::encode(&value),
+        Err(_) => shared_types::plugin_ffi::encode(&shared_types::CallbackReturn::default()),
+    }
+}
+
+#[unsafe(no_mangle)]
+fn on_download_impl(bytes: &[u8]) -> CallbackReturn {
     match generate_thumbnails(BufReader::new(Cursor::new(bytes))) {
         Ok(tags) => CallbackReturn {
             tags,

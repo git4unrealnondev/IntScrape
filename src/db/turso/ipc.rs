@@ -23,6 +23,7 @@ impl TursoDatabase {
     /// Gets namespace id if it exists
     ///
     #[ipc(name = "namespace_get", request = "GetNamespace")]
+    #[allow(clippy::ptr_arg)] // #[ipc] signature feeds the generated client
     pub async fn ipc_namespace_get(&self, name: &String) -> Option<u64> {
         let Ok(conn) = self.db.connect() else {
             return None;
@@ -62,6 +63,7 @@ impl TursoDatabase {
         name = "search_db_files_by_tag_groups",
         request = "SearchFilesByTagGroups"
     )]
+    #[allow(clippy::too_many_arguments)]
     pub async fn ipc_search_db_files_by_tag_groups(
         &self,
         and_ids: &[u64],
@@ -703,6 +705,7 @@ impl TursoDatabase {
     /// Marks a url as being dead in the db
     ///
     #[ipc(name = "dead_url_add", request = "AddDeadUrl")]
+    #[allow(clippy::ptr_arg)] // #[ipc] signature feeds the generated client
     pub async fn ipc_dead_url_add(&self, dead_url: &String) -> bool {
         self.dead_url_add_async(dead_url.clone()).await
     }
@@ -832,6 +835,7 @@ impl TursoDatabase {
     /// prints. Failures come back as `error: ...` lines.
     ///
     #[ipc(name = "run_cli", request = "RunCli")]
+    #[allow(clippy::ptr_arg)] // #[ipc] signature feeds the generated client
     pub async fn ipc_run_cli(&self, command: &String) -> String {
         crate::cli::run_cli_command(self, command).await
     }

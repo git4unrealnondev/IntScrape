@@ -39,7 +39,7 @@ async fn run(mega: &mut mega::Client, file: &str, folder: &str) -> mega::Result<
     };
 
     mega.upload_node(
-        &node,
+        node,
         file_name,
         size,
         reader.compat(),

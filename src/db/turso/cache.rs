@@ -3,6 +3,7 @@ use turso::{Connection, Result};
 
 use crate::db::turso::TursoDatabase;
 
+#[allow(dead_code)]
 impl TursoDatabase {
     /// Gets a storage location id by path from the internal cache.
     pub(in crate::db::turso) async fn file_storage_location_get_cache(

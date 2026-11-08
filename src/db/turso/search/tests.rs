@@ -472,10 +472,10 @@ impl ScaleSpec {
         if tag_id <= self.hub_tags {
             (self.hub_tags, self.files / self.hub_tags, tag_id - 1)
         } else if tag_id <= self.hub_tags + self.common_tags {
-            let per_tag = (self.files / self.common_tags).min(200).max(1);
+            let per_tag = (self.files / self.common_tags).clamp(1, 200);
             (self.common_tags, per_tag, tag_id - self.hub_tags - 1)
         } else if tag_id < self.rest_start() {
-            let per_tag = (self.files / self.mid_tags).min(10).max(1);
+            let per_tag = (self.files / self.mid_tags).clamp(1, 10);
             (
                 self.mid_tags,
                 per_tag,
@@ -528,7 +528,7 @@ impl ScaleSpec {
 /// table's primary key. No per-row state accumulates, so peak memory is one
 /// batch no matter how large the fixture is.
 async fn scale_seed(db: &TursoDatabase, spec: &ScaleSpec) -> (Vec<u64>, f64) {
-    let conn = db.connect().unwrap();
+    let _conn = db.connect().unwrap();
 
     let ns_start = Instant::now();
     let mut ns_set = HashSet::new();
@@ -556,22 +556,36 @@ async fn scale_seed(db: &TursoDatabase, spec: &ScaleSpec) -> (Vec<u64>, f64) {
     let mut done = 0u64;
     while done < spec.files {
         let batch = SQL_CHUNK_SIZE.min((spec.files - done) as usize) as u64;
+        let first_id = done + 1;
         let mut sql = String::from(
-            "INSERT OR IGNORE INTO File (hash, extension, storage_id, size_bytes) VALUES ",
+            "INSERT OR IGNORE INTO File (id, extension, storage_id, size_bytes) VALUES ",
+        );
+        let mut hash_sql = String::from(
+            "INSERT OR IGNORE INTO FileHashes (file_id, algorithm, digest) VALUES ",
         );
         let mut params: Vec<Value> = Vec::with_capacity((batch * 4) as usize);
+        let mut hash_params: Vec<Value> = Vec::with_capacity((batch * 3) as usize);
         for i in 0..batch {
             if i > 0 {
                 sql.push(',');
+                hash_sql.push(',');
             }
             let b = (i * 4) as usize;
             sql.push_str(&format!("(?{}, ?{}, ?{}, ?{})", b + 1, b + 2, b + 3, b + 4));
-            params.push(Value::from(format!("scalehash{:09}", done + i)));
+            params.push(Value::from((first_id + i) as i64));
             params.push(Value::from("bin"));
             params.push(Value::from(storage_id as i64));
             params.push(Value::from(1i64));
+            let hb = (i * 3) as usize;
+            hash_sql.push_str(&format!("(?{}, ?{}, ?{})", hb + 1, hb + 2, hb + 3));
+            hash_params.push(Value::from((first_id + i) as i64));
+            hash_params.push(Value::from("SHA512"));
+            hash_params.push(Value::from(format!("scalehash{:09}", done + i)));
         }
         conn.execute(&sql, turso::params_from_iter(params))
+            .await
+            .unwrap();
+        conn.execute(&hash_sql, turso::params_from_iter(hash_params))
             .await
             .unwrap();
         done += batch;
@@ -1251,7 +1265,7 @@ async fn scale_fixture_is_well_formed_at_small_size() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn results_are_newest_first_and_limit_truncates() {
     let db = new_test_db().await;
-    let (file_ids, truth) = seed(&db, 25, 3).await;
+    let (_file_ids, truth) = seed(&db, 25, 3).await;
     let conn = db.connect().unwrap();
 
     let mut counts: Vec<(u64, usize)> = truth.iter().map(|(id, s)| (*id, s.len())).collect();

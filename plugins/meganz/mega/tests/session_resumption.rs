@@ -5,6 +5,7 @@
 use std::env;
 
 #[tokio::test]
+#[ignore = "live MEGA API test: requires MEGA_EMAIL/MEGA_PASSWORD (and MEGA_PUBLIC_URL where applicable); run with --ignored"]
 async fn session_resumption() {
     let session = env::var("MEGA_SESSION").expect("missing MEGA_SESSION environment variable");
 

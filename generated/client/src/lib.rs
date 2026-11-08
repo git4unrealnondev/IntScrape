@@ -27,7 +27,16 @@ include!(concat!(env!("OUT_DIR"), "/supported_db_requests.rs"));
 /// independent IPC channels the host starts and clients pick from.
 pub const IPC_CHANNELS_SETTING: &str = "ipc_channel_count";
 /// Channel count used when the setting is absent / unset.
-pub const IPC_CHANNEL_DEFAULT: usize = 10;
+///
+/// Deliberately conservative: the host allows 8 concurrent handlers per
+/// channel, so this bounds total concurrent DB operations to
+/// `default * 8`. At production scale (millions of files) the DB — not the
+/// IPC layer — is the bottleneck, and more concurrent writers mostly buy
+/// MVCC conflicts and retry storms. 4 channels = 32 concurrent operations
+/// is still far more than the per-operation latency (~0.2–2 ms) needs to
+/// saturate an SSD. Tune per deployment via the `ipc_channel_count`
+/// database setting.
+pub const IPC_CHANNEL_DEFAULT: usize = 4;
 /// Safety clamp on configured channel counts.
 pub const IPC_CHANNEL_MAX: usize = 64;
 /// Selector value meaning "pick the least-loaded channel".
@@ -155,7 +164,10 @@ pub fn data_size_to_b<T: bitcode::Encode + ?Sized>(data_object: &T) -> Vec<u8> {
     // let bytd = types::x_to_bytes(tmp).to_vec();
     bitcode::encode(data_object)
 }
-trait RequestArgument {
+/// Converting a request argument into the wire request type. Public
+/// because the public `init_data_request*` functions are generic over
+/// it (a private trait there trips `private_bounds` under `-D warnings`).
+pub trait RequestArgument {
     fn into_request(self) -> SupportedDBRequests;
 }
 
@@ -174,7 +186,7 @@ impl RequestArgument for &SupportedDBRequests {
 /// Default entry point: routes over `IPC_CHANNEL_AUTO` (a uniformly random
 /// channel), so no single socket accumulates traffic.
 pub(crate) fn init_data_request<
-    T: bitcode::Encode + for<'de> bitcode::Decode<'de>,
+    T: bitcode::Encode + for<'de> bitcode::Decode<'de> + Send + 'static,
     R: RequestArgument,
 >(
     requesttype: R,
@@ -183,7 +195,7 @@ pub(crate) fn init_data_request<
 }
 
 pub(crate) async fn init_data_request_async<
-    T: bitcode::Encode + for<'de> bitcode::Decode<'de>,
+    T: bitcode::Encode + for<'de> bitcode::Decode<'de> + Send + 'static,
     R: RequestArgument,
 >(
     requesttype: R,
@@ -198,7 +210,7 @@ pub(crate) async fn init_data_request_async<
 /// need deterministic placement; normal traffic should use `IPC_CHANNEL_AUTO`.
 /// A request on one channel never blocks requests on another.
 pub fn init_data_request_on_channel<
-    T: bitcode::Encode + for<'de> bitcode::Decode<'de>,
+    T: bitcode::Encode + for<'de> bitcode::Decode<'de> + Send + 'static,
     R: RequestArgument,
 >(
     requesttype: R,
@@ -213,7 +225,7 @@ pub fn init_data_request_on_channel<
 
 /// Async sibling of [`init_data_request_on_channel`].
 pub async fn init_data_request_async_on_channel<
-    T: bitcode::Encode + for<'de> bitcode::Decode<'de>,
+    T: bitcode::Encode + for<'de> bitcode::Decode<'de> + Send + 'static,
     R: RequestArgument,
 >(
     requesttype: R,
@@ -258,10 +270,14 @@ async fn send<T: Sized + bitcode::Encode>(
     conn: &mut BufReader<LocalSocketStream>,
 ) -> std::io::Result<()> {
     let byte_buf = bitcode::encode(inp);
-    let mut frame = Vec::with_capacity(std::mem::size_of::<usize>() + byte_buf.len());
-    frame.extend_from_slice(&byte_buf.len().to_ne_bytes());
-    frame.extend_from_slice(&byte_buf);
-    conn.get_mut().write_all(&frame).await
+    // Write the length prefix and the payload as two writes instead of
+    // copying the whole payload into a single frame buffer first: at
+    // millions-of-files scale a response is 100+ MB, and that copy was a
+    // full extra memcpy of the payload on every large IPC call.
+    conn.get_mut()
+        .write_all(&byte_buf.len().to_ne_bytes())
+        .await?;
+    conn.get_mut().write_all(&byte_buf).await
 }
 
 /// Writes all data into buffer. Assumes data is preserialzied from data generic
@@ -271,9 +287,11 @@ pub async fn send_preserialize(
     inp: &[u8],
     conn: &mut BufReader<LocalSocketStream>,
 ) -> std::io::Result<()> {
-    let mut temp = inp.len().to_ne_bytes().to_vec();
-    temp.extend(inp);
-    conn.get_mut().write_all(&temp).await
+    // As in `send`: no full-payload copy into a frame buffer.
+    conn.get_mut()
+        .write_all(&inp.len().to_ne_bytes())
+        .await?;
+    conn.get_mut().write_all(inp).await
 }
 
 /// Returns a vec of bytes that represent an object

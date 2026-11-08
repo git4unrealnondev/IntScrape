@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 
 use shared_types::*;
 use smol_str::SmolStr;
@@ -61,6 +62,7 @@ async fn tags_resolve_existing<'a>(
     Ok(out)
 }
 
+#[allow(dead_code)]
 impl TursoDatabase {
     /// Loads the namespace into the internal cache
     pub(in crate::db::turso) async fn namespace_load(&self, conn: &Connection) -> Result<()> {
@@ -145,7 +147,7 @@ impl TursoDatabase {
             return Ok(out);
         }
         let conn = self.db.connect()?;
-        let fts_query = format!("{}", search_string.trim().to_owned());
+        let fts_query = search_string.trim().to_owned().to_string();
         // The FTS index only covers popular tags (`Tags_Popular.count >= 5`),
         // so search joins back to Tags for the authoritative count used to
         // rank and return. Unpopular tags are intentionally not searchable.
@@ -323,7 +325,7 @@ LIMIT ?2;",
         }
 
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "INSERT INTO Namespace (name, description) VALUES (?1, ?2)
                  ON CONFLICT(name) DO UPDATE SET description = excluded.description
                  RETURNING id",
@@ -555,12 +557,23 @@ LIMIT ?2;",
 
     /// Adds a list of files into the db and sets their id if not already set.
     ///
-    /// Existing files are resolved read-only through the UNIQUE(hash) index;
-    /// only genuinely new files are inserted (`INSERT OR IGNORE`), so a
-    /// re-scraped file costs a unique-index seek and no write is issued. This
-    /// replaces the previous `ON CONFLICT ... DO UPDATE` upsert, which rewrote
-    /// every already-present row on every re-scrape (extension, storage, size)
-    /// — at millions of files that rewrite dominated ingest.
+    /// Dedupe is by SHA-512 digest in `FileHashes` (algorithm `SHA512`,
+    /// unique on `(algorithm, digest)`): existing files are resolved
+    /// read-only through that index, so a re-scraped file costs an index
+    /// seek and no write is issued.
+    ///
+    /// Genuinely new files get an id assigned from `next_file_id` (or their
+    /// pinned id), and the `File` row and its `SHA512` row are inserted
+    /// with that same id on the caller's connection — callers run this
+    /// inside a transaction, so the pair is atomic. `FileHashes` is the
+    /// race arbiter: if two connections insert the same digest
+    /// concurrently, the loser's `FileHashes` insert is ignored, a
+    /// re-lookup resolves the winner's id, and the loser's orphaned
+    /// `File` row (nothing can reference it yet) is deleted.
+    ///
+    /// Files with an empty hash have no digest to dedupe on: they are
+    /// inserted without a `FileHashes` row and always treated as new,
+    /// matching the previous behaviour for hash-less files.
     pub(in crate::db::turso) async fn file_add_bulk(
         &self,
         conn: &Connection,
@@ -572,140 +585,136 @@ LIMIT ?2;",
             return Ok(out);
         }
 
+        /// Batched `digest -> file_id` lookup in `FileHashes` for SHA512.
+        ///
+        /// Deliberately one point query per digest, not `digest IN (...)`:
+        /// Turso's planner does not turn `algorithm = ? AND digest IN (...)`
+        /// into index seeks on the `(algorithm, digest)` index — it binds
+        /// only `algorithm` and scans every SHA-512 row, evaluating the IN
+        /// list per row (measured at 1M rows: ~70s per 4600-digest chunk
+        /// vs ~17ms for the point-query loop). The old single-column
+        /// `File.hash IN (...)` did seek, so this keeps parity with it.
+        async fn lookup_sha512(
+            conn: &Connection,
+            digests: &[&str],
+        ) -> Result<HashMap<String, i64>> {
+            let mut existing = HashMap::new();
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT file_id FROM FileHashes WHERE algorithm = 'SHA512' AND digest = ?1",
+                )
+                .await?;
+            for digest in digests.iter().filter(|d| !d.is_empty()) {
+                let mut rows = stmt.query((*digest,)).await?;
+                while let Some(row) = rows.next().await? {
+                    existing.insert((*digest).to_string(), row.get::<i64>(0)?);
+                }
+            }
+            Ok(existing)
+        }
+
         for chunk in file_list.chunks(SQL_CHUNK_SIZE) {
-            // Map hash -> file (last entry wins for duplicate hashes), so the
-            // resolved output shape matches the previous single-entry-per-hash
-            // RETURNING handling.
+            // Map hash -> file (last entry wins for duplicate hashes).
             let mut file_map: HashMap<&str, &FileInternal> = HashMap::with_capacity(chunk.len());
             for file in chunk {
                 file_map.insert(file.hash.as_str(), file);
             }
 
-            // Resolve the chunk's whole hash set with batched indexed lookups
-            // instead of one point query per hash. `File.hash` is UNIQUE, so
-            // `hash IN (...)` is a set of unique-index seeks. This used to issue
-            // one statement per file inside the scraper's write transaction
-            // (`scraper_phase_files`), so a 4.6k-file chunk issued 4.6k
-            // statements and held the MVCC conflict window open for all of them.
-            //
-            // Sorted + deduped so the rendered statement text is stable across
-            // chunks and the `IN` list carries only the chunk's distinct hashes.
             let mut hashes: Vec<&str> = file_map.keys().copied().collect();
             hashes.sort_unstable();
             hashes.dedup();
 
-            // Split the chunk into already-known hashes (resolved id) and
-            // genuinely new ones. Only the novel hashes are written.
-            let mut existing: HashMap<&str, i64> = HashMap::with_capacity(hashes.len());
-            for key_chunk in hashes.chunks(SQL_CHUNK_SIZE) {
-                let placeholders = std::iter::repeat_n("?", key_chunk.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let params: Vec<Value> = key_chunk.iter().map(|hash| Value::from(*hash)).collect();
-                let mut rows = conn
-                    .query(
-                        format!("SELECT id, hash FROM File WHERE hash IN ({placeholders});"),
-                        params_from_iter(params),
-                    )
-                    .await?;
-                while let Some(row) = rows.next().await? {
-                    let id: i64 = row.get(0)?;
-                    let hash: String = row.get(1)?;
-                    // Re-key through `file_map` so the stored key borrows from
-                    // the caller's chunk rather than the row-local String.
-                    if let Some((key, _)) = file_map.get_key_value(hash.as_str()) {
-                        existing.insert(*key, id);
-                    }
-                }
-            }
+            let existing = lookup_sha512(conn, &hashes).await?;
 
-            let novel: HashMap<&str, &FileInternal> = file_map
+            // (hash -> id) for everything already known.
+            let mut resolved: HashMap<&str, u64> = existing
                 .iter()
-                .filter(|(hash, _)| !existing.contains_key(*hash))
-                .map(|(hash, file)| (*hash, *file))
+                .filter_map(|(digest, id)| {
+                    file_map
+                        .get_key_value(digest.as_str())
+                        .map(|(key, _)| (*key, *id as u64))
+                })
                 .collect();
 
-            if novel.is_empty() {
-                for (hash, id) in existing {
-                    if let Some(file) = file_map.get(hash) {
-                        let mut file = (*file).clone().clone();
-                        file.id = Some(id as u64);
-                        out.insert(file);
-                    }
-                }
-                continue;
-            }
-
-            let mut holders = Vec::with_capacity(novel.len());
-            let mut params = Vec::with_capacity(novel.len() * 5);
-
-            for file in novel.values() {
-                holders.push("(?, ?, ?, ?, ?)");
-                params.push(Value::from(file.id.map(|f| f as i64)));
-                params.push(Value::from(file.hash.as_str()));
-                params.push(Value::from(file.extension.as_str()));
-                params.push(Value::from(file.storage_id as i64));
-                params.push(Value::from(file.size_bytes.map(|f| f as i64)));
-            }
-            let sql_str = format!(
-                "INSERT OR IGNORE INTO File (id, hash, extension, storage_id, size_bytes) \
-                 VALUES {} RETURNING id, hash;",
-                holders.join(", ")
-            );
-
-            let mut rows = conn.query(sql_str, params_from_iter(params)).await?;
-            let mut inserted_new: HashSet<String> = HashSet::with_capacity(novel.len());
-            while let Some(row) = rows.next().await? {
-                let id: i64 = row.get(0)?;
-                let hash: String = row.get(1)?;
-
-                if let Some(file) = file_map.get(hash.as_str()) {
-                    let mut file = (*file).clone().clone();
-                    file.id = Some(id as u64);
-                    out.insert(file);
-                    inserted_new.insert(hash.clone());
-                }
-            }
-
-            // A novel file can still lose the insert race with another
-            // connection; OR IGNORE then skips it and RETURNING omits it.
-            // Resolve any such straggler so no file is ever dropped from the
-            // caller's id mapping.
-            if inserted_new.len() < novel.len() {
-                let mut missing: Vec<&str> = novel
-                    .keys()
-                    .copied()
-                    .filter(|hash| !inserted_new.contains(*hash))
-                    .collect();
-                missing.sort_unstable();
-                for key_chunk in missing.chunks(SQL_CHUNK_SIZE) {
-                    let placeholders = std::iter::repeat_n("?", key_chunk.len())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let params: Vec<Value> =
-                        key_chunk.iter().map(|hash| Value::from(*hash)).collect();
-                    let mut rows = conn
-                        .query(
-                            format!("SELECT id, hash FROM File WHERE hash IN ({placeholders});"),
-                            params_from_iter(params),
-                        )
-                        .await?;
-                    while let Some(row) = rows.next().await? {
-                        let id: i64 = row.get(0)?;
-                        let hash: String = row.get(1)?;
-                        if let Some(file) = file_map.get(hash.as_str()) {
-                            let mut file = (*file).clone().clone();
-                            file.id = Some(id as u64);
-                            out.insert(file);
+            // Assign ids to genuinely new files and insert both rows.
+            let novel: Vec<(&str, u64, &FileInternal)> = file_map
+                .iter()
+                .filter(|(hash, _)| !resolved.contains_key(*hash))
+                .map(|(hash, file)| {
+                    let id = match file.id {
+                        Some(pinned) => {
+                            self.next_file_id
+                                .fetch_max(pinned + 1, Ordering::Relaxed);
+                            pinned
                         }
+                        None => self
+                            .next_file_id
+                            .fetch_add(1, Ordering::Relaxed),
+                    };
+                    (*hash, id, *file)
+                })
+                .collect();
+
+            if !novel.is_empty() {
+                let mut holders = Vec::with_capacity(novel.len());
+                let mut params = Vec::with_capacity(novel.len() * 4);
+                for (_, id, file) in &novel {
+                    holders.push("(?, ?, ?, ?)");
+                    params.push(Value::from(*id as i64));
+                    params.push(Value::from(file.extension.as_str()));
+                    params.push(Value::from(file.storage_id as i64));
+                    params.push(Value::from(file.size_bytes.map(|f| f as i64)));
+                }
+                conn.execute(
+                    format!(
+                        "INSERT OR IGNORE INTO File (id, extension, storage_id, size_bytes) \
+                         VALUES {};",
+                        holders.join(", ")
+                    ),
+                    params_from_iter(params),
+                )
+                .await?;
+
+                let tuples: Vec<(u64, &str, &str)> = novel
+                    .iter()
+                    .filter(|(hash, _, _)| !hash.is_empty())
+                    .map(|(hash, id, _)| (*id, "SHA512", *hash))
+                    .collect();
+                if !tuples.is_empty() {
+                    self.file_hashes_add_bulk(conn, &tuples).await?;
+                }
+
+                // Race resolution: if another connection won the same
+                // digest, our FileHashes insert was ignored and the lookup
+                // now resolves a different id. Delete our orphaned row
+                // (nothing can reference a just-inserted file yet) and use
+                // the winner's id.
+                let winners = lookup_sha512(conn, &novel.iter().map(|(hash, _, _)| *hash).collect::<Vec<_>>()).await?;
+                for (hash, id, _) in &novel {
+                    if let Some(winner) = winners.get(*hash)
+                        && *winner != *id as i64
+                    {
+                        let _ = conn
+                            .execute("DELETE FROM File WHERE id = ?1;", (*id as i64,))
+                            .await;
+                        resolved.insert(hash, *winner as u64);
+                    } else if !hash.is_empty() {
+                        resolved.insert(hash, *id);
+                    }
+                }
+                // Hash-less novel files have no digest to look up; keep the
+                // assigned ids.
+                for (hash, id, _) in &novel {
+                    if hash.is_empty() {
+                        resolved.insert(hash, *id);
                     }
                 }
             }
 
-            for (hash, id) in existing {
+            for (hash, id) in resolved {
                 if let Some(file) = file_map.get(hash) {
-                    let mut file = (*file).clone().clone();
-                    file.id = Some(id as u64);
+                    let mut file = (*file).clone();
+                    file.id = Some(id);
                     out.insert(file);
                 }
             }

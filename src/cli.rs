@@ -453,15 +453,15 @@ async fn run(
                 match plugin_manager.plugin_for_site(&args.site) {
                     Some(plugin) => {
                         if let Some(path) = &args.cookies {
-                            match crate::web::manager::import_cookies_txt(&db, &plugin, path) {
+                            match crate::web::manager::import_cookies_txt(db, &plugin, path) {
                                 Ok(stored) => {
                                     cli_out(format!("Stored {stored} login item(s) for {}.", plugin.name))
                                 }
-                                Err(e) => cli_out(format!("{e}")),
+                                Err(e) => cli_out(e.to_string()),
                             }
                         } else {
                             let stored = crate::web::manager::prompt_plugin_login(
-                                &db, &plugin, true, args.force,
+                                db, &plugin, true, args.force,
                             );
                             cli_out(format!("Stored {stored} login item(s) for {}.", plugin.name));
                         }

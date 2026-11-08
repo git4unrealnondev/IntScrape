@@ -7,6 +7,7 @@ use std::env;
 use rand::distributions::{Alphanumeric, DistString};
 
 #[tokio::test]
+#[ignore = "live MEGA API test: requires MEGA_EMAIL/MEGA_PASSWORD (and MEGA_PUBLIC_URL where applicable); run with --ignored"]
 async fn event_updates_test() {
     let email = env::var("MEGA_EMAIL").expect("missing MEGA_EMAIL environment variable");
     let password = env::var("MEGA_PASSWORD").expect("missing MEGA_PASSWORD environment variable");
