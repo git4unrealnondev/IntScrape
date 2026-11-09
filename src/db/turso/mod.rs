@@ -6,7 +6,7 @@ use smol_str::SmolStr;
 use tokio::sync::{Mutex, RwLock};
 use turso::{
     Builder, Database, Result,
-    transaction::{Transaction, TransactionBehavior},
+    transaction::{DropBehavior, Transaction, TransactionBehavior},
 };
 
 use crate::DB_VERSION;
@@ -157,13 +157,78 @@ impl std::ops::Deref for PooledConnection {
     type Target = turso::Connection;
 
     fn deref(&self) -> &Self::Target {
-        self.conn.as_ref().expect("PooledConnection used after take")
+        self.conn
+            .as_ref()
+            .expect("PooledConnection used after take")
     }
 }
 
 impl std::ops::DerefMut for PooledConnection {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.conn.as_mut().expect("PooledConnection used after take")
+        self.conn
+            .as_mut()
+            .expect("PooledConnection used after take")
+    }
+}
+
+impl PooledConnection {
+    /// Begin a transaction with the given behavior, intercepting
+    /// `Connection::transaction_with_behavior` (inherent methods win
+    /// over the `DerefMut` target) so every pooled transaction gets
+    /// `DropBehavior::Ignore`.
+    ///
+    /// Turso's default is to roll back a dropped-unfinished transaction
+    /// on the *next* use of the connection (`maybe_handle_dangling_tx`).
+    /// That cleanup only clears its flag after a *successful* rollback,
+    /// so when the transaction has already ended on its own — a COMMIT
+    /// that lost an MVCC conflict and rolled back internally, a
+    /// statement that auto-rolled-back — the cleanup `ROLLBACK` fails
+    /// with "cannot rollback - no transaction is active" and the flag
+    /// survives: every later query on that pooled connection fails the
+    /// same way forever (observed as the jobs poller logging that error
+    /// every second). With `Ignore`, a dropped-unfinished transaction
+    /// leaves its underlying transaction open, so `checkin` discards
+    /// the connection (autocommit is false) instead of pooling a
+    /// poisoned one; explicit commit/rollback paths are unaffected,
+    /// and a transaction that already ended pools cleanly with no
+    /// dangling flag to replay.
+    pub async fn transaction_with_behavior(
+        &mut self,
+        behavior: TransactionBehavior,
+    ) -> Result<Transaction<'_>> {
+        let mut tx = self
+            .conn
+            .as_mut()
+            .expect("PooledConnection used after take")
+            .transaction_with_behavior(behavior)
+            .await?;
+        tx.set_drop_behavior(DropBehavior::Ignore);
+        Ok(tx)
+    }
+
+    /// Begin a default-behavior transaction; see
+    /// [`Self::transaction_with_behavior`] for why the drop behavior
+    /// is forced to `Ignore` on pooled connections.
+    pub async fn transaction(&mut self) -> Result<Transaction<'_>> {
+        let mut tx = self
+            .conn
+            .as_mut()
+            .expect("PooledConnection used after take")
+            .transaction()
+            .await?;
+        tx.set_drop_behavior(DropBehavior::Ignore);
+        Ok(tx)
+    }
+
+    /// Drop the connection for real instead of returning it to the
+    /// pool. Use after an operation failed with a transaction error:
+    /// the connection's transaction state is then unknown (it may
+    /// carry a dangling rollback that would fail every later query),
+    /// so reusing it would fail every subsequent operation.
+    pub fn discard(mut self) {
+        // Taking the inner connection drops (closes) it without the
+        // Drop impl's checkin, which then sees `None` and does nothing.
+        let _ = self.conn.take();
     }
 }
 
@@ -222,6 +287,16 @@ impl TursoDatabase {
             // eight times just delays a real error report.
             || message.contains("write conflict")
             || message.contains("snapshot conflict")
+            // A COMMIT that lost an MVCC conflict can surface as a
+            // transaction-state error instead of BusySnapshot: Limbo
+            // already ended the transaction, so the crate's cleanup
+            // ROLLBACK (or a further COMMIT) is rejected with "cannot
+            // commit/rollback - no transaction is active". That is a
+            // conflict in everything but name — retrying on a fresh
+            // connection is the correct response, and these messages
+            // do not occur for deterministic SQL errors.
+            || message.contains("cannot commit - no transaction is active")
+            || message.contains("cannot rollback - no transaction is active")
     }
 
     /// The journal mode the database is served in. Defaults to `mvcc` so
@@ -633,6 +708,9 @@ impl TursoDatabase {
                 }
                 12 => {
                     self.update_db_12_to_13(&conn).await?;
+                }
+                13 => {
+                    self.update_db_13_to_14(&conn).await?;
                 }
                 _ => {
                     return Err(turso::Error::Error(format!(

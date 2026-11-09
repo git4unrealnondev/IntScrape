@@ -165,7 +165,10 @@ impl TursoDatabase {
             return Ok(out);
         }
 
-        // digest -> file_id, one cached point query per digest.
+        // digest -> file_id, one cached point query per digest. The query
+        // uses the canonical (uppercase) form so a lowercase caller-supplied
+        // digest still resolves the stored row; the result stays keyed by
+        // the caller's original string.
         let mut by_digest: HashMap<String, u64> = HashMap::new();
         let mut stmt = conn
             .prepare_cached(
@@ -176,7 +179,8 @@ impl TursoDatabase {
             if digest.is_empty() {
                 continue;
             }
-            let mut rows = stmt.query((digest.as_str(),)).await?;
+            let canonical = crate::db::canonical_digest("SHA512", digest);
+            let mut rows = stmt.query((canonical.as_str(),)).await?;
             while let Some(row) = rows.next().await? {
                 by_digest.insert(digest.clone(), row.get::<i64>(0)? as u64);
             }
@@ -353,9 +357,10 @@ impl TursoDatabase {
 
         for base_path in file_storage_map.values() {
             if let Some(good_path) = file_on_disk(&file, base_path)
-                && let Ok(final_path) = good_path.canonicalize() {
-                    return Ok(Some(final_path.to_string_lossy().to_string()));
-                }
+                && let Ok(final_path) = good_path.canonicalize()
+            {
+                return Ok(Some(final_path.to_string_lossy().to_string()));
+            }
         }
 
         Ok(None)
@@ -527,6 +532,11 @@ impl TursoDatabase {
     }
 
     /// Adds a batch of `(algorithm, digest, file_id)` rows, ignoring dups.
+    ///
+    /// Digests are canonicalized per algorithm (see
+    /// [`crate::db::canonical_digest`]) before storage, so a lowercase
+    /// SHA-512 from a slurped library or a plugin can never become the
+    /// stored digest that every read path now returns.
     pub(in crate::db::turso) async fn file_hashes_add_bulk(
         &self,
         conn: &Connection,
@@ -542,7 +552,7 @@ impl TursoDatabase {
                 holders.push("(?, ?, ?)");
                 params.push(Value::from(*file_id as i64));
                 params.push(Value::from(*algorithm));
-                params.push(Value::from(*digest));
+                params.push(Value::from(crate::db::canonical_digest(algorithm, digest)));
             }
             let sql = format!(
                 "INSERT OR IGNORE INTO FileHashes (file_id, algorithm, digest) VALUES {};",
@@ -572,9 +582,7 @@ impl TursoDatabase {
         // chunk at 1M rows). Point queries use the unique index directly
         // (~3.7µs each, measured). See `lookup_sha512` in `file_add_bulk`.
         let mut stmt = conn
-            .prepare_cached(
-                "SELECT file_id FROM FileHashes WHERE algorithm = ?1 AND digest = ?2",
-            )
+            .prepare_cached("SELECT file_id FROM FileHashes WHERE algorithm = ?1 AND digest = ?2")
             .await?;
         for chunk in hashes.chunks(SQL_CHUNK_SIZE) {
             // Drain the chunk's matches first, then fetch every matched file in
@@ -585,13 +593,12 @@ impl TursoDatabase {
             // landed on the scrape hot path.
             let mut matched: Vec<(String, String, u64)> = Vec::with_capacity(chunk.len());
             for (algorithm, digest) in chunk {
-                let mut rows = stmt.query((algorithm.as_str(), digest.as_str())).await?;
+                // Query the canonical digest form (see `file_hashes_add_bulk`);
+                // the result stays keyed by the caller's original pair.
+                let canonical = crate::db::canonical_digest(algorithm, digest);
+                let mut rows = stmt.query((algorithm.as_str(), canonical.as_str())).await?;
                 while let Some(row) = rows.next().await? {
-                    matched.push((
-                        algorithm.clone(),
-                        digest.clone(),
-                        row.get::<i64>(0)? as u64,
-                    ));
+                    matched.push((algorithm.clone(), digest.clone(), row.get::<i64>(0)? as u64));
                 }
             }
 
@@ -693,7 +700,6 @@ pub(in crate::db::turso) fn file_on_disk(
 
     None
 }
-
 
 #[cfg(test)]
 mod tests;

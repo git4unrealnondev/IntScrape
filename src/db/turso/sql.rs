@@ -585,6 +585,32 @@ LIMIT ?2;",
             return Ok(out);
         }
 
+        // `FileInternal.hash` is the SHA-512 digest. Canonicalize it
+        // (uppercase) before dedupe/lookup/insert and before it is
+        // returned to the caller, so a lowercase digest from a slurped
+        // library or a plugin is never stored — and never returned from
+        // the resolved set — in lowercase. Only full-length hex digests
+        // change (see `crate::db::canonical_digest`); short fixtures and
+        // non-hex values are untouched. The common all-canonical path
+        // keeps borrowing the caller's slice with no clones.
+        let normalized: Vec<FileInternal>;
+        let file_list: &[FileInternal] = if file_list
+            .iter()
+            .any(|file| crate::db::canonical_digest("SHA512", &file.hash) != file.hash)
+        {
+            normalized = file_list
+                .iter()
+                .map(|file| {
+                    let mut file = file.clone();
+                    file.hash = crate::db::canonical_digest("SHA512", &file.hash);
+                    file
+                })
+                .collect();
+            &normalized
+        } else {
+            file_list
+        };
+
         /// Batched `digest -> file_id` lookup in `FileHashes` for SHA512.
         ///
         /// Deliberately one point query per digest, not `digest IN (...)`:
@@ -605,7 +631,8 @@ LIMIT ?2;",
                 )
                 .await?;
             for digest in digests.iter().filter(|d| !d.is_empty()) {
-                let mut rows = stmt.query((*digest,)).await?;
+                let canonical = crate::db::canonical_digest("SHA512", digest);
+                let mut rows = stmt.query((canonical.as_str(),)).await?;
                 while let Some(row) = rows.next().await? {
                     existing.insert((*digest).to_string(), row.get::<i64>(0)?);
                 }
@@ -643,13 +670,10 @@ LIMIT ?2;",
                 .map(|(hash, file)| {
                     let id = match file.id {
                         Some(pinned) => {
-                            self.next_file_id
-                                .fetch_max(pinned + 1, Ordering::Relaxed);
+                            self.next_file_id.fetch_max(pinned + 1, Ordering::Relaxed);
                             pinned
                         }
-                        None => self
-                            .next_file_id
-                            .fetch_add(1, Ordering::Relaxed),
+                        None => self.next_file_id.fetch_add(1, Ordering::Relaxed),
                     };
                     (*hash, id, *file)
                 })
@@ -689,7 +713,11 @@ LIMIT ?2;",
                 // now resolves a different id. Delete our orphaned row
                 // (nothing can reference a just-inserted file yet) and use
                 // the winner's id.
-                let winners = lookup_sha512(conn, &novel.iter().map(|(hash, _, _)| *hash).collect::<Vec<_>>()).await?;
+                let winners = lookup_sha512(
+                    conn,
+                    &novel.iter().map(|(hash, _, _)| *hash).collect::<Vec<_>>(),
+                )
+                .await?;
                 for (hash, id, _) in &novel {
                     if let Some(winner) = winners.get(*hash)
                         && *winner != *id as i64

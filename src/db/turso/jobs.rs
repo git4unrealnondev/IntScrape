@@ -236,16 +236,10 @@ impl TursoDatabase {
                 params.push(Value::from(config.time as i64));
                 params.push(Value::from(config.reptime as i64));
                 params.push(Value::from(config.priority as i64));
-                params.push(Value::from(
-                    job_json(&config.recreation)?,
-                ));
+                params.push(Value::from(job_json(&config.recreation)?));
                 params.push(Value::from(config.site.clone()));
-                params.push(Value::from(
-                    job_json(&persistable_params(&config.param))?,
-                ));
-                params.push(Value::from(
-                    job_json(&config.user_data)?,
-                ));
+                params.push(Value::from(job_json(&persistable_params(&config.param))?));
+                params.push(Value::from(job_json(&config.user_data)?));
             }
             let sql = format!(
                 "INSERT INTO Jobs (time, reptime, priority, recreation, site, param, user_data)
@@ -433,6 +427,7 @@ impl TursoDatabase {
         match self.jobs_get_site_sql(&conn, site).await {
             Ok(jobs) => jobs,
             Err(error) => {
+                conn.discard();
                 log::error!("Database error fetching jobs for site '{site}': {error}");
                 Vec::new()
             }
@@ -451,6 +446,7 @@ impl TursoDatabase {
         match self.jobs_get_all_sql(&conn).await {
             Ok(jobs) => jobs,
             Err(error) => {
+                conn.discard();
                 log::error!("Database error fetching all jobs: {error}");
                 Vec::new()
             }
@@ -458,6 +454,17 @@ impl TursoDatabase {
     }
 
     /// Gets jobs that can run now, up to `chunk_size` of them.
+    ///
+    /// Retries on a fresh connection when the fetch fails with a
+    /// concurrency/transaction error (see `is_concurrency_conflict`):
+    /// under MVCC write load a read can lose its snapshot, and Turso
+    /// surfaces that as a transaction-state error ("cannot rollback -
+    /// no transaction is active") that also leaves the pooled
+    /// connection unusable for later queries. Retrying the same
+    /// connection would fail identically forever — the poller would
+    /// log the error every second and no job would ever run — so the
+    /// errored connection is discarded (never re-pooled) and each
+    /// attempt checks out a fresh one.
     pub async fn jobs_get_torun_chunk(
         &self,
         sites: Vec<String>,
@@ -466,23 +473,42 @@ impl TursoDatabase {
         if chunk_size == 0 || sites.is_empty() {
             return Vec::new();
         }
-        let conn = match self.connect() {
-            Ok(conn) => conn,
-            Err(error) => {
-                log::error!("Failed to connect while fetching runnable jobs: {error}");
-                return Vec::new();
-            }
-        };
-        match self
-            .jobs_get_torun_chunk_sql(&conn, sites, chunk_size)
-            .await
-        {
-            Ok(jobs) => jobs,
-            Err(error) => {
-                log::error!("Database error fetching runnable jobs: {error}");
-                Vec::new()
+        const MAX_ATTEMPTS: u32 = 8;
+        for attempt in 0..MAX_ATTEMPTS {
+            let conn = match self.connect() {
+                Ok(conn) => conn,
+                Err(error) => {
+                    log::error!("Failed to connect while fetching runnable jobs: {error}");
+                    return Vec::new();
+                }
+            };
+            match self
+                .jobs_get_torun_chunk_sql(&conn, sites.clone(), chunk_size)
+                .await
+            {
+                Ok(jobs) => return jobs,
+                Err(error) if Self::is_concurrency_conflict(&error) => {
+                    conn.discard();
+                    if attempt + 1 >= MAX_ATTEMPTS {
+                        log::error!(
+                            "Database error fetching runnable jobs after {MAX_ATTEMPTS} attempts: {error}"
+                        );
+                        return Vec::new();
+                    }
+                    log::warn!(
+                        "Fetching runnable jobs hit a transaction conflict (attempt {}); retrying: {error}",
+                        attempt + 1
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(error) => {
+                    conn.discard();
+                    log::error!("Database error fetching runnable jobs: {error}");
+                    return Vec::new();
+                }
             }
         }
+        Vec::new()
     }
 }
 
@@ -519,7 +545,6 @@ fn job_from_row(row: &Row) -> Result<DbJobsObj> {
 fn serialize_error(error: serde_json::Error) -> Error {
     Error::ConversionFailure(error.to_string())
 }
-
 
 #[cfg(test)]
 mod tests;

@@ -10,7 +10,7 @@ a plugin system for sites and a local IPC interface for clients.
 |---|---|
 | `src/lib.rs` | Library root: all modules (`db`, `web`, `plugins`, `ipc`, `cli`, …) and `DB_VERSION` (current DB schema version). |
 | `src/main.rs` | Thin binary: builds the tokio runtime and runs the daemon. |
-| `src/db/turso/` | Live database layer, split by domain (`file`, `tag`, `jobs`, `search`, `relationship`, `slurp`, `system_jobs`, `sql`, …). Each module's tests live in a `tests.rs` submodule next to it (e.g. `slurp/tests.rs`). A file's SHA-512 digest lives in `FileHashes` (algorithm `SHA512`, keyed by `file_id`) — schema v13 removed the duplicate `File.hash` column; `FileInternal.hash` in memory is populated by joining `FileHashes` on read. |
+| `src/db/turso/` | Live database layer, split by domain (`file`, `tag`, `jobs`, `search`, `relationship`, `slurp`, `system_jobs`, `sql`, …). Each module's tests live in a `tests.rs` submodule next to it (e.g. `slurp/tests.rs`). A file's SHA-512 digest lives in `FileHashes` (algorithm `SHA512`, keyed by `file_id`) — schema v13 removed the duplicate `File.hash` column; `FileInternal.hash` in memory is populated by joining `FileHashes` on read. Digests are canonicalized at the database boundary (SHA-1/SHA-256/SHA-512 uppercase, MD5 lowercase — see `db::canonical_digest`; schema v14 canonicalizes existing rows), so reads never return a lowercase SHA-512. |
 | `src/web/` | Download manager, HTTP client construction, rate limiting. |
 | `src/plugins.rs` | Plugin host: loads `cdylib` plugins from `compiled_plugins/` via `libloading`. |
 | `libs/shared_types/` | Types shared by host and plugins (the plugin ABI contract). |

@@ -4,8 +4,8 @@
 //! implementation; `use super::*` here is the `processing` module itself.
 
 use super::*;
-use shared_types::GenericNamespaceObj;
 use crate::db::SourceUrlFileStatus;
+use shared_types::GenericNamespaceObj;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -360,7 +360,10 @@ async fn boot_migrates_legacy_parents_index_set() {
     // The legacy single-column `idx_parents_lim` is retired by the rebuild
     // and restored in the v10 covering style by 11 -> 12, so the current
     // schema carries it again (on the new table, not the legacy one).
-    assert_eq!(lim_present, 1, "boot must restore idx_parents_lim in covering style");
+    assert_eq!(
+        lim_present, 1,
+        "boot must restore idx_parents_lim in covering style"
+    );
 
     let null_safe_present: i64 = {
         let mut stmt = conn.prepare("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND LOWER(name) = 'idx_unique_parents_null_safe')").await.unwrap();
@@ -532,7 +535,10 @@ async fn migration_8_to_9_drops_indexes_that_duplicate_unique_columns() {
     .unwrap();
 
     let by_hash: i64 = conn
-        .query("SELECT COUNT(*) FROM FileHashes WHERE algorithm = 'SHA512' AND digest = 'abc123';", ())
+        .query(
+            "SELECT COUNT(*) FROM FileHashes WHERE algorithm = 'SHA512' AND digest = 'abc123';",
+            (),
+        )
         .await
         .unwrap()
         .next()
@@ -583,6 +589,10 @@ async fn migration_12_to_13_moves_file_hash_into_filehashes() {
 
     let sha_a = "a".repeat(128);
     let sha_b = "b".repeat(128);
+    // The migration canonicalizes digests to uppercase (schema v14), so
+    // the lowercase v12 inputs come back uppercase.
+    let upper_a = "A".repeat(128);
+    let upper_b = "B".repeat(128);
 
     // Bake a v12-shaped File table (with the hash column) onto the fresh
     // database, pin the version to 12, and reboot into the migration.
@@ -660,7 +670,7 @@ async fn migration_12_to_13_moves_file_hash_into_filehashes() {
 
     // Digests were backfilled into FileHashes and read paths resolve them.
     let file = db.file_get(&conn, &1).await.unwrap();
-    assert_eq!(file.hash, sha_a);
+    assert_eq!(file.hash, upper_a);
     assert_eq!(file.extension, "jpg");
     let by_hash = db
         .files_get_by_hash(&conn, std::slice::from_ref(&sha_b))
@@ -669,8 +679,135 @@ async fn migration_12_to_13_moves_file_hash_into_filehashes() {
     assert_eq!(by_hash[&sha_b].id, Some(2));
     assert_eq!(
         db.file_hashes_get_all_sha512(&conn).await.unwrap(),
-        vec![sha_a, sha_b]
+        vec![upper_a, upper_b]
     );
+}
+
+/// Regression: a lowercase `FileHashes` SHA512 row that already exists
+/// when 12 -> 13 runs must not shadow the uppercase `File.hash`.
+/// Pre-v13 every read returned `File.hash`; the old
+/// `INSERT OR IGNORE` backfill kept the lowercase row (primary-key
+/// conflict) and then dropped `File.hash`, so `file_get` started
+/// returning lowercase.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_12_to_13_does_not_return_lowercase_sha512() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("file_hash_case.db");
+    let should_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let lower = "a".repeat(128);
+    let upper = "A".repeat(128);
+
+    let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+    {
+        let conn = db.connect().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE File_v12 (
+                 id INTEGER PRIMARY KEY NOT NULL,
+                 hash TEXT UNIQUE,
+                 extension TEXT,
+                 storage_id INTEGER,
+                 size_bytes INTEGER);
+             INSERT INTO File_v12 (id, extension, storage_id, size_bytes)
+                 VALUES (1, 'jpg', 1, 10);",
+        )
+        .await
+        .unwrap();
+        // The uppercase primary hash every pre-v13 read returned.
+        conn.execute(
+            "UPDATE File_v12 SET hash = ?1 WHERE id = 1;",
+            (upper.clone(),),
+        )
+        .await
+        .unwrap();
+        // A pre-existing lowercase secondary row for the same file.
+        conn.execute(
+            "INSERT INTO FileHashes (file_id, algorithm, digest) VALUES (1, 'SHA512', ?1);",
+            (lower.clone(),),
+        )
+        .await
+        .unwrap();
+        conn.execute_batch(
+            "DROP TABLE File;
+             ALTER TABLE File_v12 RENAME TO File;
+             UPDATE Settings SET num = 12 WHERE name = 'SYSTEM_VERSION';",
+        )
+        .await
+        .unwrap();
+    }
+    db.shutdown().await;
+    drop(db);
+
+    let db = TursoDatabase::new_with_exit(&db_path, should_exit).await;
+    let conn = db.connect().unwrap();
+    let file = db.file_get(&conn, &1).await.unwrap();
+    assert_eq!(
+        file.hash, upper,
+        "migration must not return lowercase SHA-512"
+    );
+    assert_eq!(
+        db.file_hashes_get_all_sha512(&conn).await.unwrap(),
+        vec![upper]
+    );
+}
+
+/// A v13 database can already carry lowercase SHA-512 digests (written
+/// verbatim by the v13 binary). The 13 -> 14 migration canonicalizes
+/// them to uppercase, and lookups by the lowercase form still resolve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_13_to_14_canonicalizes_existing_lowercase_sha512() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("file_hash_case14.db");
+    let should_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let lower = "b".repeat(128);
+    let upper = "B".repeat(128);
+
+    let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "INSERT INTO File (id, extension, storage_id, size_bytes) VALUES (1, 'jpg', 1, 10);",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO FileHashes (file_id, algorithm, digest) VALUES (1, 'SHA512', ?1);",
+            (lower.clone(),),
+        )
+        .await
+        .unwrap();
+        conn.execute_batch("UPDATE Settings SET num = 13 WHERE name = 'SYSTEM_VERSION';")
+            .await
+            .unwrap();
+    }
+    db.shutdown().await;
+    drop(db);
+
+    let db = TursoDatabase::new_with_exit(&db_path, should_exit).await;
+    let conn = db.connect().unwrap();
+    let version: i64 = conn
+        .query(
+            "SELECT num FROM Settings WHERE name = 'SYSTEM_VERSION';",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(version as u64, crate::DB_VERSION);
+    let file = db.file_get(&conn, &1).await.unwrap();
+    assert_eq!(file.hash, upper);
+    let by_hash = db
+        .files_get_by_hash(&conn, std::slice::from_ref(&lower))
+        .await
+        .unwrap();
+    assert_eq!(by_hash[&lower].hash, upper);
 }
 
 /// The 9 -> 10 migration re-stores `Parents` around the sentinel limit_to
@@ -1210,8 +1347,6 @@ fn fts_shadow_write_path_throughput_bench() {
 #[test]
 #[ignore = "manual benchmark: end-to-end scraper chunk persist on RAM-backed storage"]
 fn scraper_chunk_persist_throughput_bench() {
-    
-
     let db_path = if std::path::Path::new("/dev/shm").exists() {
         std::path::PathBuf::from("/dev/shm")
             .join(format!("intscrape-chunk-bench-{}.db", std::process::id()))
@@ -1324,8 +1459,7 @@ async fn bench_seed_db(db: &TursoDatabase, popular: u64) -> (f64, f64) {
     let conn = db.connect().unwrap();
     let seed_start = Instant::now();
     for chunk in (1u64..=popular).collect::<Vec<_>>().chunks(256) {
-        let mut sql =
-            String::from("INSERT OR REPLACE INTO Tags (name, namespace, count) VALUES ");
+        let mut sql = String::from("INSERT OR REPLACE INTO Tags (name, namespace, count) VALUES ");
         let mut params: Vec<Value> = Vec::with_capacity(chunk.len() * 3);
         for (i, id) in chunk.iter().enumerate() {
             if i > 0 {
@@ -2081,7 +2215,10 @@ async fn redgifs_shaped_tags_persist_the_uploader_and_gallery_graph() {
         operation: TagOperation::Add,
         tags: structural.clone(),
     };
-    assert!(db.tag_actions_add(std::slice::from_ref(&structural_action)).await);
+    assert!(
+        db.tag_actions_add(std::slice::from_ref(&structural_action))
+            .await
+    );
 
     // Files carry the identity tags so a download stays searchable through
     // its uploader and gallery.
@@ -2377,8 +2514,7 @@ async fn chan_shaped_values_group_back_by_their_limit_tag() {
         "both values must share the post tag"
     );
     assert!(
-        rows.iter()
-            .all(|row| row.limit_to == Some(thread_tag_id)),
+        rows.iter().all(|row| row.limit_to == Some(thread_tag_id)),
         "both values must be limited to this thread only"
     );
 
@@ -2420,16 +2556,16 @@ async fn chan_shaped_values_group_back_by_their_limit_tag() {
     children.sort_unstable();
     let mut expected = vec![md5_id, comment_id];
     expected.sort_unstable();
-    assert_eq!(children, expected, "both and only the two values group back");
+    assert_eq!(
+        children, expected,
+        "both and only the two values group back"
+    );
     assert!(
         rows.iter().all(|row| row.relate_tag_id == post_id),
         "both values must point at the post tag"
     );
 
-    let files = db
-        .relationship_get_file_id(&conn, md5_id)
-        .await
-        .unwrap();
+    let files = db.relationship_get_file_id(&conn, md5_id).await.unwrap();
     assert_eq!(
         files.len(),
         1,

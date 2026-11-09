@@ -277,15 +277,18 @@ async fn file_update_batch_writes_every_column() {
     unset.id = None;
     db.file_update_batch(&conn, &[unset]).await.unwrap();
     assert_eq!(
-        conn.query("SELECT COUNT(*) FROM FileHashes WHERE digest = 'ignored';", ())
-            .await
-            .unwrap()
-            .next()
-            .await
-            .unwrap()
-            .unwrap()
-            .get::<i64>(0)
-            .unwrap(),
+        conn.query(
+            "SELECT COUNT(*) FROM FileHashes WHERE digest = 'ignored';",
+            ()
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<i64>(0)
+        .unwrap(),
         0,
         "an unset id must not match a row"
     );
@@ -298,10 +301,12 @@ async fn file_hashes_get_all_sha512_returns_sorted_sha512_only() {
 
     // `file_add_bulk` itself records the SHA-512 digest in FileHashes
     // (schema v13+), so the bulk list is exactly the digests the files
-    // were added with — in digest order.
-    let sha_b = "b".repeat(128);
-    let sha_a = "a".repeat(128);
-    let sha_c = "c".repeat(128);
+    // were added with — in digest order. Digests are canonicalized to
+    // uppercase on write (schema v14), so the lowercase inputs come
+    // back uppercase.
+    let sha_b = "B".repeat(128);
+    let sha_a = "A".repeat(128);
+    let sha_c = "C".repeat(128);
     let files = db
         .file_add_bulk(
             &conn,
@@ -330,6 +335,88 @@ async fn file_hashes_get_all_sha512_returns_sorted_sha512_only() {
 
     let all = db.file_hashes_get_all_sha512(&conn).await.unwrap();
     assert_eq!(all, vec![sha_a, sha_b, sha_c]);
+}
+
+/// A lowercase SHA-512 must never be stored — or returned — in
+/// lowercase: files on disk are named with the uppercase digest, and
+/// pre-v13 reads returned the manager's uppercase `File.hash`. A
+/// lowercase input (slurped library, plugin-supplied hash) is
+/// canonicalized on write, resolved by dedupe, and looked up
+/// case-insensitively.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lowercase_sha512_is_canonicalized_on_write_and_lookup() {
+    let (db, _temp_dir) = new_test_db_owned().await;
+    let conn = db.connect().unwrap();
+
+    let lower = "a1b2c3".repeat(21) + "ab"; // 128 lowercase hex chars
+    assert_eq!(lower.len(), 128);
+    let upper = lower.to_ascii_uppercase();
+
+    let resolved = db
+        .file_add_bulk(&conn, &[test_file(&lower, None)])
+        .await
+        .unwrap();
+    let resolved = resolved.iter().next().unwrap();
+    assert_eq!(
+        resolved.hash, upper,
+        "resolved file must carry the canonical digest"
+    );
+    let id = resolved.id.unwrap();
+
+    let stored = db.file_get(&conn, &id).await.unwrap();
+    assert_eq!(stored.hash, upper, "stored digest must be uppercase");
+    assert_eq!(
+        db.file_hashes_get_all_sha512(&conn).await.unwrap(),
+        vec![upper.clone()]
+    );
+
+    // Re-adding the uppercase form dedupes onto the same row.
+    let again = db
+        .file_add_bulk(&conn, &[test_file(&upper, None)])
+        .await
+        .unwrap();
+    assert_eq!(again.iter().next().unwrap().id, Some(id));
+
+    // Lookups accept either casing and still return the canonical file.
+    let by_lower = db
+        .files_get_by_hash(&conn, std::slice::from_ref(&lower))
+        .await
+        .unwrap();
+    assert_eq!(by_lower[&lower].hash, upper);
+    let by_pair = db
+        .hashes_files_get(&conn, &[("SHA512".to_string(), lower.clone())])
+        .await
+        .unwrap();
+    assert_eq!(by_pair[&("SHA512".to_string(), lower.clone())].hash, upper);
+
+    // Other algorithms canonicalize the same way through the bulk add:
+    // MD5 lowercase, SHA-256 uppercase.
+    db.file_hashes_add_bulk(
+        &conn,
+        &[
+            (id, "MD5", "0123456789ABCDEF0123456789ABCDEF"),
+            (
+                id,
+                "SHA256",
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ),
+        ],
+    )
+    .await
+    .unwrap();
+    let hashes = db.file_hashes_get(&conn, id).await.unwrap();
+    assert_eq!(hashes["MD5"], "0123456789abcdef0123456789abcdef");
+    assert_eq!(
+        hashes["SHA256"],
+        "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
+    );
+
+    // Short / non-hex values are not digests and pass through untouched.
+    let short = db
+        .file_add_bulk(&conn, &[test_file("aaa", None)])
+        .await
+        .unwrap();
+    assert_eq!(short.iter().next().unwrap().hash, "aaa");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

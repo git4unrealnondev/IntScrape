@@ -37,5 +37,43 @@ pub fn hashes_supported_to_inner(hash: &HashesSupported) -> (&str, &String) {
 
 pub fn hashes_supported_to_key(hash: &HashesSupported) -> (String, String) {
     let (algorithm, digest) = hashes_supported_to_inner(hash);
-    (algorithm.to_string(), digest.clone())
+    (algorithm.to_string(), canonical_digest(algorithm, digest))
+}
+
+/// Canonical hex casing for a digest of the given algorithm.
+///
+/// The codebase's convention (see `web::manager::DownloadHasher::finish`
+/// and `hash_bytes`) is: MD5 digests are lowercase hex, while SHA-1,
+/// SHA-256 and SHA-512 digests are uppercase hex — files on disk are
+/// named with the uppercase SHA-512, and the storage check uppercases
+/// filename stems before lookup. Nothing in the database layer enforced
+/// that convention, so any lowercase digest that reached `FileHashes`
+/// (a slurped library, a plugin-supplied identifying hash, a pre-v13
+/// secondary row) was stored verbatim. Before schema v13 that was
+/// invisible: `File.hash` (always the manager's uppercase digest) was
+/// what every read returned. Since v13 the reads join `FileHashes`,
+/// so a lowercase row there is now what `file_get`,
+/// `file_hashes_get_all_sha512` and friends return.
+///
+/// Canonicalizing at the database boundary restores the pre-v13
+/// observable behaviour. Only full-length hex digests for a known
+/// algorithm are transformed: short test fixtures ("aaa", "abc123"),
+/// base64 image hashes, IPFS CIDs and other non-hex values pass
+/// through unchanged.
+pub fn canonical_digest(algorithm: &str, digest: &str) -> String {
+    let expected_len = match algorithm.to_ascii_uppercase().as_str() {
+        "MD5" => 32,
+        "SHA1" => 40,
+        "SHA256" => 64,
+        "SHA512" => 128,
+        _ => return digest.to_string(),
+    };
+    if digest.len() != expected_len || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return digest.to_string();
+    }
+    if algorithm.eq_ignore_ascii_case("MD5") {
+        digest.to_ascii_lowercase()
+    } else {
+        digest.to_ascii_uppercase()
+    }
 }

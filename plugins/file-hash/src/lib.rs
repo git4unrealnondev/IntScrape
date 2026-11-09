@@ -9,8 +9,8 @@ use std::{
 
 use client::setting_get;
 use shared_types::{
-    CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks, PluginTag, PLUGIN_BATCH_SIZE,
-    Tag,
+    CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks, PLUGIN_BATCH_SIZE,
+    PluginTag, Tag,
 };
 
 const LISTOFSUPSET: [Supset; 7] = [
@@ -249,19 +249,22 @@ fn hash_file(hashtype: &Supset, byte: &[u8]) -> Option<String> {
         Supset::SHA1 => {
             let mut hasher = Sha1::new();
             hasher.update(byte);
-            let hash = hex::encode(hasher.finalize());
+            // Uppercase, matching the canonical casing used everywhere
+            // else for SHA digests (`web::manager::hash_bytes`); MD5 above
+            // stays lowercase.
+            let hash = hex::encode_upper(hasher.finalize());
             Some(hash)
         }
         Supset::SHA256 => {
             let mut hasher = Sha256::new();
             hasher.update(byte);
-            let hash = hex::encode(hasher.finalize());
+            let hash = hex::encode_upper(hasher.finalize());
             Some(hash)
         }
         Supset::SHA512 => {
             let mut hasher = Sha512::new();
             hasher.update(byte);
-            let hash = hex::encode(hasher.finalize());
+            let hash = hex::encode_upper(hasher.finalize());
             Some(hash)
         }
         Supset::IpfsCid => {

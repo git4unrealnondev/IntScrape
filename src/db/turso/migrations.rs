@@ -223,10 +223,8 @@ DROP TABLE Parents_old;
             "Migration 10->11: adding idx_tags_namespace to Tags \
              (namespace lookups previously full-scanned the table)."
         );
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_tags_namespace ON Tags (namespace);",
-        )
-        .await?;
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_tags_namespace ON Tags (namespace);")
+            .await?;
 
         self.setting_set(
             conn,
@@ -272,14 +270,30 @@ DROP TABLE Parents_old;
         // migration step that runs through 12 -> 13.
         let has_hash_column: bool = {
             let mut stmt = conn
-                .prepare("SELECT EXISTS(SELECT 1 FROM pragma_table_info('File') WHERE name = 'hash');")
+                .prepare(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('File') WHERE name = 'hash');",
+                )
                 .await?;
             stmt.query_row(()).await?.get::<bool>(0)?
         };
         if has_hash_column {
+            // Canonicalize to uppercase first: a pre-existing lowercase
+            // `FileHashes` SHA512 row (slurped library, plugin-supplied
+            // identifying hash) must not shadow the uppercase `File.hash`
+            // that every pre-v13 read returned. `INSERT OR IGNORE` alone
+            // kept the old row (the `(file_id, algorithm)` primary key
+            // conflicts) and then dropped `File.hash`, so `file_get`
+            // started returning the lowercase digest. `UPDATE OR IGNORE`
+            // skips only a row whose uppercased digest would collide with
+            // a case-variant twin on the unique index — such a twin keeps
+            // its existing digest rather than failing the migration.
+            // The backfill likewise uppercases, matching the canonical
+            // form `file_hashes_add_bulk` now enforces.
             conn.execute_batch(
-                "INSERT OR IGNORE INTO FileHashes (file_id, algorithm, digest)
-                 SELECT id, 'SHA512', hash FROM File
+                "UPDATE OR IGNORE FileHashes SET digest = UPPER(digest)
+                 WHERE algorithm = 'SHA512';
+                 INSERT OR IGNORE INTO FileHashes (file_id, algorithm, digest)
+                 SELECT id, 'SHA512', UPPER(hash) FROM File
                  WHERE hash IS NOT NULL AND hash <> '';",
             )
             .await?;
@@ -306,6 +320,44 @@ DROP TABLE Parents_old;
                 name: "SYSTEM_VERSION".to_string(),
                 description: None,
                 num: Some(13),
+                param: None,
+            },
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Updates the db from version 13 to 14.
+    ///
+    /// Canonicalizes stored hex digests to the casing the rest of the
+    /// codebase already uses: SHA-1/SHA-256/SHA-512 uppercase (files on
+    /// disk are named with the uppercase SHA-512), MD5 lowercase.
+    /// A v13 binary could store — and, since v13 reads join
+    /// `FileHashes`, return — a lowercase SHA-512 digest verbatim from
+    /// a slurped library or a plugin-supplied identifying hash.
+    /// `UPDATE OR IGNORE` leaves a row whose canonical digest would
+    /// collide with a case-variant twin on the
+    /// `(algorithm, digest)` unique index untouched instead of failing
+    /// the migration; the twins keep their existing digest.
+    pub(in crate::db) async fn update_db_13_to_14(&self, conn: &Connection) -> Result<()> {
+        log::info!(
+            "Migration 13->14: canonicalizing FileHashes digest casing (SHA* uppercase, MD5 lowercase)."
+        );
+        conn.execute_batch(
+            "UPDATE OR IGNORE FileHashes SET digest = UPPER(digest)
+             WHERE algorithm IN ('SHA1', 'SHA256', 'SHA512');
+             UPDATE OR IGNORE FileHashes SET digest = LOWER(digest)
+             WHERE algorithm = 'MD5';",
+        )
+        .await?;
+
+        self.setting_set(
+            conn,
+            shared_types::DbSettingsObj {
+                name: "SYSTEM_VERSION".to_string(),
+                description: None,
+                num: Some(14),
                 param: None,
             },
         )
