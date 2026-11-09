@@ -61,19 +61,8 @@ pub fn hashes_supported_to_key(hash: &HashesSupported) -> (String, String) {
 /// base64 image hashes, IPFS CIDs and other non-hex values pass
 /// through unchanged.
 pub fn canonical_digest(algorithm: &str, digest: &str) -> String {
-    let expected_len = match algorithm.to_ascii_uppercase().as_str() {
-        "MD5" => 32,
-        "SHA1" => 40,
-        "SHA256" => 64,
-        "SHA512" => 128,
-        _ => return digest.to_string(),
-    };
-    if digest.len() != expected_len || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return digest.to_string();
-    }
-    if algorithm.eq_ignore_ascii_case("MD5") {
-        digest.to_ascii_lowercase()
-    } else {
-        digest.to_ascii_uppercase()
-    }
+    // Single source of truth lives on `HashesSupported` so the main
+    // software can normalize plugin-supplied hashes on ingestion with
+    // the same rules the database boundary enforces here.
+    HashesSupported::canonical_digest(algorithm, digest)
 }

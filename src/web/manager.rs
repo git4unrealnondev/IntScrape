@@ -628,7 +628,15 @@ impl Scraper {
 
                     match data {
                         // File data thats actionable
-                        ScraperReturn::Data(scraper_object) => {
+                        ScraperReturn::Data(mut scraper_object) => {
+                            // Central hash normalization: plugins emit
+                            // site-verbatim digests and are not responsible
+                            // for casing. Normalize every incoming
+                            // `HashesSupported` once here so dedup,
+                            // download verification and storage all see
+                            // the canonical form. Rebuilds the file set
+                            // so it hashes the normalized digests.
+                            scraper_object.normalize_hashes();
                             if scraper_object.files.is_empty()
                                 && scraper_object.tags.is_empty()
                                 && scraper_object.jobs.is_empty()
@@ -1325,7 +1333,7 @@ impl Scraper {
                 let hash_matches = hash
                     .iter()
                     .zip(&actual_hashes)
-                    .all(|(expected, actual)| actual == expected_hash(expected));
+                    .all(|(expected, actual)| hashes_match(expected, actual));
 
                 if hash_matches {
                     return Some(DownloadedFile {
@@ -1333,6 +1341,21 @@ impl Scraper {
                         core_hashes,
                     });
                 }
+
+                let mismatch_detail = hash
+                    .iter()
+                    .zip(&actual_hashes)
+                    .filter(|(expected, actual)| !hashes_match(expected, actual))
+                    .map(|(expected, actual)| {
+                        let (algorithm, _) =
+                            crate::db::hashes_supported_to_inner(expected);
+                        format!(
+                            "{algorithm} expected={} actual={actual}",
+                            expected_hash(expected)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
 
                 if last_mismatch_hashes.as_ref() == Some(&actual_hashes) {
                     repeated_mismatch_count += 1;
@@ -1345,10 +1368,11 @@ impl Scraper {
                     >= hash_download_retry_number.unwrap_or(HASH_MISMATCH_ACCEPT_THRESHOLD)
                 {
                     log::warn!(
-                        "Scraper: {} JobId: {} Hash mismatch repeated {} times; accepting stable download.",
+                        "Scraper: {} JobId: {} Hash mismatch repeated {} times; accepting stable download. {}",
                         self.plugin.name,
                         self.job.id,
-                        repeated_mismatch_count
+                        repeated_mismatch_count,
+                        mismatch_detail
                     );
                     return Some(DownloadedFile {
                         temp_file,
@@ -1357,10 +1381,11 @@ impl Scraper {
                 }
 
                 log::warn!(
-                    "Scraper: {} JobId: {} Hash mismatch detected. Retrying. Attempt: {}",
+                    "Scraper: {} JobId: {} Hash mismatch detected. Retrying. Attempt: {} {}",
                     self.plugin.name,
                     self.job.id,
-                    cnt + 1
+                    cnt + 1,
+                    mismatch_detail
                 );
                 let _ = tokio::fs::remove_file(&temp_file).await;
             }
@@ -1401,6 +1426,11 @@ impl Scraper {
             .config
             .user_data
             .contains_key("INTSCRAPE_REDOWNLOAD");
+
+        // Defense in depth: ingestion already normalized hashes, but
+        // re-normalizing is idempotent, so no caller can slip a
+        // non-canonical `HashesSupported` past dedup/verification.
+        file.normalize_hashes();
 
         if should_exit.load(Ordering::SeqCst) {
             info!(
@@ -1823,7 +1853,7 @@ impl Scraper {
             }
         };
 
-        let file_manager = FileManager {
+        let mut file_manager = FileManager {
             internal: FileInternal {
                 id: None,
                 hash,
@@ -1833,6 +1863,10 @@ impl Scraper {
             },
             identifying_hashes: file_hash_owned.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         };
+        // Central normalization: the plugin-supplied identifying
+        // hashes are canonical regardless of site casing; the computed
+        // SHA-512 above is already canonical, so this is a no-op for it.
+        file_manager.normalize_hashes();
 
         Ok(Some(FileReturn::File(file_manager)))
     }
@@ -2461,44 +2495,65 @@ pub fn expected_hash(hash: &HashesSupported) -> &str {
     }
 }
 
+/// Returns true when the computed `actual` digest matches the plugin-declared
+/// `expected` digest, ignoring hex casing and surrounding whitespace.
+///
+/// Plugin digests are normalized on ingestion via
+/// `FileObject::normalize_hashes` (see [`HashesSupported::canonical_digest`]:
+/// MD5 lowercase, SHA-1/256/512 uppercase), so this is defense-in-depth for
+/// callers that build a `HashesSupported` outside the parser path — a
+/// case-sensitive comparison here once turned a casing-only difference into
+/// a stable-but-wrong "hash mismatch" that re-downloaded the file three
+/// times before accepting it as stable. An empty declared digest means
+/// "no expectation".
+fn hashes_match(expected: &HashesSupported, actual: &str) -> bool {
+    use crate::db::hashes_supported_to_inner;
+    let (algorithm, expected_str) = hashes_supported_to_inner(expected);
+    if expected_str.trim().is_empty() {
+        return true;
+    }
+    HashesSupported::canonical_digest(algorithm, expected_str)
+        == HashesSupported::canonical_digest(algorithm, actual)
+}
+
 /// Hashes the bytes and compares it to what the scraper should of recieved.
 pub fn hash_bytes(bytes: &Bytes, hash: &HashesSupported) -> (String, bool) {
     match hash {
-        HashesSupported::Md5(hash) => {
+        HashesSupported::Md5(expected_str) => {
             let digest = md5::compute(bytes);
-
-            // let sharedtypes::HashesSupported(hashe, _) => hash;
-            if !hash.is_empty() && &format!("{digest:x}") != hash {
-                info!("Parser returned: {hash} Got: {digest:?}");
+            let computed = format!("{digest:x}");
+            let dune = hashes_match(hash, &computed);
+            if !dune && !expected_str.is_empty() {
+                info!("Parser returned: {expected_str} Got: {computed}");
             }
-            (format!("{digest:x}"), &format!("{digest:x}") == hash)
+            (computed, dune)
         }
-        HashesSupported::Sha1(hash) => {
+        HashesSupported::Sha1(expected_str) => {
             let mut hasher = sha1::Sha1::new();
             hasher.update(bytes);
             let hastring = encode_upper(hasher.finalize());
-            let dune = &hastring == hash;
-            if !dune && !hash.is_empty() {
-                info!("Parser returned: {hash} Got: {hastring}");
+            let dune = hashes_match(hash, &hastring);
+            if !dune && !expected_str.is_empty() {
+                info!("Parser returned: {expected_str} Got: {hastring}");
             }
             (hastring, dune)
         }
-        HashesSupported::Sha256(hash) => {
+        HashesSupported::Sha256(expected_str) => {
             let mut hasher = Sha256::new();
             hasher.update(bytes);
             let hastring = encode_upper(hasher.finalize());
-            let dune = &hastring == hash;
-            if !dune && !hash.is_empty() {
-                info!("Parser returned: {hash} Got: {hastring}");
+            let dune = hashes_match(hash, &hastring);
+            if !dune && !expected_str.is_empty() {
+                info!("Parser returned: {expected_str} Got: {hastring}");
             }
             (hastring, dune)
         }
-        HashesSupported::Sha512(hash) => {
+        HashesSupported::Sha512(expected_str) => {
             let hasher = Sha512::digest(bytes);
             let hastring = encode_upper(hasher);
-            let dune = &hastring == hash;
-            if !dune && !hash.is_empty() {
-                info!("Parser returned: {hash} Got: {hastring}");
+            let dune = hashes_match(hash, &hastring);
+            if !dune && !expected_str.is_empty() {
+                info!("Parser returned: {expected_str} Got: {hastring}");
             }
             (hastring, dune)
         }
@@ -2506,7 +2561,7 @@ pub fn hash_bytes(bytes: &Bytes, hash: &HashesSupported) -> (String, bool) {
             let mut dl_hasher = DownloadHasher::new(hash);
             dl_hasher.update(bytes);
             if let Some(hsh) = dl_hasher.finish() {
-                let dune = hsh == expected_hash(hash);
+                let dune = hashes_match(hash, &hsh);
                 (hsh, dune)
             } else {
                 ("".to_string(), false)

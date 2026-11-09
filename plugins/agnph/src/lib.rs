@@ -409,6 +409,8 @@ pub fn parser_call_impl(
             if let Some(md5_text_dirty) = url.rsplit('/').next()
                 && let Some(md5_text) = md5_text_dirty.split('.').next()
             {
+                // Site-verbatim digest; the main software normalizes
+                // `HashesSupported` and `FileHash-MD5` tag names on ingestion.
                 files.insert(FileObject {
                     source: Some(FileSource::Url(format!("https://agn.ph{}", url))),
                     hash: vec![HashesSupported::Md5(md5_text.to_string())],

@@ -390,6 +390,177 @@ pub enum HashesSupported {
     ImageHash(String),
 }
 
+impl HashesSupported {
+    /// Algorithm name as stored in `FileHashes` (`MD5`, `SHA1`, `SHA256`,
+    /// `SHA512`, `ImageHash`).
+    pub fn algorithm(&self) -> &'static str {
+        match self {
+            Self::Md5(_) => "MD5",
+            Self::Sha1(_) => "SHA1",
+            Self::Sha256(_) => "SHA256",
+            Self::Sha512(_) => "SHA512",
+            Self::ImageHash(_) => "ImageHash",
+        }
+    }
+
+    /// The digest string as carried by this variant.
+    pub fn digest(&self) -> &str {
+        match self {
+            Self::Md5(s) | Self::Sha1(s) | Self::Sha256(s) | Self::Sha512(s) | Self::ImageHash(s) => s,
+        }
+    }
+
+    /// Canonical hex casing for a digest of the given algorithm.
+    ///
+    /// The codebase convention (see the main software's
+    /// `DownloadHasher::finish` and `hash_bytes`) is: MD5 digests are
+    /// lowercase hex, while SHA-1, SHA-256 and SHA-512 digests are
+    /// uppercase hex — files on disk are named with the uppercase SHA-512.
+    /// Plugins copy digests verbatim from site APIs, Hydrus exports, or
+    /// CSV dumps (e621, rule34, etc.) that may spell the same digest in
+    /// the opposite casing, so the main software normalizes every
+    /// incoming `HashesSupported` through this instead of trusting
+    /// plugin casing. Only full-length hex digests for a known algorithm
+    /// are recased; surrounding whitespace is trimmed and a `0x`/`0X`
+    /// prefix is tolerated. Short test fixtures (`"aaa"`, `"abc123"`),
+    /// base64 image hashes, IPFS CIDs and other non-hex values pass
+    /// through unchanged (trimmed only).
+    ///
+    /// This is the single source of truth for hash normalization; the
+    /// database boundary (`db::canonical_digest`) delegates here.
+    pub fn canonical_digest(algorithm: &str, digest: &str) -> String {
+        let expected_len = match algorithm.to_ascii_uppercase().as_str() {
+            "MD5" => 32,
+            "SHA1" => 40,
+            "SHA256" => 64,
+            "SHA512" => 128,
+            _ => return digest.trim().to_string(),
+        };
+        let trimmed = digest.trim();
+        let stripped = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        if stripped.len() != expected_len || !stripped.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return stripped.to_string();
+        }
+        if algorithm.eq_ignore_ascii_case("MD5") {
+            stripped.to_ascii_lowercase()
+        } else {
+            stripped.to_ascii_uppercase()
+        }
+    }
+
+    /// A canonical copy of this hash.
+    pub fn normalized(&self) -> Self {
+        let mut copy = self.clone();
+        copy.normalize();
+        copy
+    }
+
+    /// Normalizes this hash in place to the canonical digest form (see
+    /// [`Self::canonical_digest`]). Empty digests stay empty.
+    pub fn normalize(&mut self) {
+        match self {
+            Self::Md5(s) => *s = Self::canonical_digest("MD5", s),
+            Self::Sha1(s) => *s = Self::canonical_digest("SHA1", s),
+            Self::Sha256(s) => *s = Self::canonical_digest("SHA256", s),
+            Self::Sha512(s) => *s = Self::canonical_digest("SHA512", s),
+            Self::ImageHash(s) => *s = Self::canonical_digest("ImageHash", s),
+        }
+    }
+}
+
+impl FileObject {
+    /// Normalizes every `HashesSupported` this file carries to the
+    /// canonical digest form (see [`HashesSupported::canonical_digest`])
+    /// and de-duplicates the hash list (normalization can merge
+    /// e.g. an uppercase and a lowercase spelling of the same digest,
+    /// preserving first-occurrence order). Tag names carried under
+    /// `FileHash-<algorithm>` namespaces — `skip_if` relationships and
+    /// `tag_list` actions alike — are normalized the same way, since
+    /// those tag names are digests too and must match the stored
+    /// `FileHash-<algorithm>` tags.
+    ///
+    /// Plugins emit site-verbatim digests and are not responsible for
+    /// casing; the main software calls this once on ingestion of every
+    /// `FileObject` returned by a plugin, so downstream dedup, download
+    /// verification and storage all see one canonical form.
+    pub fn normalize_hashes(&mut self) {
+        for hash in &mut self.hash {
+            hash.normalize();
+        }
+        let mut seen: Vec<HashesSupported> = Vec::with_capacity(self.hash.len());
+        self.hash.retain(|hash| {
+            if seen.contains(hash) {
+                false
+            } else {
+                seen.push(hash.clone());
+                true
+            }
+        });
+        for skip in &mut self.skip_if {
+            if let SkipIf::FileTagRelationship(tag) = skip {
+                Self::normalize_filehash_tag(&mut tag.name, &tag.namespace.name);
+            }
+        }
+        for action in &mut self.tag_list {
+            for plugin_tag in &mut action.tags {
+                Self::normalize_filehash_tag(&mut plugin_tag.tag.name, &plugin_tag.tag.namespace.name);
+                if let Some(relation) = &mut plugin_tag.relates_to {
+                    Self::normalize_filehash_tag(&mut relation.tag.name, &relation.tag.namespace.name);
+                    if let Some(limit_to) = &mut relation.limit_to {
+                        Self::normalize_filehash_tag(&mut limit_to.name, &limit_to.namespace.name);
+                    }
+                }
+            }
+        }
+    }
+
+    fn normalize_filehash_tag(name: &mut String, namespace_name: &str) {
+        if let Some(suffix) = namespace_name.strip_prefix("FileHash-") {
+            *name = HashesSupported::canonical_digest(suffix, name);
+        }
+    }
+}
+
+impl ScraperObject {
+    /// Normalizes every file's hashes (see [`FileObject::normalize_hashes`]).
+    /// Rebuilds the `HashSet` so the set is hashed with the normalized
+    /// digests rather than the plugin-verbatim ones.
+    pub fn normalize_hashes(&mut self) {
+        self.files = std::mem::take(&mut self.files)
+            .into_iter()
+            .map(|mut file| {
+                file.normalize_hashes();
+                file
+            })
+            .collect();
+    }
+}
+
+impl FileManager {
+    /// Normalizes the identifying hashes and the primary SHA-512 digest
+    /// to the canonical form (see [`HashesSupported::canonical_digest`]).
+    pub fn normalize_hashes(&mut self) {
+        for hash in &mut self.identifying_hashes {
+            hash.normalize();
+        }
+        let mut seen: Vec<HashesSupported> =
+            Vec::with_capacity(self.identifying_hashes.len());
+        self.identifying_hashes.retain(|hash| {
+            if seen.contains(hash) {
+                false
+            } else {
+                seen.push(hash.clone());
+                true
+            }
+        });
+        self.internal.hash =
+            HashesSupported::canonical_digest("SHA512", &self.internal.hash);
+    }
+}
+
 /// What to do with a source file when importing it into the library:
 /// copy it into storage (source stays), move it (source is removed), or
 /// hardlink it (source and storage share one inode; same filesystem only).
@@ -1179,6 +1350,76 @@ pub mod helpers {
                 finalize(HashSet::new(), HashSet::new(), HashSet::new()),
                 vec![ScraperReturn::Nothing]
             );
+        }
+
+        #[test]
+        fn hashes_supported_normalization_is_canonical() {
+            use super::super::HashesSupported;
+            // MD5 lowercases; SHA uppercases; both trim and strip `0x`.
+            assert_eq!(
+                HashesSupported::Md5("D8153106DA2F23B23119337C34E55A66".into()).normalized(),
+                HashesSupported::Md5("d8153106da2f23b23119337c34e55a66".into())
+            );
+            assert_eq!(
+                HashesSupported::Md5("  d8153106da2f23b23119337c34e55a66\n".into()).normalized(),
+                HashesSupported::Md5("d8153106da2f23b23119337c34e55a66".into())
+            );
+            assert_eq!(
+                HashesSupported::Sha256(
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into()
+                )
+                .normalized(),
+                HashesSupported::Sha256(
+                    "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855".into()
+                )
+            );
+            assert_eq!(
+                HashesSupported::Sha512(format!("0x{}", "a".repeat(128))).normalized(),
+                HashesSupported::Sha512("A".repeat(128))
+            );
+            // ImageHash is case-sensitive base64: trimmed only.
+            assert_eq!(
+                HashesSupported::ImageHash(" aBcDeFg= ".into()).normalized(),
+                HashesSupported::ImageHash("aBcDeFg=".into())
+            );
+            // Empty and short fixtures pass through (trimmed).
+            assert_eq!(
+                HashesSupported::Md5(String::new()).normalized(),
+                HashesSupported::Md5(String::new())
+            );
+            assert_eq!(
+                HashesSupported::Md5("aaa".into()).normalized(),
+                HashesSupported::Md5("aaa".into())
+            );
+        }
+
+        #[test]
+        fn file_object_normalize_hashes_dedupes_and_fixes_filehash_tags() {
+            use super::super::{FileObject, HashesSupported};
+            let mut file = FileObject {
+                hash: vec![
+                    HashesSupported::Md5("D8153106DA2F23B23119337C34E55A66".into()),
+                    HashesSupported::Md5("d8153106da2f23b23119337c34e55a66".into()),
+                ],
+                skip_if: vec![super::super::SkipIf::FileTagRelationship(
+                    super::super::Tag::new(
+                        "D8153106DA2F23B23119337C34E55A66",
+                        super::super::GenericNamespaceObj::new("FileHash-MD5", "d"),
+                    ),
+                )],
+                ..Default::default()
+            };
+            file.normalize_hashes();
+            assert_eq!(
+                file.hash,
+                vec![HashesSupported::Md5("d8153106da2f23b23119337c34e55a66".into())]
+            );
+            match &file.skip_if[0] {
+                super::super::SkipIf::FileTagRelationship(tag) => {
+                    assert_eq!(tag.name, "d8153106da2f23b23119337c34e55a66");
+                }
+                _ => panic!("expected FileTagRelationship"),
+            }
         }
 
         #[test]

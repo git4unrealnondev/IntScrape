@@ -11,6 +11,7 @@ mod csv_import;
 pub enum Site {
     E6,
     E6AI,
+    Blep,
 }
 
 pub enum NsIdent {
@@ -47,8 +48,44 @@ impl fmt::Display for Site {
         let s = match self {
             Site::E6 => "E621",
             Site::E6AI => "E6AI",
+            Site::Blep => "Blep",
         };
         write!(f, "{s}")
+    }
+}
+
+impl Site {
+    /// Resolves a job's `site` field to a site. Anything that is not
+    /// explicitly `e621` or `blep` falls back to `E6AI`, matching the
+    /// historical two-site default.
+    fn from_job_site(job_site: &str) -> Site {
+        match job_site.to_lowercase().as_str() {
+            "e6" | "e621" | "e621.com" => Site::E6,
+            "blep" | "blep.art" => Site::Blep,
+            _ => Site::E6AI,
+        }
+    }
+
+    /// API host for `posts.json` / `pools.json`. Note `blep.art` is
+    /// `.art` where e621/e6ai are `.net`, so this cannot be derived
+    /// from `Display` by lowercasing.
+    fn host(&self) -> &'static str {
+        match self {
+            Site::E6 => "e621.net",
+            Site::E6AI => "e6ai.net",
+            Site::Blep => "blep.art",
+        }
+    }
+
+    /// CDN host the API's `file.url` points at, used for the
+    /// no-`file.url` fallback data URL. e621/e6ai serve
+    /// `static1.<site>.net`; blep serves `cdn.blep.art`.
+    fn cdn_host(&self) -> &'static str {
+        match self {
+            Site::E6 => "static1.e621.net",
+            Site::E6AI => "static1.e6ai.net",
+            Site::Blep => "cdn.blep.art",
+        }
     }
 }
 
@@ -64,11 +101,11 @@ fn get_plugin_info() -> shared_types::CVec<u8> {
 }
 
 fn get_plugin_info_impl() -> Vec<shared_types::Plugin> {
-    // Both entries declare the Start callback so `on_start` runs no matter
+    // Every entry declares the Start callback so `on_start` runs no matter
     // which site the user actually uses; `csv_import::run` guards itself so
-    // the second invocation (one per entry) is a no-op. The CSV dump import
+    // a repeat invocation (one per entry) is a no-op. The CSV dump import
     // itself is per-site: each site reads its own PLUGIN_<SITE>_CsvImport_*
-    // settings, so E621 and E6AI dumps can be enabled independently.
+    // settings, so E621, E6AI and Blep dumps can be enabled independently.
     let csv_import_callbacks = vec![GlobalCallbacks::Start(StartupThreadType::Spawn)];
     vec![
         shared_types::Plugin {
@@ -87,6 +124,16 @@ fn get_plugin_info_impl() -> Vec<shared_types::Plugin> {
                 PluginProperties::Ratelimit(1, std::time::Duration::from_secs(1)),
                 PluginProperties::JobNum(5),
                 PluginProperties::Sites(vec!["e6ai".into(), "E6AI".into(), "e6ai.com".into()]),
+                PluginProperties::Login((LoginNeed::Optional, LoginType::Api("Put API key first then username.".into(), None) ))
+            ],
+            callbacks: csv_import_callbacks.clone(),
+        },
+        shared_types::Plugin {
+            name: "Blep".into(),
+            properties: vec![
+                PluginProperties::Ratelimit(1, std::time::Duration::from_secs(1)),
+                PluginProperties::JobNum(5),
+                PluginProperties::Sites(vec!["blep".into(), "Blep".into(), "blep.art".into()]),
                 PluginProperties::Login((LoginNeed::Optional, LoginType::Api("Put API key first then username.".into(), None) ))
             ],
             callbacks: csv_import_callbacks,
@@ -129,12 +176,7 @@ pub fn url_dump_impl(
 ) -> Vec<shared_types::ScraperDataReturn> {
     let mut out = Vec::new();
 
-    let site = if ["e6", "e621", "e621.com"].contains(&scraperdata.job.site.to_lowercase().as_str())
-    {
-        Site::E6
-    } else {
-        Site::E6AI
-    };
+    let site = Site::from_job_site(&scraperdata.job.site);
 
     let hardlimit = 751;
 
@@ -246,12 +288,7 @@ pub fn parser_call_impl(
 
     let recursion = shared_types::helpers::is_recursion(&scraperdata.job.user_data);
 
-    let site = if ["e6", "e621", "e621.com"].contains(&scraperdata.job.site.to_lowercase().as_str())
-    {
-        Site::E6
-    } else {
-        Site::E6AI
-    };
+    let site = Site::from_job_site(&scraperdata.job.site);
 
     // Adds the posts from pool parsing
 
@@ -372,7 +409,7 @@ pub fn parser_call_impl(
                         && recursion
                     {
                         let parse_url =
-                            format!("https://{}.net/pools.json?search[id]={}", site, pool_id);
+                            format!("https://{}/pools.json?search[id]={}", site.host(), pool_id);
                         jobs.insert(ScraperDataReturn {
                             job: PluginJob {
                                 site: scraperdata.job.site.clone(),
@@ -422,11 +459,16 @@ pub fn parser_call_impl(
 
                 // Only attempt to bypass the source url IF we're not logged in
                 let md5 = post["file"]["md5"].as_str();
+                // The static URL path is case-sensitive on the CDN, so the
+                // fallback URL uses the lowercase digest. The
+                // `HashesSupported` emitted below intentionally stays
+                // site-verbatim: the main software normalizes it on ingestion.
+                let md5_lower = md5.map(|s| s.trim().to_ascii_lowercase());
                 let source = post["file"]["url"]
                     .as_str()
                     .map(|u| FileSource::Url(u.to_string()))
                     .or_else(|| {
-                        let hash = md5?;
+                        let hash = md5_lower.as_deref()?;
                         let extension = post["file"]["ext"].as_str()?;
 
                         if is_logged_in {
@@ -442,8 +484,8 @@ pub fn parser_call_impl(
                         }
 
                         let static_url = format!(
-                            "https://static1.{}.net/data/{}/{}/{}.{}",
-                            site.to_string().to_lowercase(),
+                            "https://{}/data/{}/{}/{}.{}",
+                            site.cdn_host(),
                             &hash[0..2],
                             &hash[2..4],
                             hash,
@@ -751,8 +793,7 @@ fn build_url(
         return None;
     }
 
-    let lowercase_site = site.to_string().to_lowercase();
-    let mut url = format!("https://{}.net/posts.json", lowercase_site);
+    let mut url = format!("https://{}/posts.json", site.host());
 
     let login_info = params.iter().find_map(|p| {
         if let shared_types::ScraperParam::Login(shared_types::LoginType::Api(user, Some(key))) = p
@@ -790,4 +831,61 @@ fn build_url(
     }
 
     Some(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared_types::ScraperParam;
+
+    #[test]
+    fn site_resolution_and_hosts() {
+        for alias in ["e6", "e621", "e621.com", "E621"] {
+            assert!(matches!(Site::from_job_site(alias), Site::E6), "{alias}");
+        }
+        for alias in ["e6ai", "E6AI", "e6ai.com", "unknown"] {
+            assert!(
+                matches!(Site::from_job_site(alias), Site::E6AI),
+                "{alias}"
+            );
+        }
+        for alias in ["blep", "Blep", "blep.art", "BLEP.ART"] {
+            assert!(
+                matches!(Site::from_job_site(alias), Site::Blep),
+                "{alias}"
+            );
+        }
+        assert_eq!(Site::E6.host(), "e621.net");
+        assert_eq!(Site::E6AI.host(), "e6ai.net");
+        assert_eq!(Site::Blep.host(), "blep.art");
+        assert_eq!(Site::E6.cdn_host(), "static1.e621.net");
+        assert_eq!(Site::E6AI.cdn_host(), "static1.e6ai.net");
+        assert_eq!(Site::Blep.cdn_host(), "cdn.blep.art");
+        assert_eq!(Site::Blep.to_string(), "Blep");
+    }
+
+    #[test]
+    fn blep_build_url_and_namespaces() {
+        let params = vec![ScraperParam::Normal("anthro".into())];
+        assert_eq!(
+            build_url(&params, Some(2), &Site::Blep).as_deref(),
+            Some("https://blep.art/posts.json?tags=anthro&page=2")
+        );
+        assert_eq!(
+            build_url(&params, None, &Site::E6).as_deref(),
+            Some("https://e621.net/posts.json?tags=anthro")
+        );
+        assert_eq!(
+            build_url(&params, None, &Site::E6AI).as_deref(),
+            Some("https://e6ai.net/posts.json?tags=anthro")
+        );
+        assert_eq!(
+            nsobjplg(&NsIdent::PostId, &Site::Blep).name,
+            "Blep_Id"
+        );
+        assert_eq!(
+            nsobjplg(&NsIdent::General, &Site::Blep).name,
+            "Blep_General"
+        );
+    }
 }

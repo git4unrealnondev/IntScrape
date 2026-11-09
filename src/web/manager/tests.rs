@@ -318,3 +318,48 @@ fn file_processing_guard_tracks_shutdown_work() {
 
     assert_eq!(active.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn hash_match_ignores_hex_casing_and_whitespace() {
+    // The e621 MD5 from the reported failure: uppercase and padded forms
+    // must compare equal to the lowercase computed digest.
+    let md5_upper = HashesSupported::Md5("D8153106DA2F23B23119337C34E55A66".to_string());
+    assert!(hashes_match(&md5_upper, "d8153106da2f23b23119337c34e55a66"));
+    let md5_padded = HashesSupported::Md5("  d8153106da2f23b23119337c34e55a66\n".to_string());
+    assert!(hashes_match(&md5_padded, "d8153106da2f23b23119337c34e55a66"));
+
+    // SHA digests are canonical uppercase; lowercase input must match.
+    let sha256_lower = HashesSupported::Sha256(
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+    );
+    assert!(hashes_match(
+        &sha256_lower,
+        "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
+    ));
+
+    // A `0x` prefix from some tools is tolerated.
+    let sha512_prefixed = HashesSupported::Sha512(format!(
+        "0x{}",
+        "a".repeat(128)
+    ));
+    assert!(hashes_match(&sha512_prefixed, &"A".repeat(128)));
+
+    // Genuinely different digests still mismatch.
+    let md5_other = HashesSupported::Md5("0".repeat(32));
+    assert!(!hashes_match(&md5_other, "d8153106da2f23b23119337c34e55a66"));
+
+    // Empty declared digest means "no expectation".
+    assert!(hashes_match(
+        &HashesSupported::Md5(String::new()),
+        "d8153106da2f23b23119337c34e55a66"
+    ));
+    assert!(hashes_match(
+        &HashesSupported::Md5("  ".to_string()),
+        &"f".repeat(32)
+    ));
+
+    // ImageHash is base64 and case-sensitive: exact compare only.
+    let image = HashesSupported::ImageHash("aBcDeFg=".to_string());
+    assert!(hashes_match(&image, "aBcDeFg="));
+    assert!(!hashes_match(&image, "abcdefg="));
+}

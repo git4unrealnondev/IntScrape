@@ -239,7 +239,7 @@ impl TursoDatabase {
             }
         }
 
-        let file_manager = FileManager {
+        let mut file_manager = FileManager {
             internal: FileInternal {
                 id: None,
                 hash: sha512.clone(),
@@ -254,6 +254,7 @@ impl TursoDatabase {
                 HashesSupported::Sha512(sha512),
             ],
         };
+        file_manager.normalize_hashes();
         let mut map = HashMap::new();
         map.insert(file_manager, Vec::new());
         if !self.process_scraper_chunk_human(map).await.map_err(|error| error.to_string())? {
