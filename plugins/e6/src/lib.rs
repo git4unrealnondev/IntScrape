@@ -1,9 +1,10 @@
 use std::{collections::HashSet, fmt};
 
 use shared_types::{
-    DEFAULT_PRIORITY, FileObject, FileSource, FileTagAction, GenericNamespaceObj, GlobalCallbacks,
-    HashesSupported, LoginNeed, LoginType, PluginJob, PluginProperties, PluginTag, RelationContext,
-    ScraperDataReturn, ScraperParam, ScraperReturn, SkipIf, StartupThreadType, Tag,
+    DEFAULT_PRIORITY, DownloadModifiers, FileObject, FileSource, FileTagAction, GenericNamespaceObj,
+    GlobalCallbacks, HashesSupported, LoginNeed, LoginType, ModifierTarget, PluginJob, PluginProperties,
+    PluginTag, RelationContext, ScraperDataReturn, ScraperParam, ScraperReturn, SkipIf,
+    StartupThreadType, TargetModifier, Tag,
 };
 
 mod csv_import;
@@ -122,8 +123,12 @@ fn get_plugin_info_impl() -> Vec<shared_types::Plugin> {
             name: "E6AI".into(),
             properties: vec![
                 PluginProperties::Ratelimit(1, std::time::Duration::from_secs(1)),
-                PluginProperties::JobNum(5),
+                PluginProperties::JobNum(20),
                 PluginProperties::Sites(vec!["e6ai".into(), "E6AI".into(), "e6ai.com".into()]),
+                PluginProperties::Modifier(TargetModifier {
+                    target: ModifierTarget::Text,
+                    modifier: DownloadModifiers::Timeout(Some(std::time::Duration::from_secs(30))),
+                }),
                 PluginProperties::Login((LoginNeed::Optional, LoginType::Api("Put API key first then username.".into(), None) ))
             ],
             callbacks: csv_import_callbacks.clone(),
