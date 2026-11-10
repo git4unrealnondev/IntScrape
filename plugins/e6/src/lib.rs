@@ -122,8 +122,8 @@ fn get_plugin_info_impl() -> Vec<shared_types::Plugin> {
         shared_types::Plugin {
             name: "E6AI".into(),
             properties: vec![
-                PluginProperties::Ratelimit(1, std::time::Duration::from_secs(1)),
-                PluginProperties::JobNum(20),
+                PluginProperties::Ratelimit(1, std::time::Duration::from_secs(2)),
+                PluginProperties::JobNum(2),
                 PluginProperties::Sites(vec!["e6ai".into(), "E6AI".into(), "e6ai.com".into()]),
                 PluginProperties::Modifier(TargetModifier {
                     target: ModifierTarget::Text,
