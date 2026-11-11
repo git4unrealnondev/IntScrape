@@ -51,6 +51,26 @@ const MAX_CONCURRENT_PROCESSING: usize = 20;
 // semaphore stays the actual concurrency gate.
 const MAX_PER_PAGE_TASKS: usize = 64;
 
+// Files are not committed one transaction at a time: each transfer task
+// buffers its landed file in a per-job map and one `process_scraper` call
+// commits the whole buffer. Committing per file serialized the page behind
+// the flush lock and issued one transaction per file — millions of files
+// meant millions of sequential commits.
+//
+// 128 comes from the release-mode `db_bench_flush_batch_sweep` run: per-file
+// cost bottoms out there (165us/file vs 337 at 32) and jumps past 256, where
+// the buffer crosses SQL_CHUNK_SIZE and the phases split into extra chunked
+// statements per transaction.
+const FLUSH_BATCH_SIZE: usize = 128;
+
+// The page's job/tag accumulators are drained and committed once they grow
+// past this instead of holding everything until the job finishes.
+//
+// 256 (down from 512): the same sweep shows the job upsert path flat ~90us
+// per job up to 256 and collapsing at 512 (551us/job), so the old value sat
+// right on the cliff.
+const ACCUMULATOR_DRAIN_SIZE: usize = 256;
+
 // How many times should we retry to download a file
 const MAX_DOWNLOAD_RETRIES: u8 = 3;
 
@@ -454,10 +474,12 @@ impl Scraper {
         'scraperloop: for scrap_data in scraper_data_return.iter() {
             let job_list = Arc::new(Mutex::new(Vec::new()));
             let tag_list = Arc::new(Mutex::new(Vec::new()));
-            // Serializes this page's per-file db flushes. Each flush is tiny;
-            // queueing waits on a local lock beats letting this page's files
-            // race each other for the same new tag rows.
-            let flush_guard = Arc::new(tokio::sync::Mutex::new(()));
+            // Buffer of landed files waiting to be committed. Transfer tasks
+            // insert here; one `process_scraper` call commits up to
+            // `FLUSH_BATCH_SIZE` files. The lock still serializes commits so
+            // this page's files cannot race each other for the same new tag
+            // rows, but one lock cycle now commits a whole batch.
+            let flush_batch = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
             if self
                 .clone()
@@ -650,9 +672,63 @@ impl Scraper {
                                 break 'scraperloop;
                             }
 
-                            // Adds jobs from scraper into the list to process
-                            job_list.lock().await.extend(scraper_object.jobs);
-                            tag_list.lock().await.extend(scraper_object.tags);
+                            // Adds jobs from scraper into the list to process,
+                            // draining the accumulators to the db once they
+                            // grow past the threshold so a job that walks
+                            // millions of files does not hold every tag and
+                            // job it has ever seen in memory.
+                            {
+                                let mut jobs_guard = job_list.lock().await;
+                                jobs_guard.extend(scraper_object.jobs);
+                                if jobs_guard.len() >= ACCUMULATOR_DRAIN_SIZE {
+                                    let drained = std::mem::take(&mut *jobs_guard);
+                                    drop(jobs_guard);
+                                    if !self
+                                        .download_manager
+                                        .db
+                                        .clone()
+                                        .process_scraper(
+                                            HashMap::new(),
+                                            drained,
+                                            format!("scraper: {plugin_name}"),
+                                        )
+                                        .await
+                                    {
+                                        log::error!(
+                                            "Worker: {} JobId: {} -- Database issue while saving drained scrape jobs; keeping job to retry on next boot.",
+                                            plugin_name,
+                                            job_id,
+                                        );
+                                        should_remove_job
+                                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                            {
+                                let mut tags_guard = tag_list.lock().await;
+                                tags_guard.extend(scraper_object.tags);
+                                if tags_guard.len() >= ACCUMULATOR_DRAIN_SIZE {
+                                    let drained = std::mem::take(&mut *tags_guard);
+                                    drop(tags_guard);
+                                    if !self
+                                        .download_manager
+                                        .db
+                                        .tag_actions_add(&[FileTagAction {
+                                            operation: TagOperation::Add,
+                                            tags: drained,
+                                        }])
+                                        .await
+                                    {
+                                        log::error!(
+                                            "Worker: {} JobId: {} -- Database issue while saving drained scrape tags; keeping job to retry on next boot.",
+                                            plugin_name,
+                                            job_id,
+                                        );
+                                        should_remove_job
+                                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                            }
 
                             let existing_source_files = Arc::new(
                                 self.download_manager
@@ -719,7 +795,7 @@ impl Scraper {
                                 let existing_source_files = existing_source_files.clone();
                                 let existing_hash_files = existing_hash_files.clone();
                                 let existing_skip_files = existing_skip_files.clone();
-                                let flush_guard_clone = flush_guard.clone();
+                                let flush_batch_clone = flush_batch.clone();
                                 let should_remove_job_clone = should_remove_job.clone();
                                 let job_list_clone = job_list.clone();
                                 let semaphore_clone = semaphore.clone();
@@ -788,37 +864,37 @@ impl Scraper {
 
                                             match filereturn {
                                                 FileReturn::File(fileinternal) => {
-                                                    // Commits the file the moment it is
-                                                    // ready instead of holding it until
-                                                    // the page's last transfer finishes.
-                                                    //
-                                                    // This is the same chunk contract the
-                                                    // post-page commit used, called with a
-                                                    // one-file map: `process_scraper` is
-                                                    // idempotent and conflict-retrying by
-                                                    // design, so smaller chunks are only
-                                                    // more of the same. Tags and parent
-                                                    // edges of early files commit while
-                                                    // the page's remaining transfers are
-                                                    // still in flight, and a shutdown or
-                                                    // crash mid-page drops at most the
-                                                    // file it happened during.
-                                                    let mut flush = HashMap::new();
-                                                    flush.insert(
-                                                        fileinternal,
-                                                        std::mem::take(&mut file.tag_list),
-                                                    );
+                                                    // Buffers the file the moment it is
+                                                    // ready; one `process_scraper` call
+                                                    // commits up to FLUSH_BATCH_SIZE
+                                                    // buffered files. `process_scraper`
+                                                    // is idempotent and conflict-retrying
+                                                    // by design, and a shutdown or crash
+                                                    // mid-page drops at most the files
+                                                    // still sitting in the buffer.
                                                     let flushed = {
-                                                        // Wait for this page's previous
-                                                        // file to finish committing.
-                                                        let _guard =
-                                                            flush_guard_clone.lock().await;
-                                                        db.process_scraper(
-                                                            flush,
-                                                            Vec::new(),
-                                                            plugin_name.clone(),
-                                                        )
-                                                        .await
+                                                        // Holding the lock across the commit
+                                                        // serializes this page's flushes so
+                                                        // its files cannot race each other
+                                                        // for the same new tag rows.
+                                                        let mut batch =
+                                                            flush_batch_clone.lock().await;
+                                                        batch.insert(
+                                                            fileinternal,
+                                                            std::mem::take(&mut file.tag_list),
+                                                        );
+                                                        if batch.len() >= FLUSH_BATCH_SIZE {
+                                                            let batch =
+                                                                std::mem::take(&mut *batch);
+                                                            db.process_scraper(
+                                                                batch,
+                                                                Vec::new(),
+                                                                plugin_name.clone(),
+                                                            )
+                                                            .await
+                                                        } else {
+                                                            true
+                                                        }
                                                     };
 
                                                     if !flushed {
@@ -836,6 +912,13 @@ impl Scraper {
                                                             std::sync::atomic::Ordering::Relaxed,
                                                         );
                                                     }
+                                                },
+                                                FileReturn::AlreadyPresent => {
+                                                    // The file is already in the db; re-upserting
+                                                    // it (and its tags) per skip was one wasted
+                                                    // transaction per already-present file on
+                                                    // every page re-walk. The file's tags still
+                                                    // reach the db through the page's tag set.
                                                 },
                                                 FileReturn::InDownloadQueue => {
 
@@ -948,9 +1031,31 @@ impl Scraper {
 
             // Do all our happy db stuff down here :D
             //
-            // Files are flushed per file as they land (see the FileReturn
+            // Files are flushed in batches as they land (see the FileReturn
             // handling in the transfer tasks), so what is left at page end is
-            // the page's own tag set and the next-round jobs.
+            // the tail of the flush buffer, the page's own tag set and the
+            // next-round jobs.
+            {
+                let mut batch = flush_batch.lock().await;
+                if !batch.is_empty() {
+                    let batch = std::mem::take(&mut *batch);
+                    if !self
+                        .download_manager
+                        .db
+                        .clone()
+                        .process_scraper(batch, Vec::new(), format!("scraper: {plugin_name}"))
+                        .await
+                    {
+                        log::error!(
+                            "Worker: {} JobId: {} -- Final file flush failed; keeping job to retry on next boot.",
+                            plugin_name,
+                            job_id,
+                        );
+                        should_remove_job.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+
             let job_list = Arc::try_unwrap(job_list)
                 .expect("Arc reference leak")
                 .into_inner();
@@ -1473,7 +1578,7 @@ impl Scraper {
                     file_internal.id.unwrap_or(0),
                     tag
                 );
-                return Ok(Some(FileReturn::File(file_internal.clone().into())));
+                return Ok(Some(FileReturn::AlreadyPresent));
             }
         }
 
@@ -1507,7 +1612,7 @@ impl Scraper {
                 file_internal.id.unwrap_or(0),
                 file_url
             );
-            return Ok(Some(FileReturn::File(file_internal.clone().into())));
+            return Ok(Some(FileReturn::AlreadyPresent));
         }
 
         // Associates file hashes with a file object
@@ -1528,7 +1633,7 @@ impl Scraper {
                     file_internal.id.unwrap_or(0),
                     hash
                 );
-                return Ok(Some(FileReturn::File(file_internal.clone().into())));
+                return Ok(Some(FileReturn::AlreadyPresent));
             }
         }
 
@@ -2248,6 +2353,13 @@ impl DownloadsManager {
                 };
 
                 info!("DownloadManager: Setting job {} to running status.", job.id);
+                // Reset the in-download-queue tracking for the new job. The
+                // only way an entry can outlive its download is a task that
+                // panicked between insert and release; rather than leaking
+                // that URL forever (every future encounter would be skipped
+                // as InDownloadQueue), the set is rebuilt from scratch each
+                // time a job is pulled in.
+                self.downloading_urls.write().await.clear();
                 if !self.db.job_set_is_running(&job).await {
                     log::error!("Skipping job {} because it could not be claimed", job.id);
                     drop(job_permit);

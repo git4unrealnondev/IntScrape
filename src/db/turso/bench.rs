@@ -36,7 +36,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use shared_types::{
-        FileInternal, GenericNamespaceObj, PluginJob, ScraperParam, Tag, TagParents,
+        FileInternal, FileTagAction, FileManager, GenericNamespaceObj, HashesSupported, PluginJob,
+        ScraperDataReturn, ScraperParam, Tag, TagOperation, TagParents, TagType, Url,
     };
     use turso::{Builder, Connection, Value};
 
@@ -1414,6 +1415,143 @@ mod tests {
                     format!("{:.2}x", ms / baseline)
                 };
                 println!("  {size:>7}  {ms:>11.1}  {per_row:>11.2}  {statements:>11}  {ratio:>9}");
+            }
+        });
+    }
+
+    /// Sweeps flush/drain batch sizes for the scraper pipeline's two
+    /// accumulator knobs (`FLUSH_BATCH_SIZE` and `ACCUMULATOR_DRAIN_SIZE` in
+    /// `src/web/manager.rs`).
+    ///
+    /// The tunables trade one transaction per *batch* against transaction
+    /// *size*: small batches pay begin/commit overhead per file (the cost this
+    /// batching was added to avoid), large batches concentrate every phase's
+    /// writes into fewer but heavier `CONCURRENT` transactions that contend
+    /// longer with other scrapers. The optimum shows up as the size whose
+    /// `us/file` bottoms out — beyond it per-batch savings stop paying for the
+    /// bigger single writes.
+    ///
+    /// Both paths go through `process_scraper`: the flush path (files + their
+    /// tags, the re-scrape case where every file and tag already exists) and
+    /// the drain path (pending scrape jobs, which `job_add_sql` upserts on the
+    /// `time, reptime, site, param` unique index).
+    ///
+    /// ```text
+    /// BENCH_FLUSH_ITERS=10 BENCH_TAGS_PER_FILE=8 cargo test --lib \
+    ///     db::turso::bench::tests::db_bench_flush_batch_sweep -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "manual benchmark: flush/drain batch-size sweep"]
+    fn db_bench_flush_batch_sweep() {
+        let files = env_u64("BENCH_FILES", 20_000);
+        let tags = env_u64("BENCH_TAGS", 20_000);
+        let iters = env_u64("BENCH_FLUSH_ITERS", 5).max(1);
+        let tags_per_file = env_u64("BENCH_TAGS_PER_FILE", 8).max(1);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let fixture = rt.block_on(Fixture::seed("flush_sweep", files, tags));
+        println!("\nBENCH flush/drain batch sweep: {}", fixture.describe());
+
+        let namespace = GenericNamespaceObj {
+            name: "source_url".to_string(),
+            description: None,
+        };
+
+        rt.block_on(async {
+            // File + hash pairs so the FileManager keys can be rebuilt each
+            // iteration (process_scraper consumes its arguments).
+            let mut pairs: Vec<(u64, String)> = Vec::new();
+            for (i, file_id) in fixture.file_ids().into_iter().enumerate() {
+                pairs.push((file_id, format!("{i:064x}")));
+            }
+            let storage_id = fixture.storage_id;
+
+            let make_manager = |i: usize| FileManager {
+                internal: FileInternal {
+                    id: Some(pairs[i % pairs.len()].0),
+                    hash: pairs[i % pairs.len()].1.clone(),
+                    extension: "jpg".to_string(),
+                    storage_id,
+                    size_bytes: Some(1024),
+                },
+                identifying_hashes: vec![],
+            };
+
+            let make_actions = |i: usize| {
+                (0..tags_per_file)
+                    .map(|t| FileTagAction {
+                        operation: TagOperation::Add,
+                        tags: vec![shared_types::PluginTag {
+                            tag: Tag {
+                                name: format!("bench-tag-{}", (i as u64 + t) % tags),
+                                namespace: namespace.clone(),
+                            },
+                            tag_type: TagType::Normal,
+                            relates_to: None,
+                        }],
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            let make_job = |i: usize| ScraperDataReturn {
+                job: PluginJob {
+                    time: 0,
+                    reptime: 0,
+                    priority: 1,
+                    site: "bench".to_string(),
+                    recreation: None,
+                    param: vec![ScraperParam::Url(Url {
+                        url: format!("https://bench.local/page/{}", i),
+                        local_modifiers: Vec::new(),
+                    })],
+                    user_data: Default::default(),
+                },
+                skip_conditions: Vec::new(),
+            };
+
+            println!(
+                "  {:>7}  {:>10}  {:>10}  {:>10}  {:>10}",
+                "batch", "flush ms", "us/file", "jobs ms", "us/job"
+            );
+
+            for batch in [1usize, 8, 16, 32, 64, 128, 256, 512, 1024] {
+                // Flush path: `batch` files each carrying their tag actions.
+                let mut flush = Duration::ZERO;
+                for _ in 0..iters {
+                    let map: HashMap<FileManager, Vec<FileTagAction>> = (0..batch)
+                        .map(|i| (make_manager(i), make_actions(i)))
+                        .collect();
+                    let t = Instant::now();
+                    let ok = fixture.db.clone().process_scraper(
+                        map,
+                        Vec::new(),
+                        "bench flush sweep".to_string(),
+                    ).await;
+                    assert!(ok, "process_scraper flush failed at batch {batch}");
+                    flush += t.elapsed();
+                }
+
+                // Drain path: `batch` pending scrape jobs upserted in one call.
+                let mut jobs_elapsed = Duration::ZERO;
+                for _ in 0..iters {
+                    let jobs: Vec<ScraperDataReturn> =
+                        (0..batch).map(|i| make_job(i)).collect();
+                    let t = Instant::now();
+                    let ok = fixture.db.clone().process_scraper(
+                        HashMap::new(),
+                        jobs,
+                        "bench drain sweep".to_string(),
+                    ).await;
+                    assert!(ok, "process_scraper jobs failed at batch {batch}");
+                    jobs_elapsed += t.elapsed();
+                }
+
+                let flush_ms = flush.as_secs_f64() * 1_000.0 / iters as f64;
+                let jobs_ms = jobs_elapsed.as_secs_f64() * 1_000.0 / iters as f64;
+                println!(
+                    "  {batch:>7}  {flush_ms:>10.2}  {:>10.2}  {jobs_ms:>10.2}  {:>10.2}",
+                    flush_ms * 1_000.0 / batch as f64,
+                    jobs_ms * 1_000.0 / batch as f64,
+                );
             }
         });
     }
