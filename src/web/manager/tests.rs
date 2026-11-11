@@ -469,3 +469,287 @@ fn flush_buffer_tolerates_empty_tag_lists() {
     );
     assert!(batch[&key].is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// file_download_logic decision-path tests.
+//
+// These pin the routing that decides whether a scraped tag list reaches the
+// flush buffer: dedup hits must hand back the EXISTING row (AlreadyPresent)
+// so its tags can be attached, while skip/dead/no-source cases must drop the
+// file cleanly. None of these paths touch the network, so they run against
+// synthetic PageDedup maps.
+// ---------------------------------------------------------------------------
+
+use crate::db::{SourceUrlFileStatus, hashes_supported_to_key};
+use std::path::Path;
+
+struct DedupFixture {
+    scraper: std::sync::Arc<Scraper>,
+    _temp: tempfile::TempDir,
+}
+
+async fn dedup_fixture() -> DedupFixture {
+    use crate::web::ratelimit::RatelimitManager;
+
+    let temp = tempfile::tempdir().unwrap();
+    let should_exit = Arc::new(AtomicBool::new(false));
+    let db = crate::db::turso::TursoDatabase::new_with_exit(
+        &temp.path().join("test.db"),
+        should_exit.clone(),
+    )
+    .await;
+    let plugin_manager =
+        crate::plugins::PluginManager::new(temp.path(), db.clone(), should_exit.clone());
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap(),
+    );
+    let download_manager = crate::web::manager::DownloadsManager::new(
+        db,
+        plugin_manager.clone(),
+        pool,
+        should_exit.clone(),
+    );
+
+    let scraper = std::sync::Arc::new(Scraper {
+        job: shared_types::DbJobsObj {
+            id: 1,
+            isrunning: false,
+            config: shared_types::PluginJob::default(),
+        },
+        ratelimiter: Arc::new(RatelimitManager::new(1, std::time::Duration::from_secs(1))),
+        plugin_manager,
+        plugin: shared_types::Plugin {
+            name: "testsite".to_string(),
+            ..Default::default()
+        },
+        download_manager,
+        text_client: Arc::new(reqwest::Client::new()),
+        file_client: Arc::new(reqwest::Client::new()),
+    });
+
+    DedupFixture {
+        scraper,
+        _temp: temp,
+    }
+}
+
+fn existing_row(file_id: u64) -> FileInternal {
+    FileInternal {
+        id: Some(file_id),
+        hash: format!("{:0128X}", 0x2A),
+        extension: "jpg".to_string(),
+        storage_id: 0,
+        size_bytes: Some(1024),
+    }
+}
+
+fn scraped_file(url: &str) -> FileObject {
+    FileObject {
+        source: Some(FileSource::Url(url.to_string())),
+        ..Default::default()
+    }
+}
+
+fn empty_dedup() -> (
+    HashMap<String, SourceUrlFileStatus>,
+    HashMap<(String, String), FileInternal>,
+    HashMap<(String, String), FileInternal>,
+) {
+    (HashMap::new(), HashMap::new(), HashMap::new())
+}
+
+async fn route(
+    fx: &DedupFixture,
+    file: &mut FileObject,
+    source_files: &HashMap<String, SourceUrlFileStatus>,
+    hash_files: &HashMap<(String, String), FileInternal>,
+    skip_files: &HashMap<(String, String), FileInternal>,
+) -> Result<Option<crate::web::manager::FileReturn>, Box<dyn std::error::Error>> {
+    let dedup = crate::web::manager::PageDedup {
+        source_files,
+        hash_files,
+        skip_files,
+    };
+    let mut jobs = Vec::new();
+    let mut download_issue = false;
+    fx.scraper
+        .clone()
+        .file_download_logic(
+            file,
+            &mut jobs,
+            &mut download_issue,
+            &dedup,
+            Arc::new(crate::web::manager::PrioritySemaphore::new(1)),
+        )
+        .await
+}
+
+/// A URL dedup hit must return the EXISTING row via AlreadyPresent — this is
+/// the routing that lets the flush buffer attach the scraped tag list to the
+/// file id already in the db. Returning a fresh/new-shaped row here (or None)
+/// is exactly how the tag-loss regression happened.
+#[tokio::test]
+async fn url_dedup_hit_routes_to_already_present_with_existing_row() {
+    let fx = dedup_fixture().await;
+    let url = "https://test.site/img/1.jpg";
+    let existing = existing_row(42);
+
+    let mut source_files = HashMap::new();
+    source_files.insert(
+        url.to_string(),
+        SourceUrlFileStatus {
+            file: Some(existing.clone()),
+            dead: false,
+        },
+    );
+    let (hash_files, skip_files) = (HashMap::new(), HashMap::new());
+
+    let mut file = scraped_file(url);
+    let ret = route(&fx, &mut file, &source_files, &hash_files, &skip_files)
+        .await
+        .expect("routing ok");
+
+    match ret {
+        Some(crate::web::manager::FileReturn::AlreadyPresent(row)) => {
+            assert_eq!(row.id, Some(42), "must carry the EXISTING db row id");
+            assert_eq!(row.hash, existing.hash);
+        }
+        other => panic!("dedup hit must route to AlreadyPresent, got {other:?}"),
+    }
+
+    // The source_url tag must already be on the tag list, so the buffered
+    // flush carries it alongside the scraped tags.
+    assert!(
+        file.tag_list.iter().any(|action| {
+            action
+                .tags
+                .iter()
+                .any(|t| t.tag.namespace.name == "source_url")
+        }),
+        "source_url tag must ride along on the dedup hit's tag list"
+    );
+}
+
+/// A known identifying hash (MD5 here) must route to AlreadyPresent with the
+/// existing row, even though the URL is new — the same file posted under two
+/// URLs must not become two rows, and its tags must still land.
+#[tokio::test]
+async fn hash_dedup_hit_routes_to_already_present_with_existing_row() {
+    let fx = dedup_fixture().await;
+    let md5 = "d8153106da2f23b23119337c34e55a66".to_string();
+
+    let mut hash_files = HashMap::new();
+    hash_files.insert(
+        hashes_supported_to_key(&shared_types::HashesSupported::Md5(md5.clone())),
+        existing_row(7),
+    );
+    let (source_files, skip_files) = (HashMap::new(), HashMap::new());
+
+    let mut file = scraped_file("https://test.site/img/repost.jpg");
+    file.hash = vec![shared_types::HashesSupported::Md5(md5)];
+
+    let ret = route(&fx, &mut file, &source_files, &hash_files, &skip_files)
+        .await
+        .expect("routing ok");
+
+    match ret {
+        Some(crate::web::manager::FileReturn::AlreadyPresent(row)) => {
+            assert_eq!(row.id, Some(7), "hash hit must carry the existing row id");
+        }
+        other => panic!("hash dedup hit must route to AlreadyPresent, got {other:?}"),
+    }
+}
+
+/// A dead URL must be dropped cleanly: no download attempt, no buffered
+/// entry, no panic.
+#[tokio::test]
+async fn dead_url_is_dropped_cleanly() {
+    let fx = dedup_fixture().await;
+    let url = "https://test.site/dead.jpg";
+
+    let mut source_files = HashMap::new();
+    source_files.insert(
+        url.to_string(),
+        SourceUrlFileStatus {
+            file: Some(existing_row(1)),
+            dead: true,
+        },
+    );
+    let (hash_files, skip_files) = (HashMap::new(), HashMap::new());
+
+    let mut file = scraped_file(url);
+    let ret = route(&fx, &mut file, &source_files, &hash_files, &skip_files)
+        .await
+        .expect("routing ok");
+    assert!(ret.is_none(), "dead URL must not produce a FileReturn");
+}
+
+/// A skip_if FileTagRelationship hit must drop the file WITHOUT attaching
+/// its tags: the rule matched a DIFFERENT file holding that tag, so
+/// attaching would mislink. This is the intended Ok(None) — a regression
+/// back to File/AlreadyPresent here would corrupt relationships.
+#[tokio::test]
+async fn skip_tag_relationship_hit_drops_file_and_tags() {
+    let fx = dedup_fixture().await;
+    let ns = shared_types::GenericNamespaceObj {
+        name: "artist".to_string(),
+        description: None,
+    };
+    let skip_tag = shared_types::Tag::new("someone".to_string(), ns.clone());
+
+    let mut skip_files = HashMap::new();
+    skip_files.insert((ns.name.clone(), skip_tag.name.clone()), existing_row(99));
+    let (source_files, hash_files) = (HashMap::new(), HashMap::new());
+
+    let mut file = scraped_file("https://test.site/img/2.jpg");
+    file.skip_if = vec![shared_types::SkipIf::FileTagRelationship(skip_tag)];
+
+    let ret = route(&fx, &mut file, &source_files, &hash_files, &skip_files)
+        .await
+        .expect("routing ok");
+    assert!(ret.is_none(), "skip-tag hit must drop the file");
+}
+
+/// A URL already being downloaded by a concurrent task must report
+/// InDownloadQueue rather than starting a second transfer of the same file.
+#[tokio::test]
+async fn queued_url_reports_in_download_queue() {
+    let fx = dedup_fixture().await;
+    let url = "https://test.site/img/inflight.jpg";
+    let (source_files, hash_files, skip_files) = empty_dedup();
+
+    fx.scraper
+        .download_manager
+        .downloading_urls
+        .write()
+        .await
+        .insert(url.to_string());
+
+    let mut file = scraped_file(url);
+    let ret = route(&fx, &mut file, &source_files, &hash_files, &skip_files)
+        .await
+        .expect("routing ok");
+    assert!(
+        matches!(ret, Some(crate::web::manager::FileReturn::InDownloadQueue)),
+        "in-flight URL must report InDownloadQueue, got {ret:?}"
+    );
+}
+
+/// A file with no source at all must be dropped cleanly.
+#[tokio::test]
+async fn file_without_source_is_dropped_cleanly() {
+    let fx = dedup_fixture().await;
+    let (source_files, hash_files, skip_files) = empty_dedup();
+
+    let mut file = FileObject::default();
+    let ret = route(&fx, &mut file, &source_files, &hash_files, &skip_files)
+        .await
+        .expect("routing ok");
+    assert!(
+        ret.is_none(),
+        "sourceless file must not produce a FileReturn"
+    );
+}

@@ -4,6 +4,7 @@ pub mod downloading;
 pub mod manager;
 pub mod ratelimit;
 
+#[derive(Debug)]
 enum FileReturn {
     File(FileManager),
     /// The file was a dedup hit: it is already committed, so only its
