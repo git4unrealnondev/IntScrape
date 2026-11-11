@@ -71,6 +71,22 @@ const FLUSH_BATCH_SIZE: usize = 128;
 // right on the cliff.
 const ACCUMULATOR_DRAIN_SIZE: usize = 256;
 
+/// Buffers a file's tag list into the per-page flush batch.
+///
+/// This MUST merge (entry + append), never overwrite: the same physical file
+/// can land in the batch more than once per page — e.g. two page entries
+/// pointing at the same URL/hash, or a fresh download (`File`) followed by a
+/// dedup hit (`AlreadyPresent`) for the same file. `HashMap::insert` would
+/// silently drop the first entry's tags, which is exactly how file↔tag
+/// relationships were being lost on re-walks.
+fn buffer_file_tags(
+    batch: &mut HashMap<FileManager, Vec<FileTagAction>>,
+    key: FileManager,
+    tag_list: &mut Vec<FileTagAction>,
+) {
+    batch.entry(key).or_default().append(tag_list);
+}
+
 // How many times should we retry to download a file
 const MAX_DOWNLOAD_RETRIES: u8 = 3;
 
@@ -879,9 +895,10 @@ impl Scraper {
                                                         // for the same new tag rows.
                                                         let mut batch =
                                                             flush_batch_clone.lock().await;
-                                                        batch.insert(
+                                                        buffer_file_tags(
+                                                            &mut batch,
                                                             fileinternal,
-                                                            std::mem::take(&mut file.tag_list),
+                                                            &mut file.tag_list,
                                                         );
                                                         if batch.len() >= FLUSH_BATCH_SIZE {
                                                             let batch =
@@ -925,17 +942,16 @@ impl Scraper {
                                                     let flushed = {
                                                         let mut batch =
                                                             flush_batch_clone.lock().await;
-                                                        batch
-                                                            .entry(FileManager {
+                                                        buffer_file_tags(
+                                                            &mut batch,
+                                                            FileManager {
                                                                 internal: existing,
                                                                 identifying_hashes: file
                                                                     .hash
                                                                     .clone(),
-                                                            })
-                                                            .or_default()
-                                                            .extend(std::mem::take(
-                                                                &mut file.tag_list,
-                                                            ));
+                                                            },
+                                                            &mut file.tag_list,
+                                                        );
                                                         if batch.len() >= FLUSH_BATCH_SIZE {
                                                             let batch =
                                                                 std::mem::take(&mut *batch);

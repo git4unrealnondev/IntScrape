@@ -199,6 +199,22 @@ impl TursoDatabase {
     /// Phase 1 of a scraper chunk: persists files and their identifying
     /// hashes in one small plain-BEGIN transaction, returning the
     /// `hash -> db id` cache the relationship phase resolves against.
+    /// Resolves the db file id a chunk entry's tags must attach to.
+    ///
+    /// Normal entries resolve through `file_cache` by SHA512 digest. Entries
+    /// with an empty digest (existing rows that never had a SHA512 hash) are
+    /// resolved by their pinned `id` — the cache cannot hold them, since the
+    /// empty key would collapse every hash-less file in the chunk onto one id
+    /// and mislink their tags. A hash-less entry without an id cannot be
+    /// resolved and its tags are dropped (same as a cache miss).
+    fn resolve_file_id(internal: &FileInternal, file_cache: &HashMap<String, u64>) -> Option<u64> {
+        if internal.hash.is_empty() {
+            internal.id
+        } else {
+            file_cache.get(&internal.hash).copied()
+        }
+    }
+
     async fn scraper_phase_files(
         &self,
         map: &HashMap<FileManager, Vec<FileTagAction>>,
@@ -239,7 +255,14 @@ impl TursoDatabase {
 
             let mut file_cache = HashMap::with_capacity(corrected_files.len());
             for file in &corrected_files {
-                if let Some(db_id) = file.id {
+                // A missing SHA512 (legacy rows) yields hash == "". Never put
+                // it in the cache: two different hash-less files in one chunk
+                // would collapse to the last writer's id and cross-link their
+                // tags. The relationship phase resolves hash-less entries via
+                // the pinned `FileInternal.id` instead.
+                if !file.hash.is_empty()
+                    && let Some(db_id) = file.id
+                {
                     file_cache.insert(file.hash.clone(), db_id);
                 }
             }
@@ -247,12 +270,13 @@ impl TursoDatabase {
             // Identifying hashes.
             let mut file_hashes: Vec<(u64, &str, &str)> = Vec::new();
             for filemanager in map.keys() {
-                let Some(file_id) = file_cache.get(&filemanager.internal.hash) else {
+                let Some(file_id) = Self::resolve_file_id(&filemanager.internal, &file_cache)
+                else {
                     continue;
                 };
                 for file_hash in &filemanager.identifying_hashes {
                     let (algorithm, digest) = crate::db::hashes_supported_to_inner(file_hash);
-                    file_hashes.push((*file_id, algorithm, digest.as_str()));
+                    file_hashes.push((file_id, algorithm, digest.as_str()));
                 }
             }
             if !file_hashes.is_empty()
@@ -437,8 +461,8 @@ impl TursoDatabase {
             let mut set_deletions = HashSet::new();
 
             for (file_manager, tag_list) in map {
-                let file_id = match file_cache.get(&file_manager.internal.hash) {
-                    Some(&id) => id,
+                let file_id = match Self::resolve_file_id(&file_manager.internal, &file_cache) {
+                    Some(id) => id,
                     None => continue,
                 };
 

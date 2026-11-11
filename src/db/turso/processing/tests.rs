@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::db::SourceUrlFileStatus;
-use shared_types::GenericNamespaceObj;
+use shared_types::{GenericNamespaceObj, PluginTag, TagType};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -2717,5 +2717,237 @@ async fn upgrading_old_fts_schema_moves_index_onto_popular_shadow() {
     assert_eq!(found.len(), 1, "upgraded db must search popular tags");
     let shy = db.tags_search_fts("shy", 10).await.unwrap();
     assert!(shy.is_empty(), "unpopular tag must stay unsearchable");
+    db.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// process_scraper file↔tag association regressions
+//
+// These guard the batching change: files and their tag lists used to be
+// committed one `process_scraper` call per file, so every call saw exactly
+// one file and per-file resolution could never collide. Now a whole page's
+// worth of files lands in one chunk, and both the manager's flush buffer and
+// the chunk's hash-keyed caches must keep each file's tags on its own id.
+// ---------------------------------------------------------------------------
+
+fn regression_namespace() -> GenericNamespaceObj {
+    GenericNamespaceObj {
+        name: "regression".to_string(),
+        description: None,
+    }
+}
+
+fn regression_tag(name: &str) -> PluginTag {
+    PluginTag {
+        tag: Tag::new(name.to_string(), regression_namespace()),
+        tag_type: TagType::Normal,
+        relates_to: None,
+    }
+}
+
+fn regression_add_action(tags: Vec<PluginTag>) -> FileTagAction {
+    FileTagAction {
+        operation: TagOperation::Add,
+        tags,
+    }
+}
+
+fn regression_manager(hash: &str, id: Option<u64>) -> FileManager {
+    FileManager {
+        internal: FileInternal {
+            id,
+            hash: hash.to_string(),
+            extension: "jpg".to_string(),
+            storage_id: 0,
+            size_bytes: Some(1024),
+        },
+        identifying_hashes: vec![],
+    }
+}
+
+async fn regression_tag_id(db: &TursoDatabase, name: &str) -> u64 {
+    let conn = db.connect().expect("connect");
+    let mut rows = conn
+        .query("SELECT id FROM Tags WHERE name = ?1;", (name,))
+        .await
+        .expect("tag lookup");
+    let id = rows
+        .next()
+        .await
+        .expect("row")
+        .expect("tag row")
+        .get::<u64>(0)
+        .expect("tag id");
+    id
+}
+
+async fn regression_file_tag_ids(db: &TursoDatabase, file_id: u64) -> HashSet<u64> {
+    let conn = db.connect().expect("connect");
+    let ids = db
+        .relationship_get_tag_id(&conn, file_id)
+        .await
+        .expect("relationships for file");
+    ids
+}
+
+/// Two different legacy files with no SHA512 hash (`hash == ""`) in ONE chunk
+/// must each keep their own tags. The chunk used to key its file cache by
+/// hash alone, so both empty digests collapsed onto the last writer's id and
+/// cross-linked the tag lists.
+#[tokio::test]
+async fn hashless_files_in_one_chunk_keep_their_own_tags() {
+    let db = new_test_db().await;
+
+    let mut map = HashMap::new();
+    map.insert(
+        regression_manager("", Some(9001)),
+        vec![regression_add_action(vec![regression_tag("hashless-a")])],
+    );
+    map.insert(
+        regression_manager("", Some(9002)),
+        vec![regression_add_action(vec![regression_tag("hashless-b")])],
+    );
+
+    assert!(
+        db.clone()
+            .process_scraper(map, Vec::new(), "regression".to_string())
+            .await,
+        "process_scraper failed"
+    );
+
+    let tag_a = regression_tag_id(&db, "hashless-a").await;
+    let tag_b = regression_tag_id(&db, "hashless-b").await;
+    assert_ne!(tag_a, tag_b, "distinct tags must get distinct ids");
+
+    let file_a = regression_file_tag_ids(&db, 9001).await;
+    let file_b = regression_file_tag_ids(&db, 9002).await;
+    assert_eq!(
+        file_a,
+        HashSet::from([tag_a]),
+        "file 9001 must hold only its own tag"
+    );
+    assert_eq!(
+        file_b,
+        HashSet::from([tag_b]),
+        "file 9002 must hold only its own tag"
+    );
+
+    db.shutdown().await;
+}
+
+/// A re-walk that hits an existing file (the `AlreadyPresent` shape: pinned
+/// id + the file's SHA512) must attach the fresh tag list to the EXISTING id,
+/// not lose it.
+#[tokio::test]
+async fn already_present_file_reattaches_tags_on_rewalk() {
+    let db = new_test_db().await;
+    let sha512 = format!("{:0128X}", 0xA);
+
+    // First walk: file arrives as new.
+    let mut first = HashMap::new();
+    first.insert(
+        regression_manager(&sha512, None),
+        vec![regression_add_action(vec![regression_tag("first-walk")])],
+    );
+    assert!(
+        db.clone()
+            .process_scraper(first, Vec::new(), "regression".to_string())
+            .await
+    );
+    let file_id = {
+        let conn = db.connect().expect("connect");
+        let mut rows = conn
+            .query(
+                "SELECT file_id FROM FileHashes WHERE algorithm = 'SHA512' AND digest = ?1;",
+                (sha512.as_str(),),
+            )
+            .await
+            .expect("file lookup");
+        let id = rows
+            .next()
+            .await
+            .expect("row")
+            .expect("file row")
+            .get::<u64>(0)
+            .expect("file id");
+        id
+    };
+
+    // Second walk: same file, dedup hit, carries a different tag set.
+    let mut second = HashMap::new();
+    second.insert(
+        regression_manager(&sha512, Some(file_id)),
+        vec![regression_add_action(vec![regression_tag("rewalk")])],
+    );
+    assert!(
+        db.clone()
+            .process_scraper(second, Vec::new(), "regression".to_string())
+            .await
+    );
+
+    let mut expected = HashSet::new();
+    expected.insert(regression_tag_id(&db, "first-walk").await);
+    expected.insert(regression_tag_id(&db, "rewalk").await);
+    assert_eq!(
+        regression_file_tag_ids(&db, file_id).await,
+        expected,
+        "re-walked tags must land on the existing file id"
+    );
+
+    db.shutdown().await;
+}
+
+/// One chunk may legitimately contain the same physical file twice: a fresh
+/// download entry (`id: None`) and a dedup-hit entry (`id: Some`) for the
+/// same SHA512. Both tag lists must survive and land on the single db row.
+#[tokio::test]
+async fn duplicate_file_entries_in_one_chunk_keep_all_tags() {
+    let db = new_test_db().await;
+    let sha512 = format!("{:0128X}", 0xB);
+
+    let mut map = HashMap::new();
+    map.insert(
+        regression_manager(&sha512, None),
+        vec![regression_add_action(vec![regression_tag("downloaded")])],
+    );
+    map.insert(
+        regression_manager(&sha512, Some(1)),
+        vec![regression_add_action(vec![regression_tag("dedup-hit")])],
+    );
+
+    assert!(
+        db.clone()
+            .process_scraper(map, Vec::new(), "regression".to_string())
+            .await
+    );
+
+    let file_id = {
+        let conn = db.connect().expect("connect");
+        let mut rows = conn
+            .query(
+                "SELECT file_id FROM FileHashes WHERE algorithm = 'SHA512' AND digest = ?1;",
+                (sha512.as_str(),),
+            )
+            .await
+            .expect("file lookup");
+        let id = rows
+            .next()
+            .await
+            .expect("row")
+            .expect("file row")
+            .get::<u64>(0)
+            .expect("file id");
+        id
+    };
+
+    let mut expected = HashSet::new();
+    expected.insert(regression_tag_id(&db, "downloaded").await);
+    expected.insert(regression_tag_id(&db, "dedup-hit").await);
+    assert_eq!(
+        regression_file_tag_ids(&db, file_id).await,
+        expected,
+        "both entries' tags must attach to the single file row"
+    );
+
     db.shutdown().await;
 }

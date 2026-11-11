@@ -2,6 +2,9 @@
 
 use super::*;
 
+use shared_types::TagType;
+use std::collections::HashMap;
+
 /// Measures the three post-download suspects named during the redgifs
 /// slow-crawl investigation, at the real per-file cost the run saw
 /// (multi-MB media).
@@ -365,4 +368,104 @@ fn hash_match_ignores_hex_casing_and_whitespace() {
     let image = HashesSupported::ImageHash("aBcDeFg=".to_string());
     assert!(hashes_match(&image, "aBcDeFg="));
     assert!(!hashes_match(&image, "abcdefg="));
+}
+
+/// The flush buffer must MERGE tag lists per file key, never overwrite.
+///
+/// The same physical file can reach the buffer twice in one page — e.g. a
+/// fresh download entry followed by a dedup hit carrying a different scraped
+/// tag list. `HashMap::insert` here silently dropped the first entry's tags,
+/// which is how file↔tag relationships were lost on re-scrapes.
+#[test]
+fn flush_buffer_merges_tag_lists_instead_of_overwriting() {
+    let key = FileManager {
+        internal: FileInternal {
+            id: None,
+            hash: format!("{:0128x}", 1),
+            extension: "jpg".to_string(),
+            storage_id: 0,
+            size_bytes: None,
+        },
+        identifying_hashes: vec![],
+    };
+
+    let mut action = |tag: &str| FileTagAction {
+        operation: TagOperation::Add,
+        tags: vec![PluginTag {
+            tag: Tag::new(
+                tag.to_string(),
+                GenericNamespaceObj {
+                    name: "regression".to_string(),
+                    description: None,
+                },
+            ),
+            tag_type: TagType::Normal,
+            relates_to: None,
+        }],
+    };
+
+    let mut batch = HashMap::new();
+
+    // First landing (the File arm's shape).
+    let mut first_tags = vec![action("first")];
+    buffer_file_tags(&mut batch, key.clone(), &mut first_tags);
+    assert!(
+        first_tags.is_empty(),
+        "tag list must be moved into the buffer"
+    );
+
+    // Second landing for the SAME file (e.g. a duplicate page entry).
+    let mut second_tags = vec![action("second")];
+    buffer_file_tags(&mut batch, key.clone(), &mut second_tags);
+
+    let buffered = batch.get(&key).expect("buffered entry");
+    let mut names: Vec<&str> = buffered
+        .iter()
+        .flat_map(|a| a.tags.iter().map(|t| t.tag.name.as_str()))
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec!["first", "second"],
+        "both landings' tags must survive"
+    );
+
+    // A dedup-hit entry for the same file carries a pinned id, so it keys
+    // differently — it must coexist, not clobber the download entry.
+    let existing_key = FileManager {
+        internal: FileInternal {
+            id: Some(7),
+            ..key.internal.clone()
+        },
+        identifying_hashes: vec![],
+    };
+    let mut existing_tags = vec![action("dedup")];
+    buffer_file_tags(&mut batch, existing_key, &mut existing_tags);
+
+    assert_eq!(batch.len(), 2, "distinct keys must coexist");
+    let total_actions: usize = batch.values().map(|v| v.len()).sum();
+    assert_eq!(total_actions, 3, "all three tag actions must survive");
+}
+
+/// An EMPTY tag list must not clobber or grow a buffered entry: appending
+/// nothing leaves the previous landing's tags intact.
+#[test]
+fn flush_buffer_tolerates_empty_tag_lists() {
+    let key = FileManager::from(FileInternal {
+        id: None,
+        hash: format!("{:0128x}", 2),
+        extension: "png".to_string(),
+        storage_id: 0,
+        size_bytes: None,
+    });
+
+    let mut batch = HashMap::new();
+    let mut empty: Vec<FileTagAction> = Vec::new();
+    buffer_file_tags(&mut batch, key.clone(), &mut empty);
+
+    assert!(
+        batch.contains_key(&key),
+        "the file itself must still be buffered so its row is written"
+    );
+    assert!(batch[&key].is_empty());
 }
