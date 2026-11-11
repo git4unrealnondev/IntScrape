@@ -3016,3 +3016,274 @@ async fn lowercase_sha512_entry_still_attaches_tags() {
 
     db.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Broader association invariants: concurrency, idempotency, Set scoping.
+// ---------------------------------------------------------------------------
+
+async fn regression_tag_count(db: &TursoDatabase, name: &str) -> i64 {
+    let conn = db.connect().expect("connect");
+    let mut rows = conn
+        .query("SELECT count FROM Tags WHERE name = ?1;", (name,))
+        .await
+        .expect("tag count lookup");
+    let count = rows
+        .next()
+        .await
+        .expect("row")
+        .expect("tag row")
+        .get::<i64>(0)
+        .expect("count");
+    count
+}
+
+async fn regression_file_id_for_digest(db: &TursoDatabase, digest: &str) -> u64 {
+    let conn = db.connect().expect("connect");
+    let mut rows = conn
+        .query(
+            "SELECT file_id FROM FileHashes WHERE algorithm = 'SHA512' AND digest = ?1;",
+            (digest,),
+        )
+        .await
+        .expect("file lookup");
+    let id = rows
+        .next()
+        .await
+        .expect("row")
+        .expect("file row")
+        .get::<u64>(0)
+        .expect("file id");
+    id
+}
+
+/// Two scraper chunks racing to insert the SAME novel file must end with
+/// exactly one File row for the digest, and BOTH chunks' tags attached to
+/// that single row. This drives `file_add_bulk`'s race-resolution branch
+/// (loser deletes its orphaned File row and adopts the winner's id) through
+/// the full `process_scraper` path, concurrently.
+#[tokio::test]
+async fn concurrent_chunks_racing_same_novel_file_keep_one_row() {
+    let db = new_test_db().await;
+    let sha512 = format!("{:0128X}", 0xD);
+
+    let mut chunk_a = HashMap::new();
+    chunk_a.insert(
+        regression_manager(&sha512, None),
+        vec![regression_add_action(vec![regression_tag("race-a")])],
+    );
+    let mut chunk_b = HashMap::new();
+    chunk_b.insert(
+        regression_manager(&sha512, None),
+        vec![regression_add_action(vec![regression_tag("race-b")])],
+    );
+
+    let db_a = db.clone();
+    let db_b = db.clone();
+    let (ok_a, ok_b) = tokio::join!(
+        async move { db_a.process_scraper(chunk_a, Vec::new(), "race-a".to_string()).await },
+        async move { db_b.process_scraper(chunk_b, Vec::new(), "race-b".to_string()).await },
+    );
+    assert!(ok_a && ok_b, "both concurrent chunks must succeed");
+
+    let file_id = regression_file_id_for_digest(&db, &sha512).await;
+
+    // Exactly one file row owns the digest.
+    let conn = db.connect().expect("connect");
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM FileHashes WHERE algorithm = 'SHA512' AND digest = ?1;",
+            (sha512.as_str(),),
+        )
+        .await
+        .expect("digest count");
+    let digest_rows = rows
+        .next()
+        .await
+        .expect("row")
+        .expect("count row")
+        .get::<i64>(0)
+        .expect("count");
+    assert_eq!(digest_rows, 1, "race must resolve to a single file row");
+
+    // Both racers' tags attach to the surviving row.
+    let mut expected = HashSet::new();
+    expected.insert(regression_tag_id(&db, "race-a").await);
+    expected.insert(regression_tag_id(&db, "race-b").await);
+    assert_eq!(
+        regression_file_tag_ids(&db, file_id).await,
+        expected,
+        "both racers' tags must land on the surviving file row"
+    );
+
+    db.shutdown().await;
+}
+
+/// Re-scraping the IDENTICAL chunk must change nothing: no duplicate
+/// relationships, no inflated tag counts. The flush batching makes repeated
+/// pages cheap, which only holds if the write path is idempotent.
+#[tokio::test]
+async fn identical_rescrape_is_idempotent() {
+    let db = new_test_db().await;
+    let sha512 = format!("{:0128X}", 0xE);
+
+    let make_chunk = |tag: &str| {
+        let mut map = HashMap::new();
+        map.insert(
+            regression_manager(&sha512, None),
+            vec![regression_add_action(vec![regression_tag(tag)])],
+        );
+        map
+    };
+
+    assert!(
+        db.clone()
+            .process_scraper(make_chunk("idem"), Vec::new(), "walk-1".to_string())
+            .await
+    );
+    let file_id = regression_file_id_for_digest(&db, &sha512).await;
+    let tag_id = regression_tag_id(&db, "idem").await;
+    let count_after_first = regression_tag_count(&db, "idem").await;
+    assert_eq!(count_after_first, 1, "fresh tag must count exactly 1");
+
+    assert!(
+        db.clone()
+            .process_scraper(make_chunk("idem"), Vec::new(), "walk-2".to_string())
+            .await
+    );
+
+    assert_eq!(
+        regression_file_tag_ids(&db, file_id).await,
+        HashSet::from([tag_id]),
+        "re-scrape must not duplicate the relationship"
+    );
+    assert_eq!(
+        regression_tag_count(&db, "idem").await,
+        1,
+        "re-scrape must not inflate the tag count"
+    );
+
+    db.shutdown().await;
+}
+
+/// `TagOperation::Set` must replace tags only in the namespaces it targets.
+/// A Set over namespace A leaves namespace B's tags untouched — plugins rely
+/// on this to refresh artist tags without nuking categories.
+#[tokio::test]
+async fn set_operation_scopes_deletions_to_targeted_namespaces() {
+    let db = new_test_db().await;
+    let sha512 = format!("{:0128X}", 0xF);
+
+    let ns_alpha = GenericNamespaceObj {
+        name: "alpha".to_string(),
+        description: None,
+    };
+    let ns_beta = GenericNamespaceObj {
+        name: "beta".to_string(),
+        description: None,
+    };
+    let tag_in = |name: &str, ns: &GenericNamespaceObj| PluginTag {
+        tag: Tag::new(name.to_string(), ns.clone()),
+        tag_type: TagType::Normal,
+        relates_to: None,
+    };
+
+    // Walk 1: file carries alpha::old and beta::keeper.
+    let mut first = HashMap::new();
+    first.insert(
+        regression_manager(&sha512, None),
+        vec![regression_add_action(vec![
+            tag_in("alpha-old", &ns_alpha),
+            tag_in("beta-keeper", &ns_beta),
+        ])],
+    );
+    assert!(
+        db.clone()
+            .process_scraper(first, Vec::new(), "set-walk-1".to_string())
+            .await
+    );
+    let file_id = regression_file_id_for_digest(&db, &sha512).await;
+
+    // Walk 2: Set alpha to [alpha-new]. beta-keeper must survive.
+    let mut second = HashMap::new();
+    second.insert(
+        regression_manager(&sha512, Some(file_id)),
+        vec![FileTagAction {
+            operation: TagOperation::Set,
+            tags: vec![tag_in("alpha-new", &ns_alpha)],
+        }],
+    );
+    assert!(
+        db.clone()
+            .process_scraper(second, Vec::new(), "set-walk-2".to_string())
+            .await
+    );
+
+    let mut expected = HashSet::new();
+    expected.insert(regression_tag_id(&db, "alpha-new").await);
+    expected.insert(regression_tag_id(&db, "beta-keeper").await);
+    assert_eq!(
+        regression_file_tag_ids(&db, file_id).await,
+        expected,
+        "Set must replace only the targeted namespace's tags"
+    );
+
+    // Deletion must decrement the replaced tag's count, not leave it stale.
+    assert_eq!(
+        regression_tag_count(&db, "alpha-old").await,
+        0,
+        "unset tag count must drop back to 0"
+    );
+    assert_eq!(
+        regression_tag_count(&db, "beta-keeper").await,
+        1,
+        "untouched namespace's count must stay 1"
+    );
+
+    db.shutdown().await;
+}
+
+/// A file that arrives with an EMPTY tag list must still get its File row
+/// (and be resolvable later) — only its relationships are absent. The flush
+/// buffer can legitimately hold such entries after a merge.
+#[tokio::test]
+async fn file_without_tags_still_gets_its_row() {
+    let db = new_test_db().await;
+    let sha512 = format!("{:0128X}", 0x11);
+
+    let mut map = HashMap::new();
+    map.insert(regression_manager(&sha512, None), Vec::new());
+    assert!(
+        db.clone()
+            .process_scraper(map, Vec::new(), "untagged".to_string())
+            .await
+    );
+
+    let file_id = regression_file_id_for_digest(&db, &sha512).await;
+    assert!(
+        file_id > 0,
+        "untagged file must still be persisted and resolvable"
+    );
+    assert!(
+        regression_file_tag_ids(&db, file_id).await.is_empty(),
+        "untagged file must have no relationships"
+    );
+
+    // A later chunk can still tag it by digest.
+    let mut later = HashMap::new();
+    later.insert(
+        regression_manager(&sha512, Some(file_id)),
+        vec![regression_add_action(vec![regression_tag("late-tags")])],
+    );
+    assert!(
+        db.clone()
+            .process_scraper(later, Vec::new(), "untagged-later".to_string())
+            .await
+    );
+    assert_eq!(
+        regression_file_tag_ids(&db, file_id).await,
+        HashSet::from([regression_tag_id(&db, "late-tags").await]),
+        "later tags must attach to the previously untagged row"
+    );
+
+    db.shutdown().await;
+}
