@@ -32,7 +32,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use shared_types::{
-    DbSettingsObj, FileTagAction, PluginTag, RelationContext, Tag, TagOperation,
+    DbSettingsObj, FileTagAction, PluginTag, RelationContext, Tag,
+    TagOperation,
 };
 
 use super::{NsIdent, Site, nsobjplg};
@@ -198,16 +199,22 @@ fn parse_row(record: &csv::StringRecord, columns: &Columns) -> Option<PostRow> {
 /// Maps a Danbooru tag category id to its namespace identity. Unknown
 /// categories fall back to General, matching the live plugin's behaviour
 /// of only knowing the categories it parses from the API.
-fn category_ident(category: u8) -> NsIdent {
-    match category {
-        1 => NsIdent::Artist,
-        3 => NsIdent::Copyright,
-        4 => NsIdent::Character,
-        5 => NsIdent::Species,
-        6 => NsIdent::Invalid,
-        7 => NsIdent::Meta,
-        8 => NsIdent::Lore,
-        _ => NsIdent::General,
+/// 
+/// For E6AI and Blep, category 1 (Artist) is mapped to Director instead,
+/// since those sites' CSV dumps use category 1 for AI artist tags.
+fn category_ident(category: u8, site: &Site) -> NsIdent {
+    match (category, site) {
+        (1, Site::E6AI) | (1, Site::Blep) => NsIdent::Director,
+        _ => match category {
+            1 => NsIdent::Artist,
+            3 => NsIdent::Copyright,
+            4 => NsIdent::Character,
+            5 => NsIdent::Species,
+            6 => NsIdent::Invalid,
+            7 => NsIdent::Meta,
+            8 => NsIdent::Lore,
+            _ => NsIdent::General,
+        },
     }
 }
 
@@ -286,7 +293,7 @@ fn row_tags(
     for raw_tag in row.tag_string.split_whitespace() {
         let namespace = categories
             .get(raw_tag)
-            .map(|category| category_ident(*category))
+            .map(|category| category_ident(*category, site))
             .unwrap_or(NsIdent::General);
         push(raw_tag.to_string(), namespace);
     }
@@ -420,8 +427,22 @@ fn process_batch(
 
     for row in batch {
         let Some(file) = found.get(&("MD5".to_string(), row.md5.clone())) else {
-            // Never downloaded: count it, but do not invent a file record.
+            // Not downloaded yet: create a job so the downloader can fetch it.
             stats.unmatched += 1;
+            let job_url = format!("https://{}/posts.json?search[id]={}", site.host(), row.id);
+            let job = shared_types::PluginJob {
+                time: 0,
+                reptime: 0,
+                priority: shared_types::DEFAULT_PRIORITY,
+                site: site.to_string(),
+                param: vec![shared_types::ScraperParam::Url(shared_types::Url {
+                    url: job_url,
+                    ..Default::default()
+                })],
+                user_data: std::collections::BTreeMap::new(),
+                recreation: None,
+            };
+            client::jobs_add_single(job)?;
             continue;
         };
         let Some(file_id) = file.id else {
@@ -508,7 +529,7 @@ mod tests {
         // Categorised via tags.csv; unknown tags fall back to General.
         assert!(names.contains(&("dragon".into(), "E6AI_Species".into())));
         assert!(names.contains(&("krystal".into(), "E6AI_Character".into())));
-        assert!(names.contains(&("someartist".into(), "E6AI_Artist".into())));
+        assert!(names.contains(&("someartist".into(), "E6AI_Director".into())));
         assert!(names.contains(&("anthro".into(), "E6AI_General".into())));
         // The repeated "dragon" is de-duplicated (live parser dedupes too).
         assert_eq!(names.iter().filter(|(name, _)| name == "dragon").count(), 1);
@@ -577,16 +598,25 @@ mod tests {
 
     #[test]
     fn category_ident_matches_danbooru_categories() {
-        assert!(matches!(category_ident(0), NsIdent::General));
-        assert!(matches!(category_ident(1), NsIdent::Artist));
-        assert!(matches!(category_ident(3), NsIdent::Copyright));
-        assert!(matches!(category_ident(4), NsIdent::Character));
-        assert!(matches!(category_ident(5), NsIdent::Species));
-        assert!(matches!(category_ident(6), NsIdent::Invalid));
-        assert!(matches!(category_ident(7), NsIdent::Meta));
-        assert!(matches!(category_ident(8), NsIdent::Lore));
-        assert!(matches!(category_ident(2), NsIdent::General));
-        assert!(matches!(category_ident(99), NsIdent::General));
+        let e6 = &Site::E6;
+        assert!(matches!(category_ident(0, e6), NsIdent::General));
+        assert!(matches!(category_ident(1, e6), NsIdent::Artist));
+        assert!(matches!(category_ident(3, e6), NsIdent::Copyright));
+        assert!(matches!(category_ident(4, e6), NsIdent::Character));
+        assert!(matches!(category_ident(5, e6), NsIdent::Species));
+        assert!(matches!(category_ident(6, e6), NsIdent::Invalid));
+        assert!(matches!(category_ident(7, e6), NsIdent::Meta));
+        assert!(matches!(category_ident(8, e6), NsIdent::Lore));
+        assert!(matches!(category_ident(2, e6), NsIdent::General));
+        assert!(matches!(category_ident(99, e6), NsIdent::General));
+    }
+
+    #[test]
+    fn category_ident_director_for_ai_sites() {
+        let e6ai = &Site::E6AI;
+        assert!(matches!(category_ident(1, e6ai), NsIdent::Director));
+        let blep = &Site::Blep;
+        assert!(matches!(category_ident(1, blep), NsIdent::Director));
     }
 
     #[test]

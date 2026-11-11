@@ -54,11 +54,14 @@ impl TursoDatabase {
         setting_name: &String,
     ) -> Option<DbSettingsObj> {
         let setting_guard = self.setting_cache.read().await;
-        setting_guard.get(setting_name).cloned()
+        // Use uppercase for case-insensitive lookup
+        let normalized_name = setting_name.to_uppercase();
+        setting_guard.get(&normalized_name).cloned()
     }
     pub(in crate::db::turso) async fn setting_set_cache(&self, setting: &DbSettingsObj) {
         let mut setting_guard = self.setting_cache.write().await;
-        setting_guard.insert(setting.name.clone(), setting.clone());
+        // Store under uppercase key for case-insensitive lookup
+        setting_guard.insert(setting.name.to_uppercase(), setting.clone());
     }
 
     /// Gets a namespace string by id

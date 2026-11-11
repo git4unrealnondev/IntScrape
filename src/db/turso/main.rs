@@ -40,7 +40,7 @@ impl TursoDatabase {
 
         let mut rows = conn
             .query(
-                "SELECT name, description, num, param FROM Settings WHERE name = ?1;",
+                "SELECT name, description, num, param FROM Settings WHERE name = ?1 COLLATE NOCASE;",
                 (name,),
             )
             .await?;
