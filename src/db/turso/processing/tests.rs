@@ -2951,3 +2951,68 @@ async fn duplicate_file_entries_in_one_chunk_keep_all_tags() {
 
     db.shutdown().await;
 }
+
+/// A plugin that hands over a lowercase SHA512 must still resolve: the file
+/// cache is keyed by canonicalized (uppercase) digests, so a raw-string
+/// comparison silently dropped such a file's tags.
+#[tokio::test]
+async fn lowercase_sha512_entry_still_attaches_tags() {
+    let db = new_test_db().await;
+    let sha512 = format!("{:0128X}", 0xC);
+    let sha512_lower = sha512.to_lowercase();
+
+    // Seed the file with the canonical (uppercase) digest, as every local
+    // write path does.
+    let mut seed = HashMap::new();
+    seed.insert(
+        regression_manager(&sha512, None),
+        vec![regression_add_action(vec![regression_tag("canonical")])],
+    );
+    assert!(
+        db.clone()
+            .process_scraper(seed, Vec::new(), "regression".to_string())
+            .await
+    );
+
+    // A later chunk carries the same file with a lowercase digest.
+    let mut map = HashMap::new();
+    map.insert(
+        regression_manager(&sha512_lower, None),
+        vec![regression_add_action(vec![regression_tag("lowercase-hit")])],
+    );
+    assert!(
+        db.clone()
+            .process_scraper(map, Vec::new(), "regression".to_string())
+            .await
+    );
+
+    let file_id = {
+        let conn = db.connect().expect("connect");
+        let mut rows = conn
+            .query(
+                "SELECT file_id FROM FileHashes WHERE algorithm = 'SHA512' AND digest = ?1;",
+                (sha512.as_str(),),
+            )
+            .await
+            .expect("file lookup");
+        let id = rows
+            .next()
+            .await
+            .expect("row")
+            .expect("file row")
+            .get::<u64>(0)
+            .expect("file id");
+        id
+    };
+
+    let mut expected = HashSet::new();
+    expected.insert(regression_tag_id(&db, "canonical").await);
+    expected.insert(regression_tag_id(&db, "lowercase-hit").await);
+    assert_eq!(
+        regression_file_tag_ids(&db, file_id).await,
+        expected,
+        "lowercase digest must resolve to the same file and keep its tags"
+    );
+
+    db.shutdown().await;
+}

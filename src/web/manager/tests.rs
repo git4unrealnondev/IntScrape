@@ -389,7 +389,7 @@ fn flush_buffer_merges_tag_lists_instead_of_overwriting() {
         identifying_hashes: vec![],
     };
 
-    let mut action = |tag: &str| FileTagAction {
+    let action = |tag: &str| FileTagAction {
         operation: TagOperation::Add,
         tags: vec![PluginTag {
             tag: Tag::new(

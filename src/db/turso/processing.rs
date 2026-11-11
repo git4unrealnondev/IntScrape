@@ -208,10 +208,15 @@ impl TursoDatabase {
     /// and mislink their tags. A hash-less entry without an id cannot be
     /// resolved and its tags are dropped (same as a cache miss).
     fn resolve_file_id(internal: &FileInternal, file_cache: &HashMap<String, u64>) -> Option<u64> {
-        if internal.hash.is_empty() {
+        // The cache is keyed by canonical (uppercase) digests — see
+        // `file_add_bulk`. Compare the same way so a plugin-supplied
+        // lowercase digest still resolves instead of silently dropping the
+        // file's tags.
+        let hash = crate::db::canonical_digest("SHA512", &internal.hash);
+        if hash.is_empty() {
             internal.id
         } else {
-            file_cache.get(&internal.hash).copied()
+            file_cache.get(&hash).copied()
         }
     }
 
