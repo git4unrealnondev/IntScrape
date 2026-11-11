@@ -481,7 +481,6 @@ fn flush_buffer_tolerates_empty_tag_lists() {
 // ---------------------------------------------------------------------------
 
 use crate::db::{SourceUrlFileStatus, hashes_supported_to_key};
-use std::path::Path;
 
 struct DedupFixture {
     scraper: std::sync::Arc<Scraper>,
@@ -752,4 +751,444 @@ async fn file_without_source_is_dropped_cleanly() {
         ret.is_none(),
         "sourceless file must not produce a FileReturn"
     );
+}
+
+// ---------------------------------------------------------------------------
+// PageState / commit_file_return / prefetch_page_dedup: the pieces the
+// scraper loop is now composed of, each pinned end-to-end against a real
+// test database.
+// ---------------------------------------------------------------------------
+
+use crate::db::turso::TursoDatabase as ManagerTestDb;
+use std::sync::atomic::AtomicBool as TestAtomicBool;
+
+async fn page_test_db() -> (std::sync::Arc<ManagerTestDb>, tempfile::TempDir) {
+    let temp = tempfile::tempdir().unwrap();
+    let should_exit = Arc::new(TestAtomicBool::new(false));
+    let db = ManagerTestDb::new_with_exit(&temp.path().join("test.db"), should_exit).await;
+    (db, temp)
+}
+
+fn page_tag(name: &str, ns: &str) -> shared_types::PluginTag {
+    shared_types::PluginTag {
+        tag: shared_types::Tag::new(
+            name.to_string(),
+            shared_types::GenericNamespaceObj {
+                name: ns.to_string(),
+                description: None,
+            },
+        ),
+        tag_type: shared_types::TagType::Normal,
+        relates_to: None,
+    }
+}
+
+fn page_add_action(tags: Vec<shared_types::PluginTag>) -> FileTagAction {
+    FileTagAction {
+        operation: TagOperation::Add,
+        tags,
+    }
+}
+
+fn page_manager(hash: &str, id: Option<u64>) -> FileManager {
+    FileManager {
+        internal: FileInternal {
+            id,
+            hash: hash.to_string(),
+            extension: "jpg".to_string(),
+            storage_id: 0,
+            size_bytes: Some(1024),
+        },
+        identifying_hashes: vec![],
+    }
+}
+
+async fn page_file_id(db: &ManagerTestDb, digest: &str) -> u64 {
+    let conn = db.connect().expect("connect");
+    let mut rows = conn
+        .query(
+            "SELECT file_id FROM FileHashes WHERE algorithm = 'SHA512' AND digest = ?1;",
+            (digest,),
+        )
+        .await
+        .expect("file lookup");
+    rows.next()
+        .await
+        .expect("row")
+        .expect("file row")
+        .get::<u64>(0)
+        .expect("file id")
+}
+
+async fn page_file_tag_ids(db: &ManagerTestDb, file_id: u64) -> HashSet<u64> {
+    db.ipc_relationship_get_tag_id(&file_id).await
+}
+
+async fn page_tag_id(db: &ManagerTestDb, name: &str) -> u64 {
+    let conn = db.connect().expect("connect");
+    let mut rows = conn
+        .query("SELECT id FROM Tags WHERE name = ?1;", (name,))
+        .await
+        .expect("tag lookup");
+    rows.next()
+        .await
+        .expect("row")
+        .expect("tag row")
+        .get::<u64>(0)
+        .expect("tag id")
+}
+
+fn page_keep_flag() -> Arc<TestAtomicBool> {
+    Arc::new(TestAtomicBool::new(true))
+}
+
+/// The page-end tail flush must commit everything still buffered — this is
+/// the invariant that keeps buffered files' tags alive on every loop exit
+/// path (breaks included), since the tail flush sits after the loop.
+#[tokio::test]
+async fn page_state_tail_flush_commits_buffered_files_and_tags() {
+    let (db, _temp) = page_test_db().await;
+    let state = PageState::new();
+    let keep = page_keep_flag();
+
+    let hash_a = format!("{:0128X}", 0x21);
+    // Two landings for the same file merge into one buffered entry.
+    let mut first = vec![page_add_action(vec![page_tag("landing-1", "regression")])];
+    state.buffer_file(page_manager(&hash_a, None), &mut first).await;
+    let mut second = vec![page_add_action(vec![page_tag("landing-2", "regression")])];
+    state.buffer_file(page_manager(&hash_a, None), &mut second).await;
+    // A different file lands alongside.
+    let hash_b = format!("{:0128X}", 0x22);
+    let mut other = vec![page_add_action(vec![page_tag("other", "regression")])];
+    state.buffer_file(page_manager(&hash_b, None), &mut other).await;
+
+    let ok = state
+        .flush_files(db.clone(), "test", 1, &keep, "tail flush failed")
+        .await;
+    assert!(ok, "tail flush must succeed");
+    assert_eq!(state.buffered_file_count().await, 0, "buffer must be empty after tail flush");
+
+    let file_id = page_file_id(&db, &hash_a).await;
+    let mut expected = HashSet::new();
+    expected.insert(page_tag_id(&db, "landing-1").await);
+    expected.insert(page_tag_id(&db, "landing-2").await);
+    assert_eq!(
+        page_file_tag_ids(&db, file_id).await,
+        expected,
+        "merged landings' tags must all attach to the file"
+    );
+    assert_eq!(
+        page_file_tag_ids(&db, page_file_id(&db, &hash_b).await).await,
+        HashSet::from([page_tag_id(&db, "other").await]),
+    );
+}
+
+/// Batched flushing must stay batched: below FLUSH_BATCH_SIZE nothing is
+/// committed, at the threshold the buffer empties in one go.
+#[tokio::test]
+async fn page_state_flushes_only_at_threshold() {
+    let (db, _temp) = page_test_db().await;
+    let state = PageState::new();
+    let keep = page_keep_flag();
+
+    for i in 0..(FLUSH_BATCH_SIZE - 1) {
+        let mut tags = Vec::new();
+        state
+            .buffer_file(page_manager(&format!("{:0128X}", 0x30 + i), None), &mut tags)
+            .await;
+    }
+    // Below the threshold: nothing committed, everything still buffered.
+    let ok = state
+        .flush_files_if_full(db.clone(), "test", 1, &keep)
+        .await;
+    assert!(ok);
+    assert_eq!(
+        state.buffered_file_count().await,
+        FLUSH_BATCH_SIZE - 1,
+        "below the threshold the buffer must be untouched"
+    );
+
+    // Crossing the threshold commits the whole batch.
+    let mut tags = Vec::new();
+    state
+        .buffer_file(page_manager(&format!("{:0128X}", 0x30 + FLUSH_BATCH_SIZE), None), &mut tags)
+        .await;
+    let ok = state
+        .flush_files_if_full(db.clone(), "test", 1, &keep)
+        .await;
+    assert!(ok);
+    assert_eq!(
+        state.buffered_file_count().await,
+        0,
+        "at the threshold the buffer must commit and empty"
+    );
+
+    // The committed files really are in the db.
+    assert!(
+        page_file_id(&db, &format!("{:0128X}", 0x30)).await > 0,
+        "threshold flush must have persisted the first buffered file"
+    );
+}
+
+/// `commit_file_return`'s File arm end-to-end: a downloaded file plus its
+/// tag list must land as a file row with the tags attached after the tail
+/// flush.
+#[tokio::test]
+async fn commit_file_return_persists_downloaded_file_and_tags() {
+    let (db, _temp) = page_test_db().await;
+    let fx = dedup_fixture().await;
+    let state = PageState::new();
+    let keep = page_keep_flag();
+
+    let hash = format!("{:0128X}", 0x41);
+    let mut file = FileObject::default();
+    file.tag_list = vec![page_add_action(vec![page_tag("downloaded", "regression")])];
+
+    let ok = fx
+        .scraper
+        .commit_file_return(
+            crate::web::manager::FileReturn::File(page_manager(&hash, None)),
+            &mut file,
+            &state,
+            "test",
+            1,
+            &keep,
+        )
+        .await;
+    assert!(ok);
+
+    // Below the threshold the entry stays buffered.
+    assert_eq!(state.buffered_file_count().await, 1);
+
+    // Page-end tail flush persists it.
+    let ok = state
+        .flush_files(db.clone(), "test", 1, &keep, "tail failed")
+        .await;
+    assert!(ok);
+
+    let file_id = page_file_id(&db, &hash).await;
+    assert_eq!(
+        page_file_tag_ids(&db, file_id).await,
+        HashSet::from([page_tag_id(&db, "downloaded").await]),
+    );
+}
+
+/// `commit_file_return`'s AlreadyPresent arm end-to-end: a dedup hit's tag
+/// list must attach to the EXISTING row — the exact path that regressed
+/// when the arm used to be a no-op.
+#[tokio::test]
+async fn commit_file_return_already_present_attaches_tags_to_existing_row() {
+    let (db, _temp) = page_test_db().await;
+    let fx = dedup_fixture().await;
+    let state = PageState::new();
+    let keep = page_keep_flag();
+
+    // Walk 1: file lands as new.
+    let hash = format!("{:0128X}", 0x42);
+    let mut first = FileObject::default();
+    first.tag_list = vec![page_add_action(vec![page_tag("first-walk", "regression")])];
+    assert!(
+        fx.scraper
+            .commit_file_return(
+                crate::web::manager::FileReturn::File(page_manager(&hash, None)),
+                &mut first,
+                &state,
+                "test",
+                1,
+                &keep,
+            )
+            .await
+    );
+    assert!(
+        state
+            .flush_files(db.clone(), "test", 1, &keep, "tail failed")
+            .await
+    );
+    let file_id = page_file_id(&db, &hash).await;
+
+    // Walk 2: dedup hit returns the existing row with fresh tags.
+    let mut second = FileObject::default();
+    second.tag_list = vec![page_add_action(vec![page_tag("rewalk", "regression")])];
+    assert!(
+        fx.scraper
+            .commit_file_return(
+                crate::web::manager::FileReturn::AlreadyPresent(FileInternal {
+                    id: Some(file_id),
+                    hash: hash.clone(),
+                    extension: "jpg".to_string(),
+                    storage_id: 0,
+                    size_bytes: Some(1024),
+                }),
+                &mut second,
+                &state,
+                "test",
+                1,
+                &keep,
+            )
+            .await
+    );
+    assert!(
+        state
+            .flush_files(db.clone(), "test", 1, &keep, "tail failed")
+            .await
+    );
+
+    let mut expected = HashSet::new();
+    expected.insert(page_tag_id(&db, "first-walk").await);
+    expected.insert(page_tag_id(&db, "rewalk").await);
+    assert_eq!(
+        page_file_tag_ids(&db, file_id).await,
+        expected,
+        "dedup hit's tags must attach to the existing row"
+    );
+    // Exactly one file row for the digest.
+    let conn = db.connect().expect("connect");
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM File WHERE id = ?1;",
+            (file_id as i64,),
+        )
+        .await
+        .expect("count");
+    assert_eq!(
+        rows.next().await.expect("row").expect("count").get::<i64>(0).expect("count"),
+        1,
+        "dedup hit must not create a duplicate row"
+    );
+}
+
+/// The InDownloadQueue arm must buffer nothing — the transferring task owns
+/// this file's persistence.
+#[tokio::test]
+async fn commit_file_return_in_download_queue_buffers_nothing() {
+    let (_db, _temp) = page_test_db().await;
+    let fx = dedup_fixture().await;
+    let state = PageState::new();
+    let keep = page_keep_flag();
+
+    let mut file = FileObject::default();
+    file.tag_list = vec![page_add_action(vec![page_tag("dropped", "regression")])];
+
+    let ok = fx
+        .scraper
+        .commit_file_return(
+            crate::web::manager::FileReturn::InDownloadQueue,
+            &mut file,
+            &state,
+            "test",
+            1,
+            &keep,
+        )
+        .await;
+    assert!(ok);
+    assert_eq!(
+        state.buffered_file_count().await,
+        0,
+        "InDownloadQueue must buffer nothing"
+    );
+    // The tag list is left untouched on the file (consumed by nobody).
+    assert_eq!(file.tag_list.len(), 1);
+}
+
+/// The job/tag accumulators must drain to the db exactly when they cross
+/// ACCUMULATOR_DRAIN_SIZE, and the drained content must actually persist.
+#[tokio::test]
+async fn page_state_drains_tag_accumulator_at_threshold() {
+    let (db, _temp) = page_test_db().await;
+    let state = PageState::new();
+    let keep = page_keep_flag();
+
+    // One below the threshold: stays in memory.
+    let below: Vec<shared_types::PluginTag> = (0..ACCUMULATOR_DRAIN_SIZE - 1)
+        .map(|i| page_tag(&format!("drain-{i}"), "regression"))
+        .collect();
+    state
+        .push_tags(db.clone(), below, "test", 1, &keep)
+        .await;
+    let (jobs, tags) = state.counts().await;
+    assert_eq!(tags, ACCUMULATOR_DRAIN_SIZE - 1, "below threshold nothing drains");
+    assert_eq!(jobs, 0);
+
+    // Crossing the threshold drains, and the drained tags persist.
+    state
+        .push_tags(db.clone(), vec![page_tag("drain-final", "regression")], "test", 1, &keep)
+        .await;
+    let (_, tags) = state.counts().await;
+    assert_eq!(tags, 0, "crossing the threshold must drain the accumulator");
+    assert!(
+        page_tag_id(&db, "drain-0").await > 0,
+        "drained tags must be persisted"
+    );
+    assert!(page_tag_id(&db, "drain-final").await > 0);
+}
+
+/// `prefetch_page_dedup` must resolve all three maps in one pass: source-URL
+/// status, known identifying hashes, and skip-if tag owners.
+#[tokio::test]
+async fn prefetch_page_dedup_resolves_all_three_maps() {
+    let (_db, _temp) = page_test_db().await;
+    let fx = dedup_fixture().await;
+
+    // Seed: a file whose tags include its source_url tag (as the manager
+    // adds it) and an artist tag a skip_if rule can target.
+    let hash = format!("{:0128X}", 0x50);
+    let url = "https://test.site/seed/1.jpg";
+    let mut seed = HashMap::new();
+    seed.insert(
+        page_manager(&hash, None),
+        vec![page_add_action(vec![
+            page_tag(url, "source_url"),
+            page_tag("skipme", "artist"),
+        ])],
+    );
+    let fx_db = fx.scraper.download_manager.db.clone();
+    assert!(
+        fx_db
+            .clone()
+            .process_scraper(seed, Vec::new(), "prefetch-seed".to_string())
+            .await
+    );
+    let seeded_id = page_file_id(&fx_db, &hash).await;
+
+    let mut probe = FileObject::default();
+    probe.source = Some(FileSource::Url(url.to_string()));
+    probe.hash = vec![shared_types::HashesSupported::Sha512(hash.clone())];
+    probe.skip_if = vec![shared_types::SkipIf::FileTagRelationship(
+        shared_types::Tag::new(
+            "skipme".to_string(),
+            shared_types::GenericNamespaceObj {
+                name: "artist".to_string(),
+                description: None,
+            },
+        ),
+    )];
+
+    let files = HashSet::from([probe]);
+    let dedup = fx.scraper.prefetch_page_dedup(&files).await.expect("prefetch");
+
+    let source_status = dedup
+        .source_files
+        .get(url)
+        .expect("source url must resolve");
+    assert!(!source_status.dead);
+    assert_eq!(
+        source_status.file.as_ref().expect("file").id,
+        Some(seeded_id),
+        "source url must resolve to the seeded file"
+    );
+
+    let key = crate::db::hashes_supported_to_key(&shared_types::HashesSupported::Sha512(
+        hash.clone(),
+    ));
+    assert_eq!(
+        dedup.hash_files.get(&key).expect("hash must resolve").id,
+        Some(seeded_id),
+        "identifying hash must resolve to the seeded file"
+    );
+
+    let skip = dedup
+        .skip_files
+        .get(&("artist".to_string(), "skipme".to_string()))
+        .expect("skip tag must resolve");
+    assert_eq!(skip.id, Some(seeded_id), "skip tag must resolve to its owner");
 }

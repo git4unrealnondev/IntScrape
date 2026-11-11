@@ -36,7 +36,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use shared_types::{
-        FileInternal, FileManager, FileTagAction, GenericNamespaceObj, HashesSupported, PluginJob,
+        FileInternal, FileManager, FileTagAction, GenericNamespaceObj, PluginJob,
         ScraperDataReturn, ScraperParam, Tag, TagOperation, TagParents, TagType, Url,
     };
     use turso::{Builder, Connection, Value};

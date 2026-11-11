@@ -3080,8 +3080,14 @@ async fn concurrent_chunks_racing_same_novel_file_keep_one_row() {
     let db_a = db.clone();
     let db_b = db.clone();
     let (ok_a, ok_b) = tokio::join!(
-        async move { db_a.process_scraper(chunk_a, Vec::new(), "race-a".to_string()).await },
-        async move { db_b.process_scraper(chunk_b, Vec::new(), "race-b".to_string()).await },
+        async move {
+            db_a.process_scraper(chunk_a, Vec::new(), "race-a".to_string())
+                .await
+        },
+        async move {
+            db_b.process_scraper(chunk_b, Vec::new(), "race-b".to_string())
+                .await
+        },
     );
     assert!(ok_a && ok_b, "both concurrent chunks must succeed");
 
