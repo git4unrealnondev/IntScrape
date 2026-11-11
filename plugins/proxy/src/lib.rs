@@ -472,12 +472,17 @@ pub unsafe extern "C" fn proxy_get_proxy(req: *const u8, req_len: usize) -> shar
     }));
     match result {
         Ok(value) => shared_types::plugin_ffi::encode(&value),
-        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<String, shared_types::CallbackCustomDataReturning>::new()),
+        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<
+            String,
+            shared_types::CallbackCustomDataReturning,
+        >::new()),
     }
 }
 
 #[unsafe(no_mangle)]
-fn proxy_get_proxy_impl(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
+fn proxy_get_proxy_impl(
+    callback: &CallbackInfoInput,
+) -> HashMap<String, CallbackCustomDataReturning> {
     let site = input_string(callback, "site");
     let mut map = HashMap::new();
 
@@ -529,12 +534,17 @@ pub unsafe extern "C" fn proxy_get_state(req: *const u8, req_len: usize) -> shar
     }));
     match result {
         Ok(value) => shared_types::plugin_ffi::encode(&value),
-        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<String, shared_types::CallbackCustomDataReturning>::new()),
+        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<
+            String,
+            shared_types::CallbackCustomDataReturning,
+        >::new()),
     }
 }
 
 #[unsafe(no_mangle)]
-fn proxy_get_state_impl(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
+fn proxy_get_state_impl(
+    callback: &CallbackInfoInput,
+) -> HashMap<String, CallbackCustomDataReturning> {
     let site = input_string(callback, "site");
     let mut map = HashMap::new();
 
@@ -584,12 +594,17 @@ pub unsafe extern "C" fn proxy_set_list(req: *const u8, req_len: usize) -> share
     }));
     match result {
         Ok(value) => shared_types::plugin_ffi::encode(&value),
-        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<String, shared_types::CallbackCustomDataReturning>::new()),
+        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<
+            String,
+            shared_types::CallbackCustomDataReturning,
+        >::new()),
     }
 }
 
 #[unsafe(no_mangle)]
-fn proxy_set_list_impl(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
+fn proxy_set_list_impl(
+    callback: &CallbackInfoInput,
+) -> HashMap<String, CallbackCustomDataReturning> {
     let raw = input_string(callback, "list");
     let preserve = input_u64(callback, "preserve_ratings", 1) == 1;
 
@@ -649,7 +664,10 @@ pub unsafe extern "C" fn proxy_remove(req: *const u8, req_len: usize) -> shared_
     }));
     match result {
         Ok(value) => shared_types::plugin_ffi::encode(&value),
-        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<String, shared_types::CallbackCustomDataReturning>::new()),
+        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<
+            String,
+            shared_types::CallbackCustomDataReturning,
+        >::new()),
     }
 }
 
@@ -697,12 +715,17 @@ pub unsafe extern "C" fn proxy_set_sites(req: *const u8, req_len: usize) -> shar
     }));
     match result {
         Ok(value) => shared_types::plugin_ffi::encode(&value),
-        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<String, shared_types::CallbackCustomDataReturning>::new()),
+        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<
+            String,
+            shared_types::CallbackCustomDataReturning,
+        >::new()),
     }
 }
 
 #[unsafe(no_mangle)]
-fn proxy_set_sites_impl(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
+fn proxy_set_sites_impl(
+    callback: &CallbackInfoInput,
+) -> HashMap<String, CallbackCustomDataReturning> {
     let raw = input_string(callback, "sites");
     let mut map = HashMap::new();
 
@@ -749,7 +772,10 @@ pub unsafe extern "C" fn proxy_test(req: *const u8, req_len: usize) -> shared_ty
     }));
     match result {
         Ok(value) => shared_types::plugin_ffi::encode(&value),
-        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<String, shared_types::CallbackCustomDataReturning>::new()),
+        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<
+            String,
+            shared_types::CallbackCustomDataReturning,
+        >::new()),
     }
 }
 
@@ -835,12 +861,17 @@ pub unsafe extern "C" fn proxy_request(req: *const u8, req_len: usize) -> shared
     }));
     match result {
         Ok(value) => shared_types::plugin_ffi::encode(&value),
-        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<String, shared_types::CallbackCustomDataReturning>::new()),
+        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<
+            String,
+            shared_types::CallbackCustomDataReturning,
+        >::new()),
     }
 }
 
 #[unsafe(no_mangle)]
-fn proxy_request_impl(callback: &CallbackInfoInput) -> HashMap<String, CallbackCustomDataReturning> {
+fn proxy_request_impl(
+    callback: &CallbackInfoInput,
+) -> HashMap<String, CallbackCustomDataReturning> {
     let url = input_string(callback, "url");
     let site = input_string(callback, "site");
     let timeout_ms = input_u64(callback, "timeout_ms", DEFAULT_TIMEOUT_MS);
@@ -938,7 +969,10 @@ pub unsafe extern "C" fn proxy_report(req: *const u8, req_len: usize) -> shared_
     }));
     match result {
         Ok(value) => shared_types::plugin_ffi::encode(&value),
-        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<String, shared_types::CallbackCustomDataReturning>::new()),
+        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<
+            String,
+            shared_types::CallbackCustomDataReturning,
+        >::new()),
     }
 }
 

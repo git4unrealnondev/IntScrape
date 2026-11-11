@@ -1,10 +1,10 @@
 use std::{collections::HashSet, fmt};
 
 use shared_types::{
-    DEFAULT_PRIORITY, DownloadModifiers, FileObject, FileSource, FileTagAction, GenericNamespaceObj,
-    GlobalCallbacks, HashesSupported, LoginNeed, LoginType, ModifierTarget, PluginJob, PluginProperties,
-    PluginTag, RelationContext, ScraperDataReturn, ScraperParam, ScraperReturn, SkipIf,
-    StartupThreadType, TargetModifier, Tag,
+    DEFAULT_PRIORITY, DownloadModifiers, FileObject, FileSource, FileTagAction,
+    GenericNamespaceObj, GlobalCallbacks, HashesSupported, LoginNeed, LoginType, ModifierTarget,
+    PluginJob, PluginProperties, PluginTag, RelationContext, ScraperDataReturn, ScraperParam,
+    ScraperReturn, SkipIf, StartupThreadType, Tag, TargetModifier,
 };
 
 mod csv_import;
@@ -849,16 +849,10 @@ mod tests {
             assert!(matches!(Site::from_job_site(alias), Site::E6), "{alias}");
         }
         for alias in ["e6ai", "E6AI", "e6ai.com", "unknown"] {
-            assert!(
-                matches!(Site::from_job_site(alias), Site::E6AI),
-                "{alias}"
-            );
+            assert!(matches!(Site::from_job_site(alias), Site::E6AI), "{alias}");
         }
         for alias in ["blep", "Blep", "blep.art", "BLEP.ART"] {
-            assert!(
-                matches!(Site::from_job_site(alias), Site::Blep),
-                "{alias}"
-            );
+            assert!(matches!(Site::from_job_site(alias), Site::Blep), "{alias}");
         }
         assert_eq!(Site::E6.host(), "e621.net");
         assert_eq!(Site::E6AI.host(), "e6ai.net");
@@ -884,10 +878,7 @@ mod tests {
             build_url(&params, None, &Site::E6AI).as_deref(),
             Some("https://e6ai.net/posts.json?tags=anthro")
         );
-        assert_eq!(
-            nsobjplg(&NsIdent::PostId, &Site::Blep).name,
-            "Blep_Id"
-        );
+        assert_eq!(nsobjplg(&NsIdent::PostId, &Site::Blep).name, "Blep_Id");
         assert_eq!(
             nsobjplg(&NsIdent::General, &Site::Blep).name,
             "Blep_General"

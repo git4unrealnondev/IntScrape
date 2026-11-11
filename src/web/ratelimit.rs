@@ -37,8 +37,8 @@ impl RatelimitManager {
     /// Creates a new ratelimiter with user input
     pub fn new(regen_tokens: u32, time_per_regen: Duration) -> Self {
         // `NonZeroU32::MIN` is 1 by construction, so this never panics.
-        let hits_nonzero = std::num::NonZeroU32::new(regen_tokens)
-            .unwrap_or(std::num::NonZeroU32::MIN);
+        let hits_nonzero =
+            std::num::NonZeroU32::new(regen_tokens).unwrap_or(std::num::NonZeroU32::MIN);
 
         let cell_replenish_interval = time_per_regen / hits_nonzero.get();
 
@@ -46,7 +46,10 @@ impl RatelimitManager {
         // e.g. a plugin configuring `0` tokens per period. Fall back to a
         // sane 1-second period instead of panicking.
         let quota = Quota::with_period(cell_replenish_interval)
-            .unwrap_or_else(|| Quota::with_period(Duration::from_secs(1)).expect("1 second period is a valid quota period"))
+            .unwrap_or_else(|| {
+                Quota::with_period(Duration::from_secs(1))
+                    .expect("1 second period is a valid quota period")
+            })
             .allow_burst(hits_nonzero);
 
         Self {
@@ -62,7 +65,10 @@ impl RatelimitManager {
 
         // 1. Insert into the priority queue in sorted order using partition_point
         {
-            let mut queue = self.priority_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let mut queue = self
+                .priority_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let item = (priority, numberinsert);
 
             // Sort order: Higher priority first (descending), then smaller numberinsert first (FIFO ties)
@@ -106,7 +112,10 @@ impl RatelimitManager {
         // 2. Wait until we are at the head of the queue and acquire a rate-limit token
         loop {
             let is_head = {
-                let queue = self.priority_queue.lock().unwrap_or_else(|e| e.into_inner());
+                let queue = self
+                    .priority_queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 queue.first().is_some_and(|item| item.1 == numberinsert)
             };
 

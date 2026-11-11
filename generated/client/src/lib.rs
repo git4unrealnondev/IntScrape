@@ -288,9 +288,7 @@ pub async fn send_preserialize(
     conn: &mut BufReader<LocalSocketStream>,
 ) -> std::io::Result<()> {
     // As in `send`: no full-payload copy into a frame buffer.
-    conn.get_mut()
-        .write_all(&inp.len().to_ne_bytes())
-        .await?;
+    conn.get_mut().write_all(&inp.len().to_ne_bytes()).await?;
     conn.get_mut().write_all(inp).await
 }
 

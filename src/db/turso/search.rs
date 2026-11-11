@@ -203,10 +203,7 @@ impl TursoDatabase {
         limit: &Option<u64>,
         offset: &Option<u64>,
     ) -> Result<Vec<u64>> {
-        let sql = match self
-            .build_search_sql(conn, search, limit, offset)
-            .await?
-        {
+        let sql = match self.build_search_sql(conn, search, limit, offset).await? {
             Some(sql) => sql,
             None => return Ok(Vec::new()),
         };
@@ -275,7 +272,8 @@ impl TursoDatabase {
         limit: &Option<u64>,
         offset: &Option<u64>,
     ) -> Result<Option<String>> {
-        let Some((mut sql, _, conditions, order_by)) = self.build_search_parts(conn, search).await?
+        let Some((mut sql, _, conditions, order_by)) =
+            self.build_search_parts(conn, search).await?
         else {
             return Ok(None);
         };
@@ -460,7 +458,11 @@ impl TursoDatabase {
     ///
     /// No outer wrapper is needed: limbo rejects a parenthesized compound as
     /// a compound operand, and this statement is a single `SELECT`.
-    fn append_order_limit_offset(order_by: &str, limit: &Option<u64>, offset: &Option<u64>) -> String {
+    fn append_order_limit_offset(
+        order_by: &str,
+        limit: &Option<u64>,
+        offset: &Option<u64>,
+    ) -> String {
         let mut out = String::new();
         out.push_str(&format!(" ORDER BY {order_by} DESC"));
         if let Some(limit) = limit {
@@ -570,7 +572,6 @@ fn holder_ids(search_holder: &SearchHolder) -> &[u64] {
         SearchHolder::Not(ids) => ids,
     }
 }
-
 
 #[cfg(test)]
 mod tests;

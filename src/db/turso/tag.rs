@@ -422,6 +422,5 @@ impl TursoDatabase {
     }
 }
 
-
 #[cfg(test)]
 mod tests;

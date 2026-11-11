@@ -398,9 +398,9 @@ fn on_start_impl() {
 pub unsafe extern "C" fn on_regex(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         type OnRegexInput = (String, String, shared_types::Tag, u64);
-        let Some((matched, full_tag, tag_source, tag_source_id)) = (unsafe {
-            shared_types::plugin_ffi::decode::<OnRegexInput>(req, req_len)
-        }) else {
+        let Some((matched, full_tag, tag_source, tag_source_id)) =
+            (unsafe { shared_types::plugin_ffi::decode::<OnRegexInput>(req, req_len) })
+        else {
             return shared_types::CallbackReturn::default();
         };
         on_regex_impl(&matched, &full_tag, &tag_source, tag_source_id)
@@ -559,7 +559,11 @@ pub unsafe extern "C" fn parser_call(req: *const u8, req_len: usize) -> shared_t
 
 #[unsafe(no_mangle)]
 #[allow(clippy::type_complexity)]
-pub fn parser_call_impl(_text: &str, source_url: &str, data: &ScraperDataReturn) -> Vec<ScraperReturn> {
+pub fn parser_call_impl(
+    _text: &str,
+    source_url: &str,
+    data: &ScraperDataReturn,
+) -> Vec<ScraperReturn> {
     let Some(url) = public_url(&data.job.param) else {
         return vec![ScraperReturn::Nothing];
     };

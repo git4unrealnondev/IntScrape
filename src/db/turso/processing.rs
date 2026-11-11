@@ -6,8 +6,7 @@ use std::time::Duration;
 
 use shared_types::helpers::collect_namespaces;
 use shared_types::{
-    FileInternal, FileManager, FileTagAction, ScraperDataReturn, Tag,
-    TagOperation,
+    FileInternal, FileManager, FileTagAction, ScraperDataReturn, Tag, TagOperation,
 };
 use turso::{Result, Value, params_from_iter};
 
@@ -451,12 +450,14 @@ impl TursoDatabase {
                 if let Some(current_tag_ids) = current_file_relationships.get(&file_id) {
                     for &tag_id in current_tag_ids {
                         if let Some(ns_name) = tag_id_to_ns_name.get(&tag_id)
-                            && ns_name != "source_url" && !ns_name.is_empty() {
-                                current_ns_tags
-                                    .entry(ns_name.as_str())
-                                    .or_default()
-                                    .insert(tag_id);
-                            }
+                            && ns_name != "source_url"
+                            && !ns_name.is_empty()
+                        {
+                            current_ns_tags
+                                .entry(ns_name.as_str())
+                                .or_default()
+                                .insert(tag_id);
+                        }
                     }
                 }
 

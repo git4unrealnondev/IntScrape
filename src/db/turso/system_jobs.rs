@@ -7,12 +7,12 @@ use walkdir::WalkDir;
 
 use bytes::Bytes;
 use rayon::prelude::*;
-use turso::Connection;
 use shared_types::{
     DEFAULT_PRIORITY, DbJobRecreation, DbJobsObj, FileInternal, HashesSupported, PluginJob,
     ScraperParam, Url,
 };
 use strum::IntoEnumIterator;
+use turso::Connection;
 
 use crate::backup_path::dated_backup_destination;
 use crate::db::{
@@ -163,26 +163,24 @@ impl TursoDatabase {
         };
 
         match mode.as_str() {
-            SYSTEM_STORAGE_CHECK_REDOWNLOAD_MODE => {
-                match self.redownload_missing_files().await {
-                    Ok(summary) => {
-                        log::info!(
-                            "Redownload system job {} queued {} recovery job(s): {} missing file(s), \
+            SYSTEM_STORAGE_CHECK_REDOWNLOAD_MODE => match self.redownload_missing_files().await {
+                Ok(summary) => {
+                    log::info!(
+                        "Redownload system job {} queued {} recovery job(s): {} missing file(s), \
                              {} without a source URL, {} with no plugin for their URL",
-                            job.id,
-                            summary.queued_jobs,
-                            summary.missing_files,
-                            summary.no_source_url,
-                            summary.no_plugin,
-                        );
-                        true
-                    }
-                    Err(error) => {
-                        log::error!("Redownload system job {} failed: {error}", job.id);
-                        false
-                    }
+                        job.id,
+                        summary.queued_jobs,
+                        summary.missing_files,
+                        summary.no_source_url,
+                        summary.no_plugin,
+                    );
+                    true
                 }
-            }
+                Err(error) => {
+                    log::error!("Redownload system job {} failed: {error}", job.id);
+                    false
+                }
+            },
             SYSTEM_STORAGE_CHECK_FILENAME_MODE => self.run_cleanup_job(job, true).await,
             "" => self.run_cleanup_job(job, false).await,
             other => {
@@ -340,10 +338,7 @@ impl TursoDatabase {
                     computed.push((path, hash));
                 }
                 Err(error) => {
-                    log::error!(
-                        "Storage check could not hash {}: {error}",
-                        path.display()
-                    );
+                    log::error!("Storage check could not hash {}: {error}", path.display());
                     summary.failures += 1;
                 }
             }
@@ -933,7 +928,6 @@ pub fn is_system_job(job: &DbJobsObj) -> bool {
         Some(DbJobRecreation::AlwaysTime(_, _))
     ) && job.config.site.starts_with("SYSTEM_")
 }
-
 
 #[cfg(test)]
 mod tests;

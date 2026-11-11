@@ -180,13 +180,11 @@ fn create_thumbnails_dynamic_in<R: BufRead + Seek>(
                 .thread_count(4)
                 .build()
                 .map_err(|error| {
-                    ThumbError::IO(io::Error::other(
-                        format!(
-                            "Failed to load video at {}: {}",
-                            video_file_path.display(),
-                            error
-                        ),
-                    ))
+                    ThumbError::IO(io::Error::other(format!(
+                        "Failed to load video at {}: {}",
+                        video_file_path.display(),
+                        error
+                    )))
                 })?;
 
             let time_of_one_frame = 1.0 / decoder.frame_rate();

@@ -1163,7 +1163,8 @@ async fn slurp_source_with_double_quoted_fts_falls_back_to_sanitized_copy() {
     let db = new_target().await;
     let temp_dir = tempfile::tempdir().unwrap();
     let source_path = temp_dir.path().join("source.db");
-    let script = "CREATE TABLE Namespace (id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT);
+    let script =
+        "CREATE TABLE Namespace (id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT);
          INSERT INTO Namespace (id, name) VALUES (1, 'ns');
          CREATE TABLE Tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL, namespace INTEGER NOT NULL,
                             count INTEGER NOT NULL DEFAULT 0, UNIQUE(name, namespace));
@@ -1723,9 +1724,7 @@ async fn slurp_resume_reimports_hash_tail() {
     // not. Verify the cursor row exists and feeds the resume.
     let mut rows = conn
         .query(
-            &format!(
-                "SELECT last_file_id FROM {SLURP_CHECKPOINT_TABLE} WHERE stage = 'hashes'"
-            ),
+            &format!("SELECT last_file_id FROM {SLURP_CHECKPOINT_TABLE} WHERE stage = 'hashes'"),
             (),
         )
         .await

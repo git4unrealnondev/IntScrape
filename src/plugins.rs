@@ -192,7 +192,10 @@ impl PluginManager {
                         continue;
                     }
 
-                    info!("Found plugin candidate: {:?}", path.file_name().map(|n| n.to_string_lossy()));
+                    info!(
+                        "Found plugin candidate: {:?}",
+                        path.file_name().map(|n| n.to_string_lossy())
+                    );
 
                     unsafe {
                         let lib = match Library::new(&path) {
@@ -263,18 +266,17 @@ impl PluginManager {
         // (`CVec<u8>`, see `shared_types::plugin_ffi`) containing the
         // bitcode encoding of `Vec<Plugin>`, not a Rust `Vec` directly,
         // so the host does not depend on the `Vec`/struct layout.
-        let temp: libloading::Symbol<
-            unsafe extern "C" fn() -> shared_types::CVec<u8>,
-        > = match unsafe { lib.get(b"get_plugin_info") } {
-            Err(_) => {
-                error!(
-                    "Could not run get_plugin_info pull for lib. {}",
-                    path.to_string_lossy()
-                );
-                return None;
-            }
-            Ok(lib) => lib,
-        };
+        let temp: libloading::Symbol<unsafe extern "C" fn() -> shared_types::CVec<u8>> =
+            match unsafe { lib.get(b"get_plugin_info") } {
+                Err(_) => {
+                    error!(
+                        "Could not run get_plugin_info pull for lib. {}",
+                        path.to_string_lossy()
+                    );
+                    return None;
+                }
+                Ok(lib) => lib,
+            };
         unsafe { shared_types::plugin_ffi::take(temp()) }
     }
 
@@ -321,9 +323,7 @@ impl PluginManager {
 
             let request = shared_types::plugin_ffi::encode(scraperdata);
             let response = unsafe { temp(request.ptr, request.len) };
-            return Ok(
-                unsafe { shared_types::plugin_ffi::take(response) }.unwrap_or_default(),
-            );
+            return Ok(unsafe { shared_types::plugin_ffi::take(response) }.unwrap_or_default());
         }
         Err(libloading::Error::FreeLibraryUnknown)
     }
@@ -648,9 +648,11 @@ impl PluginManager {
 
                     let request = shared_types::plugin_ffi::encode(callback_info);
                     let response = unsafe { temp(request.ptr, request.len) };
-                    if let Some(return_data) =
-                        unsafe { shared_types::plugin_ffi::take::<HashMap<String, CallbackCustomDataReturning>>(response) }
-                    {
+                    if let Some(return_data) = unsafe {
+                        shared_types::plugin_ffi::take::<HashMap<String, CallbackCustomDataReturning>>(
+                            response,
+                        )
+                    } {
                         out.extend(return_data);
                     }
                 }

@@ -324,7 +324,8 @@ async fn storage_check_job_dispatch_implements_all_modes() {
     );
     // An unknown mode must report failure rather than silently pass.
     assert!(
-        !db.run_storage_check_job(&storage_check_job(Some("bogus"))).await,
+        !db.run_storage_check_job(&storage_check_job(Some("bogus")))
+            .await,
         "an unknown mode must not report success"
     );
 }
@@ -425,7 +426,9 @@ async fn storage_check_leaves_correctly_placed_file_alone() {
     let hash = "CD".repeat(64);
     let conn = db.connect().unwrap();
     let file = test_file(storage_id, &hash);
-    db.file_add_bulk(&conn, std::slice::from_ref(&file)).await.unwrap();
+    db.file_add_bulk(&conn, std::slice::from_ref(&file))
+        .await
+        .unwrap();
     let placed = write_file_on_disk(&root, &file);
 
     let summary = db
@@ -460,7 +463,10 @@ async fn storage_check_filename_mode_trusts_names_only() {
 
     assert_eq!(summary.hashed, 0, "filename mode must never hash");
     assert_eq!(summary.dumpstered, 1, "{summary:?}");
-    let dumped = temp_dir.path().join("dumpster").join(format!("{fake_hash}.png"));
+    let dumped = temp_dir
+        .path()
+        .join("dumpster")
+        .join(format!("{fake_hash}.png"));
     assert_eq!(
         std::fs::read(dumped).unwrap(),
         b"content hashing to something else"

@@ -106,7 +106,6 @@ impl IpcServer {
             });
             self.local_servers.lock().unwrap().push(handle);
         }
-
     }
 
     /// Accepts connections on one IPC channel until shutdown. Each connection

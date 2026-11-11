@@ -73,8 +73,9 @@ CREATE TABLE File
 
     /// Creates the filehash table
     pub(in crate::db::turso) async fn table_create_filehash(&self, conn: &Connection) {
-        let _ = conn.execute_batch(
-            "
+        let _ = conn
+            .execute_batch(
+                "
 CREATE TABLE FileHashes (
     file_id INTEGER NOT NULL,
     algorithm TEXT NOT NULL,
@@ -90,13 +91,14 @@ CREATE TABLE FileHashes (
 CREATE UNIQUE INDEX idx_file_hashes_algorithm_digest ON FileHashes (algorithm, digest);
 
 ",
-        )
-        .await;
+            )
+            .await;
     }
 
     pub(in crate::db::turso) async fn table_create_jobs(&self, conn: &Connection) {
-        let _ = conn.execute_batch(
-            "
+        let _ = conn
+            .execute_batch(
+                "
 CREATE TABLE Jobs (
     id INTEGER PRIMARY KEY  NOT NULL, 
     time INTEGER NOT NULL, 
@@ -111,20 +113,21 @@ CREATE TABLE Jobs (
 CREATE UNIQUE INDEX idx_jobs_dedup ON Jobs (time, reptime, site, param);
 CREATE INDEX idx_jobs_ready_priority ON Jobs (site, is_running, priority DESC, time, id);
 ",
-        )
-        .await;
+            )
+            .await;
     }
     pub(in crate::db::turso) async fn table_create_namespace(&self, conn: &Connection) {
-        let _ = conn.execute_batch(
-            "
+        let _ = conn
+            .execute_batch(
+                "
 CREATE TABLE Namespace (
     id INTEGER PRIMARY KEY , 
     name TEXT NOT NULL UNIQUE, 
     description TEXT
 );
 ",
-        )
-        .await;
+            )
+            .await;
     }
     pub(in crate::db::turso) async fn table_create_parents(&self, conn: &Connection) -> Result<()> {
         self.table_create_parents_v2(conn).await
@@ -205,8 +208,9 @@ CREATE UNIQUE INDEX idx_unique_parents ON Parents (tag_id, relate_tag_id, limit_
     }
 
     pub(in crate::db::turso) async fn table_create_tags(&self, conn: &Connection) {
-        let _ = conn.execute_batch(
-            "
+        let _ = conn
+            .execute_batch(
+                "
 CREATE TABLE IF NOT EXISTS Tags (
     id INTEGER PRIMARY KEY , 
     name TEXT NOT NULL, 
@@ -220,8 +224,8 @@ CREATE TABLE IF NOT EXISTS Tags (
 CREATE INDEX IF NOT EXISTS idx_tags_count_covering ON Tags(count DESC, name, namespace);
 CREATE INDEX IF NOT EXISTS idx_tags_namespace ON Tags (namespace);
 ",
-        )
-        .await;
+            )
+            .await;
         self.table_create_tags_popular(conn).await;
     }
 
@@ -474,17 +478,19 @@ CREATE TABLE IF NOT EXISTS Tags_Popular (
     }
 
     pub(in crate::db::turso) async fn table_create_dead_urls(&self, conn: &Connection) {
-        let _ = conn.execute_batch(
-            "
+        let _ = conn
+            .execute_batch(
+                "
 CREATE TABLE dead_urls (url TEXT PRIMARY KEY);
 ",
-        )
-        .await;
+            )
+            .await;
     }
 
     pub(in crate::db::turso) async fn table_create_settings(&self, conn: &Connection) {
-        let _ = conn.execute_batch(
-            "
+        let _ = conn
+            .execute_batch(
+                "
 CREATE TABLE Settings (
     name TEXT PRIMARY KEY,
     description TEXT, 
@@ -493,7 +499,7 @@ CREATE TABLE Settings (
 );
 
 ",
-        )
-        .await;
+            )
+            .await;
     }
 }

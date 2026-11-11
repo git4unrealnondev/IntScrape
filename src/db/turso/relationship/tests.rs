@@ -212,7 +212,9 @@ fn relationship_write_path_scale_bench() {
         // Sanity: the plan must still be a covering-index seek per tag, and
         // must not degrade into a partition scan.
         let del_conn = db.connect().unwrap();
-        let sql = "DELETE FROM Relationship_1 WHERE tag_id = ? AND file_id IN (?, ?) RETURNING tag_id".to_string();
+        let sql =
+            "DELETE FROM Relationship_1 WHERE tag_id = ? AND file_id IN (?, ?) RETURNING tag_id"
+                .to_string();
         let mut rows = del_conn
             .query(
                 &format!("EXPLAIN QUERY PLAN {sql}"),
@@ -382,9 +384,7 @@ async fn file_to_tag_lookup_pushes_its_filter_into_every_namespace_arm() {
         .unwrap();
     let mut rows = conn
         .query(
-            &format!(
-                "EXPLAIN QUERY PLAN SELECT file_id, tag_id FROM {unpushed} WHERE {predicate}"
-            ),
+            &format!("EXPLAIN QUERY PLAN SELECT file_id, tag_id FROM {unpushed} WHERE {predicate}"),
             params_from_iter(
                 wanted
                     .iter()

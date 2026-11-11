@@ -398,13 +398,14 @@ impl TursoDatabase {
         }
 
         if !drops.is_empty()
-            && let Err(error) = sqlite3_cli(&[&copy_str, &drops]) {
-                let _ = std::fs::remove_file(&copy);
-                return Err(turso::Error::ConversionFailure(format!(
-                    "sqlite3 schema sanitization of {} failed: {error}",
-                    copy.display()
-                )));
-            }
+            && let Err(error) = sqlite3_cli(&[&copy_str, &drops])
+        {
+            let _ = std::fs::remove_file(&copy);
+            return Err(turso::Error::ConversionFailure(format!(
+                "sqlite3 schema sanitization of {} failed: {error}",
+                copy.display()
+            )));
+        }
 
         Ok(SlurpSourceTemp { path: copy })
     }
@@ -658,7 +659,9 @@ impl TursoDatabase {
             // Only a destination that already owns tags needs the per-batch
             // "exists?" lookup; an empty Tags table has nothing to resolve.
             let has_existing_tags: bool = {
-                let mut stmt = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM Tags)").await?;
+                let mut stmt = conn
+                    .prepare_cached("SELECT EXISTS(SELECT 1 FROM Tags)")
+                    .await?;
                 let exists: i64 = stmt.query_row(()).await?.get(0)?;
                 exists != 0
             };
@@ -892,7 +895,9 @@ impl TursoDatabase {
                     .await?;
                 let has_staging: i64 = exists.query_row(()).await?.get(0)?;
                 if has_staging != 0 {
-                    let mut stmt = conn.prepare_cached("SELECT COUNT(*) FROM Tags_slurp").await?;
+                    let mut stmt = conn
+                        .prepare_cached("SELECT COUNT(*) FROM Tags_slurp")
+                        .await?;
                     stmt.query_row(()).await?.get::<i64>(0)? as usize
                 } else {
                     0
@@ -1413,14 +1418,15 @@ impl TursoDatabase {
                 // `CREATE INDEX ... ON <table>(file_id, tag_id)` to the source
                 // (or a local copy of it) makes the scan index-driven.
                 if let Some(indexed) = slurp_source_keyset_indexed(source, &partition).await
-                    && !indexed {
-                        log::warn!(
-                            "Slurp: source table {partition} has no (file_id, tag_id) index; \
+                    && !indexed
+                {
+                    log::warn!(
+                        "Slurp: source table {partition} has no (file_id, tag_id) index; \
                              the keyset scan re-scans the whole table per batch. Add \
                              `CREATE INDEX idx_{partition}_file_tag \
                              ON {partition}(file_id, tag_id)` to the source (or a copy of it)."
-                        );
-                    }
+                    );
+                }
                 // Resume: a partition whose scan already reached its natural
                 // end (empty batch) with its recount and index restore
                 // finished is skipped whole by a re-run; one cut short by a
@@ -1588,14 +1594,15 @@ impl TursoDatabase {
                 let target_by_source_namespace: HashMap<u64, u64> =
                     legacy_namespaces.iter().copied().collect();
                 if let Some(indexed) = slurp_source_keyset_indexed(source, "Relationship").await
-                    && !indexed {
-                        log::warn!(
-                            "Slurp: source table Relationship has no (file_id, tag_id) \
+                    && !indexed
+                {
+                    log::warn!(
+                        "Slurp: source table Relationship has no (file_id, tag_id) \
                              index; the keyset scan re-scans the whole table per batch. \
                              Add `CREATE INDEX idx_Relationship_file_tag \
                              ON Relationship(file_id, tag_id)` to the source (or a copy of it)."
-                        );
-                    }
+                    );
+                }
                 // Only cold imports tear the file_id indexes down; see the
                 // partition path for the rationale.
                 if cold_import {
@@ -2464,7 +2471,6 @@ async fn slurp_recount_namespace(conn: &Connection, namespace_id: u64) -> Result
     conn.execute("COMMIT", ()).await?;
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests;

@@ -300,8 +300,8 @@ async fn search_matches_holder_semantics_across_shapes() {
                     searches: searches.clone(),
                 },
                 &limit,
-            &None,
-                )
+                &None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -560,9 +560,8 @@ async fn scale_seed(db: &TursoDatabase, spec: &ScaleSpec) -> (Vec<u64>, f64) {
         let mut sql = String::from(
             "INSERT OR IGNORE INTO File (id, extension, storage_id, size_bytes) VALUES ",
         );
-        let mut hash_sql = String::from(
-            "INSERT OR IGNORE INTO FileHashes (file_id, algorithm, digest) VALUES ",
-        );
+        let mut hash_sql =
+            String::from("INSERT OR IGNORE INTO FileHashes (file_id, algorithm, digest) VALUES ");
         let mut params: Vec<Value> = Vec::with_capacity((batch * 4) as usize);
         let mut hash_params: Vec<Value> = Vec::with_capacity((batch * 3) as usize);
         for i in 0..batch {
@@ -599,8 +598,7 @@ async fn scale_seed(db: &TursoDatabase, spec: &ScaleSpec) -> (Vec<u64>, f64) {
     let mut done = 0u64;
     while done < spec.tags {
         let batch = SQL_CHUNK_SIZE.min((spec.tags - done) as usize) as u64;
-        let mut sql =
-            String::from("INSERT OR IGNORE INTO Tags (name, namespace, count) VALUES ");
+        let mut sql = String::from("INSERT OR IGNORE INTO Tags (name, namespace, count) VALUES ");
         let mut params: Vec<Value> = Vec::with_capacity((batch * 3) as usize);
         for i in 0..batch {
             if i > 0 {
@@ -793,10 +791,16 @@ async fn scale_time_searches(
             searches: searches.clone(),
         };
         // Warm once so the first sample is not paying for a cold b-tree.
-        let _ = db.search_db_files(conn, &obj(), &limit, &None).await.unwrap();
+        let _ = db
+            .search_db_files(conn, &obj(), &limit, &None)
+            .await
+            .unwrap();
         for _ in 0..iters {
             let started = Instant::now();
-            let got = db.search_db_files(conn, &obj(), &limit, &None).await.unwrap();
+            let got = db
+                .search_db_files(conn, &obj(), &limit, &None)
+                .await
+                .unwrap();
             samples.push(started.elapsed().as_secs_f64() * 1000.0);
             rows_total += got.len();
         }
@@ -1030,8 +1034,8 @@ fn search_million_file_scale_bench() {
                             .collect(),
                     },
                     &None,
-                &None,
-                    )
+                    &None,
+                )
                 .await
                 .unwrap();
             let got_set: BTreeSet<u64> = got.iter().copied().collect();
@@ -1181,7 +1185,8 @@ async fn scale_fixture_is_well_formed_at_small_size() {
                     searches,
                 },
                 &None,
-            &None,                )
+                &None,
+            )
             .await
             .unwrap()
             .expect("search should produce a statement");
@@ -1247,8 +1252,8 @@ async fn scale_fixture_is_well_formed_at_small_size() {
                     .collect(),
             },
             &None,
-        &None,
-            )
+            &None,
+        )
         .await
         .unwrap();
     let in_window: Vec<u64> = got
@@ -1329,9 +1334,20 @@ async fn offset_pages_the_newest_first_result() {
         .unwrap();
     assert!(all.len() > 10, "need a sizeable tag for paging to matter");
 
-    for (limit, offset) in [(3u64, 0u64), (3, 3), (3, 7), (2, all.len() as u64 - 1), (5, all.len() as u64)] {
+    for (limit, offset) in [
+        (3u64, 0u64),
+        (3, 3),
+        (3, 7),
+        (2, all.len() as u64 - 1),
+        (5, all.len() as u64),
+    ] {
         let paged = db
-            .search_db_files(&conn, &tags_obj(searches.clone()), &Some(limit), &Some(offset))
+            .search_db_files(
+                &conn,
+                &tags_obj(searches.clone()),
+                &Some(limit),
+                &Some(offset),
+            )
             .await
             .unwrap();
         let window: Vec<u64> = all
@@ -1347,7 +1363,10 @@ async fn offset_pages_the_newest_first_result() {
     }
 
     // Count agreement: the aggregate sees exactly what the scan yields.
-    let counted = db.search_db_files_count(&conn, &tags_obj(searches)).await.unwrap();
+    let counted = db
+        .search_db_files_count(&conn, &tags_obj(searches))
+        .await
+        .unwrap();
     assert_eq!(
         counted,
         all.len() as u64,

@@ -6,9 +6,8 @@ use std::{
 use scraper::{Html, Selector};
 use shared_types::{
     DEFAULT_PRIORITY, DownloadModifiers, FileObject, FileSource, FileTagAction,
-    GenericNamespaceObj, LoginNeed, LoginType, ModifierTarget, PluginProperties,
-    PluginTag, RelationContext, ScraperDataReturn, ScraperParam, ScraperReturn, Tag,
-    TargetModifier,
+    GenericNamespaceObj, LoginNeed, LoginType, ModifierTarget, PluginProperties, PluginTag,
+    RelationContext, ScraperDataReturn, ScraperParam, ScraperReturn, Tag, TargetModifier,
 };
 use url::Url;
 
@@ -600,7 +599,11 @@ fn parse_submission_page(
     if let Ok(sel) = Selector::parse(".submission-tags a[data-tag-name]") {
         for elem in document.select(&sel) {
             if let Some(kw) = elem.value().attr("data-tag-name") {
-                push(kw.to_string(), ns("FA_Tag", "Submission tag/keyword"), &mut data_tags);
+                push(
+                    kw.to_string(),
+                    ns("FA_Tag", "Submission tag/keyword"),
+                    &mut data_tags,
+                );
             }
         }
     }
@@ -614,7 +617,11 @@ fn parse_submission_page(
         for elem in document.select(&sel) {
             if let Some(tags) = elem.value().attr("data-tags") {
                 for kw in tags.split_whitespace() {
-                    push(kw.to_string(), ns("FA_Tag", "Submission tag/keyword"), &mut data_tags);
+                    push(
+                        kw.to_string(),
+                        ns("FA_Tag", "Submission tag/keyword"),
+                        &mut data_tags,
+                    );
                 }
             }
         }
@@ -1138,7 +1145,12 @@ mod tests {
             .flat_map(|a| a.tags.iter())
             .map(|t| t.tag.name.as_str())
             .collect();
-        for expected in ["c_artwork_digital", "t_all", "s_unspecified_any", "u_ulitochka"] {
+        for expected in [
+            "c_artwork_digital",
+            "t_all",
+            "s_unspecified_any",
+            "u_ulitochka",
+        ] {
             assert!(
                 file_tag_names.contains(&expected),
                 "file should carry {expected:?}"
@@ -1216,7 +1228,10 @@ mod tests {
             url_dump_impl(&mk(url("https://www.furaffinity.net/gallery/yggiiggy/"))).len(),
             1
         );
-        assert_eq!(url_dump_impl(&mk(ScraperParam::Normal("avian".into()))).len(), 1);
+        assert_eq!(
+            url_dump_impl(&mk(ScraperParam::Normal("avian".into()))).len(),
+            1
+        );
 
         let out = url_dump_impl(&mk(url("https://www.furaffinity.net/view/66953097")));
         assert_eq!(out[0].job.param.len(), 1);

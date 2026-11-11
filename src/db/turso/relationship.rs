@@ -369,8 +369,7 @@ impl TursoDatabase {
         conn: &Connection,
         limit_tag_id: u64,
     ) -> Result<Vec<TagParents>> {
-        self.parents_by_column(conn, "limit_to", limit_tag_id)
-            .await
+        self.parents_by_column(conn, "limit_to", limit_tag_id).await
     }
 
     /// Gets one exact child-parent relation, including its optional limit tag.
@@ -455,11 +454,13 @@ impl TursoDatabase {
             let mut rows = conn.query(&sql, params_from_iter(chunk.to_vec())).await?;
             while let Some(row) = rows.next().await? {
                 let limit_tag_id: i64 = row.get(2)?;
-                out.entry(limit_tag_id as u64).or_default().push(TagParents {
-                    tag_id: row.get(0)?,
-                    relate_tag_id: row.get(1)?,
-                    limit_to: parents_limit_decode(Some(limit_tag_id)),
-                });
+                out.entry(limit_tag_id as u64)
+                    .or_default()
+                    .push(TagParents {
+                        tag_id: row.get(0)?,
+                        relate_tag_id: row.get(1)?,
+                        limit_to: parents_limit_decode(Some(limit_tag_id)),
+                    });
             }
         }
 
@@ -1130,7 +1131,6 @@ fn tag_count_update_sql(deltas: &[(u64, u64)], decrement: bool) -> (String, Vec<
         params,
     )
 }
-
 
 #[cfg(test)]
 mod tests;

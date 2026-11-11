@@ -24,10 +24,11 @@ use regex::Regex;
 use reqwest::Client;
 use scraper::{Html, Selector};
 use shared_types::{
-    CallbackCustomDataReturning, CallbackInfoInput, CallbackReturn, DbSettingsObj, DEFAULT_PRIORITY,
-    FileObject, FileSource, FileTagAction, GenericNamespaceObj, GlobalCallbacks, Plugin, PluginJob,
-    PluginProperties, PluginTag, RelationContext, ScraperDataReturn, ScraperParam, ScraperObject,
-    ScraperReturn, SearchType, SkipIf, StartupThreadType, Tag, TagOperation, Url,
+    CallbackCustomDataReturning, CallbackInfoInput, CallbackReturn, DEFAULT_PRIORITY,
+    DbSettingsObj, FileObject, FileSource, FileTagAction, GenericNamespaceObj, GlobalCallbacks,
+    Plugin, PluginJob, PluginProperties, PluginTag, RelationContext, ScraperDataReturn,
+    ScraperObject, ScraperParam, ScraperReturn, SearchType, SkipIf, StartupThreadType, Tag,
+    TagOperation, Url,
 };
 
 const SITE: &str = "catbox";
@@ -199,9 +200,9 @@ fn get_plugin_info_impl() -> Vec<Plugin> {
 pub unsafe extern "C" fn on_regex(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         type OnRegexInput = (String, String, shared_types::Tag, u64);
-        let Some((matched, full_tag, tag_source, tag_source_id)) = (unsafe {
-            shared_types::plugin_ffi::decode::<OnRegexInput>(req, req_len)
-        }) else {
+        let Some((matched, full_tag, tag_source, tag_source_id)) =
+            (unsafe { shared_types::plugin_ffi::decode::<OnRegexInput>(req, req_len) })
+        else {
             return shared_types::CallbackReturn::default();
         };
         on_regex_impl(&matched, &full_tag, &tag_source, tag_source_id)
@@ -294,7 +295,9 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
         }
     }
     if failures > 0 {
-        log_silent(format!("CATBOX: {failures} startup scrape(s) failed to queue"));
+        log_silent(format!(
+            "CATBOX: {failures} startup scrape(s) failed to queue"
+        ));
     }
 
     client::setting_set(DbSettingsObj {
@@ -454,11 +457,7 @@ fn handle_album(fetcher: &mut Fetcher, album_url: &str) -> Vec<ScraperReturn> {
     }
 }
 
-fn build_album_data(
-    fetcher: &mut Fetcher,
-    album_url: &str,
-    page: &str,
-) -> Vec<ScraperReturn> {
+fn build_album_data(fetcher: &mut Fetcher, album_url: &str, page: &str) -> Vec<ScraperReturn> {
     let Some((title, text, file_urls)) = parse_album_page(page) else {
         log_silent(format!("CATBOX: no album contents parsed from {album_url}"));
         return vec![ScraperReturn::Nothing];
@@ -495,7 +494,10 @@ fn build_album_data(
         start_tags.insert(PluginTag {
             tag: Tag {
                 name: text.clone(),
-                namespace: ns_value(NS_TEXT, Some("The text that is inside of a catbox collection.")),
+                namespace: ns_value(
+                    NS_TEXT,
+                    Some("The text that is inside of a catbox collection."),
+                ),
             },
             relates_to: Some(RelationContext {
                 tag: album.clone(),
@@ -576,7 +578,9 @@ fn build_album_data(
                     },
                 ],
             }],
-            skip_if: vec![SkipIf::FileTagRelationship(source_url_tag(file_url.clone()))],
+            skip_if: vec![SkipIf::FileTagRelationship(source_url_tag(
+                file_url.clone(),
+            ))],
         });
 
         if batch_files.len() >= FILES_PER_BATCH {
@@ -585,7 +589,10 @@ fn build_album_data(
     }
 
     if !batch_files.is_empty() || pending_tags.is_some() {
-        out.push(batch(batch_files.iter().cloned().collect(), pending_tags.take()));
+        out.push(batch(
+            batch_files.iter().cloned().collect(),
+            pending_tags.take(),
+        ));
     }
     if out.is_empty() {
         return vec![ScraperReturn::Nothing];
@@ -614,30 +621,30 @@ fn parse_album_page(page: &str) -> Option<(Option<String>, Option<String>, Vec<S
     let mut title = None;
     let mut text = None;
     if let Ok(title_selector) = Selector::parse("div.title")
-        && let Some(node) = document.select(&title_selector).next() {
-            let mut lines: Vec<String> = node
-                .text()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(ToOwned::to_owned)
-                .collect();
-            if !lines.is_empty() {
-                title = lines.first().cloned();
-                lines.remove(0);
-                let combined = lines.join("\n");
-                if !combined.trim().is_empty() {
-                    text = Some(combined);
-                }
+        && let Some(node) = document.select(&title_selector).next()
+    {
+        let mut lines: Vec<String> = node
+            .text()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        if !lines.is_empty() {
+            title = lines.first().cloned();
+            lines.remove(0);
+            let combined = lines.join("\n");
+            if !combined.trim().is_empty() {
+                text = Some(combined);
             }
         }
+    }
 
     let mut file_urls: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
 
-    if let (Ok(list_selector), Ok(link_selector)) = (
-        Selector::parse("div.imagelist"),
-        Selector::parse("a[href]"),
-    ) {
+    if let (Ok(list_selector), Ok(link_selector)) =
+        (Selector::parse("div.imagelist"), Selector::parse("a[href]"))
+    {
         for list in document.select(&list_selector) {
             for link in list.select(&link_selector) {
                 if let Some(href) = link.value().attr("href") {
@@ -732,10 +739,7 @@ fn handle_file(fetcher: &mut Fetcher, file_url: &str) -> Vec<ScraperReturn> {
 enum Outcome {
     /// A body came back. Text pages expect it to be html; single files treat
     /// an html body as "this link is not a file".
-    Body {
-        data: Vec<u8>,
-        is_html: bool,
-    },
+    Body { data: Vec<u8>, is_html: bool },
     /// The link is gone (4xx) — no point revisiting it.
     Dead,
     /// The route is broken (dns, reset, timeout, net trouble).
@@ -791,8 +795,7 @@ impl Fetcher {
             Err(err) => {
                 // Own the route/client before requesting again so the mutable
                 // proxy build step and the report step don't fight over `self`.
-                let proxy = self
-                    .proxy_client().cloned();
+                let proxy = self.proxy_client().cloned();
                 let Some(proxy_client) = proxy else {
                     return Outcome::Transport(err);
                 };
@@ -829,12 +832,7 @@ impl Fetcher {
         self.proxy.as_ref().map(|(_, client)| client)
     }
 
-    fn request(
-        &self,
-        client: &Client,
-        url: &str,
-        timeout: Duration,
-    ) -> Result<Outcome, String> {
+    fn request(&self, client: &Client, url: &str, timeout: Duration) -> Result<Outcome, String> {
         let response = self.runtime.block_on(async {
             client
                 .get(url)
@@ -856,12 +854,7 @@ impl Fetcher {
 
         let data = self
             .runtime
-            .block_on(async {
-                response
-                    .bytes()
-                    .await
-                    .map_err(|err| err.to_string())
-            })?
+            .block_on(async { response.bytes().await.map_err(|err| err.to_string()) })?
             .to_vec();
 
         Ok(Outcome::Body { data, is_html })
@@ -1029,7 +1022,10 @@ mod tests {
         let mut seen = HashSet::new();
         let mut urls = Vec::new();
         add_file_link("//files.catbox.moe/xy1234.webm,", &mut seen, &mut urls);
-        assert_eq!(urls, vec!["https://files.catbox.moe/xy1234.webm".to_string()]);
+        assert_eq!(
+            urls,
+            vec!["https://files.catbox.moe/xy1234.webm".to_string()]
+        );
     }
 
     #[test]

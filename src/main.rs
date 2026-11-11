@@ -8,6 +8,13 @@ use std::{
     time::Duration,
 };
 
+use fast_log::{
+    consts::LogSize,
+    plugin::{
+        file_split::{KeepType, Rolling, RollingType},
+        packer::LogPacker,
+    },
+};
 use intscrape::{
     db::turso::TursoDatabase,
     db::{
@@ -17,13 +24,6 @@ use intscrape::{
     ipc::IpcServer,
     plugins::PluginManager,
     web::manager::DownloadsManager,
-};
-use fast_log::{
-    consts::LogSize,
-    plugin::{
-        file_split::{KeepType, Rolling, RollingType},
-        packer::LogPacker,
-    },
 };
 use rayon::ThreadPoolBuilder;
 
@@ -36,6 +36,15 @@ const DEFAULT_DB_PATH: &str = "turso.db";
 const DEFAULT_LOG_PATH: &str = "log.txt";
 const DEFAULT_PLUGINS_PATH: &str = "compiled_plugins";
 const JOB_PROCESSING_CHUNK_SIZE: usize = 256;
+/// The spawner only polls the database for new jobs when a site's in-memory
+/// backlog (queued + running) drops below this. Keeps the expensive
+/// ready-jobs scan off the database while sites still hold plenty of work.
+const JOB_REFILL_WATERMARK: usize = JOB_PROCESSING_CHUNK_SIZE;
+/// System-job sites are polled only every Nth spawner cycle (1s each), so
+/// maintenance checks do not drive the expensive jobs scan every second.
+const SYSTEM_JOB_POLL_INTERVAL: u64 = 10;
+/// How many system jobs to claim per system-job poll.
+const SYSTEM_JOB_REFILL_AMOUNT: usize = 64;
 /// Default number of tokio worker threads (see `worker_threads()`).
 const DEFAULT_WORKER_THREADS: usize = 16;
 
@@ -118,8 +127,7 @@ async fn run_app() -> Result<(), Box<dyn Error + Send + Sync>> {
     let db = TursoDatabase::new_with_exit(&db_path, should_exit.clone()).await;
     log::info!("Turso database ready at {}", db_path.display());
 
-    let plugin_manager =
-        PluginManager::new(&plugins_path, db.clone(), should_exit.clone());
+    let plugin_manager = PluginManager::new(&plugins_path, db.clone(), should_exit.clone());
     db.set_plugin_manager(plugin_manager.clone());
 
     let download_manager = DownloadsManager::new(
@@ -174,6 +182,7 @@ async fn run_app() -> Result<(), Box<dyn Error + Send + Sync>> {
     let active_system_jobs_clone = active_system_jobs.clone();
     let should_exit_for_spawner = should_exit.clone();
     let mut spawner = tokio::task::spawn(async move {
+        let mut poll_cycle: u64 = 0;
         loop {
             if should_exit_for_spawner.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
@@ -186,17 +195,44 @@ async fn run_app() -> Result<(), Box<dyn Error + Send + Sync>> {
             // maintenance keeps up during a multi-hour import. WAL-mode
             // readers no longer pin an MVCC snapshot that stalls the import's
             // WAL truncation, so the poll itself is safe to run.
-            let mut sites = plugin_manager_clone.get_storage_sites();
-            sites.push(SYSTEM_DATABASE_BACKUP_SITE.to_string());
-            if !db_spawn.is_slurping() {
-                sites.push(SYSTEM_DATABASE_SLURP_SITE.to_string());
+            // Only poll when the in-memory pipeline is running dry. The
+            // ready-jobs query walks a large index over millions of rows, so
+            // polling it every second while hundreds of jobs are already
+            // queued/running is pure overhead. Each site is topped up to
+            // `JOB_REFILL_WATERMARK` jobs; sites still holding at least that
+            // much work are skipped entirely this pass. System-job sites are
+            // polled on a slower cadence so maintenance keeps moving without
+            // driving the expensive scan every second.
+            let mut jobs_to_run = Vec::new();
+            let mut refill_sites = Vec::new();
+            for site in plugin_manager_clone.get_storage_sites() {
+                let backlog = download_manager_clone.in_memory_job_count(&site).await;
+                if backlog < JOB_REFILL_WATERMARK {
+                    let need = JOB_REFILL_WATERMARK - backlog;
+                    refill_sites.push((site, need));
+                }
             }
-            sites.push(SYSTEM_FILE_SIZE_SITE.to_string());
-            sites.push(SYSTEM_FILE_HASH_SITE.to_string());
-            sites.push(SYSTEM_STORAGE_CHECK_SITE.to_string());
-            let jobs_to_run = db_spawn
-                .jobs_get_torun_chunk(sites, JOB_PROCESSING_CHUNK_SIZE)
-                .await;
+            let poll_system_jobs = poll_cycle % SYSTEM_JOB_POLL_INTERVAL == 0;
+            if poll_system_jobs {
+                for site in [
+                    SYSTEM_DATABASE_BACKUP_SITE.to_string(),
+                    SYSTEM_FILE_SIZE_SITE.to_string(),
+                    SYSTEM_FILE_HASH_SITE.to_string(),
+                    SYSTEM_STORAGE_CHECK_SITE.to_string(),
+                ]
+                .into_iter()
+                .chain(
+                    std::iter::once(SYSTEM_DATABASE_SLURP_SITE.to_string())
+                        .filter(|_| !db_spawn.is_slurping()),
+                ) {
+                    refill_sites.push((site, SYSTEM_JOB_REFILL_AMOUNT));
+                }
+            }
+
+            for (site, need) in refill_sites {
+                jobs_to_run.extend(db_spawn.jobs_get_torun_chunk(vec![site], need).await);
+            }
+            poll_cycle += 1;
 
             for job in jobs_to_run
                 .iter()

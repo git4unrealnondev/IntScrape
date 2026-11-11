@@ -1,10 +1,8 @@
 extern crate clap;
 
 use crate::cli::cli_structs::Database;
+use crate::db::{SYSTEM_DATABASE_SLURP_SITE, turso::TursoDatabase};
 use crate::helper_functions;
-use crate::{
-    db::{SYSTEM_DATABASE_SLURP_SITE, turso::TursoDatabase},
-};
 use shared_types::DbJobRecreation;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -207,13 +205,15 @@ async fn run_cli_command_inner(db: &TursoDatabase, command: &str) -> Result<Stri
             // --help / --version render as "errors" in clap but are the
             // output the caller asked for.
             clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
-                return Ok(error.render().to_string())
+                return Ok(error.render().to_string());
             }
             _ => return Err(error.render().to_string()),
         },
     };
     if parsed.a.is_none() {
-        return Ok(cli_structs::MainWrapper::command().render_help().to_string());
+        return Ok(cli_structs::MainWrapper::command()
+            .render_help()
+            .to_string());
     }
 
     // One CLI run at a time: outputs would interleave otherwise, and database
@@ -228,10 +228,7 @@ async fn run_cli_command_inner(db: &TursoDatabase, command: &str) -> Result<Stri
     CLI_CAPTURE
         .scope(captured.clone(), run(db, plugin_manager.as_deref(), parsed))
         .await?;
-    let mut output = captured
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let mut output = captured.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if output.len() >= CLI_OUTPUT_CAP {
         output.push_str("\n[output truncated]");
     }
@@ -243,7 +240,6 @@ async fn run(
     plugin_manager: Option<&crate::plugins::PluginManager>,
     args: cli_structs::MainWrapper,
 ) -> Result<String, String> {
-
     let Some(command) = &args.a else {
         return Err("no command given; run with --help for usage".into());
     };
@@ -281,12 +277,8 @@ async fn run(
                     };
 
                     db.jobs_add_single(job).await;
-
-
                 }
-                cli_structs::JobStruct::AddBulk(_addstruct) => {
-                    
-                }
+                cli_structs::JobStruct::AddBulk(_addstruct) => {}
                 cli_structs::JobStruct::Remove(_remove) => {
                     // return shared_types::AllFields::JobsRemove(shared_types::JobsRemove { site:
                     // remove.site.to_string(), query: remove.query.to_string(), time:
@@ -295,21 +287,11 @@ async fn run(
             }
         }
         cli_structs::Test::Search(searchstruct) => match searchstruct {
-            cli_structs::SearchStruct::Parent(_parent) => {
-                
-            }
-            cli_structs::SearchStruct::Fid(_id) => {
-                
-            }
-            cli_structs::SearchStruct::Tid(_id) => {
-                
-            }
-            cli_structs::SearchStruct::Tag(_tag) => {
-                
-            }
-            cli_structs::SearchStruct::Hash(_hash) => {
-                
-            }
+            cli_structs::SearchStruct::Parent(_parent) => {}
+            cli_structs::SearchStruct::Fid(_id) => {}
+            cli_structs::SearchStruct::Tid(_id) => {}
+            cli_structs::SearchStruct::Tag(_tag) => {}
+            cli_structs::SearchStruct::Hash(_hash) => {}
         },
         cli_structs::Test::Tasks(taskstruct) => match taskstruct {
             cli_structs::TasksStruct::Import(directory) => {
@@ -372,69 +354,62 @@ async fn run(
                 }
             },
             cli_structs::TasksStruct::Reimport(reimp) => match reimp {
-                cli_structs::Reimport::DirectoryLocation(_loc) => {
-                    
-                }
+                cli_structs::Reimport::DirectoryLocation(_loc) => {}
             },
-            cli_structs::TasksStruct::Database(db_action) => {
-                match db_action {
-                    Database::DbSlurp(slurp) => {
-                        match db.db_slurp(Path::new(&slurp.source)).await {
-                            Ok(counts) => cli_out(format!(
-                                "Imported {} namespaces, {} tags, and {} files",
-                                counts.0, counts.1, counts.2
-                            )),
-                            Err(error) => {
-                                cli_out(format!("database slurp failed: {error}"));
-                                return Err(format!("database slurp failed: {error}"));
-                            }
-                        }
+            cli_structs::TasksStruct::Database(db_action) => match db_action {
+                Database::DbSlurp(slurp) => match db.db_slurp(Path::new(&slurp.source)).await {
+                    Ok(counts) => cli_out(format!(
+                        "Imported {} namespaces, {} tags, and {} files",
+                        counts.0, counts.1, counts.2
+                    )),
+                    Err(error) => {
+                        cli_out(format!("database slurp failed: {error}"));
+                        return Err(format!("database slurp failed: {error}"));
                     }
-                    Database::CheckFiles(action) => {
-                        if let Err(error) = db.fix_internal_files(action) {
-                            cli_out(format!("storage check failed: {error}"));
-                            return Err(format!("storage check failed: {error}"));
-                        }
+                },
+                Database::CheckFiles(action) => {
+                    if let Err(error) = db.fix_internal_files(action) {
+                        cli_out(format!("storage check failed: {error}"));
+                        return Err(format!("storage check failed: {error}"));
                     }
-                    Database::RecacheRoaring => {
-                        db.recache_roaring_db();
-                    }
-                    Database::ScheduleBackup(backup) => {
-                        db.jobs_add_single(shared_types::PluginJob {
-                            time: helper_functions::get_sys_time_in_secs(),
-                            reptime: time_conv(&backup.time),
-                            priority: i64::MAX as u64,
-                            site: crate::db::SYSTEM_DATABASE_BACKUP_SITE.to_string(),
-                            param: vec![shared_types::ScraperParam::Normal(
-                                backup.destination.clone(),
-                            )],
-                            user_data: BTreeMap::new(),
-                            recreation: Some(shared_types::DbJobRecreation::AlwaysTime(
-                                backup.every,
-                                backup.count,
-                            )),
-                        })
-                        .await;
-                    }
-                    Database::ScheduleHashMissing(hash_job) => {
-                        db.jobs_add_single(shared_types::PluginJob {
-                            time: helper_functions::get_sys_time_in_secs(),
-                            reptime: time_conv(&hash_job.time),
-                            priority: i64::MAX as u64,
-                            site: crate::db::SYSTEM_FILE_HASH_SITE.to_string(),
-                            param: Vec::new(),
-                            user_data: BTreeMap::new(),
-                            recreation: Some(shared_types::DbJobRecreation::AlwaysTime(
-                                hash_job.every,
-                                hash_job.count,
-                            )),
-                        })
-                        .await;
-                    }
-                    _ => {}
                 }
-                
-            }
+                Database::RecacheRoaring => {
+                    db.recache_roaring_db();
+                }
+                Database::ScheduleBackup(backup) => {
+                    db.jobs_add_single(shared_types::PluginJob {
+                        time: helper_functions::get_sys_time_in_secs(),
+                        reptime: time_conv(&backup.time),
+                        priority: i64::MAX as u64,
+                        site: crate::db::SYSTEM_DATABASE_BACKUP_SITE.to_string(),
+                        param: vec![shared_types::ScraperParam::Normal(
+                            backup.destination.clone(),
+                        )],
+                        user_data: BTreeMap::new(),
+                        recreation: Some(shared_types::DbJobRecreation::AlwaysTime(
+                            backup.every,
+                            backup.count,
+                        )),
+                    })
+                    .await;
+                }
+                Database::ScheduleHashMissing(hash_job) => {
+                    db.jobs_add_single(shared_types::PluginJob {
+                        time: helper_functions::get_sys_time_in_secs(),
+                        reptime: time_conv(&hash_job.time),
+                        priority: i64::MAX as u64,
+                        site: crate::db::SYSTEM_FILE_HASH_SITE.to_string(),
+                        param: Vec::new(),
+                        user_data: BTreeMap::new(),
+                        recreation: Some(shared_types::DbJobRecreation::AlwaysTime(
+                            hash_job.every,
+                            hash_job.count,
+                        )),
+                    })
+                    .await;
+                }
+                _ => {}
+            },
             cli_structs::TasksStruct::Login(args) => {
                 let Some(plugin_manager) = plugin_manager else {
                     cli_out("plugin manager is not loaded, cannot run login here".to_string());
@@ -454,26 +429,28 @@ async fn run(
                     Some(plugin) => {
                         if let Some(path) = &args.cookies {
                             match crate::web::manager::import_cookies_txt(db, &plugin, path) {
-                                Ok(stored) => {
-                                    cli_out(format!("Stored {stored} login item(s) for {}.", plugin.name))
-                                }
+                                Ok(stored) => cli_out(format!(
+                                    "Stored {stored} login item(s) for {}.",
+                                    plugin.name
+                                )),
                                 Err(e) => cli_out(e.to_string()),
                             }
                         } else {
                             let stored = crate::web::manager::prompt_plugin_login(
                                 db, &plugin, true, args.force,
                             );
-                            cli_out(format!("Stored {stored} login item(s) for {}.", plugin.name));
+                            cli_out(format!(
+                                "Stored {stored} login item(s) for {}.",
+                                plugin.name
+                            ));
                         }
                     }
                     None => {
-                        cli_out(
-                            format!(
-                                "No plugin found for '{}'. Known sites: {}",
-                                args.site,
-                                plugin_manager.get_storage_sites().join(", ")
-                            )
-                        );
+                        cli_out(format!(
+                            "No plugin found for '{}'. Known sites: {}",
+                            args.site,
+                            plugin_manager.get_storage_sites().join(", ")
+                        ));
                     }
                 }
             }
@@ -532,9 +509,7 @@ mod tests {
 
         // The file was copied into storage (Copy keeps the source in place).
         assert!(source.exists());
-        let stored: Vec<_> = std::fs::read_dir(&storage_dir)
-            .unwrap()
-            .collect();
+        let stored: Vec<_> = std::fs::read_dir(&storage_dir).unwrap().collect();
         assert_eq!(stored.len(), 1, "one partition dir in storage");
 
         // ... and recorded in the DB: findable by its MD5 identifying hash.
@@ -543,7 +518,10 @@ mod tests {
             .hashes_files_get_sync(&[shared_types::HashesSupported::Md5(md5)])
             .await;
         let file = found
-            .get(&("MD5".to_string(), format!("{:x}", md5::compute(contents.as_slice()))))
+            .get(&(
+                "MD5".to_string(),
+                format!("{:x}", md5::compute(contents.as_slice())),
+            ))
             .expect("imported file should resolve by md5");
         assert!(file.id.is_some());
         assert_eq!(file.extension, "png");
@@ -553,13 +531,17 @@ mod tests {
             .await
             .expect("re-import should succeed");
         let found_again = db
-            .hashes_files_get_sync(&[shared_types::HashesSupported::Md5(
-                format!("{:x}", md5::compute(contents.as_slice())),
-            )])
+            .hashes_files_get_sync(&[shared_types::HashesSupported::Md5(format!(
+                "{:x}",
+                md5::compute(contents.as_slice())
+            ))])
             .await;
         assert_eq!(
             found_again
-                .get(&("MD5".to_string(), format!("{:x}", md5::compute(contents.as_slice()))))
+                .get(&(
+                    "MD5".to_string(),
+                    format!("{:x}", md5::compute(contents.as_slice()))
+                ))
                 .and_then(|file| file.id),
             file.id
         );
@@ -596,25 +578,40 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_cli_command_help_and_errors() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let db =
-            TursoDatabase::new_with_exit(&temp_dir.path().join("test.db"), Arc::new(AtomicBool::new(false)))
-                .await;
+        let db = TursoDatabase::new_with_exit(
+            &temp_dir.path().join("test.db"),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
 
         let help = run_cli_command(&db, "--help").await;
-        assert!(help.contains("Usage"), "help should render usage, got: {help}");
+        assert!(
+            help.contains("Usage"),
+            "help should render usage, got: {help}"
+        );
 
         assert!(run_cli_command(&db, "").await.starts_with("error:"));
-        assert!(run_cli_command(&db, "not-a-command").await.starts_with("error:"));
-        assert!(run_cli_command(&db, "job add 'unterminated").await.starts_with("error:"));
+        assert!(
+            run_cli_command(&db, "not-a-command")
+                .await
+                .starts_with("error:")
+        );
+        assert!(
+            run_cli_command(&db, "job add 'unterminated")
+                .await
+                .starts_with("error:")
+        );
     }
 
     /// A real command through the runner: adding a job lands in the DB.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_cli_command_adds_a_job() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let db =
-            TursoDatabase::new_with_exit(&temp_dir.path().join("test.db"), Arc::new(AtomicBool::new(false)))
-                .await;
+        let db = TursoDatabase::new_with_exit(
+            &temp_dir.path().join("test.db"),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
 
         let output = run_cli_command(&db, "job add testsite \"male\" now").await;
         assert!(!output.starts_with("error:"), "job add failed: {output}");
@@ -630,9 +627,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_cli_command_rejects_interactive_login() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let db =
-            TursoDatabase::new_with_exit(&temp_dir.path().join("test.db"), Arc::new(AtomicBool::new(false)))
-                .await;
+        let db = TursoDatabase::new_with_exit(
+            &temp_dir.path().join("test.db"),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
 
         let output = run_cli_command(&db, "tasks login testsite").await;
         assert!(
@@ -640,6 +639,4 @@ mod tests {
             "interactive login must be refused, got: {output}"
         );
     }
-
-
 }

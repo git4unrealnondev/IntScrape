@@ -10,7 +10,7 @@ use std::{
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use shared_types::{
     CallbackCustomData, CallbackReturn, FileTagAction, GenericNamespaceObj, GlobalCallbacks,
-    PluginTag, PLUGIN_BATCH_SIZE, Tag,
+    PLUGIN_BATCH_SIZE, PluginTag, Tag,
 };
 
 use thumbnailer::{ThumbnailSize, create_thumbnails_dynamic};
@@ -179,7 +179,10 @@ fn on_start_impl() {
 /// `req..req + req_len` must be valid for the call. The wrapper
 /// null-checks, decodes inside `catch_unwind`, and returns an empty
 /// result on failure instead of panicking.
-pub unsafe extern "C" fn file_thumbnail_generate_thumbnail_fid(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
+pub unsafe extern "C" fn file_thumbnail_generate_thumbnail_fid(
+    req: *const u8,
+    req_len: usize,
+) -> shared_types::CVec<u8> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let Some(callback) = (unsafe {
             shared_types::plugin_ffi::decode::<shared_types::CallbackInfoInput>(req, req_len)
@@ -190,7 +193,10 @@ pub unsafe extern "C" fn file_thumbnail_generate_thumbnail_fid(req: *const u8, r
     }));
     match result {
         Ok(value) => shared_types::plugin_ffi::encode(&value),
-        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<String, shared_types::CallbackCustomDataReturning>::new()),
+        Err(_) => shared_types::plugin_ffi::encode(&std::collections::HashMap::<
+            String,
+            shared_types::CallbackCustomDataReturning,
+        >::new()),
     }
 }
 

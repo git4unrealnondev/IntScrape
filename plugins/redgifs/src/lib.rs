@@ -216,9 +216,10 @@ fn first_term(job: &shared_types::PluginJob) -> Option<String> {
     // Fall back to a url's identifying segment.
     for param in &job.param {
         if let shared_types::ScraperParam::Url(url) = param
-            && let Some(term) = term_from_url(&url.url) {
-                return Some(term);
-            }
+            && let Some(term) = term_from_url(&url.url)
+        {
+            return Some(term);
+        }
     }
 
     None

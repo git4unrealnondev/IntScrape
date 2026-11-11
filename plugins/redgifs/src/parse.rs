@@ -43,8 +43,7 @@ impl Harvest {
 }
 
 /// Runtime knobs from the database settings.
-#[derive(Clone, Copy, Debug)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Options {
     /// Prefer the audio-removed variant when one exists.
     pub prefer_silent: bool,
@@ -53,7 +52,6 @@ pub struct Options {
     /// Re-request every gallery found, even when its gifs are already held.
     pub refresh_galleries: bool,
 }
-
 
 /// The sanitised id of one gif.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -326,9 +324,13 @@ fn value_tags(gif: &json::JsonValue, id: &GifId) -> Vec<PluginTag> {
         push(Ns::CreatedUtc, created.to_string(), &mut out);
     }
     if let (Some(width), Some(height)) = (gif["width"].as_u64(), gif["height"].as_u64())
-        && width > 0 && height > 0 && width < 100_000 && height < 100_000 {
-            push(Ns::Dimensions, format!("{width}x{height}"), &mut out);
-        }
+        && width > 0
+        && height > 0
+        && width < 100_000
+        && height < 100_000
+    {
+        push(Ns::Dimensions, format!("{width}x{height}"), &mut out);
+    }
     match gif["duration"].as_u64() {
         Some(duration) if duration < 86_400 => {
             push(Ns::Duration, duration.to_string(), &mut out);
@@ -527,10 +529,12 @@ mod tests {
 
     #[test]
     fn gallery_entries_become_followup_jobs_and_dedupe() {
-        let gifs = [parse(r#"{"id": "a1", "gallery": "gal-1"}"#),
+        let gifs = [
+            parse(r#"{"id": "a1", "gallery": "gal-1"}"#),
             parse(r#"{"id": "a2", "gallery": "gal-1"}"#),
             parse(r#"{"id": "b1", "gallery": "gal-2"}"#),
-            parse(r#"{"id": "c1", "gallery": null}"#)];
+            parse(r#"{"id": "c1", "gallery": null}"#),
+        ];
         let refs: Vec<&json::JsonValue> = gifs.iter().collect();
 
         let jobs = gallery_jobs(&refs, &Options::default());

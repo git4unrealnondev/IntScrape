@@ -18,9 +18,9 @@ use std::{
 
 use regex::Regex;
 use shared_types::{
-    CallbackReturn, DbSettingsObj, DEFAULT_PRIORITY, FileObject, FileSource, FileTagAction,
+    CallbackReturn, DEFAULT_PRIORITY, DbSettingsObj, FileObject, FileSource, FileTagAction,
     GenericNamespaceObj, GlobalCallbacks, Plugin, PluginJob, PluginProperties, PluginTag,
-    ScraperDataReturn, ScraperParam, ScraperObject, ScraperReturn, SearchType, SkipIf,
+    ScraperDataReturn, ScraperObject, ScraperParam, ScraperReturn, SearchType, SkipIf,
     StartupThreadType, Tag, TagOperation, Url,
 };
 
@@ -128,9 +128,9 @@ fn owned_by_plugin(url: &str) -> bool {
 pub unsafe extern "C" fn on_regex(req: *const u8, req_len: usize) -> shared_types::CVec<u8> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         type OnRegexInput = (String, String, shared_types::Tag, u64);
-        let Some((matched, full_tag, tag_source, tag_source_id)) = (unsafe {
-            shared_types::plugin_ffi::decode::<OnRegexInput>(req, req_len)
-        }) else {
+        let Some((matched, full_tag, tag_source, tag_source_id)) =
+            (unsafe { shared_types::plugin_ffi::decode::<OnRegexInput>(req, req_len) })
+        else {
             return shared_types::CallbackReturn::default();
         };
         on_regex_impl(&matched, &full_tag, &tag_source, tag_source_id)
@@ -268,8 +268,7 @@ fn handle_on_start() -> Result<(), Box<dyn Error>> {
             for job in callback_return.jobs {
                 if let Err(error) = client::jobs_add_single(job.job) {
                     failures += 1;
-                    let _ =
-                        client::log_silent(format!("DIRECT: could not queue {url}: {error}"));
+                    let _ = client::log_silent(format!("DIRECT: could not queue {url}: {error}"));
                 }
             }
         }

@@ -326,7 +326,10 @@ fn hash_match_ignores_hex_casing_and_whitespace() {
     let md5_upper = HashesSupported::Md5("D8153106DA2F23B23119337C34E55A66".to_string());
     assert!(hashes_match(&md5_upper, "d8153106da2f23b23119337c34e55a66"));
     let md5_padded = HashesSupported::Md5("  d8153106da2f23b23119337c34e55a66\n".to_string());
-    assert!(hashes_match(&md5_padded, "d8153106da2f23b23119337c34e55a66"));
+    assert!(hashes_match(
+        &md5_padded,
+        "d8153106da2f23b23119337c34e55a66"
+    ));
 
     // SHA digests are canonical uppercase; lowercase input must match.
     let sha256_lower = HashesSupported::Sha256(
@@ -338,15 +341,15 @@ fn hash_match_ignores_hex_casing_and_whitespace() {
     ));
 
     // A `0x` prefix from some tools is tolerated.
-    let sha512_prefixed = HashesSupported::Sha512(format!(
-        "0x{}",
-        "a".repeat(128)
-    ));
+    let sha512_prefixed = HashesSupported::Sha512(format!("0x{}", "a".repeat(128)));
     assert!(hashes_match(&sha512_prefixed, &"A".repeat(128)));
 
     // Genuinely different digests still mismatch.
     let md5_other = HashesSupported::Md5("0".repeat(32));
-    assert!(!hashes_match(&md5_other, "d8153106da2f23b23119337c34e55a66"));
+    assert!(!hashes_match(
+        &md5_other,
+        "d8153106da2f23b23119337c34e55a66"
+    ));
 
     // Empty declared digest means "no expectation".
     assert!(hashes_match(

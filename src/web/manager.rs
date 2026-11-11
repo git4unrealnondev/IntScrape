@@ -1347,8 +1347,7 @@ impl Scraper {
                     .zip(&actual_hashes)
                     .filter(|(expected, actual)| !hashes_match(expected, actual))
                     .map(|(expected, actual)| {
-                        let (algorithm, _) =
-                            crate::db::hashes_supported_to_inner(expected);
+                        let (algorithm, _) = crate::db::hashes_supported_to_inner(expected);
                         format!(
                             "{algorithm} expected={} actual={actual}",
                             expected_hash(expected)
@@ -1484,31 +1483,32 @@ impl Scraper {
                 FileSource::Url(file_url) => Some(file_url),
                 FileSource::Bytes(_) => None,
             })
-            && let Some(source_status) = dedup.source_files.get(file_url) {
-                if source_status.dead {
-                    info!(
-                        "Scraper: {} JobId: {} Skipping dead URL: {}",
-                        self.plugin.name, self.job.id, file_url
-                    );
-                    return Ok(None);
-                }
-
-                let Some(file_internal) = source_status.file.as_ref() else {
-                    info!(
-                        "Scraper: {} JobId: {} -- Skipping URL with no associated file: {}",
-                        self.plugin.name, self.job.id, file_url
-                    );
-                    return Ok(None);
-                };
+            && let Some(source_status) = dedup.source_files.get(file_url)
+        {
+            if source_status.dead {
                 info!(
-                    "Scraper: {} JobId: {} Skipping file_id {} because URL: {} already in db.",
-                    self.plugin.name,
-                    self.job.id,
-                    file_internal.id.unwrap_or(0),
-                    file_url
+                    "Scraper: {} JobId: {} Skipping dead URL: {}",
+                    self.plugin.name, self.job.id, file_url
                 );
-                return Ok(Some(FileReturn::File(file_internal.clone().into())));
+                return Ok(None);
             }
+
+            let Some(file_internal) = source_status.file.as_ref() else {
+                info!(
+                    "Scraper: {} JobId: {} -- Skipping URL with no associated file: {}",
+                    self.plugin.name, self.job.id, file_url
+                );
+                return Ok(None);
+            };
+            info!(
+                "Scraper: {} JobId: {} Skipping file_id {} because URL: {} already in db.",
+                self.plugin.name,
+                self.job.id,
+                file_internal.id.unwrap_or(0),
+                file_url
+            );
+            return Ok(Some(FileReturn::File(file_internal.clone().into())));
+        }
 
         // Associates file hashes with a file object
         for hash in file.hash.iter().filter(|_| !is_redownload) {
@@ -1771,7 +1771,8 @@ impl Scraper {
                     };
 
                     {
-                        let mut hash_guard = file_hash_local.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut hash_guard =
+                            file_hash_local.lock().unwrap_or_else(|e| e.into_inner());
                         hash_guard.push(new_hash);
                     }
                 }
@@ -1861,7 +1862,10 @@ impl Scraper {
                 storage_id,
                 size_bytes,
             },
-            identifying_hashes: file_hash_owned.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            identifying_hashes: file_hash_owned
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
         };
         // Central normalization: the plugin-supplied identifying
         // hashes are canonical regardless of site casing; the computed
@@ -1960,16 +1964,15 @@ impl DownloadsManager {
         for property in &plugin.properties {
             if let PluginProperties::Login((_loginneed, logintype)) = property
                 && let LoginType::Cookie(name, _) = logintype
-                    && let Some(api_key) = self.db.setting_get_sync_blocking(&format!(
-                        "PLUGIN_{}_{}_COOKIE",
-                        plugin.name, name
-                    ))
-                {
-                    out.push(ScraperParam::Login(LoginType::Cookie(
-                        name.clone(),
-                        Some(api_key.param.clone().unwrap_or_default()),
-                    )));
-                }
+                && let Some(api_key) = self
+                    .db
+                    .setting_get_sync_blocking(&format!("PLUGIN_{}_{}_COOKIE", plugin.name, name))
+            {
+                out.push(ScraperParam::Login(LoginType::Cookie(
+                    name.clone(),
+                    Some(api_key.param.clone().unwrap_or_default()),
+                )));
+            }
         }
 
         if let Some(api_key) = self
@@ -2019,6 +2022,21 @@ impl DownloadsManager {
     pub async fn all_jobs_complete(&self) -> bool {
         let jobs = self.jobs.read().await;
         jobs.is_empty()
+    }
+
+    /// Number of jobs a site currently holds in memory, queued or running.
+    ///
+    /// Running jobs stay in `job_storage` (with `isrunning` set) until they
+    /// finish, so this is the full backlog the in-memory pipeline still has
+    /// to work through. Used by the spawner to only poll the database when a
+    /// site is close to running dry.
+    pub async fn in_memory_job_count(&self, plugin_name: &str) -> usize {
+        self.jobs
+            .read()
+            .await
+            .get(plugin_name)
+            .map(|storage| storage.job_storage.len())
+            .unwrap_or(0)
     }
 
     pub async fn downloads_complete(&self) -> bool {
@@ -2344,17 +2362,19 @@ pub(crate) fn import_cookies_txt(
         return Err(format!("{} declares no cookie logins.", plugin.name));
     }
 
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("Could not read {path}: {e}"))?;
+    let text = std::fs::read_to_string(path).map_err(|e| format!("Could not read {path}: {e}"))?;
 
     // Domain aliases that look like hosts (e.g. `furaffinity.net`).
     let aliases: Vec<String> = plugin
         .properties
         .iter()
         .filter_map(|p| match p {
-            PluginProperties::Sites(sites) => {
-                Some(sites.iter().map(|s| s.to_ascii_lowercase()).collect::<Vec<_>>())
-            }
+            PluginProperties::Sites(sites) => Some(
+                sites
+                    .iter()
+                    .map(|s| s.to_ascii_lowercase())
+                    .collect::<Vec<_>>(),
+            ),
             _ => None,
         })
         .flatten()

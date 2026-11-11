@@ -210,7 +210,8 @@ impl TursoDatabase {
         // stored is left alone; the DB insert below is idempotent, so
         // re-importing the same file is always safe.
         let already_stored = storage_path.exists()
-            && std::fs::canonicalize(path).ok().as_deref() == std::fs::canonicalize(&storage_path).ok().as_deref();
+            && std::fs::canonicalize(path).ok().as_deref()
+                == std::fs::canonicalize(&storage_path).ok().as_deref();
         if !already_stored {
             if !storage_path.exists() {
                 let parent = storage_path
@@ -257,7 +258,11 @@ impl TursoDatabase {
         file_manager.normalize_hashes();
         let mut map = HashMap::new();
         map.insert(file_manager, Vec::new());
-        if !self.process_scraper_chunk_human(map).await.map_err(|error| error.to_string())? {
+        if !self
+            .process_scraper_chunk_human(map)
+            .await
+            .map_err(|error| error.to_string())?
+        {
             return Err("database failed to record the imported file".into());
         }
 

@@ -26,7 +26,9 @@ pub struct CVec<T> {
 /// Plugins receive this as bitcode bytes (see the `plugin_ffi` helpers
 /// below) instead of a `&ScraperDataReturn` reference, whose owned fields
 /// have no stable C ABI.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, bitcode::Encode, bitcode::Decode,
+)]
 pub struct ParserCallInput {
     pub text: String,
     pub source_url: String,
@@ -249,7 +251,9 @@ pub struct PluginJob {
 ///
 /// Used as a return from a plugin when doing text scraping
 ///
-#[derive(Clone, Default, PartialEq, Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, Default, PartialEq, Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode,
+)]
 pub enum ScraperReturn {
     // Valid data from the system
     Data(ScraperObject),
@@ -263,7 +267,9 @@ pub enum ScraperReturn {
     // Sends job back into queue with x waiting time in seconds
     RetryLater(u64),
 }
-#[derive(Default, Clone, PartialEq, Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Default, Clone, PartialEq, Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode,
+)]
 pub struct ScraperObject {
     pub files: HashSet<FileObject>,
     pub tags: HashSet<PluginTag>,
@@ -272,7 +278,9 @@ pub struct ScraperObject {
 }
 
 /// Gets used for the on_download callback return
-#[derive(Default, Clone, PartialEq, Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Default, Clone, PartialEq, Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode,
+)]
 pub struct CallbackReturn {
     pub tags: HashSet<FileTagAction>,
     pub jobs: HashSet<ScraperDataReturn>,
@@ -318,7 +326,18 @@ pub struct FileTagAction {
 
 /// Represents one file
 /// Current version of FileObject
-#[derive(Default, Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Debug,
+    Serialize,
+    Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
 pub struct FileObject {
     pub source: Option<FileSource>,
     // Hash of file
@@ -372,13 +391,17 @@ pub struct TagSearch {
     pub count: u64,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode,
+)]
 pub enum FileSource {
     Url(String),
     Bytes(Vec<u8>),
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode,
+)]
 #[cfg_attr(feature = "strum", derive(strum_macros::EnumIter))]
 pub enum HashesSupported {
     Md5(String),
@@ -406,7 +429,11 @@ impl HashesSupported {
     /// The digest string as carried by this variant.
     pub fn digest(&self) -> &str {
         match self {
-            Self::Md5(s) | Self::Sha1(s) | Self::Sha256(s) | Self::Sha512(s) | Self::ImageHash(s) => s,
+            Self::Md5(s)
+            | Self::Sha1(s)
+            | Self::Sha256(s)
+            | Self::Sha512(s)
+            | Self::ImageHash(s) => s,
         }
     }
 
@@ -506,9 +533,15 @@ impl FileObject {
         }
         for action in &mut self.tag_list {
             for plugin_tag in &mut action.tags {
-                Self::normalize_filehash_tag(&mut plugin_tag.tag.name, &plugin_tag.tag.namespace.name);
+                Self::normalize_filehash_tag(
+                    &mut plugin_tag.tag.name,
+                    &plugin_tag.tag.namespace.name,
+                );
                 if let Some(relation) = &mut plugin_tag.relates_to {
-                    Self::normalize_filehash_tag(&mut relation.tag.name, &relation.tag.namespace.name);
+                    Self::normalize_filehash_tag(
+                        &mut relation.tag.name,
+                        &relation.tag.namespace.name,
+                    );
                     if let Some(limit_to) = &mut relation.limit_to {
                         Self::normalize_filehash_tag(&mut limit_to.name, &limit_to.namespace.name);
                     }
@@ -546,8 +579,7 @@ impl FileManager {
         for hash in &mut self.identifying_hashes {
             hash.normalize();
         }
-        let mut seen: Vec<HashesSupported> =
-            Vec::with_capacity(self.identifying_hashes.len());
+        let mut seen: Vec<HashesSupported> = Vec::with_capacity(self.identifying_hashes.len());
         self.identifying_hashes.retain(|hash| {
             if seen.contains(hash) {
                 false
@@ -556,8 +588,7 @@ impl FileManager {
                 true
             }
         });
-        self.internal.hash =
-            HashesSupported::canonical_digest("SHA512", &self.internal.hash);
+        self.internal.hash = HashesSupported::canonical_digest("SHA512", &self.internal.hash);
     }
 }
 
@@ -565,7 +596,16 @@ impl FileManager {
 /// copy it into storage (source stays), move it (source is removed), or
 /// hardlink it (source and storage share one inode; same filesystem only).
 #[derive(
-    Clone, Copy, PartialEq, Eq, Hash, Debug, Deserialize, Serialize, bitcode::Encode, bitcode::Decode,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Debug,
+    Deserialize,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
 )]
 pub enum FileAction {
     Copy,
@@ -592,13 +632,26 @@ pub struct DbJobsObj {
     pub config: PluginJob,
 }
 
-#[derive(Debug, Clone, Default, Eq, Hash, PartialEq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    Eq,
+    Hash,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
 pub struct ScraperDataReturn {
     pub job: PluginJob,
     pub skip_conditions: Vec<SkipIf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, bitcode::Encode, bitcode::Decode,
+)]
 pub enum SkipIf {
     // If a relationship between any file and tag exists.
     FileTagRelationship(Tag),
@@ -614,7 +667,18 @@ pub enum SkipIf {
     // Skips job if a relate_tag_id and limit_to exists
     ParentsRelateLimitto((Tag, Tag)),
 }
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Default, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    Eq,
+    Hash,
+    PartialEq,
+    Default,
+    Serialize,
+    Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
 pub struct Plugin {
     /// Name of the site (human readable plz)
     pub name: String,
@@ -635,7 +699,9 @@ pub struct Plugin {
     pub properties: Vec<PluginProperties>,
 }
 
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode,
+)]
 pub enum PluginProperties {
     /// Ratelimit number of tokens per time
     Ratelimit(u32, Duration),
@@ -750,7 +816,18 @@ pub enum LoginType {
 /// Data storage for the login type needed to determine if we have to use this to access a site or
 /// if its just a nice to have
 ///
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Default, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    Eq,
+    Hash,
+    PartialEq,
+    Default,
+    Serialize,
+    Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
 pub enum LoginNeed {
     Required,
     #[default]
@@ -778,7 +855,9 @@ pub struct LoginUsernameOrPassword {
     pub password: Secret<String>,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode,
+)]
 pub enum GlobalCallbacks {
     // Ran when a file is downloaded
     Download,
@@ -847,7 +926,19 @@ pub enum CallbackCustomData {
     VCallback,
 }
 
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Ord, PartialOrd, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    Eq,
+    Hash,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Serialize,
+    Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
 pub enum StartupThreadType {
     // Runs plugin and waits until it finished
     Inline,
@@ -857,7 +948,9 @@ pub enum StartupThreadType {
     SpawnInline,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, bitcode::Encode, bitcode::Decode,
+)]
 pub enum SearchType {
     String(String),
     Regex(String),
@@ -1034,7 +1127,7 @@ impl FileTagAction {
 /// FurAffinity `400`s was exactly such a divergence.
 pub mod helpers {
     use super::{
-        DownloadModifiers, FileObject, FileTagAction, FileSource, GenericNamespaceObj,
+        DownloadModifiers, FileObject, FileSource, FileTagAction, GenericNamespaceObj,
         HashesSupported, LoginType, ModifierTarget, PluginJob, ScraperDataReturn, ScraperObject,
         ScraperParam, ScraperReturn, TargetModifier, Url,
     };
@@ -1050,11 +1143,7 @@ pub mod helpers {
         if files.is_empty() && tags.is_empty() && jobs.is_empty() {
             vec![ScraperReturn::Nothing]
         } else {
-            vec![ScraperReturn::Data(ScraperObject {
-                files,
-                tags,
-                jobs,
-            })]
+            vec![ScraperReturn::Data(ScraperObject { files, tags, jobs })]
         }
     }
 
@@ -1233,7 +1322,11 @@ pub mod helpers {
             hash: vec![HashesSupported::Sha512(hash.clone())],
             ..Default::default()
         };
-        Some(finalize(HashSet::from([file]), HashSet::new(), HashSet::new()))
+        Some(finalize(
+            HashSet::from([file]),
+            HashSet::new(),
+            HashSet::new(),
+        ))
     }
 
     /// Single-URL job for `url_dump` implementations.
@@ -1296,10 +1389,7 @@ pub mod helpers {
 
         #[test]
         fn dedupe_cookie_header_collapses_repeats() {
-            assert_eq!(
-                dedupe_cookie_header("a=1; b=2; a=1; b=2; a=3"),
-                "a=3; b=2"
-            );
+            assert_eq!(dedupe_cookie_header("a=1; b=2; a=1; b=2; a=3"), "a=3; b=2");
             assert_eq!(dedupe_cookie_header(""), "");
         }
 
@@ -1339,9 +1429,15 @@ pub mod helpers {
                 numeric_segment_after("https://x/view/123/", &["view", "full"]),
                 Some("123".into())
             );
-            assert_eq!(numeric_segment_after("https://x/view/abc/", &["view"]), None);
+            assert_eq!(
+                numeric_segment_after("https://x/view/abc/", &["view"]),
+                None
+            );
             assert_eq!(last_segment("https://x/a/b/"), Some("b".into()));
-            assert_eq!(segment_after("https://x/gallery/bob/", "gallery"), Some("bob".into()));
+            assert_eq!(
+                segment_after("https://x/gallery/bob/", "gallery"),
+                Some("bob".into())
+            );
         }
 
         #[test]
@@ -1412,7 +1508,9 @@ pub mod helpers {
             file.normalize_hashes();
             assert_eq!(
                 file.hash,
-                vec![HashesSupported::Md5("d8153106da2f23b23119337c34e55a66".into())]
+                vec![HashesSupported::Md5(
+                    "d8153106da2f23b23119337c34e55a66".into()
+                )]
             );
             match &file.skip_if[0] {
                 super::super::SkipIf::FileTagRelationship(tag) => {

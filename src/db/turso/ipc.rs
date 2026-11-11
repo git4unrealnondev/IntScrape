@@ -140,7 +140,10 @@ impl TursoDatabase {
     /// list (e.g. the WebUI `/api/v0/file-hashes` endpoint): one IPC round
     /// trip and one indexed scan instead of one round trip and one query per
     /// file. See `file_hashes_get_all_sha512`.
-    #[ipc(name = "get_file_hashes_all_sha512", request = "GetAllFileHashesSha512")]
+    #[ipc(
+        name = "get_file_hashes_all_sha512",
+        request = "GetAllFileHashesSha512"
+    )]
     pub async fn ipc_get_file_hashes_all_sha512(&self) -> Vec<String> {
         let Ok(conn) = self.db.connect() else {
             return Vec::new();
@@ -164,7 +167,9 @@ impl TursoDatabase {
         let Ok(conn) = self.db.connect() else {
             return HashMap::new();
         };
-        self.hashes_files_get(&conn, hashes).await.unwrap_or_default()
+        self.hashes_files_get(&conn, hashes)
+            .await
+            .unwrap_or_default()
     }
 
     /// Bulk lookup of files by their primary `File.hash`, keyed by hash.
@@ -172,14 +177,13 @@ impl TursoDatabase {
     /// the looked-up digest as the primary hash itself (e.g. md5-primary
     /// rows from older/slurped libraries) rather than only in `FileHashes`.
     #[ipc(name = "files_get_by_hash", request = "FilesGetByHash")]
-    pub async fn ipc_files_get_by_hash(
-        &self,
-        hashes: &[String],
-    ) -> HashMap<String, FileInternal> {
+    pub async fn ipc_files_get_by_hash(&self, hashes: &[String]) -> HashMap<String, FileInternal> {
         let Ok(conn) = self.db.connect() else {
             return HashMap::new();
         };
-        self.files_get_by_hash(&conn, hashes).await.unwrap_or_default()
+        self.files_get_by_hash(&conn, hashes)
+            .await
+            .unwrap_or_default()
     }
 
     ///
@@ -198,7 +202,10 @@ impl TursoDatabase {
     /// Gets tag ids associated with a namespace id, newest-created first.
     /// `limit` bounds how many ids are returned; `None` or a limit of zero
     /// returns every id, matching the unlimited request.
-    #[ipc(name = "get_tag_ids_namespace_id_limited", request = "GetNamespaceTagIDsLimited")]
+    #[ipc(
+        name = "get_tag_ids_namespace_id_limited",
+        request = "GetNamespaceTagIDsLimited"
+    )]
     pub async fn ipc_tag_id_get_namespace_id_limited(
         &self,
         namespace_id: &u64,
@@ -390,13 +397,8 @@ impl TursoDatabase {
 
         // Ensure all referenced namespaces exist (see put_tags_to_file) so
         // the transaction below stays DML-only.
-        let namespace_set = collect_namespaces(
-            &tags_by_file
-                .values()
-                .flatten()
-                .cloned()
-                .collect::<Vec<_>>(),
-        );
+        let namespace_set =
+            collect_namespaces(&tags_by_file.values().flatten().cloned().collect::<Vec<_>>());
         if let Err(error) = self.namespace_ensure_set(&namespace_set).await {
             log::error!("Failed to pre-ensure namespaces for bulk tag add: {error}");
             return false;
@@ -728,9 +730,7 @@ impl TursoDatabase {
         self.source_url_files_get(url_set)
             .await
             .into_iter()
-            .filter_map(|(url, status)| {
-                status.file.and_then(|file| file.id).map(|id| (url, id))
-            })
+            .filter_map(|(url, status)| status.file.and_then(|file| file.id).map(|id| (url, id)))
             .collect()
     }
 
@@ -840,7 +840,6 @@ impl TursoDatabase {
         crate::cli::run_cli_command(self, command).await
     }
 }
-
 
 #[cfg(test)]
 mod tests;

@@ -31,10 +31,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use shared_types::{
-    DbSettingsObj, FileTagAction, PluginTag, RelationContext, Tag,
-    TagOperation,
-};
+use shared_types::{DbSettingsObj, FileTagAction, PluginTag, RelationContext, Tag, TagOperation};
 
 use super::{NsIdent, Site, nsobjplg};
 
@@ -53,9 +50,7 @@ pub fn run() {
     }
     for site in [Site::E6, Site::E6AI, Site::Blep] {
         if let Err(error) = run_site(&site) {
-            let _ = client::log_silent(format!(
-                "e6 csv import {site}: failed: {error}"
-            ));
+            let _ = client::log_silent(format!("e6 csv import {site}: failed: {error}"));
         }
     }
 }
@@ -174,10 +169,7 @@ fn parse_row(record: &csv::StringRecord, columns: &Columns) -> Option<PostRow> {
     if md5.len() != 32 || !md5.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
-    let parent_id = field(record, columns.parent_id)
-        .trim()
-        .parse::<u64>()
-        .ok();
+    let parent_id = field(record, columns.parent_id).trim().parse::<u64>().ok();
     let sources = field(record, columns.source)
         .split('\n')
         .map(str::trim)
@@ -199,7 +191,7 @@ fn parse_row(record: &csv::StringRecord, columns: &Columns) -> Option<PostRow> {
 /// Maps a Danbooru tag category id to its namespace identity. Unknown
 /// categories fall back to General, matching the live plugin's behaviour
 /// of only knowing the categories it parses from the API.
-/// 
+///
 /// For E6AI and Blep, category 1 (Artist) is mapped to Director instead,
 /// since those sites' CSV dumps use category 1 for AI artist tags.
 fn category_ident(category: u8, site: &Site) -> NsIdent {
@@ -258,11 +250,7 @@ fn load_tag_categories(tags_path: Option<&Path>) -> HashMap<String, u8> {
 /// parser (`parser_call` in lib.rs) attaches to a post's file: the post id,
 /// rating, description, sources and categorised tags — all as bare tags in
 /// a single Add action.
-fn row_tags(
-    row: &PostRow,
-    site: &Site,
-    categories: &HashMap<String, u8>,
-) -> Vec<PluginTag> {
+fn row_tags(row: &PostRow, site: &Site, categories: &HashMap<String, u8>) -> Vec<PluginTag> {
     let mut seen = HashSet::new();
     let mut tags = Vec::new();
     let mut push = |name: String, namespace: NsIdent| {
@@ -485,20 +473,15 @@ mod tests {
 
     fn categories() -> HashMap<String, u8> {
         HashMap::from([
-            ("dragon".to_string(), 5),   // species
-            ("krystal".to_string(), 4),  // character
+            ("dragon".to_string(), 5),     // species
+            ("krystal".to_string(), 4),    // character
             ("someartist".to_string(), 1), // artist
         ])
     }
 
     fn tag_namespaces(tags: &[PluginTag]) -> Vec<(String, String)> {
         tags.iter()
-            .map(|tag| {
-                (
-                    tag.tag.name.clone(),
-                    tag.tag.namespace.name.clone(),
-                )
-            })
+            .map(|tag| (tag.tag.name.clone(), tag.tag.namespace.name.clone()))
             .collect()
     }
 
@@ -622,7 +605,13 @@ mod tests {
     #[test]
     fn parse_row_reads_a_posts_csv_record() {
         let headers = csv::StringRecord::from(vec![
-            "id", "md5", "rating", "tag_string", "source", "description", "parent_id",
+            "id",
+            "md5",
+            "rating",
+            "tag_string",
+            "source",
+            "description",
+            "parent_id",
         ]);
         let columns = Columns {
             id: column_index(&headers, "id").unwrap(),

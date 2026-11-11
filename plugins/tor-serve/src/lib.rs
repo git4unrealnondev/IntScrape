@@ -412,9 +412,9 @@ async fn issue_token(headers: HeaderMap, State(state): State<AppState>) -> impl 
             .iter()
             .min_by_key(|(_, issued)| *issued)
             .map(|(token, _)| token.clone())
-        {
-            issued_tokens.remove(&oldest);
-        }
+    {
+        issued_tokens.remove(&oldest);
+    }
     issued_tokens.insert(token.clone(), now);
     Json(serde_json::json!({
         "access_token": token,

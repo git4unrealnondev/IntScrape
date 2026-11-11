@@ -140,7 +140,10 @@ async fn import_file_ipc_copies_and_moves() {
         .hashes_files_get_sync(&[shared_types::HashesSupported::Md5(md5)])
         .await;
     let file = found
-        .get(&("MD5".to_string(), format!("{:x}", md5::compute(contents.as_slice()))))
+        .get(&(
+            "MD5".to_string(),
+            format!("{:x}", md5::compute(contents.as_slice())),
+        ))
         .expect("imported file should resolve by md5");
     assert!(file.id.is_some());
     assert_eq!(file.extension, "png");
@@ -158,7 +161,10 @@ async fn import_file_ipc_copies_and_moves() {
     assert!(!mover.exists(), "move should remove the source");
 
     let missing = db
-        .ipc_import_file(&"/definitely/missing".to_string(), &shared_types::FileAction::Copy)
+        .ipc_import_file(
+            &"/definitely/missing".to_string(),
+            &shared_types::FileAction::Copy,
+        )
         .await;
     assert!(
         missing.contains("No such file"),
