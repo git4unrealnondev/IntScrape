@@ -1963,6 +1963,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cssparser"
+version = "0.38.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11119743ad110e8c1bdccd930d7f5c30c99e5fc76a7b63ec9807e84eef0c5f59"
+dependencies = [
+ "cssparser-macros 0.7.1",
+ "dtoa-short",
+ "itoa",
+ "phf 0.14.0",
+ "smallvec",
+]
+
+[[package]]
 name = "cssparser-macros"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5638,6 +5651,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7fd106b8571932f2b8d961a296390c56f05d454ce95e2405f1d8703ca0119e8e"
 
 [[package]]
+name = "pawbooru"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "json",
+ "scraper 0.29.0",
+ "shared_types",
+]
+
+[[package]]
 name = "pawchive"
 version = "0.1.0"
 dependencies = [
@@ -7211,6 +7234,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "scraper"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6844b5f49a5579f12ba4f89d9f7eec6d71889e4aa0bc7181821040ce66f08fff"
+dependencies = [
+ "cssparser 0.38.0",
+ "ego-tree 0.11.1",
+ "getopts",
+ "html5ever 0.40.1",
+ "precomputed-hash",
+ "selectors 0.41.0",
+]
+
+[[package]]
 name = "sec1"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7302,6 +7339,23 @@ dependencies = [
  "precomputed-hash",
  "rustc-hash 2.1.3",
  "servo_arc 0.4.3",
+ "smallvec",
+]
+
+[[package]]
+name = "selectors"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8322aebea94a6cc288ff884e8a49bdbceef60206c400c6c46d22e62fc4fd91a6"
+dependencies = [
+ "bitflags",
+ "cssparser 0.38.0",
+ "derive_more 2.1.1",
+ "log",
+ "new_debug_unreachable",
+ "precomputed-hash",
+ "rustc-hash 2.1.3",
+ "servo_arc 0.5.0",
  "smallvec",
 ]
 
@@ -7481,6 +7535,15 @@ name = "servo_arc"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "170fb83ab34de17dc69aa7c67482b22218ddb85da56546f9bd6b929e32a05930"
+dependencies = [
+ "stable_deref_trait",
+]
+
+[[package]]
+name = "servo_arc"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4eceb519ec34d8290aaf6e46f435102f2bfa63f22b05a144fb16ab266d3b198"
 dependencies = [
  "stable_deref_trait",
 ]

@@ -913,12 +913,54 @@ impl Scraper {
                                                         );
                                                     }
                                                 },
-                                                FileReturn::AlreadyPresent => {
-                                                    // The file is already in the db; re-upserting
-                                                    // it (and its tags) per skip was one wasted
-                                                    // transaction per already-present file on
-                                                    // every page re-walk. The file's tags still
-                                                    // reach the db through the page's tag set.
+                                                FileReturn::AlreadyPresent(existing) => {
+                                                    // The file row already exists, but this
+                                                    // scrape may carry fresh tags for it.
+                                                    // Buffer the tag list against the existing
+                                                    // row so `process_scraper`'s relationship
+                                                    // phase attaches them — this is what kept
+                                                    // file↔tag relationships alive across page
+                                                    // re-walks. `file_add_bulk` no-ops on the
+                                                    // existing hash, so no duplicate row is made.
+                                                    let flushed = {
+                                                        let mut batch =
+                                                            flush_batch_clone.lock().await;
+                                                        batch
+                                                            .entry(FileManager {
+                                                                internal: existing,
+                                                                identifying_hashes: file
+                                                                    .hash
+                                                                    .clone(),
+                                                            })
+                                                            .or_default()
+                                                            .extend(std::mem::take(
+                                                                &mut file.tag_list,
+                                                            ));
+                                                        if batch.len() >= FLUSH_BATCH_SIZE {
+                                                            let batch =
+                                                                std::mem::take(&mut *batch);
+                                                            db.process_scraper(
+                                                                batch,
+                                                                Vec::new(),
+                                                                plugin_name.clone(),
+                                                            )
+                                                            .await
+                                                        } else {
+                                                            true
+                                                        }
+                                                    };
+
+                                                    if !flushed {
+                                                        log::error!(
+                                                            "Worker: {} JobId: {} -- Tag flush for existing file failed; keeping job to retry on next boot.",
+                                                            plugin_name,
+                                                            job_id,
+                                                        );
+                                                        should_remove_job_clone.store(
+                                                            false,
+                                                            std::sync::atomic::Ordering::Relaxed,
+                                                        );
+                                                    }
                                                 },
                                                 FileReturn::InDownloadQueue => {
 
@@ -1578,7 +1620,11 @@ impl Scraper {
                     file_internal.id.unwrap_or(0),
                     tag
                 );
-                return Ok(Some(FileReturn::AlreadyPresent));
+                // This is a plugin "skip if some file has tag X" rule, not a
+                // dedup hit on THIS file — attaching this file's tag list to
+                // the matched file would mislink, so the whole file (and its
+                // tags) is dropped, same as the legacy behavior.
+                return Ok(None);
             }
         }
 
@@ -1612,7 +1658,10 @@ impl Scraper {
                 file_internal.id.unwrap_or(0),
                 file_url
             );
-            return Ok(Some(FileReturn::AlreadyPresent));
+            // Dedup hit: the file row exists, but this scrape may carry new
+            // tags for it. Hand the existing row back so the flush path can
+            // attach the tag list to it instead of losing the relationships.
+            return Ok(Some(FileReturn::AlreadyPresent(file_internal.clone())));
         }
 
         // Associates file hashes with a file object
@@ -1633,7 +1682,10 @@ impl Scraper {
                     file_internal.id.unwrap_or(0),
                     hash
                 );
-                return Ok(Some(FileReturn::AlreadyPresent));
+                // Dedup hit on an identifying hash: hand the existing row back
+                // so the scraped tag list still lands as relationships (see
+                // the URL dedup arm above).
+                return Ok(Some(FileReturn::AlreadyPresent(file_internal.clone())));
             }
         }
 
