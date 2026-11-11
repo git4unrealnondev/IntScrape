@@ -36,7 +36,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use shared_types::{
-        FileInternal, FileTagAction, FileManager, GenericNamespaceObj, HashesSupported, PluginJob,
+        FileInternal, FileManager, FileTagAction, GenericNamespaceObj, HashesSupported, PluginJob,
         ScraperDataReturn, ScraperParam, Tag, TagOperation, TagParents, TagType, Url,
     };
     use turso::{Builder, Connection, Value};
@@ -1521,11 +1521,11 @@ mod tests {
                         .map(|i| (make_manager(i), make_actions(i)))
                         .collect();
                     let t = Instant::now();
-                    let ok = fixture.db.clone().process_scraper(
-                        map,
-                        Vec::new(),
-                        "bench flush sweep".to_string(),
-                    ).await;
+                    let ok = fixture
+                        .db
+                        .clone()
+                        .process_scraper(map, Vec::new(), "bench flush sweep".to_string())
+                        .await;
                     assert!(ok, "process_scraper flush failed at batch {batch}");
                     flush += t.elapsed();
                 }
@@ -1533,14 +1533,13 @@ mod tests {
                 // Drain path: `batch` pending scrape jobs upserted in one call.
                 let mut jobs_elapsed = Duration::ZERO;
                 for _ in 0..iters {
-                    let jobs: Vec<ScraperDataReturn> =
-                        (0..batch).map(|i| make_job(i)).collect();
+                    let jobs: Vec<ScraperDataReturn> = (0..batch).map(|i| make_job(i)).collect();
                     let t = Instant::now();
-                    let ok = fixture.db.clone().process_scraper(
-                        HashMap::new(),
-                        jobs,
-                        "bench drain sweep".to_string(),
-                    ).await;
+                    let ok = fixture
+                        .db
+                        .clone()
+                        .process_scraper(HashMap::new(), jobs, "bench drain sweep".to_string())
+                        .await;
                     assert!(ok, "process_scraper jobs failed at batch {batch}");
                     jobs_elapsed += t.elapsed();
                 }

@@ -3,8 +3,11 @@
 //! Attaches the data from a site's CSV dump to files that were already
 //! downloaded: each post is matched to an existing file by its md5 and its
 //! tags/metadata are added to that file. Posts whose file was never
-//! downloaded are skipped (and counted) — this importer never creates file
-//! records and never downloads anything.
+//! downloaded do not get metadata attached here — instead a `posts.json`
+//! search job is spawned (mirroring the live parser's parent/child job
+//! format: `?tags=~id:{id}+status:any`, ten ids per job, `recursion=false`)
+//! so the normal scrape pipeline downloads the file and the live plugin
+//! attaches its metadata. The importer itself never downloads anything.
 //!
 //! Controlled from the webui Settings page through per-site settings
 //! (plugin name = the site's `Display`, i.e. `E621` / `E6AI` / `Blep`):
@@ -37,6 +40,10 @@ use super::{NsIdent, Site, nsobjplg};
 
 /// Rows processed per database round trip.
 const BATCH_SIZE: usize = 1000;
+
+/// Posts per spawned `posts.json` search job, matching the live parser's
+/// `posts_to_search` chunking (see `parser_call` in lib.rs).
+const JOB_ID_CHUNK: usize = 10;
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -105,8 +112,8 @@ fn run_site(site: &Site) -> Result<(), Box<dyn Error>> {
     let _ = client::log_silent(format!(
         "e6 csv import {site}: finished (completed: {completed}) — \
          {} rows seen, {} invalid, {} matched to a downloaded file, \
-         {} skipped (no downloaded file).",
-        stats.rows_seen, stats.invalid, stats.matched, stats.unmatched,
+         {} unmatched ({} search jobs queued for the downloader).",
+        stats.rows_seen, stats.invalid, stats.matched, stats.unmatched, stats.jobs_queued,
     ));
 
     // One-shot: disarm so the next boot does not re-import the whole dump.
@@ -131,6 +138,7 @@ struct ImportStats {
     invalid: usize,
     matched: usize,
     unmatched: usize,
+    jobs_queued: usize,
 }
 
 /// One parsed `posts.csv` row (only the columns the importer uses).
@@ -171,9 +179,7 @@ fn parse_row(record: &csv::StringRecord, columns: &Columns) -> Option<PostRow> {
     }
     let parent_id = field(record, columns.parent_id).trim().parse::<u64>().ok();
     let sources = field(record, columns.source)
-        .split('\n')
-        .map(str::trim)
-        .filter(|source| !source.is_empty())
+        .split_whitespace()
         .map(str::to_string)
         .collect();
 
@@ -192,6 +198,9 @@ fn parse_row(record: &csv::StringRecord, columns: &Columns) -> Option<PostRow> {
 /// categories fall back to General, matching the live plugin's behaviour
 /// of only knowing the categories it parses from the API.
 ///
+/// Danbooru categories: 0 General, 1 Artist, 2 Contributor, 3 Copyright,
+/// 4 Character, 5 Species, 6 Invalid, 7 Meta, 8 Lore.
+///
 /// For E6AI and Blep, category 1 (Artist) is mapped to Director instead,
 /// since those sites' CSV dumps use category 1 for AI artist tags.
 fn category_ident(category: u8, site: &Site) -> NsIdent {
@@ -199,6 +208,7 @@ fn category_ident(category: u8, site: &Site) -> NsIdent {
         (1, Site::E6AI) | (1, Site::Blep) => NsIdent::Director,
         _ => match category {
             1 => NsIdent::Artist,
+            2 => NsIdent::Contributor,
             3 => NsIdent::Copyright,
             4 => NsIdent::Character,
             5 => NsIdent::Species,
@@ -330,8 +340,8 @@ fn import_posts(
             process_batch(site, &batch, &categories, &mut stats)?;
             batch.clear();
             let _ = client::log_silent(format!(
-                "e6 csv import {site}: {} rows seen, {} matched, {} skipped (no downloaded file).",
-                stats.rows_seen, stats.matched, stats.unmatched,
+                "e6 csv import {site}: {} rows seen, {} matched, {} unmatched ({} jobs queued).",
+                stats.rows_seen, stats.matched, stats.unmatched, stats.jobs_queued,
             ));
             if client::should_exit()? {
                 let _ = client::log_silent(format!(
@@ -412,25 +422,14 @@ fn process_batch(
 
     let mut tags_by_file: HashMap<u64, Vec<FileTagAction>> = HashMap::new();
     let mut parent_tags: Vec<PluginTag> = Vec::new();
+    let mut unmatched_ids: Vec<u64> = Vec::new();
 
     for row in batch {
         let Some(file) = found.get(&("MD5".to_string(), row.md5.clone())) else {
-            // Not downloaded yet: create a job so the downloader can fetch it.
+            // Not downloaded yet: queue a search job so the downloader can
+            // fetch it through the normal pipeline.
             stats.unmatched += 1;
-            let job_url = format!("https://{}/posts.json?search[id]={}", site.host(), row.id);
-            let job = shared_types::PluginJob {
-                time: 0,
-                reptime: 0,
-                priority: shared_types::DEFAULT_PRIORITY,
-                site: site.to_string(),
-                param: vec![shared_types::ScraperParam::Url(shared_types::Url {
-                    url: job_url,
-                    ..Default::default()
-                })],
-                user_data: std::collections::BTreeMap::new(),
-                recreation: None,
-            };
-            client::jobs_add_single(job)?;
+            unmatched_ids.push(row.id);
             continue;
         };
         let Some(file_id) = file.id else {
@@ -452,6 +451,43 @@ fn process_batch(
 
         // Parent/children relationships, stored exactly like the live parser.
         parent_tags.extend(parent_tags_for_row(row, site));
+    }
+
+    // Queue searches for posts without a downloaded file, mirroring the
+    // live parser's parent/child job format exactly: `~id:` tag terms
+    // (up to `JOB_ID_CHUNK` per job) plus `+status:any` so deleted posts
+    // are visible, `recursion=false` so the spawned parse does not fan out
+    // into more parent/child/pool jobs, and the live parser's priority.
+    // The URL itself is built by `build_url`, the same helper the live
+    // parser uses.
+    for chunk in unmatched_ids.chunks(JOB_ID_CHUNK) {
+        let mut params: Vec<shared_types::ScraperParam> = chunk
+            .iter()
+            .map(|id| shared_types::ScraperParam::Normal(format!("~id:{id}")))
+            .collect();
+        params.push(shared_types::ScraperParam::Normal("+status:any".into()));
+
+        let Some(url) = super::build_url(&params, None, site) else {
+            continue;
+        };
+
+        let job = shared_types::PluginJob {
+            time: 0,
+            reptime: 0,
+            priority: shared_types::DEFAULT_PRIORITY - 2,
+            site: site.to_string(),
+            param: vec![shared_types::ScraperParam::Url(shared_types::Url {
+                url,
+                ..Default::default()
+            })],
+            user_data: std::collections::BTreeMap::from([(
+                "recursion".to_string(),
+                "false".to_string(),
+            )]),
+            recreation: None,
+        };
+        client::jobs_add_single(job)?;
+        stats.jobs_queued += 1;
     }
 
     if !tags_by_file.is_empty() {
@@ -590,7 +626,7 @@ mod tests {
         assert!(matches!(category_ident(6, e6), NsIdent::Invalid));
         assert!(matches!(category_ident(7, e6), NsIdent::Meta));
         assert!(matches!(category_ident(8, e6), NsIdent::Lore));
-        assert!(matches!(category_ident(2, e6), NsIdent::General));
+        assert!(matches!(category_ident(2, e6), NsIdent::Contributor));
         assert!(matches!(category_ident(99, e6), NsIdent::General));
     }
 
@@ -636,7 +672,19 @@ mod tests {
         assert_eq!(row.id, 3);
         // md5s are lowercased so they match the stored FileHashes digests.
         assert_eq!(row.md5, "0554113ffa2043d3477b86a171d9b087");
+        // Newline- and space-separated source lists both split into
+        // individual source URLs.
         assert_eq!(row.sources.len(), 2);
+        let spaced = csv::StringRecord::from(vec![
+            "5",
+            "0554113ffa2043d3477b86a171d9b087",
+            "s",
+            "",
+            "https://example.com/a https://example.com/b",
+            "",
+            "",
+        ]);
+        assert_eq!(parse_row(&spaced, &columns).unwrap().sources.len(), 2);
         assert_eq!(row.parent_id, None);
 
         // A row without a usable md5 is invalid.

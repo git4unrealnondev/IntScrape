@@ -789,7 +789,7 @@ fn nsobjplg(name: &NsIdent, site: &Site) -> GenericNamespaceObj {
 ///
 /// Builds local URLs for parsing
 ///
-fn build_url(
+pub(crate) fn build_url(
     params: &[shared_types::ScraperParam],
     pagenum: Option<u64>,
     site: &Site,
