@@ -10,7 +10,8 @@
 //! attaches its metadata. The importer itself never downloads anything.
 //!
 //! Controlled from the webui Settings page through per-site settings
-//! (plugin name = the site's `Display`, i.e. `E621` / `E6AI` / `Blep`):
+//! (plugin name = the site's `Display`, i.e. `E621` / `E6AI` / `Blep` /
+//! `FloofGens`):
 //!
 //! - `PLUGIN_<SITE>_CsvImport_ShouldRun` — set `param` to `True` to run.
 //!   On completion it is flipped back to `False` so it does not re-run on
@@ -49,13 +50,13 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Entry point called from `on_start`.
 pub fn run() {
-    // The library exposes one Plugin entry per site (E621 / E6AI / Blep)
-    // sharing one `on_start` symbol, so the manager invokes this once per
-    // entry.
+    // The library exposes one Plugin entry per site (E621 / E6AI / Blep /
+    // FloofGens) sharing one `on_start` symbol, so the manager invokes this
+    // once per entry.
     if STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    for site in [Site::E6, Site::E6AI, Site::Blep] {
+    for site in [Site::E6, Site::E6AI, Site::Blep, Site::FloofGens] {
         if let Err(error) = run_site(&site) {
             let _ = client::log_silent(format!("e6 csv import {site}: failed: {error}"));
         }

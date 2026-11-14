@@ -13,6 +13,7 @@ pub enum Site {
     E6,
     E6AI,
     Blep,
+    FloofGens,
 }
 
 pub enum NsIdent {
@@ -50,6 +51,7 @@ impl fmt::Display for Site {
             Site::E6 => "E621",
             Site::E6AI => "E6AI",
             Site::Blep => "Blep",
+            Site::FloofGens => "FloofGens",
         };
         write!(f, "{s}")
     }
@@ -63,6 +65,7 @@ impl Site {
         match job_site.to_lowercase().as_str() {
             "e6" | "e621" | "e621.com" => Site::E6,
             "blep" | "blep.art" => Site::Blep,
+            "floofgens" | "floofgens.net" => Site::FloofGens,
             _ => Site::E6AI,
         }
     }
@@ -75,6 +78,7 @@ impl Site {
             Site::E6 => "e621.net",
             Site::E6AI => "e6ai.net",
             Site::Blep => "blep.art",
+            Site::FloofGens => "floofgens.net",
         }
     }
 
@@ -86,6 +90,7 @@ impl Site {
             Site::E6 => "static1.e621.net",
             Site::E6AI => "static1.e6ai.net",
             Site::Blep => "cdn.blep.art",
+            Site::FloofGens => "static1.floofgens.net",
         }
     }
 }
@@ -140,6 +145,20 @@ fn get_plugin_info_impl() -> Vec<shared_types::Plugin> {
                 PluginProperties::JobNum(5),
                 PluginProperties::Sites(vec!["blep".into(), "Blep".into(), "blep.art".into()]),
                 PluginProperties::Login((LoginNeed::Optional, LoginType::Api("Put API key first then username.".into(), None) ))
+            ],
+            callbacks: csv_import_callbacks.clone(),
+        },
+        shared_types::Plugin {
+            name: "FloofGens".into(),
+            properties: vec![
+                PluginProperties::Ratelimit(1, std::time::Duration::from_secs(1)),
+                PluginProperties::JobNum(5),
+                PluginProperties::Sites(vec![
+                    "floofgens".into(),
+                    "FloofGens".into(),
+                    "floofgens.net".into(),
+                ]),
+                PluginProperties::Login((LoginNeed::Optional, LoginType::Api("Put API key first then username. Can find more info here: https://floofgens.net/help/api".into(), None) ))
             ],
             callbacks: csv_import_callbacks,
         },
@@ -854,13 +873,22 @@ mod tests {
         for alias in ["blep", "Blep", "blep.art", "BLEP.ART"] {
             assert!(matches!(Site::from_job_site(alias), Site::Blep), "{alias}");
         }
+        for alias in ["floofgens", "FloofGens", "floofgens.net", "FLOOFGENS.NET"] {
+            assert!(
+                matches!(Site::from_job_site(alias), Site::FloofGens),
+                "{alias}"
+            );
+        }
         assert_eq!(Site::E6.host(), "e621.net");
         assert_eq!(Site::E6AI.host(), "e6ai.net");
         assert_eq!(Site::Blep.host(), "blep.art");
+        assert_eq!(Site::FloofGens.host(), "floofgens.net");
         assert_eq!(Site::E6.cdn_host(), "static1.e621.net");
         assert_eq!(Site::E6AI.cdn_host(), "static1.e6ai.net");
         assert_eq!(Site::Blep.cdn_host(), "cdn.blep.art");
+        assert_eq!(Site::FloofGens.cdn_host(), "static1.floofgens.net");
         assert_eq!(Site::Blep.to_string(), "Blep");
+        assert_eq!(Site::FloofGens.to_string(), "FloofGens");
     }
 
     #[test]
@@ -878,10 +906,78 @@ mod tests {
             build_url(&params, None, &Site::E6AI).as_deref(),
             Some("https://e6ai.net/posts.json?tags=anthro")
         );
+        assert_eq!(
+            build_url(&params, Some(2), &Site::FloofGens).as_deref(),
+            Some("https://floofgens.net/posts.json?tags=anthro&page=2")
+        );
         assert_eq!(nsobjplg(&NsIdent::PostId, &Site::Blep).name, "Blep_Id");
         assert_eq!(
             nsobjplg(&NsIdent::General, &Site::Blep).name,
             "Blep_General"
         );
+    }
+
+    #[test]
+    fn parses_a_floofgens_post() {
+        // Shape of `https://floofgens.net/posts.json?tags=...` (Danbooru API).
+        let payload = r#"{"posts":[{
+            "id":193990,
+            "rating":"e",
+            "description":"https://t.me/comet_yiff",
+            "sources":["https://t.me/comet_yiff"],
+            "pools":[],
+            "relationships":{"parent_id":null,"children":[]},
+            "tags":{"general":["anthro"],"artist":["comet_husky"],"species":["canine"]},
+            "file":{
+                "md5":"848cb7cb765bad40a02b7fbf47b95316",
+                "ext":"png",
+                "url":"https://static1.floofgens.net/data/84/8c/848cb7cb765bad40a02b7fbf47b95316.png"
+            }
+        }]}"#;
+        let scraperdata = shared_types::ScraperDataReturn {
+            job: shared_types::PluginJob {
+                site: "floofgens".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let out = parser_call_impl(payload, "https://floofgens.net/posts.json", &scraperdata);
+        let ScraperReturn::Data(data) = &out[0] else {
+            panic!("expected parsed data, got {out:?}");
+        };
+
+        assert_eq!(data.files.len(), 1);
+        let file = data.files.iter().next().unwrap();
+        assert_eq!(
+            file.hash,
+            vec![HashesSupported::Md5(
+                "848cb7cb765bad40a02b7fbf47b95316".into()
+            )]
+        );
+        assert!(matches!(
+            &file.source,
+            Some(FileSource::Url(url)) if url == "https://static1.floofgens.net/data/84/8c/848cb7cb765bad40a02b7fbf47b95316.png"
+        ));
+
+        let names: Vec<(String, String)> = file.tag_list[0]
+            .tags
+            .iter()
+            .map(|plugin_tag| {
+                (
+                    plugin_tag.tag.name.clone(),
+                    plugin_tag.tag.namespace.name.clone(),
+                )
+            })
+            .collect();
+        assert!(names.contains(&("193990".into(), "FloofGens_Id".into())));
+        assert!(names.contains(&("e".into(), "FloofGens_Rating".into())));
+        assert!(names.contains(&("anthro".into(), "FloofGens_General".into())));
+        assert!(names.contains(&("comet_husky".into(), "FloofGens_Artist".into())));
+        assert!(names.contains(&("canine".into(), "FloofGens_Species".into())));
+        assert!(names.contains(&(
+            "https://t.me/comet_yiff".into(),
+            "FloofGens_Sources".into()
+        )));
     }
 }
