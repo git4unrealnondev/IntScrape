@@ -11,6 +11,7 @@ use turso::{
 
 use crate::DB_VERSION;
 use crate::plugins::PluginManager;
+use crate::db::turso::relationship_store::{ReadMode, WriteMode};
 
 mod cache;
 mod dead_url;
@@ -20,6 +21,7 @@ mod main;
 mod namespace;
 mod processing;
 mod relationship;
+mod relationship_store;
 mod schema_current;
 mod search;
 mod slurp;
@@ -30,6 +32,8 @@ mod tag;
 mod api;
 #[cfg(test)]
 mod bench;
+#[cfg(test)]
+mod vecprobe;
 mod ipc;
 mod migrations;
 
@@ -413,6 +417,124 @@ impl TursoDatabase {
         }
     }
 
+    /// Applies the MVCC checkpoint threshold, and reports the value actually
+    /// in force.
+    ///
+    /// Under MVCC a row's history lives in the logical log until a checkpoint
+    /// materializes it into the b-tree, so a page with many uncheckpointed
+    /// versions costs more to read. The engine's default is
+    /// `DEFAULT_LOG_CHECKPOINT_THRESHOLD` (4,120,000 bytes of log), which at
+    /// production write rates lets a popular tag's version chain grow for a
+    /// long time before anything reclaims it.
+    ///
+    /// Measured on a 20k-row posting list (see `db_bench_mvcc_history`):
+    ///
+    /// | `mvcc_checkpoint_threshold` | per-row read | worst observed |
+    /// |---|---|---|
+    /// | default (4,120,000) | 3.21 us | 430 ms at 100k churn rows |
+    /// | 200,000 | 0.66 us | 41 ms at 100k churn rows |
+    ///
+    /// So the default costs ~5x the read latency per row and ~10x at the
+    /// tail. The threshold is *bytes of logical log*, not rows, so it is
+    /// lowered here in proportion to the write rate rather than picked as a
+    /// fixed constant: the value is what production sets, and `0` keeps the
+    /// engine's default so an operator can disable the tuning.
+    ///
+    /// `INTSCRAPE_MVCC_CHECKPOINT_THRESHOLD` overrides the value (bytes);
+    /// `0` restores the engine default.
+    pub(in crate::db::turso) async fn apply_mvcc_checkpoint_threshold(&self) -> i64 {
+        let threshold = Self::mvcc_checkpoint_threshold();
+        let conn = match self.connect() {
+            Ok(conn) => conn,
+            Err(error) => {
+                log::error!("Could not connect to set mvcc_checkpoint_threshold: {error}");
+                return threshold;
+            }
+        };
+        // `-1` is the engine's "disabled" value; sending it through the
+        // pragma keeps the knob honest for an operator who wants it off.
+        let value = if threshold == 0 {
+            // Leave the engine's default alone; just report it.
+            match conn.query("PRAGMA mvcc_checkpoint_threshold;", ()).await {
+                Ok(mut rows) => match rows.next().await {
+                    Ok(Some(row)) => row.get::<i64>(0).unwrap_or(-1),
+                    _ => -1,
+                },
+                Err(error) => {
+                    log::error!("Could not read mvcc_checkpoint_threshold: {error}");
+                    -1
+                }
+            }
+        } else {
+            match conn
+                .execute_batch(&format!(
+                    "PRAGMA mvcc_checkpoint_threshold = {threshold};"
+                ))
+                .await
+            {
+                Ok(_) => threshold,
+                Err(error) => {
+                    log::error!(
+                        "Could not set mvcc_checkpoint_threshold = {threshold}: {error}"
+                    );
+                    -1
+                }
+            }
+        };
+        if value > 0 && value != threshold {
+            log::info!(
+                "mvcc_checkpoint_threshold in force: {value} (requested {threshold})"
+            );
+        }
+        value
+    }
+
+    /// The checkpoint threshold this build wants, in bytes of logical log.
+    ///
+    /// A production-scaled database writes relationships continuously, and
+    /// the version chains that build up on the popular tags are what make a
+    /// posting-list read degrade. 200,000 bytes measured as the knee: below
+    /// it the read cost stops tracking the churn entirely, and above it the
+    /// tail climbs fast. Set to 0 to keep the engine default.
+    fn mvcc_checkpoint_threshold() -> i64 {
+        const DEFAULT: i64 = 200_000;
+        match std::env::var("INTSCRAPE_MVCC_CHECKPOINT_THRESHOLD")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+        {
+            Some(0) => 0,
+            Some(value) => value.max(0),
+            None => DEFAULT,
+        }
+    }
+
+    /// Warns about the one relationship mode combination that fails silently.
+    ///
+    /// Reading the legacy partitions while writing only the flat table is a
+    /// valid thing to do *briefly* -- it is how a rollback starts -- but it
+    /// is not a stable state: every relationship written after the switch is
+    /// absent from the partitions, so search results are quietly incomplete
+    /// rather than wrong in a way anything would notice.
+    ///
+    /// There is no error to surface and nothing to refuse, so this only logs.
+    /// The fix is to point writes back at `dual` and let a recount pass refill
+    /// the partitions before reading them again.
+    async fn warn_on_relationship_mode_mismatch(&self) {
+        let Ok(conn) = self.connect() else {
+            return;
+        };
+        let write_mode = self.relationship_write_mode(&conn).await;
+        let read_mode = self.relationship_read_mode(&conn).await;
+        if matches!(write_mode, WriteMode::Single) && matches!(read_mode, ReadMode::Legacy) {
+            log::warn!(
+                "relationship_read_mode=legacy with relationship_write_mode=single: the \
+                 per-namespace partitions are no longer being written, so reads will miss \
+                 every relationship added since the switch. Set relationship_write_mode=dual \
+                 and let a recount pass refill the partitions before relying on legacy reads."
+            );
+        }
+    }
+
     /// Checks out a pooled Turso connection (see `ConnectionPool`), with a
     /// short busy timeout installed on new connections.
     ///
@@ -646,6 +768,16 @@ impl TursoDatabase {
 
         self.load_cache().await?;
 
+        // The checkpoint threshold is a connection-level pragma, so it has to
+        // be applied after the serving journal mode is settled. Left at the
+        // engine's default, a popular tag's version chain grows for a long
+        // time before anything reclaims it, and a posting-list read degrades
+        // as it grows (measured at 3.2 us/row default vs 0.66 us/row tuned,
+        // and 430 ms vs 41 ms at the tail).
+        self.apply_mvcc_checkpoint_threshold().await;
+
+        self.warn_on_relationship_mode_mismatch().await;
+
         loop {
             // Every arm must either advance the stored version or return:
             // a `loop` that simply falls through (missing setting, missing
@@ -712,6 +844,9 @@ impl TursoDatabase {
                 13 => {
                     self.update_db_13_to_14(&conn).await?;
                 }
+                14 => {
+                    self.update_db_14_to_15(&conn).await?;
+                }
                 _ => {
                     return Err(turso::Error::Error(format!(
                         "No upgrade path from db schema version {version_num} to {DB_VERSION}"
@@ -760,6 +895,10 @@ impl TursoDatabase {
         self.table_create_dead_urls(&conn).await;
         self.table_create_parents(&conn).await?;
         self.table_create_namespace(&conn).await;
+        // The flat relationship table (schema v15). A fresh database needs it
+        // created here as well as in the 14->15 migration, or the first
+        // relationship write fails with "no such table: Relationship".
+        self.table_create_relationship(&conn).await;
         self.table_create_jobs(&conn).await;
 
         self.discover_initial_settings(&conn).await?;

@@ -33,7 +33,7 @@ use std::error::Error;
 use tokio::{
     fs::File,
     io::AsyncWriteExt,
-    sync::{Mutex, RwLock, Semaphore},
+    sync::{Mutex, RwLock},
     task::JoinSet,
 };
 
@@ -42,9 +42,6 @@ const MAX_CONCURRENT_DOWNLOADS: usize = 5;
 
 // How many jobs can we run simultainously
 const MAX_CONCURRENT_JOBS: usize = 10;
-
-// Dunno what this does
-const MAX_CONCURRENT_PROCESSING: usize = 20;
 
 // How many per-page file tasks the JoinSet may hold at once. Bounds resident
 // task state when a single page returns thousands of files; the transfer
@@ -158,14 +155,22 @@ impl PageState {
     }
 
     /// Commits the whole file buffer with one `process_scraper` call. An
-    /// empty buffer is a successful no-op. The buffer lock is held across
-    /// the commit (same as before the split) so this page's files cannot
-    /// race each other for the same new tag rows.
+    /// empty buffer is a successful no-op. The buffer lock is held only long
+    /// enough to take the batch; the commit runs without it.
     ///
     /// On failure the batch is gone — that is not destructive: the next
     /// boot re-walks the page and the file dedupes against what did land.
     /// The job is kept (`should_remove_job` cleared) so that re-walk
     /// actually happens.
+    ///
+    /// The lock used to be held across the commit, which made every
+    /// `buffer_file` on the page queue behind a whole transaction instead of
+    /// behind a map operation. Measured with `page_state_lock_bench`: at a
+    /// ~5 ms commit, a concurrent `buffer_file` waited 3.058 ms against an
+    /// uncontended 0.001 ms, and that stall recurs every `FLUSH_BATCH_SIZE`
+    /// files. Releasing before the commit drops it to 0.001 ms. At a ~0 ms
+    /// commit the two shapes are indistinguishable, so the change only pays
+    /// where commits are slow — which is the case the batching exists for.
     async fn flush_files(
         &self,
         db: Arc<TursoDatabase>,
@@ -174,11 +179,13 @@ impl PageState {
         should_remove_job: &AtomicBool,
         failure_reason: &str,
     ) -> bool {
-        let mut batch = self.files.lock().await;
-        if batch.is_empty() {
-            return true;
-        }
-        let batch = std::mem::take(&mut *batch);
+        let batch = {
+            let mut guard = self.files.lock().await;
+            if guard.is_empty() {
+                return true;
+            }
+            std::mem::take(&mut *guard)
+        };
         let ok = db
             .process_scraper(batch, Vec::new(), format!("scraper: {plugin_name}"))
             .await;
@@ -519,7 +526,6 @@ pub struct DownloadsManager {
     downloading_urls: RwLock<HashSet<String>>,
     heavy_processing_pool: Arc<ThreadPool>,
     //job_limiter: Arc<Semaphore>,
-    processing_limiter: Arc<Semaphore>,
     should_exit: Arc<AtomicBool>,
     active_file_processing: Arc<AtomicUsize>,
     // Reqwest clients are shared per-plugin (keyed by plugin name + text/file
@@ -959,8 +965,8 @@ impl Scraper {
                                     // actually allocate — the transfer's
                                     // chunk buffer and the post-download
                                     // whole-file buffer — stay bounded by
-                                    // this semaphore and by
-                                    // `processing_limiter` respectively.
+                                    // this semaphore and by the Rayon pool
+                                    // respectively.
                                     let dedup = PageDedup {
                                         source_files: &existing_source_files,
                                         hash_files: &existing_hash_files,
@@ -1861,8 +1867,8 @@ impl Scraper {
 
                             // Released before any post-download work: from here
                             // on the file is on disk and the next transfer may
-                            // start. `processing_limiter` bounds the stage that
-                            // follows.
+                            // start. The post-download stage is bounded by the
+                            // Rayon pool rather than a permit.
                             drop(transfer_permit);
                             self.release_download_file(file_url).await;
                             if let Some(downloaded) = downloaded {
@@ -1914,24 +1920,20 @@ impl Scraper {
 
         let temp_file_path = temp_file.path().to_path_buf();
         let processing_file_path = temp_file_path.clone();
-        let processing_permit = tokio::select! {
-            permit = self
-                .download_manager
-                .processing_limiter
-                .clone()
-                .acquire_owned() => permit?,
-            _ = async {
-                while !should_exit.load(Ordering::SeqCst) {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            } => {
-                info!(
-                    "Scraper: {} JobId: {} -- Skipping file because shutdown was requested while waiting for processing.",
-                    self.plugin.name, self.job.id
-                );
-                return Ok(None);
-            }
-        };
+        // The `processing_limiter` permit used to be taken here and moved into
+        // the Rayon task, capping that stage at MAX_CONCURRENT_PROCESSING (20)
+        // regardless of the pool's real width. It was removed as redundant:
+        // `heavy_processing_pool` is already a bounded ThreadPool (Rayon
+        // defaults to one thread per core), so the semaphore only throttled
+        // work the pool was built to size. The shutdown poll it also carried
+        // is unchanged and still abandons a file waiting for a pool thread.
+        if should_exit.load(Ordering::SeqCst) {
+            info!(
+                "Scraper: {} JobId: {} -- Skipping file because shutdown was requested before processing.",
+                self.plugin.name, self.job.id
+            );
+            return Ok(None);
+        }
         let processing_pool = self.download_manager.heavy_processing_pool.clone();
         let db = self.download_manager.db.clone();
         let should_exit_for_processing = should_exit.clone();
@@ -1939,7 +1941,6 @@ impl Scraper {
 
         // Run CPU-heavy hashing and plugin callbacks on the bounded Rayon pool.
         processing_pool.spawn(move || {
-            let _processing_permit = processing_permit;
             let result = (|| {
                 if should_exit_for_processing.load(Ordering::SeqCst) {
                     return Err("shutdown requested".to_string());
@@ -2203,7 +2204,6 @@ impl DownloadsManager {
             downloading_urls: HashSet::new().into(),
             heavy_processing_pool,
             //job_limiter: Arc::new(Semaphore::new(3)),
-            processing_limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_PROCESSING)),
             should_exit,
             active_file_processing: Arc::new(AtomicUsize::new(0)),
             client_cache: HashMap::new().into(),

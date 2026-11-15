@@ -14,6 +14,28 @@ async fn new_target() -> Arc<TursoDatabase> {
     TursoDatabase::new_with_exit(&db_path, should_exit).await
 }
 
+/// Makes the slurp write both the flat table and the legacy partitions.
+///
+/// The default is `single` (flat only), which is what the migration ships. The
+/// slurp tests assert on the *partition* contents -- that the import routed
+/// rows to the right namespace's table and rebuilt its index -- so they have to
+/// opt into the dual store rather than inherit a default that never fills the
+/// tables they inspect.
+async fn write_both_stores(db: &TursoDatabase) {
+    let conn = db.connect().unwrap();
+    db.setting_set(
+        &conn,
+        shared_types::DbSettingsObj {
+            name: "relationship_write_mode".into(),
+            description: None,
+            num: None,
+            param: Some("dual".into()),
+        },
+    )
+    .await
+    .unwrap();
+}
+
 /// Point a source sqlite file at `script` and return a connection to it.
 /// The tempdir must outlive the connection and database, so all are returned.
 async fn new_source(script: &str) -> (turso::Database, turso::Connection, tempfile::TempDir) {
@@ -480,6 +502,7 @@ async fn slurp_builds_popular_only_fts_shadow() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slurp_streams_legacy_relationship_table_once() {
     let db = new_target().await;
+    write_both_stores(&db).await;
 
     // A single shared `Relationship` table holding every namespace, like
     // the production source. Rows must be read once and routed by
@@ -626,6 +649,7 @@ async fn slurp_streams_legacy_relationship_table_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slurp_tags_fresh_fast_path_then_upsert_on_rerun() {
     let db = new_target().await;
+    write_both_stores(&db).await;
 
     let temp_dir = tempfile::tempdir().unwrap();
     let source_path = temp_dir.path().join("source.db");
@@ -780,6 +804,7 @@ async fn slurp_tags_fresh_fast_path_then_upsert_on_rerun() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slurp_cold_partition_only_recounts_and_restores_covering() {
     let db = new_target().await;
+    write_both_stores(&db).await;
 
     let temp_dir = tempfile::tempdir().unwrap();
     let source_path = temp_dir.path().join("source.db");
@@ -1451,6 +1476,7 @@ async fn slurp_resume_mid_legacy_scan_recounts_pending_namespaces() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slurp_resume_discards_stale_progress_when_source_changes() {
     let db = new_target().await;
+    write_both_stores(&db).await;
     let temp_dir = tempfile::tempdir().unwrap();
     let source_a = temp_dir.path().join("source_a.db");
     let source_b = temp_dir.path().join("source_b.db");
@@ -1538,6 +1564,7 @@ async fn slurp_resume_discards_stale_progress_when_source_changes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slurp_resume_skips_committed_tag_batches() {
     let db = new_target().await;
+    write_both_stores(&db).await;
     let temp_dir = tempfile::tempdir().unwrap();
     let source_path = temp_dir.path().join("source.db");
     let script = "CREATE TABLE Namespace (
@@ -1808,3 +1835,126 @@ async fn slurp_diagnoses_missing_keyset_index() {
         "a clustered (file_id, tag_id) PK must be detected"
     );
 }
+
+/// The recount path is the one `Tags.count` writer that used to leave the
+/// `Tags_Popular` shadow behind.
+///
+/// `relationship_add`, `relationship_delete` and `tag_counts_apply` all move the
+/// shadow with the count. The recount did not: it wrote counts with
+/// `tag_count_set_sql` and stopped, so between the recount and the
+/// end-of-slurp wholesale rebuild the shadow described the *old* counts. A
+/// crash in that window left it stale with nothing to heal it --
+/// `table_ensure_tags_popular` only checks that the FTS index resolves, never
+/// that its rows still match `Tags`.
+///
+/// This drives a tag across the threshold through a recount and asserts the
+/// shadow follows in the same transaction. It also pins that the recount reads
+/// from the store the read mode names: under `single` the partitions are frozen
+/// at their pre-migration contents, so counting one would silently resurrect
+/// deleted relationships.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recount_moves_the_popular_shadow_with_the_count() {
+    let db = new_target().await;
+    let conn = db.connect().unwrap();
+    db.namespace_ensure_set(&HashSet::from([shared_types::GenericNamespaceObj {
+        name: "recount_ns".into(),
+        description: None,
+    }]))
+    .await
+    .unwrap();
+    let ns_id = db.namespace_get_name_cache("recount_ns").await.unwrap();
+
+    let tag_id = {
+        let tags = HashSet::from([shared_types::Tag {
+            name: "recount_tag".into(),
+            namespace: shared_types::GenericNamespaceObj {
+                name: "recount_ns".into(),
+                description: None,
+            },
+        }]);
+        db.tag_add_bulk(&conn, &tags)
+            .await
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap()
+            .id as u64
+    };
+
+    // Five relationships on the flat table, but a stale count of 1: the state
+    // a recount exists to correct.
+    for file_id in 1..=5u64 {
+        conn.execute(
+            "INSERT OR IGNORE INTO Relationship (file_id, tag_id, namespace)
+             VALUES (?1, ?2, ?3);",
+            params_from_iter([
+                Value::from(file_id as i64),
+                Value::from(tag_id as i64),
+                Value::from(ns_id as i64),
+            ]),
+        )
+        .await
+        .unwrap();
+    }
+    conn.execute(
+        "UPDATE Tags SET count = 1 WHERE id = ?1;",
+        params_from_iter([Value::from(tag_id as i64)]),
+    )
+    .await
+    .unwrap();
+
+    async fn shadow_count(conn: &Connection, tag_id: u64) -> i64 {
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM Tags_Popular WHERE tag_id = ?1;",
+                params_from_iter([Value::from(tag_id as i64)]),
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    }
+
+    assert_eq!(shadow_count(&conn, tag_id).await, 0, "the tag starts out popular-less");
+
+    db.slurp_recount_namespace(&conn, ns_id).await.unwrap();
+
+    let count_after: i64 = {
+        let mut rows = conn
+            .query(
+                "SELECT count FROM Tags WHERE id = ?1;",
+                params_from_iter([Value::from(tag_id as i64)]),
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    assert_eq!(count_after, 5, "the recount makes the count authoritative");
+    assert_eq!(
+        shadow_count(&conn, tag_id).await,
+        1,
+        "the shadow must follow the count across the threshold in the same transaction"
+    );
+
+    // And the reverse crossing: drop back below and the shadow must empty.
+    conn.execute("DELETE FROM Relationship WHERE tag_id = ?1;", params_from_iter([Value::from(tag_id as i64)]))
+        .await
+        .unwrap();
+    db.slurp_recount_namespace(&conn, ns_id).await.unwrap();
+    let count_after: i64 = {
+        let mut rows = conn
+            .query(
+                "SELECT count FROM Tags WHERE id = ?1;",
+                params_from_iter([Value::from(tag_id as i64)]),
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    assert_eq!(count_after, 0, "the recount zeroes an emptied tag");
+    assert_eq!(
+        shadow_count(&conn, tag_id).await,
+        0,
+        "the shadow must empty when the count drops below the threshold"
+    );
+}
+

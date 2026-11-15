@@ -6,6 +6,7 @@ use turso::{Connection, Result, Value, params_from_iter};
 
 use crate::db::SQL_CHUNK_SIZE;
 use crate::db::turso::TursoDatabase;
+use crate::db::turso::relationship_store::ReadMode;
 
 #[allow(dead_code)]
 impl TursoDatabase {
@@ -219,30 +220,54 @@ impl TursoDatabase {
         // Step 2: first file id per tag id from the index-probed union of the
         // namespace-partitioned relationship tables, grouped into one result
         // (LIMIT 1 per tag becomes MIN(file_id) GROUP BY tag_id).
-        let tables = super::relationship::relationship_union_tables(conn).await;
-        let batch = super::relationship::pushed_union_batch_size(tables.len());
+        //
+        // The flat table holds every namespace's relationships, so the same
+        // answer comes from one grouped seek on its primary key rather than
+        // a union over the partitions.
         let mut first_files: HashMap<u64, u64> = HashMap::new();
-
         let tag_ids_vec: Vec<u64> = tag_ids.iter().copied().collect();
-        for chunk in tag_ids_vec.chunks(batch) {
-            let predicate = format!(
-                "tag_id IN ({})",
-                super::relationship::numbered_placeholders(chunk.len())
-            );
-            let relationship_source =
-                super::relationship::union_source_from_tables(&tables, "r", Some(&predicate));
-            let sql = format!(
-                "SELECT r.tag_id, MIN(r.file_id)
-                 FROM {relationship_source}
-                 GROUP BY r.tag_id;"
-            );
-            let params: Vec<Value> = chunk.iter().map(|id| Value::from(*id as i64)).collect();
+        if self.relationship_read_mode(conn).await == ReadMode::Flat {
+            for chunk in tag_ids_vec.chunks(SQL_CHUNK_SIZE) {
+                let placeholders =
+                    std::iter::repeat_n("?", chunk.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                let sql = format!(
+                    "SELECT tag_id, MIN(file_id) FROM Relationship \
+                     WHERE tag_id IN ({placeholders}) GROUP BY tag_id;"
+                );
+                let params: Vec<Value> =
+                    chunk.iter().map(|id| Value::from(*id as i64)).collect();
+                let mut rows = conn.query(&sql, params_from_iter(params)).await?;
+                while let Some(row) = rows.next().await? {
+                    let tag_id: u64 = row.get(0)?;
+                    let file_id: u64 = row.get(1)?;
+                    first_files.insert(tag_id, file_id);
+                }
+            }
+        } else {
+            let tables = super::relationship::relationship_union_tables(conn).await;
+            let batch = super::relationship::pushed_union_batch_size(tables.len());
+            for chunk in tag_ids_vec.chunks(batch) {
+                let predicate = format!(
+                    "tag_id IN ({})",
+                    super::relationship::numbered_placeholders(chunk.len())
+                );
+                let relationship_source =
+                    super::relationship::union_source_from_tables(&tables, "r", Some(&predicate));
+                let sql = format!(
+                    "SELECT r.tag_id, MIN(r.file_id)
+                     FROM {relationship_source}
+                     GROUP BY r.tag_id;"
+                );
+                let params: Vec<Value> = chunk.iter().map(|id| Value::from(*id as i64)).collect();
 
-            let mut rows = conn.query(&sql, params_from_iter(params)).await?;
-            while let Some(row) = rows.next().await? {
-                let tag_id: u64 = row.get(0)?;
-                let file_id: u64 = row.get(1)?;
-                first_files.insert(tag_id, file_id);
+                let mut rows = conn.query(&sql, params_from_iter(params)).await?;
+                while let Some(row) = rows.next().await? {
+                    let tag_id: u64 = row.get(0)?;
+                    let file_id: u64 = row.get(1)?;
+                    first_files.insert(tag_id, file_id);
+                }
             }
         }
 
@@ -353,6 +378,15 @@ impl TursoDatabase {
         conn: &Connection,
         tag_id: u64,
     ) -> Result<bool> {
+        if self.relationship_read_mode(conn).await == ReadMode::Flat {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM Relationship WHERE tag_id = ?1 LIMIT 1;",
+                    (tag_id as i64,),
+                )
+                .await?;
+            return Ok(rows.next().await?.is_some());
+        }
         let Some(namespace_id) = self.tag_namespace_id(conn, tag_id).await? else {
             return Ok(false);
         };
@@ -373,7 +407,7 @@ impl TursoDatabase {
         conn: &Connection,
         file_ids: &HashSet<u64>,
     ) -> Result<HashMap<u64, HashSet<Tag>>> {
-        let mut out: HashMap<u64, HashSet<Tag>> = HashMap::new();
+        let out: HashMap<u64, HashSet<Tag>> = HashMap::new();
         if file_ids.is_empty() {
             return Ok(out);
         }
@@ -381,6 +415,46 @@ impl TursoDatabase {
         // A HashSet has no order, so collect once to get a stable, sliceable
         // sequence; the ids themselves are what matters, not their order.
         let file_id_vec: Vec<u64> = file_ids.iter().copied().collect();
+        if self.relationship_read_mode(conn).await == ReadMode::Flat {
+            let mut acc: HashMap<u64, HashSet<Tag>> = HashMap::new();
+            // The flat table holds every namespace's relationships, so the
+            // file's tag set comes from one seek instead of a union over the
+            // namespace partitions.
+            for chunk in file_id_vec.chunks(SQL_CHUNK_SIZE) {
+                let placeholders = std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT r.file_id, t.name, n.name, n.description
+                     FROM Relationship r
+                     JOIN Tags t ON r.tag_id = t.id
+                     JOIN Namespace n ON t.namespace = n.id
+                     WHERE r.file_id IN ({placeholders})"
+                );
+                let params: Vec<Value> =
+                    chunk.iter().map(|id| Value::from(*id as i64)).collect();
+
+                let mut rows = conn.query(sql, params_from_iter(params)).await?;
+                while let Some(row) = rows.next().await? {
+                    let file_id: u64 = row.get(0)?;
+                    let tag_name: String = row.get(1)?;
+                    let namespace_name: String = row.get(2)?;
+                    let namespace_desc: Option<String> = row.get(3)?;
+
+                    acc.entry(file_id).or_default().insert(Tag {
+                        name: tag_name,
+                        namespace: GenericNamespaceObj {
+                            name: namespace_name,
+                            description: namespace_desc,
+                        },
+                    });
+                }
+            }
+            return Ok(acc);
+        }
+
+        let mut out: HashMap<u64, HashSet<Tag>> = HashMap::new();
+
         // Pushed into each namespace arm so the partitions are index-probed
         // rather than scanned; numbered placeholders keep it one binding, and
         // the namespace list is read once for both the arm count and the text.

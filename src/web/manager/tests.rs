@@ -883,6 +883,164 @@ async fn page_state_tail_flush_commits_buffered_files_and_tags() {
     );
 }
 
+/// Measures the one PageState cost that is still a guess: `flush_files` holds
+/// the buffer lock across the whole `process_scraper` commit, so every
+/// `buffer_file` on the page queues behind that commit instead of behind a map
+/// operation.
+///
+/// This measures the mechanism directly rather than racing a real flush. An
+/// earlier version spawned a flush and polled for the buffer to empty, which
+/// could not work: `flush_files` does `mem::take` *before* the commit, so the
+/// buffer reads empty at exactly the moment the lock is still held, and the
+/// probe was guaranteed to find it free. Two arms that both measure an
+/// uncontended lock agree with each other and say nothing.
+///
+/// So: take the lock by hand, drain the batch, then hold it across a wait that
+/// stands in for the commit (`BENCH_PAGESTATE_COMMIT_MS`, default 20 ms -- a
+/// real `process_scraper` on a 128-entry batch is single-digit ms, so this is
+/// if anything generous). While it is held, time a `buffer_file`. Then repeat
+/// with the guard dropped before the wait.
+///
+/// Both shapes are simulated rather than read out of `flush_files`, so this
+/// stays a record of why the change was made after `flush_files` was changed to
+/// release early. The number that matters is the probe's wait: if it does not
+/// move between the arms, releasing the lock early buys nothing.
+///
+/// ```text
+/// BENCH_PAGESTATE_BATCH=128 BENCH_PAGESTATE_COMMIT_MS=20 \
+///     cargo test --release --lib web::manager::tests::page_state_lock_bench \
+///     -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "manual benchmark: flush lock held across commit vs released"]
+async fn page_state_lock_bench() {
+    use std::time::Instant;
+
+    fn env_u64(name: &str, default: u64) -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    let batch_size = env_u64("BENCH_PAGESTATE_BATCH", 128).max(1) as usize;
+    let commit_ms = env_u64("BENCH_PAGESTATE_COMMIT_MS", 20);
+    let rounds = env_u64("BENCH_PAGESTATE_ROUNDS", 5).max(1);
+
+    let (db, _temp) = page_test_db().await;
+    let keep = page_keep_flag();
+
+    // One arm, run as a task. The only difference between arms is where the
+    // guard drops, which is the thing under test.
+    //
+    // `commit_ms == 0` runs the real `process_scraper` on the real batch, so
+    // the two arms are compared on the production path. Passing an empty batch
+    // there would measure a no-op commit and make both arms look free.
+    async fn run_flush(
+        state: Arc<PageState>,
+        db: Arc<ManagerTestDb>,
+        commit_ms: u64,
+        hold: bool,
+    ) -> f64 {
+        let started = Instant::now();
+        if hold {
+            // Shipped shape: one guard, held across the commit.
+            let mut guard = state.files.lock().await;
+            let batch = std::mem::take(&mut *guard);
+            if commit_ms == 0 {
+                db.process_scraper(batch, Vec::new(), "bench".to_string())
+                    .await;
+            } else {
+                drop(batch);
+                tokio::time::sleep(Duration::from_millis(commit_ms)).await;
+            }
+            drop(guard);
+        } else {
+            // Candidate: take the batch, release the lock, then commit.
+            let batch = {
+                let mut guard = state.files.lock().await;
+                std::mem::take(&mut *guard)
+            };
+            if commit_ms == 0 {
+                db.process_scraper(batch, Vec::new(), "bench".to_string())
+                    .await;
+            } else {
+                drop(batch);
+                tokio::time::sleep(Duration::from_millis(commit_ms)).await;
+            }
+        }
+        started.elapsed().as_secs_f64() * 1_000.0
+    }
+
+    // The probe is deliberately separate from the flush so its wait is not
+    // folded into the flush's own duration.
+    async fn probe(state: &Arc<PageState>) -> f64 {
+        let started = Instant::now();
+        let mut tags = Vec::new();
+        state
+            .buffer_file(page_manager(&format!("{:0128X}", 0xDEAD), None), &mut tags)
+            .await;
+        started.elapsed().as_secs_f64() * 1_000.0
+    }
+
+    println!(
+        "\nBENCH page-state flush lock: {batch_size} entries, commit ~{commit_ms} ms, \
+         {rounds} rounds"
+    );
+
+    for (label, hold) in [
+        ("held across commit (old)", true),
+        ("released before commit (shipped)", false),
+    ] {
+        let mut wait = f64::MAX;
+        let mut flush_ms = f64::MAX;
+        for _ in 0..rounds {
+            let state = Arc::new(PageState::new());
+            for i in 0..batch_size {
+                let key = page_manager(&format!("{i:0128X}"), None);
+                let mut tags = vec![page_add_action(vec![page_tag(
+                    &format!("bench-{i}"),
+                    "bench_ns",
+                )])];
+                state.buffer_file(key, &mut tags).await;
+            }
+
+            let flush_state = state.clone();
+            let flush_db = db.clone();
+            let flush = tokio::spawn(async move {
+                run_flush(flush_state, flush_db, commit_ms, hold).await
+            });
+
+            // Let the flush task reach its lock acquisition. Not a correctness
+            // signal -- just enough of a head start that the probe is
+            // contending rather than winning the race. 2 ms is well inside the
+            // commit window, so the probe still lands mid-commit.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let w = probe(&state).await;
+            let took = flush.await.unwrap();
+
+            wait = wait.min(w);
+            flush_ms = flush_ms.min(took);
+        }
+        println!("  {label:<28} flush {flush_ms:>8.3} ms   probe wait {wait:>8.3} ms");
+    }
+
+    // Sanity anchor: an uncontended buffer_file, so a probe figure can be read
+    // as "N x the uncontended cost" rather than as an absolute.
+    let state = PageState::new();
+    let mut best = f64::MAX;
+    for _ in 0..5 {
+        let started = Instant::now();
+        let mut tags = Vec::new();
+        state
+            .buffer_file(page_manager(&format!("{:0128X}", 0xFEED), None), &mut tags)
+            .await;
+        best = best.min(started.elapsed().as_secs_f64() * 1_000.0);
+    }
+    println!("  {label:<28} {best:>8.3} ms   (uncontended reference)", label = "no contention");
+    let _ = keep;
+}
+
 /// Batched flushing must stay batched: below FLUSH_BATCH_SIZE nothing is
 /// committed, at the threshold the buffer empties in one go.
 #[tokio::test]
@@ -1191,4 +1349,113 @@ async fn prefetch_page_dedup_resolves_all_three_maps() {
         .get(&("artist".to_string(), "skipme".to_string()))
         .expect("skip tag must resolve");
     assert_eq!(skip.id, Some(seeded_id), "skip tag must resolve to its owner");
+}
+
+
+// ---------------------------------------------------------------------------
+// Perceptual hash (ImageHash) agreement between host and plugin
+// ---------------------------------------------------------------------------
+
+mod image_hash_agreement {
+    use super::*;
+
+    /// Writes a small deterministic PNG, the kind of file both sides hash.
+    fn gradient_png(w: u32, h: u32, seed: u8) -> std::path::PathBuf {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(format!("grad-{seed}.png"));
+        let mut img = image::RgbaImage::new(w, h);
+        for (x, y, pixel) in img.enumerate_pixels_mut() {
+            let v = (x.wrapping_mul(3).wrapping_add(y.wrapping_mul(5)).wrapping_add(seed as u32)) as u8;
+            *pixel = image::Rgba([v, 255u8.wrapping_sub(v), (x ^ y) as u8, 255]);
+        }
+        let mut file = std::fs::File::create(&path).unwrap();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut file, image::ImageFormat::Png)
+            .expect("encode");
+        // Leak the tempdir: the file must outlive this call.
+        std::mem::forget(dir);
+        path
+    }
+
+    /// The host's `image_hash_from_path` must produce a stable, well-formed hash.
+    ///
+    /// This is the producer side of the contract. If it changed, every hash the
+    /// plugin backfills from `FileHashes` would be computed under different
+    /// settings and would silently never match a locally-computed one.
+    #[test]
+    fn host_hash_is_stable_and_well_formed() {
+        let path = gradient_png(64, 64, 1);
+        let a = image_hash_from_path(&path).expect("hash a");
+        let b = image_hash_from_path(&path).expect("hash b");
+        // Pinned so the clip-search plugin's test can assert the same digests:
+        // the two implementations are then tied to each other rather than each
+        // merely agreeing with itself.
+        assert_eq!(a, "9zvAhLWgD/g", "host hash for seed 1 drifted");
+        assert_eq!(
+            image_hash_from_path(&gradient_png(64, 64, 200)).unwrap(),
+            "x2fBlyMPUwc",
+            "host hash for seed 200 drifted"
+        );
+        assert_eq!(a, b, "hashing must be deterministic");
+        // 64-bit Median hash -> 11 base64 chars (STANDARD_NO_PAD, no padding).
+        assert_eq!(a.len(), 11, "unexpected hash width for {a}");
+        assert!(
+            a.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/'),
+            "unexpected base64 alphabet in {a}"
+        );
+    }
+
+    /// Different images must hash differently, and by a wide margin.
+    ///
+    /// This is what the duplicate threshold assumes: a 64-bit hash puts
+    /// unrelated images near 32 bits apart, so a threshold of 8 bits is far
+    /// outside the noise floor. If two obviously different gradients came back
+    /// within 8 bits, every pair would be reported as a duplicate.
+    #[test]
+    fn different_images_are_far_apart() {
+        use image_hasher::ImageHash;
+
+        let a = gradient_png(64, 64, 1);
+        let b = gradient_png(64, 64, 200);
+        let ha = image_hash_from_path(&a).expect("hash a");
+        let hb = image_hash_from_path(&b).expect("hash b");
+
+        let left = ImageHash::<Box<[u8]>>::from_base64(&ha).expect("parse a");
+        let right = ImageHash::<Box<[u8]>>::from_base64(&hb).expect("parse b");
+        let bits = left.dist(&right);
+        assert!(
+            bits > 8,
+            "different images must exceed the 8-bit duplicate threshold, got {bits}"
+        );
+    }
+
+    /// A re-encode of the same picture must land inside the duplicate threshold.
+    ///
+    /// This is the case the feature exists for: the same image saved again,
+    /// possibly at a different quality. It is also the case CLIP scores lowest,
+    /// which is why the hash rescues it rather than replacing CLIP.
+    #[test]
+    fn a_reencode_stays_within_the_threshold() {
+        use image_hasher::ImageHash;
+
+        // Same pixels, encoded twice with different PNG compression, plus a
+        // lossless resave through the decoder. A perceptual hash must be stable
+        // across that.
+        let path = gradient_png(64, 64, 7);
+        let ha = image_hash_from_path(&path).expect("hash a");
+
+        let img = image::open(&path).expect("decode");
+        let reencoded = std::path::PathBuf::from("/tmp/opencode/reencode-test.png");
+        let mut out = std::fs::File::create(&reencoded).unwrap();
+        img.write_to(&mut out, image::ImageFormat::Png).expect("reencode");
+        let hb = image_hash_from_path(&reencoded).expect("hash b");
+
+        let left = ImageHash::<Box<[u8]>>::from_base64(&ha).expect("parse a");
+        let right = ImageHash::<Box<[u8]>>::from_base64(&hb).expect("parse b");
+        assert_eq!(
+            left.dist(&right),
+            0,
+            "a lossless re-encode must hash identically"
+        );
+    }
 }

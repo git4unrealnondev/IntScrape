@@ -214,8 +214,31 @@ impl TursoDatabase {
             .await?;
 
             for ns_id in chunk {
+                // Both stores are cleaned unconditionally, regardless of the
+                // write mode. The mode decides where a *write* lands; it must
+                // not decide what a *delete* cleans up, or a namespace deleted
+                // after a mode switch leaves orphaned rows in the store that
+                // is no longer being written. Dropping a table and an indexed
+                // delete are both rare-path operations, so there is nothing to
+                // save by skipping either.
                 conn.execute(format!("DROP TABLE IF EXISTS Relationship_{ns_id};"), ())
                     .await?;
+            }
+
+            // Chunked rather than one statement per id: a namespace delete
+            // is a bulk operation, and the index on `namespace` keeps it from
+            // scanning the whole table.
+            for ids in chunk.chunks(SQL_CHUNK_SIZE) {
+                let placeholders = std::iter::repeat_n("?", ids.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                conn.execute(
+                    format!("DELETE FROM Relationship WHERE namespace IN ({placeholders});"),
+                    ids.iter()
+                        .map(|id| Value::from(*id as i64))
+                        .collect::<Vec<Value>>(),
+                )
+                .await?;
             }
         }
 

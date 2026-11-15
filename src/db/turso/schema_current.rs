@@ -129,6 +129,49 @@ CREATE TABLE Namespace (
             )
             .await;
     }
+
+    /// Creates the flat relationship table introduced in schema v15.
+    ///
+    /// One table for every namespace, replacing the per-namespace
+    /// `Relationship_{ns}` partitions for the read path. The partition key
+    /// was `(tag_id, file_id)`, and a tag belongs to exactly one namespace,
+    /// so a tag's posting list already lived in one b-tree -- the flat table
+    /// is the same structure with one fewer level of indirection and, more
+    /// importantly, without the `UNION ALL` that a cross-namespace lookup
+    /// had to build.
+    ///
+    /// `namespace` is denormalized from `Tags.namespace`. It is what keeps
+    /// the per-namespace tag recount scoped: without it, a recount would
+    /// sweep the whole `Tags` tree into a new MVCC image, which the slurp
+    /// records as pinning RSS at ~10 GB with no wal progress.
+    ///
+    /// Three indexes, each covering the direction it serves:
+    ///
+    /// * the primary key `(tag_id, file_id)` -- a tag's posting list, and
+    ///   the `GROUP BY tag_id` the recount does.
+    /// * `idx_relationship_file_tag (file_id, tag_id)` -- a file's tags.
+    ///   The legacy per-namespace index was on `(file_id)` alone, so every
+    ///   row of a file's tag set paid a table b-tree hop to fetch `tag_id`;
+    ///   carrying `tag_id` in the index makes the read index-only.
+    /// * `idx_relationship_namespace (namespace, tag_id, file_id)` -- the
+    ///   per-namespace recount and the per-namespace delete.
+    pub(in crate::db::turso) async fn table_create_relationship(&self, conn: &Connection) {
+        let _ = conn
+            .execute_batch(
+                "
+CREATE TABLE IF NOT EXISTS Relationship (
+    file_id INTEGER NOT NULL,
+    tag_id INTEGER NOT NULL,
+    namespace INTEGER NOT NULL,
+
+    PRIMARY KEY (tag_id, file_id)
+);
+CREATE INDEX IF NOT EXISTS idx_relationship_file_tag ON Relationship (file_id, tag_id);
+CREATE INDEX IF NOT EXISTS idx_relationship_namespace ON Relationship (namespace, tag_id, file_id);
+",
+            )
+            .await;
+    }
     pub(in crate::db::turso) async fn table_create_parents(&self, conn: &Connection) -> Result<()> {
         self.table_create_parents_v2(conn).await
     }

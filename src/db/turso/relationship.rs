@@ -5,6 +5,7 @@ use turso::{Connection, Result, Value, params_from_iter};
 
 use crate::db::SQL_CHUNK_SIZE;
 use crate::db::turso::TursoDatabase;
+use crate::db::turso::relationship_store::ReadMode;
 
 /// Cap on the size of a single popularity fold-in statement.
 ///
@@ -15,7 +16,7 @@ use crate::db::turso::TursoDatabase;
 /// scrape page), which stalls every job behind `tag_count_lock`. Statements of
 /// a few hundred terms stay close to the real per-row cost (b-tree MVCC
 /// writes), so the fold-in is split into pieces this size.
-const POPULARITY_FOLD_CHUNK: usize = 100;
+pub(in crate::db::turso) const POPULARITY_FOLD_CHUNK: usize = 100;
 
 /// Minimum `Tags.count` for a tag to be mirrored into the `Tags_Popular`
 /// search shadow (and therefore be autocomplete-searchable).
@@ -194,6 +195,22 @@ impl TursoDatabase {
         conn: &Connection,
         tag_id: u64,
     ) -> Result<Option<u64>> {
+        // The flat table carries every namespace's relationships, so this
+        // needs no namespace lookup and no partition -- it is a seek on the
+        // primary key.
+        if self.relationship_read_mode(conn).await == ReadMode::Flat {
+            let mut rows = conn
+                .query(
+                    "SELECT file_id FROM Relationship WHERE tag_id = ?1 LIMIT 1;",
+                    (tag_id as i64,),
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                return Ok(Some(row.get(0)?));
+            }
+            return Ok(None);
+        }
+
         let Some(namespace_id) = self.tag_namespace_id(conn, tag_id).await? else {
             return Ok(None);
         };
@@ -220,6 +237,25 @@ impl TursoDatabase {
         conn: &Connection,
         file_id: u64,
     ) -> Result<HashSet<u64>> {
+        // The flat table: one index seek on `idx_relationship_file_tag`,
+        // which carries `tag_id` in the index so the read is index-only.
+        // The legacy path needed a `UNION ALL` over every namespace's
+        // partition, with the predicate repeated in each arm because limbo
+        // does not push a predicate through a union.
+        if self.relationship_read_mode(conn).await == ReadMode::Flat {
+            let mut out = HashSet::new();
+            let mut rows = conn
+                .query(
+                    "SELECT tag_id FROM Relationship WHERE file_id = ?1;",
+                    (file_id as i64,),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                out.insert(row.get(0)?);
+            }
+            return Ok(out);
+        }
+
         // No namespaces -> no relationship partitions -> no relationships.
         // (Also avoids binding ?1 against the placeholder-free WHERE 0 source.)
         if relationship_union_tables(conn).await.is_empty() {
@@ -245,6 +281,23 @@ impl TursoDatabase {
         conn: &Connection,
         tag_id: u64,
     ) -> Result<HashSet<u64>> {
+        // The flat table: a seek on the primary key `(tag_id, file_id)`,
+        // which covers the query. The legacy path had to reach into the
+        // one partition that holds the tag.
+        if self.relationship_read_mode(conn).await == ReadMode::Flat {
+            let mut out = HashSet::new();
+            let mut rows = conn
+                .query(
+                    "SELECT file_id FROM Relationship WHERE tag_id = ?1;",
+                    (tag_id as i64,),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                out.insert(row.get(0)?);
+            }
+            return Ok(out);
+        }
+
         // No namespaces -> no relationship partitions -> no relationships.
         if relationship_union_tables(conn).await.is_empty() {
             return Ok(HashSet::new());
@@ -270,10 +323,26 @@ impl TursoDatabase {
         file_id: u64,
         namespace_id: u64,
     ) -> Result<HashSet<u64>> {
-        let sql = format!("SELECT tag_id FROM Relationship_{namespace_id} WHERE file_id = ?1;");
+        let (sql, params) = if self.relationship_read_mode(conn).await == ReadMode::Flat {
+            // The flat table carries the namespace on the row, so the filter
+            // is a column comparison on the same seek.
+            (
+                "SELECT tag_id FROM Relationship WHERE file_id = ?1 AND namespace = ?2;"
+                    .to_string(),
+                params_from_iter(vec![
+                    Value::from(file_id as i64),
+                    Value::from(namespace_id as i64),
+                ]),
+            )
+        } else {
+            (
+                format!("SELECT tag_id FROM Relationship_{namespace_id} WHERE file_id = ?1;"),
+                params_from_iter(vec![Value::from(file_id as i64)]),
+            )
+        };
 
         let mut out = HashSet::new();
-        let mut rows = conn.query(&sql, (file_id as i64,)).await?;
+        let mut rows = conn.query(&sql, params).await?;
         while let Some(row) = rows.next().await? {
             out.insert(row.get(0)?);
         }
@@ -287,6 +356,22 @@ impl TursoDatabase {
         conn: &Connection,
         tag_id: u64,
     ) -> Result<HashSet<u64>> {
+        if self.relationship_read_mode(conn).await == ReadMode::Flat {
+            // One seek on the primary key for the tag itself, one for the
+            // parents it declares, unioned and deduplicated.
+            let sql = "SELECT DISTINCT file_id FROM Relationship
+                       WHERE tag_id = ?1
+                          OR tag_id IN (
+                              SELECT Parents.relate_tag_id FROM Parents WHERE Parents.tag_id = ?1
+                          );";
+            let mut out = HashSet::new();
+            let mut rows = conn.query(sql, (tag_id as i64,)).await?;
+            while let Some(row) = rows.next().await? {
+                out.insert(row.get(0)?);
+            }
+            return Ok(out);
+        }
+
         // Pushed into each arm; the outer DISTINCT still collapses the
         // per-partition results into one file set.
         let relationship_source = self
@@ -541,6 +626,59 @@ impl TursoDatabase {
         Ok(out)
     }
 
+    /// The post-update form of `tags_needing_shadow_sync`: returns the subset
+    /// of `tags` whose *current* `Tags.count` disagrees with their
+    /// `Tags_Popular` membership.
+    ///
+    /// The recount path writes absolute counts rather than deltas, so there is
+    /// no "old count + delta" to derive the new value from -- by the time this
+    /// runs the row already holds its final count, and the question is simply
+    /// whether the shadow agrees with it. Same exactness property as the delta
+    /// variant: it compares the actual post-update threshold state against
+    /// actual shadow presence, so it repairs drift as well as propagating a
+    /// genuine crossing, and it never writes a row that is already consistent.
+    pub(in crate::db::turso) async fn tags_with_shadow_drift(
+        &self,
+        conn: &Connection,
+        tags: &[(u64, u64)],
+    ) -> Result<Vec<u64>> {
+        if tags.is_empty() {
+            return Ok(Vec::new());
+        }
+        let values: Vec<Value> = tags.iter().map(|(id, _)| Value::from(*id as i64)).collect();
+        let placeholders = std::iter::repeat_n("?", tags.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        // `tp.tag_id IS NOT NULL` is the shadow-presence flag; both sides are
+        // primary-key lookups, so this stays a set of point reads.
+        let mut rows = conn
+            .query(
+                format!(
+                    "SELECT t.id, (t.count >= ?), (tp.tag_id IS NOT NULL)
+                     FROM Tags t
+                     LEFT JOIN Tags_Popular tp ON tp.tag_id = t.id
+                     WHERE t.id IN ({placeholders})"
+                ),
+                params_from_iter(
+                    std::iter::once(Value::from(POPULAR_TAG_THRESHOLD))
+                        .chain(values)
+                        .collect::<Vec<Value>>(),
+                ),
+            )
+            .await?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let tag_id: u64 = row.get(0)?;
+            let popular: i64 = row.get(1)?;
+            let in_shadow: i64 = row.get(2)?;
+            if (popular != 0) != (in_shadow != 0) {
+                out.push(tag_id);
+            }
+        }
+        Ok(out)
+    }
+
     /// Mirrors the given tags' current popularity into the search shadow:
     /// `Tags_Popular` keeps exactly the `count >= 5` tags that the FTS index
     /// covers. Must run on the same connection (and, for the batch path, the
@@ -626,10 +764,33 @@ impl TursoDatabase {
         let Some(namespace_id) = self.tag_namespace_id(conn, tag_id).await? else {
             return Ok(());
         };
-        let sql = format!(
-            "INSERT OR IGNORE INTO Relationship_{namespace_id} (file_id, tag_id) VALUES (?1, ?2);"
-        );
-        let inserted = conn.execute(sql, (file_id as i64, tag_id as i64)).await?;
+        let write_mode = self.relationship_write_mode(conn).await;
+
+        let mut inserted = 0u64;
+        if write_mode.writes_flat() {
+            inserted += conn
+                .execute(
+                    "INSERT OR IGNORE INTO Relationship (file_id, tag_id, namespace)
+                     VALUES (?1, ?2, ?3);",
+                    (
+                        file_id as i64,
+                        tag_id as i64,
+                        namespace_id as i64,
+                    ),
+                )
+                .await?;
+        }
+        if write_mode.writes_partitions() {
+            let sql = format!(
+                "INSERT OR IGNORE INTO Relationship_{namespace_id} (file_id, tag_id) VALUES (?1, ?2);"
+            );
+            let partition_inserted = conn
+                .execute(sql, (file_id as i64, tag_id as i64))
+                .await?;
+            if !write_mode.writes_flat() {
+                inserted = partition_inserted;
+            }
+        }
         if inserted > 0 {
             conn.execute(
                 "UPDATE Tags SET count = count + 1 WHERE id = ?1;",
@@ -691,6 +852,56 @@ impl TursoDatabase {
                 .insert((file_id, tag_id));
         }
 
+        let write_mode = self.relationship_write_mode(conn).await;
+
+        // The flat table takes the whole batch in one sorted run, keyed by
+        // (tag_id, file_id) -- the primary key's order, so its b-tree is
+        // extended at its right edge rather than randomly. The legacy
+        // partitions are fed the same way, each on its own key range.
+        if write_mode.writes_flat() {
+            let mut flat: Vec<(u64, u64, u64)> = relationships
+                .iter()
+                .filter_map(|&(file_id, tag_id)| {
+                    tag_namespaces
+                        .get(&tag_id)
+                        .map(|namespace_id| (file_id, tag_id, *namespace_id))
+                })
+                .collect();
+            flat.sort_unstable_by_key(|(_, tag_id, _)| *tag_id);
+            for chunk in flat.chunks(SQL_CHUNK_SIZE) {
+                let mut holders = Vec::with_capacity(chunk.len());
+                let mut params = Vec::with_capacity(chunk.len() * 3);
+                for (file_id, tag_id, namespace_id) in chunk {
+                    holders.push("(?, ?, ?)");
+                    params.push(Value::from(*file_id as i64));
+                    params.push(Value::from(*tag_id as i64));
+                    params.push(Value::from(*namespace_id as i64));
+                }
+                let mut inserted_rows = conn
+                    .query(
+                        format!(
+                            "INSERT OR IGNORE INTO Relationship (file_id, tag_id, namespace) \
+                             VALUES {} RETURNING tag_id",
+                            holders.join(", ")
+                        ),
+                        params_from_iter(params),
+                    )
+                    .await?;
+                // Only genuinely inserted rows appear in RETURNING; OR IGNORE
+                // rows are skips and must not bump the count. The count is
+                // taken from the flat table when it takes part in the write,
+                // so a dual write does not count the same row twice.
+                while let Some(row) = inserted_rows.next().await? {
+                    let tag_id: u64 = row.get(0)?;
+                    *aggregated_deltas.entry(tag_id).or_default() += 1;
+                }
+            }
+        }
+
+        if !write_mode.writes_partitions() {
+            return Ok(aggregated_deltas);
+        }
+
         for (namespace_id, namespace_relationships) in by_namespace {
             // Feed each namespace's table rows in (tag_id, file_id) key order.
             // Tuned for the MVCC commit-log path (sequential b-tree extension
@@ -707,6 +918,19 @@ impl TursoDatabase {
                     holders.push("(?, ?)");
                     params.push(Value::from(*file_id as i64));
                     params.push(Value::from(*tag_id as i64));
+                }
+                if write_mode.writes_flat() {
+                    // The flat table already counted the genuinely new rows.
+                    conn.execute(
+                        format!(
+                            "INSERT OR IGNORE INTO Relationship_{namespace_id} (file_id, tag_id) \
+                             VALUES {}",
+                            holders.join(", ")
+                        ),
+                        params_from_iter(params),
+                    )
+                    .await?;
+                    continue;
                 }
                 let mut inserted_rows = conn
                     .query(
@@ -779,6 +1003,51 @@ impl TursoDatabase {
                 .push((file_id, tag_id));
         }
 
+        let write_mode = self.relationship_write_mode(conn).await;
+
+        // The flat table's primary key is `(tag_id, file_id)` too, so the
+        // same "pin the tag, list the files" delete is a covering-index seek
+        // there as well.
+        if write_mode.writes_flat() {
+            let mut by_tag: HashMap<u64, Vec<u64>> = HashMap::new();
+            for &(file_id, tag_id) in relationships {
+                if !tag_namespaces.contains_key(&tag_id) {
+                    continue;
+                }
+                by_tag.entry(tag_id).or_default().push(file_id);
+            }
+            for (tag_id, mut file_ids) in by_tag {
+                file_ids.sort_unstable();
+                file_ids.dedup();
+                for chunk in file_ids.chunks(SQL_CHUNK_SIZE) {
+                    let placeholders = std::iter::repeat_n("?", chunk.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let mut params = Vec::with_capacity(chunk.len() + 1);
+                    params.push(Value::from(tag_id as i64));
+                    params.extend(chunk.iter().map(|file_id| Value::from(*file_id as i64)));
+                    let mut deleted_rows = conn
+                        .query(
+                            format!(
+                                "DELETE FROM Relationship
+                                 WHERE tag_id = ? AND file_id IN ({placeholders})
+                                 RETURNING tag_id"
+                            ),
+                            params_from_iter(params),
+                        )
+                        .await?;
+                    while let Some(row) = deleted_rows.next().await? {
+                        let returned: u64 = row.get(0)?;
+                        *aggregated_deltas.entry(returned).or_default() += 1;
+                    }
+                }
+            }
+        }
+
+        if !write_mode.writes_partitions() {
+            return Ok(aggregated_deltas);
+        }
+
         for (namespace_id, rels) in by_namespace {
             // Group by tag and delete with `tag_id = ? AND file_id IN (...)`.
             //
@@ -820,6 +1089,18 @@ impl TursoDatabase {
                     let mut params = Vec::with_capacity(chunk.len() + 1);
                     params.push(Value::from(tag_id as i64));
                     params.extend(chunk.iter().map(|file_id| Value::from(*file_id as i64)));
+                    if write_mode.writes_flat() {
+                        // The flat table already counted the removed rows.
+                        conn.execute(
+                            format!(
+                                "DELETE FROM Relationship_{namespace_id}
+                                 WHERE tag_id = ? AND file_id IN ({placeholders})"
+                            ),
+                            params_from_iter(params),
+                        )
+                        .await?;
+                        continue;
+                    }
                     let mut deleted_rows = conn
                         .query(
                             format!(
@@ -936,9 +1217,26 @@ impl TursoDatabase {
         let Some(namespace_id) = self.tag_namespace_id(conn, tag_id).await? else {
             return Ok(());
         };
-        let sql =
-            format!("DELETE FROM Relationship_{namespace_id} WHERE file_id = ?1 AND tag_id = ?2;");
-        let deleted = conn.execute(sql, (file_id as i64, tag_id as i64)).await?;
+        let write_mode = self.relationship_write_mode(conn).await;
+
+        let mut deleted = 0u64;
+        if write_mode.writes_flat() {
+            deleted += conn
+                .execute(
+                    "DELETE FROM Relationship WHERE file_id = ?1 AND tag_id = ?2;",
+                    (file_id as i64, tag_id as i64),
+                )
+                .await?;
+        }
+        if write_mode.writes_partitions() {
+            let sql = format!(
+                "DELETE FROM Relationship_{namespace_id} WHERE file_id = ?1 AND tag_id = ?2;"
+            );
+            let partition_deleted = conn.execute(sql, (file_id as i64, tag_id as i64)).await?;
+            if !write_mode.writes_flat() {
+                deleted = partition_deleted;
+            }
+        }
         if deleted > 0 {
             conn.execute(
                 "UPDATE Tags SET count = MAX(count - 1, 0) WHERE id = ?1;",
@@ -987,13 +1285,23 @@ impl TursoDatabase {
         file_ids: &[u64],
     ) -> Result<Vec<(String, Vec<Value>)>> {
         let mut out = Vec::new();
-        // The `file_id IN (...)` filter is pushed into every namespace arm (see
-        // `relationship_union_source`), so each partition is probed through
-        // `idx_Relationship_{ns}_tag_file` instead of being scanned. Numbered
-        // placeholders let the same list be repeated per arm for one binding,
-        // and `pushed_union_batch_size` keeps each statement small enough to
-        // parse cheaply.
-        //
+
+        // The flat table: one statement, one index seek per id, and the
+        // index carries `tag_id` so the read is index-only. This replaces
+        // the N-arm union, whose SQL text grew with the namespace count and
+        // whose batch size shrank as `PUSHED_UNION_PARAM_BUDGET / N`.
+        if self.relationship_read_mode(conn).await == ReadMode::Flat {
+            for chunk in file_ids.chunks(SQL_CHUNK_SIZE) {
+                let placeholders = numbered_placeholders(chunk.len());
+                let sql = format!(
+                    "SELECT file_id, tag_id FROM Relationship WHERE file_id IN ({placeholders})"
+                );
+                let params: Vec<Value> = chunk.iter().map(|id| Value::from(*id as i64)).collect();
+                out.push((sql, params));
+            }
+            return Ok(out);
+        }
+
         // The namespace list is fetched once and reused for both the arm count
         // and every chunk's text, so a multi-chunk lookup still costs one
         // namespace query in total.
@@ -1107,6 +1415,37 @@ impl TursoDatabase {
 /// WHERE id IN (...)`, bumping every tag's count by its aggregated delta in
 /// one round trip instead of one UPDATE per tag. `decrement` clamps the count
 /// at zero via `MAX(count - delta, 0)`.
+/// Test-only: build the `UPDATE Tags SET count = ...` statement for a fixture
+/// seed. Exists so the lock bench seeds counts through the same statement shape
+/// production uses rather than a hand-written variant.
+#[cfg(test)]
+pub(in crate::db::turso) fn tag_count_seed_sql_for_bench(
+    ids: &[u64],
+) -> (String, Vec<Value>) {
+    let clauses: Vec<String> = ids.iter().map(|_| "WHEN ? THEN ?".to_string()).collect();
+    // Placeholders are numbered across both blocks: the CASE pairs come first,
+    // then the IN list, so the numbering has to continue rather than restart.
+    let placeholders: Vec<String> = (ids.len() * 2 + 1..=ids.len() * 3)
+        .map(|i| format!("?{i}"))
+        .collect();
+    let mut params: Vec<Value> = Vec::with_capacity(ids.len() * 3);
+    for id in ids {
+        params.push(Value::from(*id as i64));
+        params.push(Value::from(5i64));
+    }
+    for id in ids {
+        params.push(Value::from(*id as i64));
+    }
+    (
+        format!(
+            "UPDATE Tags SET count = CASE id {} ELSE 0 END WHERE id IN ({})",
+            clauses.join(" "),
+            placeholders.join(", ")
+        ),
+        params,
+    )
+}
+
 fn tag_count_update_sql(deltas: &[(u64, u64)], decrement: bool) -> (String, Vec<Value>) {
     let mut clauses = Vec::with_capacity(deltas.len());
     let mut params = Vec::with_capacity(deltas.len() * 3);

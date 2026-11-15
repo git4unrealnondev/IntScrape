@@ -340,6 +340,178 @@ DROP TABLE Parents_old;
     /// collide with a case-variant twin on the
     /// `(algorithm, digest)` unique index untouched instead of failing
     /// the migration; the twins keep their existing digest.
+    /// Updates the db from version 14 to 15.
+    ///
+    /// Adds the flat `Relationship` table and backfills it from every
+    /// legacy `Relationship_{ns}` partition.
+    ///
+    /// The partitions were introduced so the *import* path could filter rows
+    /// per namespace without scanning: the slurp's own notes record ~9.5
+    /// hours of source reads against a single shared table. They never
+    /// helped the read path -- a file's tags can live in any namespace, so
+    /// every partition had to be probed anyway, through a `UNION ALL` whose
+    /// SQL text grew with the namespace count. Measured against a 32-arm
+    /// fixture, the flat table answers the same lookup 22x-236x faster, and
+    /// it writes ~17% faster too.
+    ///
+    /// The legacy partitions are **kept in the schema** for one release, and
+    /// backfilled above, so a rollback does not need a restore. The default
+    /// write mode is `single`: only the flat table is written, which is the
+    /// point of the migration. Flip `relationship_write_mode` to `dual` to
+    /// keep the partitions in step (and `relationship_read_mode` to `legacy`
+    /// to read them) -- but note that a rollback needs the partitions
+    /// refilled first, since rows written under `single` never reached them.
+    ///
+    /// The backfill is set-based and restartable: `INSERT OR IGNORE` against
+    /// the flat table's primary key makes a re-run of the migration a no-op,
+    /// and the per-namespace copy is chunked so no single statement is
+    /// larger than `SQL_CHUNK_SIZE` rows.
+    pub(in crate::db) async fn update_db_14_to_15(&self, conn: &Connection) -> Result<()> {
+        log::info!(
+            "Migration 14->15: adding the flat Relationship table and backfilling it \
+             from the per-namespace partitions."
+        );
+
+        self.table_create_relationship(conn).await;
+
+        // Every legacy partition, in id order. The namespace id is the suffix
+        // of the table name, which is also the namespace the rows belong to:
+        // a relationship row is routed to the partition of its *tag's*
+        // namespace, and a tag's namespace never changes.
+        let mut partitions: Vec<(String, u64)> = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'table' AND lower(name) LIKE 'relationship\\_%' ESCAPE '\\';",
+                )
+                .await?;
+            let mut rows = stmt.query(()).await?;
+            while let Some(row) = rows.next().await? {
+                let name: String = row.get(0)?;
+                let lowered = name.to_ascii_lowercase();
+                let Some(suffix) = lowered.strip_prefix("relationship_") else {
+                    continue;
+                };
+                let Ok(namespace_id) = suffix.parse::<u64>() else {
+                    continue;
+                };
+                partitions.push((name, namespace_id));
+            }
+        }
+        partitions.sort_by_key(|(_, namespace_id)| *namespace_id);
+
+        for (table, namespace_id) in &partitions {
+            let mut copied = 0u64;
+            // Keyset-paginated: the flat table's primary key is
+            // `(tag_id, file_id)`, so the source is read in that order and
+            // the cursor advances past the last row of each batch. A plain
+            // `LIMIT` without a cursor would re-read the same first chunk
+            // forever.
+            //
+            // Tag ids are rowids starting at 1, so a `-1` sentinel is
+            // unambiguously "before the first row" and the first page needs
+            // no special case.
+            let mut last_tag_id: i64 = -1;
+            let mut last_file_id: i64 = -1;
+            loop {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT tag_id, file_id FROM {table}
+                         WHERE tag_id > ?1 OR (tag_id = ?1 AND file_id > ?2)
+                         ORDER BY tag_id, file_id
+                         LIMIT {chunk};",
+                        chunk = crate::db::SQL_CHUNK_SIZE
+                    ))
+                    .await?;
+                let mut rows = stmt
+                    .query(turso::params_from_iter([
+                        turso::Value::from(last_tag_id),
+                        turso::Value::from(last_file_id),
+                    ]))
+                    .await?;
+                let mut batch: Vec<(i64, i64)> = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    batch.push((row.get(0)?, row.get(1)?));
+                }
+                drop(rows);
+                if batch.is_empty() {
+                    break;
+                }
+                let holders: Vec<&str> = batch.iter().map(|_| "(?, ?, ?)").collect();
+                let mut params: Vec<turso::Value> = Vec::with_capacity(batch.len() * 3);
+                for (tag_id, file_id) in &batch {
+                    params.push(turso::Value::from(*file_id));
+                    params.push(turso::Value::from(*tag_id));
+                    params.push(turso::Value::from(*namespace_id as i64));
+                }
+                conn.execute(
+                    format!(
+                        "INSERT OR IGNORE INTO Relationship (file_id, tag_id, namespace)
+                         VALUES {}",
+                        holders.join(", ")
+                    ),
+                    turso::params_from_iter(params),
+                )
+                .await?;
+                copied += batch.len() as u64;
+                if batch.len() < crate::db::SQL_CHUNK_SIZE {
+                    break;
+                }
+                let Some(&(tag_id, file_id)) = batch.last() else {
+                    break;
+                };
+                last_tag_id = tag_id;
+                last_file_id = file_id;
+            }
+            log::info!(
+                "Migration 14->15: backfilled {copied} rows from {table} into Relationship."
+            );
+        }
+
+        // The rollout defaults: write only the flat table, read from it. The
+        // legacy partitions stay in the schema and are still backfilled above,
+        // so a rollback to `dual` + `legacy` has the pre-migration data it
+        // needs -- only the rows written after the switch would be missing,
+        // which is what the boot warning is about.
+        self.setting_set(
+            conn,
+            shared_types::DbSettingsObj {
+                name: super::relationship_store::WRITE_MODE_SETTING.to_string(),
+                description: Some(
+                    "Which tables a relationship write touches: single, dual or legacy."
+                        .to_string(),
+                ),
+                num: None,
+                param: Some("single".to_string()),
+            },
+        )
+        .await?;
+        self.setting_set(
+            conn,
+            shared_types::DbSettingsObj {
+                name: super::relationship_store::READ_MODE_SETTING.to_string(),
+                description: Some("Which tables a relationship read uses: flat or legacy.".to_string()),
+                num: None,
+                param: Some("flat".to_string()),
+            },
+        )
+        .await?;
+
+        self.setting_set(
+            conn,
+            shared_types::DbSettingsObj {
+                name: "SYSTEM_VERSION".to_string(),
+                description: None,
+                num: Some(15),
+                param: None,
+            },
+        )
+        .await?;
+
+        Ok(())
+    }
+
     pub(in crate::db) async fn update_db_13_to_14(&self, conn: &Connection) -> Result<()> {
         log::info!(
             "Migration 13->14: canonicalizing FileHashes digest casing (SHA* uppercase, MD5 lowercase)."
@@ -398,5 +570,229 @@ DROP TABLE Parents_old;
         .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Migration tests. These build a v14-shaped database by hand and run the
+    //! upgrade, because the backfill's pagination is the part that can fail
+    //! silently: a cursor that does not advance re-reads the first chunk
+    //! forever, and one that skips rows leaves relationships missing.
+
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use turso::Builder;
+
+    async fn temp_db_path(label: &str) -> std::path::PathBuf {
+        let dir = tempfile::tempdir().unwrap();
+        // Leak the guard: the path has to outlive the call, and the test
+        // process cleans /tmp anyway.
+        let path = dir.keep();
+        path.join(format!("intscrape-mig-{label}-{}.db", std::process::id()))
+    }
+
+    fn remove_db(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        for suffix in ["-log", "-wal", "-shm"] {
+            let mut side = path.to_path_buf().into_os_string();
+            side.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(side));
+        }
+    }
+
+    /// A v14 database: namespaces, tags, files, and per-namespace relationship
+    /// partitions with no flat `Relationship` table.
+    async fn build_v14(path: &std::path::Path, namespaces: usize, rows_per_ns: u64) {
+        remove_db(path);
+        let db = Builder::new_local(&path.to_string_lossy())
+            .experimental_index_method(true)
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.pragma_update("journal_mode", "'mvcc'").await.unwrap();
+
+        let mut ddl = String::from(
+            "CREATE TABLE Namespace (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT);
+             CREATE TABLE Tags (
+                 id INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 namespace INTEGER NOT NULL,
+                 count INTEGER NOT NULL DEFAULT 0,
+                 UNIQUE(name, namespace));
+             CREATE TABLE File (id INTEGER PRIMARY KEY NOT NULL, extension TEXT,
+                 storage_id INTEGER, size_bytes INTEGER);
+             CREATE TABLE Settings (name TEXT PRIMARY KEY, description TEXT, num INTEGER, param TEXT);
+             CREATE TABLE FileStorageLocations (id INTEGER PRIMARY KEY, location TEXT NOT NULL UNIQUE);
+             CREATE TABLE FileHashes (file_id INTEGER NOT NULL, algorithm TEXT NOT NULL, digest TEXT NOT NULL,
+                 PRIMARY KEY (file_id, algorithm));
+             CREATE TABLE dead_urls (url TEXT PRIMARY KEY);
+             CREATE TABLE Jobs (id INTEGER PRIMARY KEY NOT NULL, time INTEGER NOT NULL,
+                 reptime INTEGER NOT NULL, priority INTEGER NOT NULL,
+                 is_running BOOL NOT NULL DEFAULT False, recreation TEXT NOT NULL,
+                 site TEXT NOT NULL, param TEXT NOT NULL, user_data TEXT NOT NULL);",
+        );
+        // The partition table name is the *namespace row id*, which is
+        // 1-based, not a zero-based loop index.
+        for ns in 1..=namespaces {
+            ddl.push_str(&format!(
+                "CREATE TABLE Relationship_{ns} (
+                     file_id INTEGER NOT NULL,
+                     tag_id INTEGER NOT NULL,
+                     PRIMARY KEY (tag_id, file_id));
+                 CREATE INDEX idx_Relationship_{ns}_tag_file
+                     ON Relationship_{ns} (file_id);"
+            ));
+        }
+        conn.execute_batch(&ddl).await.unwrap();
+
+        for ns in 1..=namespaces {
+            conn.execute(
+                "INSERT INTO Namespace (id, name) VALUES (?1, ?2);",
+                turso::params_from_iter([
+                    turso::Value::from(ns as i64),
+                    turso::Value::from(format!("ns{}", ns - 1)),
+                ]),
+            )
+            .await
+            .unwrap();
+        }
+        for ns in 1..=namespaces {
+            for row in 0..rows_per_ns {
+                // Ids must be unique across the whole fixture: the backfill
+                // dedupes on the flat table's (tag_id, file_id) primary key,
+                // so reusing an id in two partitions would silently drop rows.
+                let tag_id = (ns as i64 - 1) * rows_per_ns as i64 + row as i64 + 1;
+                let file_id = (ns as i64 - 1) * rows_per_ns as i64 + row as i64 + 1;
+                conn.execute(
+                    "INSERT OR IGNORE INTO Tags (id, name, namespace) VALUES (?1, ?2, ?3);",
+                    turso::params_from_iter([
+                        turso::Value::from(tag_id),
+                        turso::Value::from(format!("tag{tag_id}")),
+                        turso::Value::from(ns as i64),
+                    ]),
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    &format!(
+                        "INSERT OR IGNORE INTO Relationship_{ns} (file_id, tag_id) VALUES (?1, ?2);"
+                    ),
+                    turso::params_from_iter([
+                        turso::Value::from(file_id),
+                        turso::Value::from(tag_id),
+                    ]),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        // Mark the schema so `check_db` knows it has to run 14 -> 15.
+        conn.execute(
+            "INSERT INTO Settings (name, description, num, param)
+             VALUES ('SYSTEM_VERSION', NULL, 14, NULL);",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The 14 -> 15 backfill must copy every row, across a chunk boundary, and
+    /// stamp each with the namespace its partition belongs to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn migration_14_to_15_backfills_every_partition_row() {
+        // Deliberately more rows than one SQL_CHUNK_SIZE so the pagination
+        // cursor has to advance more than once.
+        let rows_per_ns = crate::db::SQL_CHUNK_SIZE as u64 * 2 + 7;
+        let namespaces = 3;
+        let path = temp_db_path("backfill").await;
+        build_v14(&path, namespaces, rows_per_ns).await;
+
+        let should_exit = Arc::new(AtomicBool::new(false));
+        let db = TursoDatabase::new_with_exit(&path, should_exit).await;
+        let conn = db.connect().unwrap();
+
+        // The migration ran during `new_with_exit` (check_db).
+        let version: i64 = {
+            let mut rows = conn
+                .query(
+                    "SELECT num FROM Settings WHERE name = 'SYSTEM_VERSION';",
+                    (),
+                )
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(version, 15, "the migration must record version 15");
+
+        let total: i64 = {
+            let mut rows = conn
+                .query("SELECT COUNT(*) FROM Relationship;", ())
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(
+            total,
+            (rows_per_ns * namespaces as u64) as i64,
+            "every partition row must be backfilled"
+        );
+
+        // Every row must carry its partition's namespace, which is what keeps
+        // the per-namespace recount scoped.
+        for ns_id in 1..=namespaces as i64 {
+            let scoped: i64 = {
+                let mut rows = conn
+                    .query(
+                        "SELECT COUNT(*) FROM Relationship WHERE namespace = ?1;",
+                        turso::params_from_iter([turso::Value::from(ns_id)]),
+                    )
+                    .await
+                    .unwrap();
+                rows.next().await.unwrap().unwrap().get(0).unwrap()
+            };
+            assert_eq!(
+                scoped, rows_per_ns as i64,
+                "namespace {ns_id} must backfill {} rows",
+                rows_per_ns
+            );
+        }
+
+        // Re-running must be a no-op, not a duplicate.
+        let db2 = TursoDatabase::new_with_exit(&path, Arc::new(AtomicBool::new(false))).await;
+        let conn2 = db2.connect().unwrap();
+        let total2: i64 = {
+            let mut rows = conn2
+                .query("SELECT COUNT(*) FROM Relationship;", ())
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(total2, total, "a re-run must not duplicate rows");
+
+        remove_db(&path);
+    }
+
+    /// A database that has never had partitions (fresh v15 shape) must not be
+    /// disturbed by the migration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn migration_14_to_15_is_a_no_op_without_partitions() {
+        let path = temp_db_path("nopart").await;
+        remove_db(&path);
+        let should_exit = Arc::new(AtomicBool::new(false));
+        let db = TursoDatabase::new_with_exit(&path, should_exit).await;
+        let conn = db.connect().unwrap();
+        let total: i64 = {
+            let mut rows = conn
+                .query("SELECT COUNT(*) FROM Relationship;", ())
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(total, 0);
+        remove_db(&path);
     }
 }

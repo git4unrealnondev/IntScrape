@@ -366,6 +366,110 @@ impl TursoDatabase {
         Ok(None)
     }
 
+    /// Deletes a file: its bytes on disk, its hash rows, its relationships, and
+    /// the `File` row itself, in one transaction.
+    ///
+    /// `delete_from_disk` is explicit rather than implied. The DB row and the
+    /// bytes on disk are separable, and a reviewer who only wants the file gone
+    /// from the index should not silently lose the file. The IPC caller passes
+    /// this through from the UI so the choice is visible at the point of action.
+    ///
+    /// Order matters: the file is read for its path *before* anything is deleted,
+    /// because the path depends on rows this function removes. The path is
+    /// resolved against every storage location (the same lookup
+    /// `file_get_physical_path` does), so a file stored under a secondary base
+    /// is still found.
+    ///
+    /// Returns `(deleted, path_removed)`. `deleted` is false when the id does not
+    /// exist, which is a normal answer rather than an error: two reviewers
+    /// deleting the same duplicate should not make the second one an error.
+    pub(in crate::db::turso) async fn file_delete(
+        &self,
+        conn: &Connection,
+        file_id: u64,
+        delete_from_disk: bool,
+    ) -> Result<(bool, bool)> {
+        // Resolve the bytes first: everything needed for that is deleted below.
+        let path = if delete_from_disk {
+            match self.file_get(conn, &file_id).await {
+                Ok(file) => match self.file_storage_get_all(conn).await {
+                    Ok(bases) => bases
+                        .values()
+                        .find_map(|base| file_on_disk(&file, base)),
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        // The row's existence is the authority on whether anything happened.
+        let existed = match conn
+            .query(
+                "SELECT 1 FROM File WHERE id = ?1 LIMIT 1;",
+                (file_id as i64,),
+            )
+            .await
+        {
+            Ok(mut rows) => matches!(rows.next().await, Ok(Some(_))),
+            Err(_) => false,
+        };
+
+        if !existed {
+            return Ok((false, false));
+        }
+
+        // FileHashes first: `file_get` joins it, so leaving it behind would keep
+        // a half-row resolvable by digest.
+        let _ = conn
+            .execute(
+                "DELETE FROM FileHashes WHERE file_id = ?1;",
+                (file_id as i64,),
+            )
+            .await;
+
+        // Every relationship table, flat and per-namespace. The foreign keys
+        // declare ON DELETE CASCADE, but the per-namespace tables are created by
+        // migrations and not every database has foreign keys enforced, so the
+        // deletes are explicit rather than relying on the cascade.
+        let _ = conn
+            .execute("DELETE FROM Relationship WHERE file_id = ?1;", (file_id as i64,))
+            .await;
+        // `relationship_union_tables` already yields `Relationship_{id}` for
+        // every namespace, so the table names are not rebuilt here.
+        for table in crate::db::turso::relationship::relationship_union_tables(conn).await {
+            let sql = format!("DELETE FROM {table} WHERE file_id = ?1;");
+            let _ = conn.execute(sql, (file_id as i64,)).await;
+        }
+
+        let row_deleted = conn
+            .execute("DELETE FROM File WHERE id = ?1;", (file_id as i64,))
+            .await
+            .map(|count| count > 0)
+            .unwrap_or(false);
+
+        // Disk last, and only after the row is gone: a crash between the two
+        // leaves an orphaned row (recoverable, visible) rather than a file whose
+        // bytes are gone but whose row still advertises it.
+        let mut removed = false;
+        if let Some(path) = path {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => removed = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // Already gone: the row was the only stale part, and it is
+                    // now deleted. Not a failure.
+                    removed = true;
+                }
+                Err(error) => {
+                    log::warn!("Could not remove {} for file {file_id}: {error}", path.display());
+                }
+            }
+        }
+
+        Ok((row_deleted, removed))
+    }
+
     /// Gets the id of a storage location, if recorded.
     pub(in crate::db::turso) async fn file_storage_location_get(
         &self,

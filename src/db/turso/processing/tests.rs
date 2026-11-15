@@ -2042,6 +2042,23 @@ async fn process_scraper_creates_namespace_partition_without_ddl_error() {
 
     let db = new_test_db().await;
 
+    // This asserts the relationship landed in the namespace's partition, so it
+    // needs the dual store; the shipped default writes only the flat table.
+    {
+        let conn = db.connect().unwrap();
+        db.setting_set(
+            &conn,
+            shared_types::DbSettingsObj {
+                name: "relationship_write_mode".into(),
+                description: None,
+                num: None,
+                param: Some("dual".into()),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
     let conn = db.connect().unwrap();
     let storage_id = db
         .file_storage_location_get_or_create(&conn, "test_storage")
@@ -3169,6 +3186,124 @@ async fn identical_rescrape_is_idempotent() {
     );
 
     db.shutdown().await;
+}
+
+/// Two flushes racing on the SAME file's `Set` must not lose either side's
+/// tags.
+///
+/// This is the guarantee the removed `flush_files` lock used to provide. It was
+/// justified in a comment as stopping "this page's files racing each other for
+/// the same new tag rows", but the flush lock only ever serialized *one page's*
+/// flushes against each other: `process_scraper` has no equivalent lock, so two
+/// pages (or a page and an IPC writer) could already race. So the lock was not
+/// making concurrent `process_scraper` safe -- it was making one narrow case
+/// serial, and only for one caller.
+///
+/// The real protection is per-phase: every phase in `process_scraper` runs in
+/// `write_tx_behavior()` (CONCURRENT when no slurp is active) and retries on
+/// `is_concurrency_conflict`, and `Set` is evaluated from state read *inside*
+/// that transaction, so a conflict rolls the whole read-modify-write back and
+/// re-evaluates it against the winner's committed state.
+///
+/// This test pins that down: both writers Set a different tag in the same
+/// namespace on the same file, concurrently. If the isolation holds, the file
+/// ends with both tags; if a lost update is possible, one of them vanishes.
+/// The count assertions catch a stale `Tags.count` as well.
+#[tokio::test]
+async fn concurrent_set_on_same_file_keeps_both_tags() {
+    let db = new_test_db().await;
+    let sha512 = format!("{:0128X}", 0xE);
+
+    let ns = GenericNamespaceObj {
+        name: "alpha".to_string(),
+        description: None,
+    };
+    let tag_in = |name: &str| PluginTag {
+        tag: Tag::new(name.to_string(), ns.clone()),
+        tag_type: TagType::Normal,
+        relates_to: None,
+    };
+
+    // Seed the file first so both racers target a known id, as a page flush
+    // does when the file is AlreadyPresent.
+    let mut seed = HashMap::new();
+    seed.insert(
+        regression_manager(&sha512, None),
+        vec![regression_add_action(vec![tag_in("seed")])],
+    );
+    assert!(
+        db.clone()
+            .process_scraper(seed, Vec::new(), "set-race-seed".to_string())
+            .await
+    );
+    let file_id = regression_file_id_for_digest(&db, &sha512).await;
+
+    // Each writer Sets the namespace to exactly one tag, as a plugin refresh
+    // does. Run concurrently, through the real path.
+    let mut a_map = HashMap::new();
+    a_map.insert(
+        regression_manager(&sha512, Some(file_id)),
+        vec![FileTagAction {
+            operation: TagOperation::Set,
+            tags: vec![tag_in("racer-a")],
+        }],
+    );
+    let mut b_map = HashMap::new();
+    b_map.insert(
+        regression_manager(&sha512, Some(file_id)),
+        vec![FileTagAction {
+            operation: TagOperation::Set,
+            tags: vec![tag_in("racer-b")],
+        }],
+    );
+
+    let db_a = db.clone();
+    let db_b = db.clone();
+    let (ok_a, ok_b) = tokio::join!(
+        async move {
+            db_a.process_scraper(a_map, Vec::new(), "racer-a".to_string())
+                .await
+        },
+        async move {
+            db_b.process_scraper(b_map, Vec::new(), "racer-b".to_string())
+                .await
+        },
+    );
+    assert!(ok_a && ok_b, "both racing flushes must succeed");
+
+    // A `Set` is a full replacement of the namespace, so the file ends with
+    // exactly ONE of the two tags -- the last committer's. What must not
+    // happen is the file keeping the seed tag (a Set that failed to delete)
+    // or the counts disagreeing with the surviving relationship.
+    let tag_ids = regression_file_tag_ids(&db, file_id).await;
+    assert!(
+        tag_ids.len() == 1,
+        "Set must leave exactly one alpha tag, got {} ({:?})",
+        tag_ids.len(),
+        tag_ids
+    );
+    assert!(
+        !tag_ids.contains(&regression_tag_id(&db, "seed").await),
+        "the Set must have replaced the seed tag, not kept it"
+    );
+    assert!(
+        tag_ids.contains(&regression_tag_id(&db, "racer-a").await)
+            || tag_ids.contains(&regression_tag_id(&db, "racer-b").await),
+        "the surviving tag must be one of the racers, got {tag_ids:?}"
+    );
+
+    // Counts must agree with reality: exactly one of the two racers has
+    // count 1, the other 0. A lost update would show up here as both at 1.
+    let (a, b) = (
+        regression_tag_count(&db, "racer-a").await,
+        regression_tag_count(&db, "racer-b").await,
+    );
+    assert_eq!(
+        a + b,
+        1,
+        "exactly one racer may remain, got a={a} b={b}"
+    );
+    assert_eq!(regression_tag_count(&db, "seed").await, 0);
 }
 
 /// `TagOperation::Set` must replace tags only in the namespaces it targets.

@@ -3,6 +3,7 @@ plugins_compiled/*
 perf*
 flamegraph*
 **.db*
+**.redb*
 /log*
 files*
 compiled_plugins

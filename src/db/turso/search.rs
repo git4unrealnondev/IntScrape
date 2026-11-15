@@ -5,6 +5,7 @@ use turso::{Connection, Result, Value, params_from_iter};
 
 use crate::db::SQL_CHUNK_SIZE;
 use crate::db::turso::TursoDatabase;
+use crate::db::turso::relationship_store::ReadMode;
 
 /// How many tag ids are pulled from FTS when resolving a human name.
 const FTS_NAME_LIMIT: usize = 10;
@@ -260,6 +261,7 @@ impl TursoDatabase {
         }
     }
 
+
     /// Resolves the searched tags and renders the statement `search_db_files`
     /// runs. Split out from the executor so tests can inspect, and
     /// `EXPLAIN QUERY PLAN`, the exact SQL the hot path emits.
@@ -293,14 +295,16 @@ impl TursoDatabase {
     /// predicate list; the aggregate stays a plain scan of the driver's index
     /// (or the `File` table's primary key), so counting never needs a temp
     /// B-tree or a sorter.
-    async fn build_search_parts(
+    pub(in crate::db::turso) async fn build_search_parts(
         &self,
         conn: &Connection,
         search: &SearchObj,
     ) -> Result<Option<(String, String, Vec<String>, &'static str)>> {
         // Resolve every searched tag's namespace and popularity in one batched
         // query. The namespace picks the `Relationship_{ns}` partition a probe
-        // has to hit; the count picks the driving scan.
+        // has to hit in the legacy store; the flat store needs only the id.
+        // The count picks the driving scan in both.
+        let flat = self.relationship_read_mode(conn).await == ReadMode::Flat;
         let mut id_info: HashMap<u64, (u64, i64)> = HashMap::new();
         let mut tag_ids = HashSet::new();
         for search_holder in search.searches.iter() {
@@ -401,7 +405,7 @@ impl TursoDatabase {
             {
                 continue;
             }
-            conditions.push(render_predicate(kind, &probes, driver.key_column()));
+            conditions.push(render_predicate(kind, &probes, driver.key_column(), flat));
         }
 
         if conditions.is_empty() && matches!(driver, Driver::AllFiles) {
@@ -414,17 +418,30 @@ impl TursoDatabase {
             Driver::Tag {
                 namespace_id,
                 tag_id,
-            } => (
-                format!(
-                    "SELECT d.file_id AS file_id FROM Relationship_{namespace_id} d \
-                     WHERE d.tag_id = {tag_id}"
-                ),
-                format!(
-                    "SELECT COUNT(d.file_id) FROM Relationship_{namespace_id} d \
-                     WHERE d.tag_id = {tag_id}"
-                ),
-                "d.file_id",
-            ),
+            } => {
+                if flat {
+                    // The flat table's primary key is `(tag_id, file_id)`, so
+                    // the driving scan is a range seek that already yields
+                    // `file_id` in order, exactly as the partition did.
+                    (
+                        format!("SELECT d.file_id AS file_id FROM Relationship d WHERE d.tag_id = {tag_id}"),
+                        format!("SELECT COUNT(d.file_id) FROM Relationship d WHERE d.tag_id = {tag_id}"),
+                        "d.file_id",
+                    )
+                } else {
+                    (
+                        format!(
+                            "SELECT d.file_id AS file_id FROM Relationship_{namespace_id} d \
+                             WHERE d.tag_id = {tag_id}"
+                        ),
+                        format!(
+                            "SELECT COUNT(d.file_id) FROM Relationship_{namespace_id} d \
+                             WHERE d.tag_id = {tag_id}"
+                        ),
+                        "d.file_id",
+                    )
+                }
+            }
             Driver::AllFiles => (
                 "SELECT d.id AS file_id FROM File d WHERE 1".to_string(),
                 "SELECT COUNT(d.id) FROM File d WHERE 1".to_string(),
@@ -523,12 +540,26 @@ fn classify(search_holder: &SearchHolder) -> (&[u64], Predicate) {
 /// Tag ids are inlined rather than bound because the statement is assembled per
 /// search anyway. They come from `Tags.id` (an integer primary key), never from
 /// user input, so there is nothing here to bind.
-fn render_predicate(kind: Predicate, probes: &[(u64, u64)], driver_key: &str) -> String {
+fn render_predicate(
+    kind: Predicate,
+    probes: &[(u64, u64)],
+    driver_key: &str,
+    flat: bool,
+) -> String {
     let probe = |namespace_id: u64, tag_id: u64, alias: &str| {
-        format!(
-            "EXISTS(SELECT 1 FROM Relationship_{namespace_id} {alias} \
-             WHERE {alias}.tag_id = {tag_id} AND {alias}.file_id = d.{driver_key})"
-        )
+        if flat {
+            // One table holds every namespace's relationships, so a probe is
+            // a lookup on the primary key without naming a partition.
+            format!(
+                "EXISTS(SELECT 1 FROM Relationship {alias} \
+                 WHERE {alias}.tag_id = {tag_id} AND {alias}.file_id = d.{driver_key})"
+            )
+        } else {
+            format!(
+                "EXISTS(SELECT 1 FROM Relationship_{namespace_id} {alias} \
+                 WHERE {alias}.tag_id = {tag_id} AND {alias}.file_id = d.{driver_key})"
+            )
+        }
     };
 
     match kind {

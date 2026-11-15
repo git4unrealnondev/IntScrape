@@ -12,6 +12,7 @@ use turso::{Result, Value, params_from_iter};
 
 use crate::db::SourceUrlFileStatus;
 use crate::db::turso::TursoDatabase;
+use crate::db::turso::relationship_store::ReadMode;
 
 impl TursoDatabase {
     /// Handles all the processing for files and tags and relational items.
@@ -643,9 +644,11 @@ impl TursoDatabase {
         else {
             return out;
         };
-        let relationship_table = format!("Relationship_{source_url_namespace_id}");
+        let flat = self.relationship_read_mode(&conn).await == ReadMode::Flat;
 
-        // Resolve the smallest file per source URL in one grouped join.
+        // Resolve the smallest file per source URL in one grouped join. The
+        // flat table carries the namespace on the row, so the filter is a
+        // column comparison rather than a partition name.
         let mut url_to_file_id: HashMap<String, u64> = HashMap::new();
         for urls in urls.chunks(crate::db::SQL_CHUNK_SIZE) {
             if urls.is_empty() {
@@ -654,17 +657,49 @@ impl TursoDatabase {
             let placeholders = std::iter::repeat_n("?", urls.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let sql = format!(
-                "SELECT t.name, MIN(r.file_id)
-                 FROM Tags t
-                 JOIN {relationship_table} r ON r.tag_id = t.id
-                 WHERE t.namespace = ?1
-                   AND t.name IN ({}) 
-                 GROUP BY t.id;",
-                placeholders
-            );
-            let mut params: Vec<Value> = urls.iter().map(|url| Value::from(url.as_str())).collect();
-            params.insert(0, Value::from(source_url_namespace_id as i64));
+            let (sql, params) = if flat {
+                (
+                    format!(
+                        "SELECT t.name, MIN(r.file_id)
+                         FROM Tags t
+                         JOIN Relationship r ON r.tag_id = t.id
+                         WHERE t.namespace = ?1
+                           AND r.namespace = ?1
+                           AND t.name IN ({}) 
+                         GROUP BY t.id;",
+                        placeholders
+                    ),
+                    {
+                        let mut params: Vec<Value> = urls
+                            .iter()
+                            .map(|url| Value::from(url.as_str()))
+                            .collect();
+                        params.insert(0, Value::from(source_url_namespace_id as i64));
+                        params
+                    },
+                )
+            } else {
+                let relationship_table = format!("Relationship_{source_url_namespace_id}");
+                (
+                    format!(
+                        "SELECT t.name, MIN(r.file_id)
+                         FROM Tags t
+                         JOIN {relationship_table} r ON r.tag_id = t.id
+                         WHERE t.namespace = ?1
+                           AND t.name IN ({}) 
+                         GROUP BY t.id;",
+                        placeholders
+                    ),
+                    {
+                        let mut params: Vec<Value> = urls
+                            .iter()
+                            .map(|url| Value::from(url.as_str()))
+                            .collect();
+                        params.insert(0, Value::from(source_url_namespace_id as i64));
+                        params
+                    },
+                )
+            };
             if let Ok(mut rows) = conn.query(&sql, params_from_iter(params)).await {
                 while let Ok(Some(row)) = rows.next().await {
                     if let (Ok(url), Ok(file_id)) = (row.get::<String>(0), row.get::<u64>(1)) {

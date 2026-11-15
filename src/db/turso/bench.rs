@@ -37,9 +37,10 @@ mod tests {
 
     use shared_types::{
         FileInternal, FileManager, FileTagAction, GenericNamespaceObj, PluginJob,
-        ScraperDataReturn, ScraperParam, Tag, TagOperation, TagParents, TagType, Url,
+        ScraperDataReturn, ScraperParam, SearchHolder, SearchObj, Tag, TagOperation,
+        TagParents, TagType, Url,
     };
-    use turso::{Builder, Connection, Value};
+    use turso::{Builder, Connection, Value, params_from_iter};
 
     use crate::db::SQL_CHUNK_SIZE;
     use crate::db::turso::sql::{parents_insert_sql, parents_params};
@@ -237,6 +238,16 @@ mod tests {
             "  {label:<44} {:>9.2} ms/iter  {:>9.2} us/row  ({} rows x {iterations} iters)",
             per_iter_ms, per_row_us, rows
         );
+    }
+
+    /// True for the transient "someone else holds the write lock" errors that
+    /// `retry_mvcc` retries in production. Used here so the bench's writers
+    /// queue the way real ones do instead of panicking on the first collision.
+    fn is_busy(error: &turso::Error) -> bool {
+        matches!(
+            error,
+            turso::Error::Busy(_) | turso::Error::BusySnapshot(_)
+        )
     }
 
     /// Prints a statement's query plan, so a slow number can be attributed to a
@@ -3786,4 +3797,3113 @@ mod tests {
             }
         });
     }
+
+    /// The shape of a relationship table, measured across every path the
+    /// migration would touch.
+    ///
+    /// Two variables, four combinations:
+    ///
+    /// * **Partitioned** (today): one `Relationship_{ns}` table per namespace,
+    ///   so a lookup that can touch any namespace has to `UNION ALL` every
+    ///   partition, with the predicate repeated per arm. **Single**: one
+    ///   `Relationship` table.
+    /// * **Index shape**: `idx(file_id)` (today -- the plan says `USING INDEX`,
+    ///   not `USING COVERING INDEX`, so every row pays a table b-tree hop) or
+    ///   `idx(file_id, tag_id)`.
+    ///
+    /// Every phase runs against the same fixture, in the order a scraper
+    /// would exercise them: read, write, delete. The read phase batches
+    /// exactly the way production does (`PUSHED_UNION_PARAM_BUDGET / arms`
+    /// ids per statement for the partitioned shape, `SQL_CHUNK_SIZE` for the
+    /// single table), so the statement *count* is part of the measurement
+    /// rather than something the comparison papers over.
+    ///
+    /// ```text
+    /// BENCH_ARMS=200 BENCH_FILES=200000 cargo test --lib \
+    ///     db::turso::bench::tests::db_bench_relationship_shape -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "manual benchmark: relationship partition and index shape"]
+    fn db_bench_relationship_shape() {
+        let arms = env_u64("BENCH_ARMS", 64).max(1) as usize;
+        let files = env_u64("BENCH_FILES", 20_000);
+        let rels_per_file = env_u64("BENCH_RELS_PER_FILE", 4);
+        let ids_per_query = env_u64("BENCH_IDS", 64).max(1) as usize;
+        let iters = env_u64("BENCH_ITERS", 5).max(1);
+        let write_files = env_u64("BENCH_WRITE_FILES", 2_000);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            println!(
+                "\nBENCH relationship shape: {arms} arms, {files} files, \
+                 {rels_per_file} rels/file, {ids_per_query} ids/query"
+            );
+
+            // `partitioned` picks the storage shape; `covering` adds `tag_id`
+            // to the file_id index so the lookup can be served from the index
+            // alone.
+            let variants: [(&str, bool, bool); 4] = [
+                ("A partitioned, idx(file_id)", true, false),
+                ("B partitioned, idx(file_id,tag_id)", true, true),
+                ("C single table, idx(file_id)", false, false),
+                ("D single table, idx(file_id,tag_id)", false, true),
+            ];
+
+            for (label, partitioned, covering) in variants {
+                let path = bench_db_path(&format!("relshape-{}", label.chars().next().unwrap()));
+                bench_remove(&path);
+                let db = Builder::new_local(&path.to_string_lossy())
+                    .build()
+                    .await
+                    .unwrap();
+                let conn = db.connect().unwrap();
+                conn.pragma_update("journal_mode", "'mvcc'").await.unwrap();
+
+                // The table a row belongs to. A partition is chosen by the
+                // tag's namespace, exactly as `relationships_bulk_add` picks
+                // it, so a tag's rows never straddle two tables.
+                let table_for = |tag_id: u64| -> String {
+                    if partitioned {
+                        format!("Relationship_{}", tag_id % arms as u64)
+                    } else {
+                        "Relationship".to_string()
+                    }
+                };
+
+                let index_cols = if covering { "file_id, tag_id" } else { "file_id" };
+                let mut ddl = String::new();
+                if partitioned {
+                    for arm in 0..arms {
+                        ddl.push_str(&format!(
+                            "CREATE TABLE Relationship_{arm} (
+                                 file_id INTEGER NOT NULL,
+                                 tag_id INTEGER NOT NULL,
+                                 PRIMARY KEY (tag_id, file_id));
+                             CREATE INDEX idx_Relationship_{arm}_tag_file
+                                 ON Relationship_{arm} ({index_cols});"
+                        ));
+                    }
+                } else {
+                    ddl.push_str(&format!(
+                        "CREATE TABLE Relationship (
+                             file_id INTEGER NOT NULL,
+                             tag_id INTEGER NOT NULL,
+                             PRIMARY KEY (tag_id, file_id));
+                         CREATE INDEX idx_Relationship_file_tag
+                             ON Relationship ({index_cols});"
+                    ));
+                }
+                conn.execute_batch(&ddl).await.unwrap();
+
+                // Seed. Rows are grouped per table and sorted by
+                // (tag_id, file_id) so each b-tree is extended at its right
+                // edge, the way `relationships_bulk_add` feeds it. The insert
+                // phase is timed too: partitioning is supposed to buy
+                // write-side b-tree locality, and that claim has to be checked
+                // against the same fixture, not assumed.
+                let mut per_table: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
+                for file in 0..files {
+                    for rel in 0..rels_per_file {
+                        let tag_id = file * rels_per_file + rel + 1;
+                        per_table
+                            .entry(table_for(tag_id))
+                            .or_default()
+                            .push((file + 1, tag_id));
+                    }
+                }
+                let total_rows = (files * rels_per_file) as usize;
+                let insert_started = Instant::now();
+                for (table, mut rows) in per_table {
+                    rows.sort_unstable_by_key(|(file_id, tag_id)| (*tag_id, *file_id));
+                    for chunk in rows.chunks(SQL_CHUNK_SIZE) {
+                        let holders: Vec<&str> = chunk.iter().map(|_| "(?, ?)").collect();
+                        let mut params: Vec<Value> = Vec::with_capacity(chunk.len() * 2);
+                        for (file_id, tag_id) in chunk {
+                            params.push(Value::from(*file_id as i64));
+                            params.push(Value::from(*tag_id as i64));
+                        }
+                        conn.execute(
+                            format!(
+                                "INSERT INTO {table} (file_id, tag_id) VALUES {}",
+                                holders.join(", ")
+                            ),
+                            params_from_iter(params),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+                let insert_elapsed = insert_started.elapsed();
+
+                // How production batches the lookup: the partitioned shape is
+                // limited by a *text* budget divided by the arm count, so the
+                // statement count grows with the number of namespaces.
+                let batch = if partitioned {
+                    (3_200 / arms.max(1)).clamp(1, SQL_CHUNK_SIZE)
+                } else {
+                    SQL_CHUNK_SIZE
+                };
+
+                // ---- phase 1: file -> tags, N ids ----------------------
+                let query_ids: Vec<u64> = (0..ids_per_query as u64)
+                    .map(|i| (i * files / ids_per_query as u64) + 1)
+                    .collect();
+                let mut read_ms = f64::MAX;
+                let mut read_rows = 0usize;
+                let mut statements = 0usize;
+                let mut sql_bytes = 0usize;
+                for iter in 0..iters + 1 {
+                    let started = Instant::now();
+                    let mut rows_seen = 0usize;
+                    for chunk in query_ids.chunks(batch) {
+                        let placeholders: Vec<String> =
+                            (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+                        let sql = if partitioned {
+                            let arms_sql: Vec<String> = (0..arms)
+                                .map(|arm| {
+                                    format!(
+                                        "SELECT file_id, tag_id FROM Relationship_{arm} \
+                                         WHERE file_id IN ({})",
+                                        placeholders.join(", ")
+                                    )
+                                })
+                                .collect();
+                            format!(
+                                "SELECT file_id, tag_id FROM ({}) AS r",
+                                arms_sql.join(" UNION ALL ")
+                            )
+                        } else {
+                            format!(
+                                "SELECT file_id, tag_id FROM Relationship WHERE file_id IN ({})",
+                                placeholders.join(", ")
+                            )
+                        };
+                        let params: Vec<Value> =
+                            chunk.iter().map(|id| Value::from(*id as i64)).collect();
+                        let mut rows = conn
+                            .query(&sql, params_from_iter(params))
+                            .await
+                            .unwrap();
+                        while let Ok(Some(_)) = rows.next().await {
+                            rows_seen += 1;
+                        }
+                        if iter == 0 {
+                            statements += 1;
+                            sql_bytes += sql.len();
+                            // The plan, with the ids inlined so EXPLAIN does
+                            // not need bindings.
+                            let literals: Vec<String> =
+                                chunk.iter().map(|id| id.to_string()).collect();
+                            let explain_sql =
+                                sql.replace(&placeholders.join(", "), &literals.join(", "));
+                            explain(&conn, &explain_sql).await;
+                        }
+                    }
+                    if iter == 0 {
+                        read_rows = rows_seen;
+                    } else {
+                        read_ms = read_ms.min(started.elapsed().as_secs_f64() * 1_000.0);
+                    }
+                }
+
+                // ---- phase 2: file -> tags, one id ---------------------
+                // The single-file lookup, which is what a page load does.
+                let mut single_ms = f64::MAX;
+                for iter in 0..iters + 1 {
+                    let started = Instant::now();
+                    let sql = if partitioned {
+                        let arms_sql: Vec<String> = (0..arms)
+                            .map(|arm| {
+                                format!(
+                                    "SELECT file_id, tag_id FROM Relationship_{arm} \
+                                     WHERE file_id = ?1"
+                                )
+                            })
+                            .collect();
+                        format!(
+                            "SELECT file_id, tag_id FROM ({}) AS r",
+                            arms_sql.join(" UNION ALL ")
+                        )
+                    } else {
+                        "SELECT file_id, tag_id FROM Relationship WHERE file_id = ?1".to_string()
+                    };
+                    let mut rows = conn
+                        .query(&sql, params_from_iter([Value::from(1i64)]))
+                        .await
+                        .unwrap();
+                    while let Ok(Some(_)) = rows.next().await {}
+                    if iter > 0 {
+                        single_ms = single_ms.min(started.elapsed().as_secs_f64() * 1_000.0);
+                    }
+                }
+
+                // ---- phase 3: tag -> files, one tag -------------------
+                // Served by the primary key, so the partition shape does not
+                // change the plan -- but it does change how many b-trees the
+                // seek has to pick between, and this is the direction the
+                // search planner drives.
+                let mut tag_ms = f64::MAX;
+                for iter in 0..iters + 1 {
+                    let started = Instant::now();
+                    let sql = format!(
+                        "SELECT file_id FROM {} WHERE tag_id = ?1",
+                        table_for(1)
+                    );
+                    let mut rows = conn
+                        .query(&sql, params_from_iter([Value::from(1i64)]))
+                        .await
+                        .unwrap();
+                    while let Ok(Some(_)) = rows.next().await {}
+                    if iter > 0 {
+                        tag_ms = tag_ms.min(started.elapsed().as_secs_f64() * 1_000.0);
+                    }
+                }
+
+                // ---- phase 4: bulk add ---------------------------------
+                // Novel rows, fed the way `relationships_bulk_add` feeds
+                // them: grouped per table, sorted by (tag_id, file_id),
+                // chunked at SQL_CHUNK_SIZE.
+                let novel: Vec<(u64, u64)> = (0..write_files)
+                    .flat_map(|file| {
+                        (0..rels_per_file).map(move |rel| {
+                            (
+                                files + file + 1,
+                                (files + file) * rels_per_file + rel + 1 + total_rows as u64,
+                            )
+                        })
+                    })
+                    .collect();
+                let mut novel_per_table: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
+                for &(file_id, tag_id) in &novel {
+                    novel_per_table
+                        .entry(table_for(tag_id))
+                        .or_default()
+                        .push((file_id, tag_id));
+                }
+                let write_started = Instant::now();
+                for (table, mut rows) in novel_per_table {
+                    rows.sort_unstable_by_key(|(file_id, tag_id)| (*tag_id, *file_id));
+                    for chunk in rows.chunks(SQL_CHUNK_SIZE) {
+                        let holders: Vec<&str> = chunk.iter().map(|_| "(?, ?)").collect();
+                        let mut params: Vec<Value> = Vec::with_capacity(chunk.len() * 2);
+                        for (file_id, tag_id) in chunk {
+                            params.push(Value::from(*file_id as i64));
+                            params.push(Value::from(*tag_id as i64));
+                        }
+                        conn.execute(
+                            format!(
+                                "INSERT INTO {table} (file_id, tag_id) VALUES {}",
+                                holders.join(", ")
+                            ),
+                            params_from_iter(params),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+                let write_ms = write_started.elapsed().as_secs_f64() * 1_000.0;
+
+                // ---- phase 5: bulk delete -----------------------------
+                // `DELETE ... WHERE tag_id = ? AND file_id IN (...)`, the shape
+                // `relationship_bulk_delete` uses because the partition's
+                // primary key is (tag_id, file_id).
+                let delete_started = Instant::now();
+                let mut deleted = 0u64;
+                for chunk in novel.chunks(SQL_CHUNK_SIZE) {
+                    let mut by_tag: HashMap<u64, Vec<u64>> = HashMap::new();
+                    for &(file_id, tag_id) in chunk {
+                        by_tag.entry(tag_id).or_default().push(file_id);
+                    }
+                    for (tag_id, mut file_ids) in by_tag {
+                        file_ids.sort_unstable();
+                        file_ids.dedup();
+                        // Numbered placeholders throughout: the tag id takes
+                        // ?1 and the file list starts at ?2, so the two
+                        // parameter blocks cannot collide.
+                        let placeholders: Vec<String> = (2..=file_ids.len() + 1)
+                            .map(|i| format!("?{i}"))
+                            .collect();
+                        let mut params: Vec<Value> = vec![Value::from(tag_id as i64)];
+                        params.extend(file_ids.iter().map(|id| Value::from(*id as i64)));
+                        deleted += conn
+                            .execute(
+                                format!(
+                                    "DELETE FROM {} WHERE tag_id = ?1 AND file_id IN ({})",
+                                    table_for(tag_id),
+                                    placeholders.join(", ")
+                                ),
+                                params_from_iter(params),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                }
+                let delete_ms = delete_started.elapsed().as_secs_f64() * 1_000.0;
+
+                println!(
+                    "  {label}\n    \
+                     seed      {total_rows:>9} rows in {:>9.2} ms ({:>6.1} us/row)\n    \
+                     read  N   {read_ms:>9.3} ms  ({read_rows} rows, {statements} stmt, \
+                     {sql_bytes} B of SQL)\n    \
+                     read  1   {single_ms:>9.3} ms\n    \
+                     read tag  {tag_ms:>9.3} ms\n    \
+                     write     {write_ms:>9.2} ms  ({} novel rows)\n    \
+                     delete    {delete_ms:>9.2} ms  ({deleted} rows)",
+                    insert_elapsed.as_secs_f64() * 1_000.0,
+                    insert_elapsed.as_secs_f64() * 1_000_000.0 / total_rows as f64,
+                    novel.len(),
+                );
+            }
+        });
+    }
+
+    /// What a declared foreign key actually costs on this backend.
+    ///
+    /// The `Tags` table declares `FOREIGN KEY (namespace) REFERENCES
+    /// Namespace(id)`, and `Relationship_{ns}` declares two more. The backend
+    /// runs with `PRAGMA foreign_keys = 0`, so those constraints never fire
+    /// and their `ON DELETE CASCADE` clauses are inert -- the code says so
+    /// itself. The open question is whether *declaring* them is still
+    /// expensive: an inert constraint that costs a lookup per row touched is
+    /// not free, and `tag_counts_apply` touches a `Tags` row per tag.
+    ///
+    /// This measures the two shapes that matter rather than a bare PK probe:
+    /// a full-row read (which materializes the row) and the `UPDATE ... WHERE
+    /// id IN (...)` shape that `tag_counts_apply` issues. A bare `SELECT id`
+    /// can be answered from the rowid alone and never materializes anything,
+    /// so it cannot show a per-row cost even if one exists.
+    ///
+    /// The parent table's size is varied because the hypothesis behind the
+    /// original 116 ms figure was that resolving the key costs *per parent
+    /// row*: a `Namespace` table with tens of thousands of rows would make
+    /// every `Tags` row touch expensive.
+    ///
+    /// ```text
+    /// BENCH_FK_PARENTS=20000 BENCH_FK_ROWS=200000 cargo test --lib \
+    ///     db::turso::bench::tests::db_bench_foreign_key_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "manual benchmark: what a declared foreign key costs"]
+    fn db_bench_foreign_key_cost() {
+        let rows = env_u64("BENCH_FK_ROWS", 100_000);
+        let parents = env_u64("BENCH_FK_PARENTS", 20_000);
+        let reps = env_u64("BENCH_FK_REPS", 200).max(1);
+        let update_batch = env_u64("BENCH_FK_UPDATE", 100).max(1) as usize;
+        let update_reps = env_u64("BENCH_FK_UPDATE_REPS", 20).max(1);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            println!(
+                "\nBENCH foreign key cost: {rows} rows, {parents} parent rows, \
+                 {update_batch} rows per UPDATE"
+            );
+
+            let path = bench_db_path("fkcost");
+            bench_remove(&path);
+            let db = Builder::new_local(&path.to_string_lossy())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.pragma_update("journal_mode", "'mvcc'").await.unwrap();
+
+            conn.execute_batch(&format!(
+                "CREATE TABLE Namespace (
+                     id INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL UNIQUE,
+                     description TEXT);
+                 CREATE TABLE Tags_fk (
+                     id INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     namespace INTEGER NOT NULL,
+                     count INTEGER NOT NULL DEFAULT 0,
+                     UNIQUE(name, namespace),
+                     FOREIGN KEY (namespace) REFERENCES Namespace(id));
+                 CREATE TABLE Tags_nofk (
+                     id INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     namespace INTEGER NOT NULL,
+                     count INTEGER NOT NULL DEFAULT 0,
+                     UNIQUE(name, namespace));"
+            ))
+            .await
+            .unwrap();
+
+            // Parent rows, then the two `Tags` shapes with identical content.
+            for chunk_start in (0..parents).step_by(SQL_CHUNK_SIZE) {
+                let end = (chunk_start + SQL_CHUNK_SIZE as u64).min(parents);
+                let holders: Vec<String> = (chunk_start..end).map(|_| "(?, ?)".to_string()).collect();
+                let mut params: Vec<Value> = Vec::new();
+                for id in chunk_start..end {
+                    params.push(Value::from(id as i64));
+                    params.push(Value::from(format!("ns-{id}")));
+                }
+                conn.execute(
+                    format!(
+                        "INSERT INTO Namespace (id, name) VALUES {}",
+                        holders.join(", ")
+                    ),
+                    params_from_iter(params),
+                )
+                .await
+                .unwrap();
+            }
+            for table in ["Tags_fk", "Tags_nofk"] {
+                for chunk_start in (0..rows).step_by(SQL_CHUNK_SIZE) {
+                    let end = (chunk_start + SQL_CHUNK_SIZE as u64).min(rows);
+                    let holders: Vec<String> =
+                        (chunk_start..end).map(|_| "(?, ?, ?)".to_string()).collect();
+                    let mut params: Vec<Value> = Vec::new();
+                    for id in chunk_start..end {
+                        params.push(Value::from(id as i64));
+                        params.push(Value::from(format!("tag-name-{id:08}")));
+                        params.push(Value::from((id % parents) as i64));
+                    }
+                    conn.execute(
+                        format!(
+                            "INSERT INTO {table} (id, name, namespace) VALUES {}",
+                            holders.join(", ")
+                        ),
+                        params_from_iter(params),
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+
+            // Probe ids spread across the table, so the reads are hits and
+            // land on cold-ish pages rather than one hot row.
+            let probes: Vec<i64> = (0..reps)
+                .map(|i| ((i as u64 * rows / reps.max(1) as u64) % rows) as i64)
+                .collect();
+
+            for table in ["Tags_fk", "Tags_nofk"] {
+                // Full-row read: this materializes the row, which is where a
+                // per-row parent-key resolution would show up.
+                let started = Instant::now();
+                for id in &probes {
+                    let mut rows = conn
+                        .query(
+                            &format!("SELECT id, name, namespace, count FROM {table} WHERE id = ?1"),
+                            params_from_iter([Value::from(*id)]),
+                        )
+                        .await
+                        .unwrap();
+                    while let Ok(Some(_)) = rows.next().await {}
+                }
+                let full_row = started.elapsed();
+
+                // Bare-id read: answerable from the rowid alone.
+                let started = Instant::now();
+                for id in &probes {
+                    let mut rows = conn
+                        .query(
+                            &format!("SELECT id FROM {table} WHERE id = ?1"),
+                            params_from_iter([Value::from(*id)]),
+                        )
+                        .await
+                        .unwrap();
+                    while let Ok(Some(_)) = rows.next().await {}
+                }
+                let bare_id = started.elapsed();
+
+                // The `tag_counts_apply` shape: one UPDATE over a batch of
+                // ids, which materializes every row it touches.
+                let batch: Vec<i64> = (0..update_batch).map(|i| i as i64 + 1).collect();
+                let placeholders: Vec<String> =
+                    (1..=batch.len()).map(|i| format!("?{i}")).collect();
+                let update_sql = format!(
+                    "UPDATE {table} SET count = count + 1 WHERE id IN ({})",
+                    placeholders.join(", ")
+                );
+                let started = Instant::now();
+                for _ in 0..update_reps {
+                    conn.execute(
+                        &update_sql,
+                        params_from_iter(batch.iter().map(|id| Value::from(*id))),
+                    )
+                    .await
+                    .unwrap();
+                }
+                let update = started.elapsed();
+
+                println!(
+                    "  {table:<12} full-row read {:>9.3} ms/op   \
+                     bare-id read {:>9.3} ms/op   \
+                     UPDATE {} rows {:>9.3} ms/op",
+                    full_row.as_secs_f64() * 1_000.0 / reps as f64,
+                    bare_id.as_secs_f64() * 1_000.0 / reps as f64,
+                    update_batch,
+                    update.as_secs_f64() * 1_000.0 / update_reps as f64,
+                );
+            }
+            println!(
+                "  ({} tag rows, {} parent rows, {} read reps, {} update reps x {} rows)",
+                rows, parents, reps, update_reps, update_batch
+            );
+        });
+    }
+
+    /// The `limit_to` scope model, measured against the alternative of
+    /// carrying the scope on the relationship row.
+    ///
+    /// The forum and gallery plugins record two different things:
+    ///
+    /// * a *structural* edge -- "post X is a reply to post Y" -- which is a
+    ///   real edge in the tag graph, and
+    /// * a *scoped* value -- "the tag `Anal` belongs to gif G" -- which is
+    ///   not an edge at all. It says that a tag instance is scoped to an
+    ///   entity, and today it is stored as a `Parents` row with a `limit_to`
+    ///   qualifier, because the tag itself is shared by every entity that
+    ///   carries it.
+    ///
+    /// The scoped value is already implied by the file's tag set -- the file
+    /// that carries `Anal` also carries the entity tag `G` -- so the
+    /// `limit_to` edge is a materialized join across the file boundary. The
+    /// alternative is to carry the scope *on* the relationship row:
+    ///
+    /// ```text
+    /// today:      Relationship(file_id, tag_id)
+    ///             Parents(tag_id, relate_tag_id, limit_to)   -- scope lives here
+    ///
+    /// proposed:  Relationship(file_id, tag_id, scope_tag_id) -- scope rides along
+    ///             Parents(tag_id, relate_tag_id)             -- structural edges only
+    /// ```
+    ///
+    /// The proposed shape stores strictly *less*: the scoped facts move from a
+    /// second table onto a column of a row that already exists, and `Parents`
+    /// keeps only the structural edges. The three queries below are the ones
+    /// that read those facts today, and they are the ones the migration has
+    /// to keep answering.
+    ///
+    /// ```text
+    /// BENCH_SCOPE_ENTITIES=50000 BENCH_SCOPE_VALUES=2000 cargo test --lib \
+    ///     db::turso::bench::tests::db_bench_relationship_scope -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "manual benchmark: limit_to scope vs scope on the relationship"]
+    fn db_bench_relationship_scope() {
+        let entities = env_u64("BENCH_SCOPE_ENTITIES", 20_000);
+        let values = env_u64("BENCH_SCOPE_VALUES", 2_000);
+        let values_per_entity = env_u64("BENCH_SCOPE_VALUES_PER_ENTITY", 5);
+        let reps = env_u64("BENCH_SCOPE_REPS", 50).max(1);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            println!(
+                "\nBENCH relationship scope: {entities} entities, {values} value tags, \
+                 {values_per_entity} values/entity"
+            );
+
+            // Tag ids are laid out so the two models can share them: entity
+            // tags first, then value tags.
+            let entity_tag = |entity: u64| entity + 1;
+            let value_tag = |value: u64| entities + value + 1;
+
+            // ---- variant A: today (scope lives in Parents) ------------
+            let path_a = bench_db_path("scope-parents");
+            bench_remove(&path_a);
+            let db_a = Builder::new_local(&path_a.to_string_lossy())
+                .build()
+                .await
+                .unwrap();
+            let conn_a = db_a.connect().unwrap();
+            conn_a.pragma_update("journal_mode", "'mvcc'").await.unwrap();
+            conn_a
+                .execute_batch(
+                    "CREATE TABLE Relationship (
+                         file_id INTEGER NOT NULL,
+                         tag_id INTEGER NOT NULL,
+                         PRIMARY KEY (tag_id, file_id));
+                     CREATE INDEX idx_Relationship_file_tag
+                         ON Relationship (file_id, tag_id);
+                     CREATE TABLE Parents (
+                         id INTEGER PRIMARY KEY,
+                         tag_id INTEGER NOT NULL,
+                         relate_tag_id INTEGER NOT NULL,
+                         limit_to INTEGER NOT NULL DEFAULT -1,
+                         CHECK (tag_id != relate_tag_id));
+                     CREATE INDEX idx_parents_rel
+                         ON Parents (relate_tag_id, tag_id, limit_to);
+                     CREATE INDEX idx_parents_lim
+                         ON Parents (limit_to, tag_id, relate_tag_id);",
+                )
+                .await
+                .unwrap();
+
+            // ---- variant B: scope on the relationship row -------------
+            let path_b = bench_db_path("scope-column");
+            bench_remove(&path_b);
+            let db_b = Builder::new_local(&path_b.to_string_lossy())
+                .build()
+                .await
+                .unwrap();
+            let conn_b = db_b.connect().unwrap();
+            conn_b.pragma_update("journal_mode", "'mvcc'").await.unwrap();
+            conn_b
+                .execute_batch(
+                    "CREATE TABLE Relationship (
+                         file_id INTEGER NOT NULL,
+                         tag_id INTEGER NOT NULL,
+                         scope_tag_id INTEGER NOT NULL DEFAULT -1,
+                         PRIMARY KEY (tag_id, file_id, scope_tag_id));
+                     CREATE INDEX idx_Relationship_file_tag
+                         ON Relationship (file_id, tag_id);
+                     CREATE INDEX idx_Relationship_scope
+                         ON Relationship (scope_tag_id, tag_id, file_id);
+                     CREATE TABLE Parents (
+                         id INTEGER PRIMARY KEY,
+                         tag_id INTEGER NOT NULL,
+                         relate_tag_id INTEGER NOT NULL,
+                         CHECK (tag_id != relate_tag_id));",
+                )
+                .await
+                .unwrap();
+
+            // The same facts in both. Each entity has one file, its own entity
+            // tag, and `values_per_entity` value tags.
+            let mut rel_rows_a: Vec<(u64, u64)> = Vec::new();
+            let mut rel_rows_b: Vec<(u64, u64, i64)> = Vec::new();
+            let mut parent_rows: Vec<(u64, u64, i64)> = Vec::new();
+            for entity in 0..entities {
+                let file_id = entity + 1;
+                let etag = entity_tag(entity);
+                // The file carries its own entity tag.
+                rel_rows_a.push((file_id, etag));
+                rel_rows_b.push((file_id, etag, -1));
+                for v in 0..values_per_entity {
+                    let value = (entity + v) % values;
+                    let vtag = value_tag(value);
+                    rel_rows_a.push((file_id, vtag));
+                    rel_rows_b.push((file_id, vtag, etag as i64));
+                    // The scope fact, stored as a Parents edge today.
+                    parent_rows.push((vtag, etag, etag as i64));
+                }
+            }
+
+            let seed_started = Instant::now();
+            // Variant A: relationship rows without a scope, plus the scope
+            // facts as `Parents` edges.
+            let mut sorted = rel_rows_a.clone();
+            sorted.sort_unstable_by_key(|(file_id, tag_id)| (*tag_id, *file_id));
+            for chunk in sorted.chunks(SQL_CHUNK_SIZE) {
+                let holders: Vec<&str> = chunk.iter().map(|_| "(?, ?)").collect();
+                let mut params: Vec<Value> = Vec::with_capacity(chunk.len() * 2);
+                for (file_id, tag_id) in chunk {
+                    params.push(Value::from(*file_id as i64));
+                    params.push(Value::from(*tag_id as i64));
+                }
+                conn_a
+                    .execute(
+                        format!(
+                            "INSERT INTO Relationship (file_id, tag_id) VALUES {}",
+                            holders.join(", ")
+                        ),
+                        params_from_iter(params),
+                    )
+                    .await
+                    .unwrap();
+            }
+            // Variant B: the same facts, with the scope riding on the
+            // relationship row, and no `Parents` edges at all.
+            let mut scoped_rows = rel_rows_b.clone();
+            scoped_rows.sort_unstable_by_key(|(file_id, tag_id, _)| (*tag_id, *file_id));
+            for chunk in scoped_rows.chunks(SQL_CHUNK_SIZE) {
+                let holders: Vec<&str> = chunk.iter().map(|_| "(?, ?, ?)").collect();
+                let mut params: Vec<Value> = Vec::with_capacity(chunk.len() * 3);
+                for (file_id, tag_id, scope) in chunk {
+                    params.push(Value::from(*file_id as i64));
+                    params.push(Value::from(*tag_id as i64));
+                    params.push(Value::from(*scope));
+                }
+                conn_b
+                    .execute(
+                        format!(
+                            "INSERT INTO Relationship (file_id, tag_id, scope_tag_id) VALUES {}",
+                            holders.join(", ")
+                        ),
+                        params_from_iter(params),
+                    )
+                    .await
+                    .unwrap();
+            }
+            for chunk in parent_rows.chunks(SQL_CHUNK_SIZE) {
+                let holders: Vec<&str> = chunk.iter().map(|_| "(?, ?, ?)").collect();
+                let mut params: Vec<Value> = Vec::with_capacity(chunk.len() * 3);
+                for (tag_id, relate, limit) in chunk {
+                    params.push(Value::from(*tag_id as i64));
+                    params.push(Value::from(*relate as i64));
+                    params.push(Value::from(*limit));
+                }
+                conn_a
+                    .execute(
+                        format!(
+                            "INSERT INTO Parents (tag_id, relate_tag_id, limit_to) VALUES {}",
+                            holders.join(", ")
+                        ),
+                        params_from_iter(params),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let seed_ms = seed_started.elapsed().as_secs_f64() * 1_000.0;
+
+            // The three reads that matter.
+            let probe_entity = entities / 2;
+            let probe_value = values / 2;
+
+            // Q1: which files carry a value tag.
+            let mut q1_a = f64::MAX;
+            let mut q1_b = f64::MAX;
+            for _ in 0..reps {
+                let started = Instant::now();
+                let mut rows = conn_a
+                    .query(
+                        "SELECT file_id FROM Relationship WHERE tag_id = ?1;",
+                        params_from_iter([Value::from(value_tag(probe_value) as i64)]),
+                    )
+                    .await
+                    .unwrap();
+                while let Ok(Some(_)) = rows.next().await {}
+                q1_a = q1_a.min(started.elapsed().as_secs_f64() * 1_000.0);
+
+                let started = Instant::now();
+                let mut rows = conn_b
+                    .query(
+                        "SELECT file_id FROM Relationship WHERE tag_id = ?1;",
+                        params_from_iter([Value::from(value_tag(probe_value) as i64)]),
+                    )
+                    .await
+                    .unwrap();
+                while let Ok(Some(_)) = rows.next().await {}
+                q1_b = q1_b.min(started.elapsed().as_secs_f64() * 1_000.0);
+            }
+
+            // Q2: which value tags are scoped to an entity.
+            let mut q2_a = f64::MAX;
+            let mut q2_b = f64::MAX;
+            for _ in 0..reps {
+                let started = Instant::now();
+                let mut rows = conn_a
+                    .query(
+                        "SELECT tag_id FROM Parents WHERE limit_to = ?1;",
+                        params_from_iter([Value::from(entity_tag(probe_entity) as i64)]),
+                    )
+                    .await
+                    .unwrap();
+                while let Ok(Some(_)) = rows.next().await {}
+                q2_a = q2_a.min(started.elapsed().as_secs_f64() * 1_000.0);
+
+                let started = Instant::now();
+                let mut rows = conn_b
+                    .query(
+                        "SELECT tag_id FROM Relationship WHERE scope_tag_id = ?1;",
+                        params_from_iter([Value::from(entity_tag(probe_entity) as i64)]),
+                    )
+                    .await
+                    .unwrap();
+                while let Ok(Some(_)) = rows.next().await {}
+                q2_b = q2_b.min(started.elapsed().as_secs_f64() * 1_000.0);
+            }
+
+            // Q3: which entities carry a value tag. Today this needs the
+            // `Parents` edge; proposed it falls out of the relationship row.
+            let mut q3_a = f64::MAX;
+            let mut q3_b = f64::MAX;
+            for _ in 0..reps {
+                let started = Instant::now();
+                let mut rows = conn_a
+                    .query(
+                        "SELECT limit_to FROM Parents WHERE relate_tag_id = ?1;",
+                        params_from_iter([Value::from(value_tag(probe_value) as i64)]),
+                    )
+                    .await
+                    .unwrap();
+                while let Ok(Some(_)) = rows.next().await {}
+                q3_a = q3_a.min(started.elapsed().as_secs_f64() * 1_000.0);
+
+                let started = Instant::now();
+                let mut rows = conn_b
+                    .query(
+                        "SELECT DISTINCT scope_tag_id FROM Relationship WHERE tag_id = ?1;",
+                        params_from_iter([Value::from(value_tag(probe_value) as i64)]),
+                    )
+                    .await
+                    .unwrap();
+                while let Ok(Some(_)) = rows.next().await {}
+                q3_b = q3_b.min(started.elapsed().as_secs_f64() * 1_000.0);
+            }
+
+            let rows_a: i64 = conn_a
+                .query("SELECT COUNT(*) FROM Relationship;", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .map(|r| r.get(0).unwrap())
+                .unwrap_or(0);
+            let parents_a: i64 = conn_a
+                .query("SELECT COUNT(*) FROM Parents;", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .map(|r| r.get(0).unwrap())
+                .unwrap_or(0);
+            let rows_b: i64 = conn_b
+                .query("SELECT COUNT(*) FROM Relationship;", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .map(|r| r.get(0).unwrap())
+                .unwrap_or(0);
+
+            println!(
+                "  A scope in Parents      Q1 files-with-value {:>8.3} ms   \
+                 Q2 tags-scoped-to {:>8.3} ms   Q3 entities-with-value {:>8.3} ms",
+                q1_a, q2_a, q3_a
+            );
+            println!(
+                "  B scope on Relationship Q1 files-with-value {:>8.3} ms   \
+                 Q2 tags-scoped-to {:>8.3} ms   Q3 entities-with-value {:>8.3} ms",
+                q1_b, q2_b, q3_b
+            );
+            println!(
+                "    A stores {rows_a} relationship rows + {parents_a} Parents rows; \
+                 B stores {rows_b} relationship rows + 0 Parents rows"
+            );
+            println!("    seed: {seed_ms:.2} ms for both shapes");
+        });
+    }
+
+    /// What the popularity bookkeeping costs, and what it would cost to take
+    /// it off the write path.
+    ///
+    /// `Tags.count` and the `Tags_Popular` search shadow are both *derived*
+    /// from the relationship rows, and today both are maintained
+    /// incrementally by the writer: `tag_counts_apply` folds count deltas in
+    /// behind a global lock, and `sync_tags_popular` keeps the shadow in
+    /// step -- which also means a Tantivy segment is flushed per statement.
+    ///
+    /// Three write paths are compared, on the same fixture:
+    ///
+    /// * **A (today)**: count fold-in plus the shadow sync.
+    /// * **B**: count fold-in only; the shadow is rebuilt wholesale later.
+    /// * **C**: neither; the count is recomputed from the relationship table
+    ///   when someone asks for it.
+    ///
+    /// The reads are measured against the same three states, so the trade-off
+    /// is explicit: taking the bookkeeping off the writer moves cost onto the
+    /// reader, and the question is how much of each there is.
+    ///
+    /// ```text
+    /// BENCH_COUNT_TAGS=50000 BENCH_COUNT_RELS=5 cargo test --lib \
+    ///     db::turso::bench::tests::db_bench_tag_count_path -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "manual benchmark: incremental tag count and popular shadow"]
+    fn db_bench_tag_count_path() {
+        let tags = env_u64("BENCH_COUNT_TAGS", 20_000);
+        let rels_per_tag = env_u64("BENCH_COUNT_RELS", 5);
+        let batch = env_u64("BENCH_COUNT_BATCH", 100).max(1) as usize;
+        let iters = env_u64("BENCH_COUNT_ITERS", 20).max(1);
+        let threshold = 5i64;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            println!(
+                "\nBENCH tag count path: {tags} tags, {rels_per_tag} rels/tag, \
+                 {batch} tags per fold-in"
+            );
+
+            let path = bench_db_path("tagcount");
+            bench_remove(&path);
+            let db = Builder::new_local(&path.to_string_lossy())
+                .experimental_index_method(true)
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.pragma_update("journal_mode", "'mvcc'").await.unwrap();
+            conn.execute_batch(
+                "CREATE TABLE Tags (
+                     id INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     namespace INTEGER NOT NULL,
+                     count INTEGER NOT NULL DEFAULT 0,
+                     UNIQUE(name, namespace));
+                 CREATE INDEX idx_tags_count_covering
+                     ON Tags (count DESC, name, namespace);
+                 CREATE TABLE Tags_Popular (
+                     tag_id INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL);
+                 CREATE TABLE Relationship (
+                     file_id INTEGER NOT NULL,
+                     tag_id INTEGER NOT NULL,
+                     PRIMARY KEY (tag_id, file_id));
+                 CREATE INDEX idx_Relationship_file_tag
+                     ON Relationship (file_id, tag_id);",
+            )
+            .await
+            .unwrap();
+
+            // Seed tags and their relationships, then set the counts to the
+            // value the relationship rows imply.
+            for chunk_start in (0..tags).step_by(SQL_CHUNK_SIZE) {
+                let end = (chunk_start + SQL_CHUNK_SIZE as u64).min(tags);
+                let holders: Vec<String> =
+                    (chunk_start..end).map(|_| "(?, ?, ?)".to_string()).collect();
+                let mut params: Vec<Value> = Vec::new();
+                for id in chunk_start..end {
+                    params.push(Value::from(id as i64 + 1));
+                    params.push(Value::from(format!("tag-{id:08}")));
+                    params.push(Value::from(1i64));
+                }
+                conn.execute(
+                    format!(
+                        "INSERT INTO Tags (id, name, namespace) VALUES {}",
+                        holders.join(", ")
+                    ),
+                    params_from_iter(params),
+                )
+                .await
+                .unwrap();
+            }
+            for chunk_start in (0..tags).step_by(SQL_CHUNK_SIZE) {
+                let end = (chunk_start + SQL_CHUNK_SIZE as u64).min(tags);
+                let mut rows: Vec<(u64, u64)> = Vec::new();
+                for id in chunk_start..end {
+                    for rel in 0..rels_per_tag {
+                        rows.push((id * rels_per_tag + rel + 1, id + 1));
+                    }
+                }
+                rows.sort_unstable();
+                for chunk in rows.chunks(SQL_CHUNK_SIZE) {
+                    let holders: Vec<&str> = chunk.iter().map(|_| "(?, ?)").collect();
+                    let mut params: Vec<Value> = Vec::with_capacity(chunk.len() * 2);
+                    for (file_id, tag_id) in chunk {
+                        params.push(Value::from(*file_id as i64));
+                        params.push(Value::from(*tag_id as i64));
+                    }
+                    conn.execute(
+                        format!(
+                            "INSERT INTO Relationship (file_id, tag_id) VALUES {}",
+                            holders.join(", ")
+                        ),
+                        params_from_iter(params),
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            // Seed the counts from the relationship rows. A correlated
+            // subquery is not an option here -- limbo cannot resolve an
+            // outer reference in that position -- so the aggregate is read
+            // out and folded in with CASE, the way `slurp_recount_namespace`
+            // does it.
+            {
+                let mut counts: std::collections::HashMap<i64, i64> =
+                    std::collections::HashMap::new();
+                let mut rows = conn
+                    .query("SELECT tag_id, COUNT(*) FROM Relationship GROUP BY tag_id;", ())
+                    .await
+                    .unwrap();
+                while let Ok(Some(row)) = rows.next().await {
+                    let tag_id: i64 = row.get(0).unwrap();
+                    let count: i64 = row.get(1).unwrap();
+                    counts.insert(tag_id, count);
+                }
+                let entries: Vec<(i64, i64)> = counts.into_iter().collect();
+                for chunk in entries.chunks(SQL_CHUNK_SIZE) {
+                    let clauses: Vec<String> =
+                        chunk.iter().map(|_| "WHEN ? THEN ?".to_string()).collect();
+                    let placeholders: Vec<String> =
+                        (1..=chunk.len()).map(|_| "?".to_string()).collect();
+                    let mut params: Vec<Value> = Vec::new();
+                    for (id, count) in chunk {
+                        params.push(Value::from(*id));
+                        params.push(Value::from(*count));
+                    }
+                    for (id, _) in chunk {
+                        params.push(Value::from(*id));
+                    }
+                    conn.execute(
+                        format!(
+                            "UPDATE Tags SET count = CASE id {} ELSE 0 END WHERE id IN ({})",
+                            clauses.join(" "),
+                            placeholders.join(", ")
+                        ),
+                        params_from_iter(params),
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+
+            // The FTS shadow, with the same ngram index the schema creates.
+            // Built after the counts are in place so the shadow starts
+            // consistent, the way it does after a slurp.
+            conn.execute_batch(&format!(
+                "INSERT INTO Tags_Popular (tag_id, name)
+                     SELECT id, name FROM Tags WHERE count >= {threshold};
+                 CREATE INDEX idx_tags_fts ON Tags_Popular USING fts (name)
+                     WITH (tokenizer='ngram', min_gram=2, max_gram=3);
+                 CREATE TABLE Tags_Popular_plain (
+                     tag_id INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL);
+                 INSERT INTO Tags_Popular_plain (tag_id, name)
+                     SELECT id, name FROM Tags WHERE count >= {threshold};"
+            ))
+            .await
+            .unwrap();
+
+            // ---- the three write paths --------------------------------
+            // Each one applies the same delta: +1 to `batch` tags.
+            let delta_ids: Vec<i64> = (1..=batch as i64).collect();
+
+            // A: the count fold-in plus the shadow sync, exactly as
+            // `tag_counts_apply` does it.
+            let count_sql = {
+                let clauses: Vec<String> = delta_ids
+                    .iter()
+                    .map(|_| "WHEN ? THEN ?".to_string())
+                    .collect();
+                let placeholders: Vec<String> =
+                    (1..=delta_ids.len()).map(|_| "?".to_string()).collect();
+                let mut params: Vec<Value> = Vec::new();
+                for id in &delta_ids {
+                    params.push(Value::from(*id));
+                    params.push(Value::from(1i64));
+                }
+                for id in &delta_ids {
+                    params.push(Value::from(*id));
+                }
+                (
+                    format!(
+                        "UPDATE Tags SET count = count + CASE id {} ELSE 0 END \
+                         WHERE id IN ({})",
+                        clauses.join(" "),
+                        placeholders.join(", ")
+                    ),
+                    params,
+                )
+            };
+            let shadow_preread_sql = {
+                let placeholders: Vec<String> =
+                    (1..=delta_ids.len()).map(|_| "?".to_string()).collect();
+                (
+                    format!(
+                        "SELECT t.id, t.count, (tp.tag_id IS NOT NULL)
+                         FROM Tags t LEFT JOIN Tags_Popular tp ON tp.tag_id = t.id
+                         WHERE t.id IN ({})",
+                        placeholders.join(", ")
+                    ),
+                    delta_ids
+                        .iter()
+                        .map(|id| Value::from(*id))
+                        .collect::<Vec<Value>>(),
+                )
+            };
+            let shadow_delete_sql = {
+                let placeholders: Vec<String> =
+                    (1..=delta_ids.len()).map(|_| "?".to_string()).collect();
+                let mut params: Vec<Value> = delta_ids
+                    .iter()
+                    .map(|id| Value::from(*id))
+                    .collect::<Vec<Value>>();
+                params.extend(delta_ids.iter().map(|id| Value::from(*id)));
+                params.push(Value::from(threshold));
+                (
+                    format!(
+                        "DELETE FROM Tags_Popular
+                         WHERE tag_id IN ({0}) AND tag_id NOT IN (
+                             SELECT id FROM Tags WHERE id IN ({0}) AND count >= ?)",
+                        placeholders.join(", ")
+                    ),
+                    params,
+                )
+            };
+            let shadow_insert_sql = {
+                let placeholders: Vec<String> =
+                    (1..=delta_ids.len()).map(|_| "?".to_string()).collect();
+                let mut params: Vec<Value> = delta_ids
+                    .iter()
+                    .map(|id| Value::from(*id))
+                    .collect::<Vec<Value>>();
+                params.push(Value::from(threshold));
+                (
+                    format!(
+                        "INSERT OR IGNORE INTO Tags_Popular (tag_id, name)
+                         SELECT id, name FROM Tags WHERE id IN ({}) AND count >= ?",
+                        placeholders.join(", ")
+                    ),
+                    params,
+                )
+            };
+
+            let mut a_ms = f64::MAX;
+            let mut a_cross_ms = f64::MAX;
+            let mut b_ms = f64::MAX;
+            let mut c_ms = f64::MAX;
+            let mut total_crossings = 0i64;
+            for iter in 0..iters {
+                // A steady state: the count fold-in plus the pre-read that
+                // decides whether the shadow needs touching. This is what
+                // production does on every batch, and in steady state nothing
+                // crosses the threshold.
+                let started = Instant::now();
+                conn.execute(&count_sql.0, params_from_iter(count_sql.1.clone()))
+                    .await
+                    .unwrap();
+                let mut rows = conn
+                    .query(&shadow_preread_sql.0, params_from_iter(shadow_preread_sql.1.clone()))
+                    .await
+                    .unwrap();
+                let mut crossing = 0i64;
+                while let Ok(Some(row)) = rows.next().await {
+                    let old_count: i64 = row.get(1).unwrap();
+                    let in_shadow: i64 = row.get(2).unwrap();
+                    if (old_count + 1 >= threshold) != (in_shadow != 0) {
+                        crossing += 1;
+                    }
+                }
+                total_crossings += crossing;
+                let a = started.elapsed().as_secs_f64() * 1_000.0;
+
+                // A with a crossing: the two shadow statements run as well,
+                // and each one flushes a Tantivy segment.
+                let started = Instant::now();
+                conn.execute(&shadow_delete_sql.0, params_from_iter(shadow_delete_sql.1.clone()))
+                    .await
+                    .unwrap();
+                conn.execute(&shadow_insert_sql.0, params_from_iter(shadow_insert_sql.1.clone()))
+                    .await
+                    .unwrap();
+                let a_cross = a + started.elapsed().as_secs_f64() * 1_000.0;
+
+                // B: count fold-in only.
+                let started = Instant::now();
+                conn.execute(&count_sql.0, params_from_iter(count_sql.1.clone()))
+                    .await
+                    .unwrap();
+                let b = started.elapsed().as_secs_f64() * 1_000.0;
+
+                // C: nothing on the write path.
+                let started = Instant::now();
+                std::hint::black_box(&delta_ids);
+                let c = started.elapsed().as_secs_f64() * 1_000.0;
+
+                if iter > 0 {
+                    a_ms = a_ms.min(a);
+                    a_cross_ms = a_cross_ms.min(a_cross);
+                    b_ms = b_ms.min(b);
+                    c_ms = c_ms.min(c);
+                }
+            }
+
+            // ---- the reads ---------------------------------------------
+            // The popular-tags list, which is what the shadow exists to serve.
+            let mut popular_ms = f64::MAX;
+            for _ in 0..iters {
+                let started = Instant::now();
+                let mut rows = conn
+                    .query(
+                        "SELECT id, name FROM Tags WHERE count >= ?1
+                         ORDER BY count DESC, name LIMIT 50;",
+                        params_from_iter([Value::from(threshold)]),
+                    )
+                    .await
+                    .unwrap();
+                while let Ok(Some(_)) = rows.next().await {}
+                popular_ms = popular_ms.min(started.elapsed().as_secs_f64() * 1_000.0);
+            }
+
+            // The authoritative recount, which is what variant C would have to
+            // run to make `count` true again.
+            let recount_started = Instant::now();
+            let mut counts: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+            {
+                let mut rows = conn
+                    .query(
+                        "SELECT tag_id, COUNT(*) FROM Relationship GROUP BY tag_id;",
+                        (),
+                    )
+                    .await
+                    .unwrap();
+                while let Ok(Some(row)) = rows.next().await {
+                    let tag_id: i64 = row.get(0).unwrap();
+                    let count: i64 = row.get(1).unwrap();
+                    counts.insert(tag_id, count);
+                }
+            }
+            let recount_scan_ms = recount_started.elapsed().as_secs_f64() * 1_000.0;
+            let recount_write_started = Instant::now();
+            for chunk in counts.iter().collect::<Vec<_>>().chunks(SQL_CHUNK_SIZE) {
+                let clauses: Vec<String> =
+                    chunk.iter().map(|_| "WHEN ? THEN ?".to_string()).collect();
+                let placeholders: Vec<String> =
+                    (1..=chunk.len()).map(|_| "?".to_string()).collect();
+                let mut params: Vec<Value> = Vec::new();
+                for (id, count) in chunk {
+                    params.push(Value::from(**id));
+                    params.push(Value::from(**count));
+                }                for (id, _) in chunk {
+                    params.push(Value::from(**id));
+                }
+                conn.execute(
+                    format!(
+                        "UPDATE Tags SET count = CASE id {} ELSE 0 END WHERE id IN ({})",
+                        clauses.join(" "),
+                        placeholders.join(", ")
+                    ),
+                    params_from_iter(params),
+                )
+                .await
+                .unwrap();
+            }
+            let recount_write_ms = recount_write_started.elapsed().as_secs_f64() * 1_000.0;
+
+            // The wholesale shadow rebuild, which is what variant B would
+            // have to run to make the shadow true again.
+            let rebuild_started = Instant::now();
+            conn.execute_batch(&format!(
+                "DELETE FROM Tags_Popular;
+                 INSERT INTO Tags_Popular (tag_id, name)
+                     SELECT id, name FROM Tags WHERE count >= {threshold};"
+            ))
+            .await
+            .unwrap();
+            let rebuild_ms = rebuild_started.elapsed().as_secs_f64() * 1_000.0;
+
+            println!(
+                "  write path, per fold-in of {batch} tags:\n    \
+                 A steady state (count + pre-read)   {:>9.3} ms\n    \
+                 A with a threshold crossing         {:>9.3} ms\n    \
+                 B count only                       {:>9.3} ms\n    \
+                 C nothing                          {:>9.3} ms\n    \
+                 ({total_crossings} threshold crossings in {iters} fold-ins)",
+                a_ms, a_cross_ms, b_ms, c_ms
+            );
+            println!(
+                "  reads:\n    \
+                 popular list (50)      {:>9.3} ms\n    \
+                 authoritative recount   {:>9.3} ms scan + {:>9.3} ms write\n    \
+                 wholesale shadow rebuild{:>9.3} ms",
+                popular_ms, recount_scan_ms, recount_write_ms, rebuild_ms
+            );
+
+            // ---- is the FTS index worth its write tax? -----------------
+            // The ngram index is what the shadow exists for, but it is also
+            // what makes every shadow write flush a Tantivy segment. The
+            // alternative is a plain scan with LIKE over the same rows --
+            // affordable if the popular set is small enough, which it is by
+            // construction (`count >= {threshold}`).
+            let mut fts_ms = f64::MAX;
+            let mut like_ms = f64::MAX;
+            let mut like_rows = 0usize;
+            for probe in 0..20i64 {
+                let term = format!("tag-{:08}", probe * 977);
+                let started = Instant::now();
+                let mut rows = conn
+                    .query(
+                        "SELECT tag_id FROM Tags_Popular WHERE fts_match(name, ?1) LIMIT 20;",
+                        params_from_iter([Value::from(term.clone())]),
+                    )
+                    .await
+                    .unwrap();
+                while let Ok(Some(_)) = rows.next().await {}
+                fts_ms = fts_ms.min(started.elapsed().as_secs_f64() * 1_000.0);
+
+                let started = Instant::now();
+                let mut rows = conn
+                    .query(
+                        "SELECT tag_id FROM Tags_Popular_plain
+                         WHERE name LIKE '%' || ?1 || '%' LIMIT 20;",
+                        params_from_iter([Value::from(term.clone())]),
+                    )
+                    .await
+                    .unwrap();
+                let mut count = 0usize;
+                while let Ok(Some(_)) = rows.next().await {
+                    count += 1;
+                }
+                like_ms = like_ms.min(started.elapsed().as_secs_f64() * 1_000.0);
+                like_rows = count;
+            }
+            let popular_rows: i64 = conn
+                .query("SELECT COUNT(*) FROM Tags_Popular;", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .map(|r| r.get(0).unwrap())
+                .unwrap_or(0);
+            println!(
+                "  tag search over {popular_rows} popular rows:\n    \
+                 FTS (ngram)   {:>9.3} ms\n    \
+                 LIKE scan     {:>9.3} ms   ({like_rows} rows matched)",
+                fts_ms, like_ms
+            );
+        });
+    }
+
+    /// The hypothesis that the per-namespace partitioning exists to protect:
+    /// that a single relationship table makes `tag_id -> file_id` lookups
+    /// slow.
+    ///
+    /// The earlier benches measured the *other* direction (`file_id -> tag_id`,
+    /// the one that has to union the partitions) and used a tag
+    /// distribution where every tag belonged to exactly one file. Production
+    /// is the opposite: a handful of tags carry a huge number of files, and
+    /// most tags carry a few. The search planner drives on the rarest tag and
+    /// then scans that tag's posting list, so the shape that matters is "one
+    /// tag, many files".
+    ///
+    /// The fixture models that:
+    ///
+    /// * `hot_tags` tags each attached to `hot_files` files -- the posting
+    ///   list a search scans, and the set a re-tag chunk rewrites.
+    /// * `rare_tags` tags each attached to a handful of files -- the long tail.
+    ///
+    /// Both shapes get the same rows, fed the way production feeds them
+    /// (grouped per table, sorted by `(tag_id, file_id)`), and every query is
+    /// run warm. The measurements are taken after a seeding pass, and the
+    /// reported number is the best of several runs, so a cold cache cannot
+    /// masquerade as a shape difference.
+    ///
+    /// ```text
+    /// BENCH_RELS=5000000 BENCH_HOT_TAGS=100 BENCH_HOT_FILES=50000 \
+    ///     cargo test --lib db::turso::bench::tests::db_bench_relationship_scale \
+    ///     -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "manual benchmark: tag -> file lookups at scale, partitioned vs single"]
+    fn db_bench_relationship_scale() {
+        let hot_tags = env_u64("BENCH_HOT_TAGS", 100).max(1);
+        let hot_files = env_u64("BENCH_HOT_FILES", 20_000).max(1);
+        let rare_tags = env_u64("BENCH_RARE_TAGS", 200_000);
+        let rare_files = env_u64("BENCH_RARE_FILES", 3).max(1);
+        let arms = env_u64("BENCH_ARMS", 32).max(1) as usize;
+        let iters = env_u64("BENCH_ITERS", 7).max(1);
+        let rewrite = env_u64("BENCH_REWRITE", 20_000);
+
+        let hot_row_count = hot_tags * hot_files;
+        let rare_row_count = rare_tags * rare_files;
+        let total_rows = hot_row_count + rare_row_count;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            println!(
+                "\nBENCH relationship scale: {total_rows} rows \
+                 ({hot_tags} hot tags x {hot_files} files + \
+                 {rare_tags} rare tags x {rare_files} files), {arms} arms"
+            );
+
+            for (label, partitioned) in [
+                ("partitioned", true),
+                ("single", false),
+            ] {
+                let path = bench_db_path(&format!("relscale-{}", label));
+                bench_remove(&path);
+                let db = Builder::new_local(&path.to_string_lossy())
+                    .build()
+                    .await
+                    .unwrap();
+                let conn = db.connect().unwrap();
+                conn.pragma_update("journal_mode", "'mvcc'").await.unwrap();
+
+                let table_for = |tag_id: u64| -> String {
+                    if partitioned {
+                        format!("Relationship_{}", tag_id % arms as u64)
+                    } else {
+                        "Relationship".to_string()
+                    }
+                };
+                let mut ddl = String::new();
+                if partitioned {
+                    for arm in 0..arms {
+                        ddl.push_str(&format!(
+                            "CREATE TABLE Relationship_{arm} (
+                                 file_id INTEGER NOT NULL,
+                                 tag_id INTEGER NOT NULL,
+                                 PRIMARY KEY (tag_id, file_id));
+                             CREATE INDEX idx_Relationship_{arm}_tag_file
+                                 ON Relationship_{arm} (file_id, tag_id);"
+                        ));
+                    }
+                } else {
+                    ddl.push_str(
+                        "CREATE TABLE Relationship (
+                             file_id INTEGER NOT NULL,
+                             tag_id INTEGER NOT NULL,
+                             PRIMARY KEY (tag_id, file_id));
+                         CREATE INDEX idx_Relationship_file_tag
+                             ON Relationship (file_id, tag_id);",
+                    );
+                }
+                conn.execute_batch(&ddl).await.unwrap();
+
+                // The rows. Hot tags get contiguous file ids so the posting
+                // list is a contiguous key range in both shapes -- the case
+                // that should favour the single table most.
+                let mut per_table: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
+                let mut push = |tag_id: u64, file_id: u64| {
+                    per_table
+                        .entry(table_for(tag_id))
+                        .or_default()
+                        .push((file_id, tag_id));
+                };
+                let mut file_id = 0u64;
+                for hot in 0..hot_tags {
+                    for _f in 0..hot_files {
+                        push(hot + 1, file_id + 1);
+                        file_id += 1;
+                    }
+                }
+                for rare in 0..rare_tags {
+                    let tag_id = hot_tags + rare + 1;
+                    for _f in 0..rare_files {
+                        push(tag_id, file_id + 1);
+                        file_id += 1;
+                    }
+                }
+                let seed_started = Instant::now();
+                for (table, mut rows) in per_table {
+                    rows.sort_unstable_by_key(|(file_id, tag_id)| (*tag_id, *file_id));
+                    for chunk in rows.chunks(SQL_CHUNK_SIZE) {
+                        let holders: Vec<&str> = chunk.iter().map(|_| "(?, ?)").collect();
+                        let mut params: Vec<Value> = Vec::with_capacity(chunk.len() * 2);
+                        for (file_id, tag_id) in chunk {
+                            params.push(Value::from(*file_id as i64));
+                            params.push(Value::from(*tag_id as i64));
+                        }
+                        conn.execute(
+                            format!(
+                                "INSERT INTO {table} (file_id, tag_id) VALUES {}",
+                                holders.join(", ")
+                            ),
+                            params_from_iter(params),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+                let seed_ms = seed_started.elapsed().as_secs_f64() * 1_000.0;
+
+                // ---- the queries --------------------------------------
+                // A hot tag's posting list, which is what the search
+                // planner drives on and what a re-tag chunk rewrites.
+                let hot_tag = hot_tags / 2;
+                let rare_tag = hot_tags + rare_tags / 2;
+
+                let mut hot_scan_ms = f64::MAX;
+                let mut hot_scan_rows = 0usize;
+                for iter in 0..iters {
+                    let started = Instant::now();
+                    let mut rows = conn
+                        .query(
+                            &format!(
+                                "SELECT file_id FROM {} WHERE tag_id = ?1 \
+                                 ORDER BY file_id LIMIT 50;",
+                                table_for(hot_tag)
+                            ),
+                            params_from_iter([Value::from(hot_tag as i64)]),
+                        )
+                        .await
+                        .unwrap();
+                    let mut count = 0usize;
+                    while let Ok(Some(_)) = rows.next().await {
+                        count += 1;
+                    }
+                    if iter == 0 {
+                        hot_scan_rows = count;
+                        explain(
+                            &conn,
+                            &format!(
+                                "SELECT file_id FROM {} WHERE tag_id = {} \
+                                 ORDER BY file_id LIMIT 50;",
+                                table_for(hot_tag),
+                                hot_tag
+                            ),
+                        )
+                        .await;
+                    } else {
+                        hot_scan_ms = hot_scan_ms.min(started.elapsed().as_secs_f64() * 1_000.0);
+                    }
+                }
+
+                // The whole posting list, no LIMIT. This is the shape that
+                // degrades fastest as a table grows, because it reads every
+                // row the tag owns.
+                let mut hot_full_ms = f64::MAX;
+                let mut hot_full_rows = 0usize;
+                for iter in 0..iters {
+                    let started = Instant::now();
+                    let mut rows = conn
+                        .query(
+                            &format!(
+                                "SELECT file_id FROM {} WHERE tag_id = ?1;",
+                                table_for(hot_tag)
+                            ),
+                            params_from_iter([Value::from(hot_tag as i64)]),
+                        )
+                        .await
+                        .unwrap();
+                    let mut count = 0usize;
+                    while let Ok(Some(_)) = rows.next().await {
+                        count += 1;
+                    }
+                    if iter == 0 {
+                        hot_full_rows = count;
+                    } else {
+                        hot_full_ms = hot_full_ms.min(started.elapsed().as_secs_f64() * 1_000.0);
+                    }
+                }
+
+                // A rare tag's posting list: the common case, and the one the
+                // search planner picks as its driver.
+                let mut rare_scan_ms = f64::MAX;
+                for iter in 0..iters {
+                    let started = Instant::now();
+                    let mut rows = conn
+                        .query(
+                            &format!(
+                                "SELECT file_id FROM {} WHERE tag_id = ?1 \
+                                 ORDER BY file_id LIMIT 50;",
+                                table_for(rare_tag)
+                            ),
+                            params_from_iter([Value::from(rare_tag as i64)]),
+                        )
+                        .await
+                        .unwrap();
+                    while let Ok(Some(_)) = rows.next().await {}
+                    if iter > 0 {
+                        rare_scan_ms = rare_scan_ms.min(started.elapsed().as_secs_f64() * 1_000.0);
+                    }
+                }
+
+                // The recount aggregate: `GROUP BY tag_id` over the whole
+                // table, which `slurp_recount_namespace` runs per namespace.
+                // For the partitioned shape that is one aggregate *per
+                // partition*, so the total is the sum over all of them --
+                // comparing one partition against the whole table would
+                // flatter the partitioned shape by the arm count.
+                let recount_started = Instant::now();
+                let mut recount_rows = 0usize;
+                // One aggregate per partition for the partitioned shape; one
+                // global aggregate for the single table. The partitioned
+                // shape's total is the sum over its partitions, so this
+                // compares like with like.
+                let recount_arms = if partitioned { arms } else { 1 };
+                for arm in 0..recount_arms {
+                    let sql = if partitioned {
+                        format!(
+                            "SELECT tag_id, COUNT(*) FROM Relationship_{arm} GROUP BY tag_id;"
+                        )
+                    } else {
+                        "SELECT tag_id, COUNT(*) FROM Relationship GROUP BY tag_id;".to_string()
+                    };
+                    let mut rows = conn.query(&sql, ()).await.unwrap();
+                    while let Ok(Some(_)) = rows.next().await {
+                        recount_rows += 1;
+                    }
+                }
+                let recount_ms = recount_started.elapsed().as_secs_f64() * 1_000.0;
+
+                // ---- the write ----------------------------------------
+                // Re-tag a hot tag: the chunk that the production comment
+                // calls out as a 24k-row rewrite, and the one that made the
+                // MVCC commit-log path expensive. The file ids are *novel*,
+                // past the end of the seeded range, so this is a real insert
+                // rather than a duplicate probe -- `INSERT OR IGNORE` against
+                // rows that already exist measures the index lookup, not the
+                // write.
+                let novel_base = total_rows + 1;
+                let rewrite_rows: Vec<(u64, u64)> = (0..rewrite)
+                    .map(|f| (novel_base + f, hot_tag))
+                    .collect();
+                let mut rewrite_per_table: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
+                for &(file_id, tag_id) in &rewrite_rows {
+                    rewrite_per_table
+                        .entry(table_for(tag_id))
+                        .or_default()
+                        .push((file_id, tag_id));
+                }
+                let write_started = Instant::now();
+                for (table, mut rows) in rewrite_per_table {
+                    rows.sort_unstable_by_key(|(file_id, tag_id)| (*tag_id, *file_id));
+                    for chunk in rows.chunks(SQL_CHUNK_SIZE) {
+                        let holders: Vec<&str> = chunk.iter().map(|_| "(?, ?)").collect();
+                        let mut params: Vec<Value> = Vec::with_capacity(chunk.len() * 2);
+                        for (file_id, tag_id) in chunk {
+                            params.push(Value::from(*file_id as i64));
+                            params.push(Value::from(*tag_id as i64));
+                        }
+                        conn.execute(
+                            format!(
+                                "INSERT OR IGNORE INTO {table} (file_id, tag_id) VALUES {}",
+                                holders.join(", ")
+                            ),
+                            params_from_iter(params),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+                let write_ms = write_started.elapsed().as_secs_f64() * 1_000.0;
+
+                // ---- churn: build MVCC history ------------------------
+                // This is the variable the earlier benches left out. Every
+                // insert and delete leaves a new version behind, and a page
+                // with a long version chain costs more to read. A table that
+                // has been scraped for a year has deep chains; a freshly
+                // seeded one does not. The churn phase creates the history,
+                // and the hot-tag scan is then measured again, so the claim
+                // "one table degrades because its history is deeper" is
+                // tested rather than assumed.
+                let churn_rounds = env_u64("BENCH_CHURN_ROUNDS", 20).max(1);
+                let churn_rows = env_u64("BENCH_CHURN_ROWS", 2_000);
+                let churn_started = Instant::now();
+                for round in 0..churn_rounds {
+                    let base = novel_base + rewrite + round * churn_rows;
+                    for &(file_id, tag_id) in
+                        &(0..churn_rows).map(|f| (base + f, hot_tag)).collect::<Vec<_>>()
+                    {
+                        let _ = (file_id, tag_id);
+                    }
+                    let rows_in: Vec<(u64, u64)> = (0..churn_rows)
+                        .map(|f| (base + f, hot_tag))
+                        .collect();
+                    let holders: Vec<&str> = rows_in.iter().map(|_| "(?, ?)").collect();
+                    let mut params: Vec<Value> = Vec::with_capacity(rows_in.len() * 2);
+                    for (file_id, tag_id) in &rows_in {
+                        params.push(Value::from(*file_id as i64));
+                        params.push(Value::from(*tag_id as i64));
+                    }
+                    conn.execute(
+                        format!(
+                            "INSERT OR IGNORE INTO {} (file_id, tag_id) VALUES {}",
+                            table_for(hot_tag),
+                            holders.join(", ")
+                        ),
+                        params_from_iter(params),
+                    )
+                    .await
+                    .unwrap();
+                }
+                let churn_ms = churn_started.elapsed().as_secs_f64() * 1_000.0;
+
+                // The hot tag scan, again, with the history behind it.
+                let mut hot_scan_after_ms = f64::MAX;
+                let mut hot_full_after_ms = f64::MAX;
+                for iter in 0..iters {
+                    let started = Instant::now();
+                    let mut rows = conn
+                        .query(
+                            &format!(
+                                "SELECT file_id FROM {} WHERE tag_id = ?1 \
+                                 ORDER BY file_id LIMIT 50;",
+                                table_for(hot_tag)
+                            ),
+                            params_from_iter([Value::from(hot_tag as i64)]),
+                        )
+                        .await
+                        .unwrap();
+                    while let Ok(Some(_)) = rows.next().await {}
+                    if iter > 0 {
+                        hot_scan_after_ms =
+                            hot_scan_after_ms.min(started.elapsed().as_secs_f64() * 1_000.0);
+                    }
+
+                    let started = Instant::now();
+                    let mut rows = conn
+                        .query(
+                            &format!(
+                                "SELECT file_id FROM {} WHERE tag_id = ?1;",
+                                table_for(hot_tag)
+                            ),
+                            params_from_iter([Value::from(hot_tag as i64)]),
+                        )
+                        .await
+                        .unwrap();
+                    while let Ok(Some(_)) = rows.next().await {}
+                    if iter > 0 {
+                        hot_full_after_ms =
+                            hot_full_after_ms.min(started.elapsed().as_secs_f64() * 1_000.0);
+                    }
+                }
+
+                println!(
+                    "  {label}\n    \
+                     seed {total_rows} rows        {:>9.1} ms ({:.1} us/row)\n    \
+                     hot tag, first 50 files     {:>9.3} ms  ({hot_scan_rows} rows)\n    \
+                     hot tag, whole list         {:>9.3} ms  ({hot_full_rows} rows)\n    \
+                     rare tag, first 50 files    {:>9.3} ms\n    \
+                     GROUP BY tag_id             {:>9.1} ms  ({recount_rows} groups)\n    \
+                     rewrite {rewrite} rows       {:>9.1} ms\n    \
+                     churn {churn_rounds}x{churn_rows}     {:>9.1} ms\n    \
+                     after churn, first 50       {:>9.3} ms\n    \
+                     after churn, whole list     {:>9.3} ms",
+                    seed_ms,
+                    seed_ms * 1_000.0 / total_rows as f64,
+                    hot_scan_ms,
+                    hot_full_ms,
+                    rare_scan_ms,
+                    recount_ms,
+                    write_ms,
+                    churn_ms,
+                    hot_scan_after_ms,
+                    hot_full_after_ms,
+                );
+            }
+        });
+    }
+
+    /// Why a tag's posting list gets slower over time, and whether the
+    /// MVCC knobs can pull it back.
+    ///
+    /// The scale bench showed the hot tag's whole-list scan going from 36 ms
+    /// to 288 ms after a churn of 40k rows, in *both* the partitioned and the
+    /// single-table shape. That is not the table shape -- it is version
+    /// depth. Every insert leaves a new row version behind, and a page with a
+    /// long version chain costs more to read.
+    ///
+    /// Limbo's answer to that is an incremental GC: `mvcc_gc_threshold`
+    /// (16,384 new versions by default) triggers a pass that walks at most
+    /// `MAX_CHAINS_PER_GC` (4,096) row chains per pass. Under heavy write
+    /// load the pass cannot keep up with the chains being created, so they
+    /// grow.
+    ///
+    /// This measures the read latency at a series of version depths, then
+    /// drops the GC threshold and re-measures, to answer two questions:
+    ///
+    /// * how much of the slowdown is version depth, and
+    /// * whether a more aggressive GC recovers it, and what it costs on the
+    ///   write path.
+    ///
+    /// ```text
+    /// BENCH_MVCC_HOT=20000 BENCH_MVCC_CHURN=100000 cargo test --lib \
+    ///     db::turso::bench::tests::db_bench_mvcc_history -- --ignored --nocapture
+    /// ```
+    /// Whether `tag_count_lock` has to be global, or can be sharded by tag id.
+    ///
+    /// The lock exists because `Tags.count` is one row per tag and two writers
+    /// bumping the *same* tag's count would conflict (a write-write conflict
+    /// under MVCC, which aborts and retries the whole transaction). What it
+    /// actually guards is per-row, but the mutex is global, so two writers
+    /// bumping *different* tags serialise anyway.
+    ///
+    /// This measures how much that costs. The shape is the real one: many
+    /// concurrent folds-in, each carrying deltas for its own set of tags, with
+    /// the sets overlapping or disjoint. If disjoint sets are much faster than
+    /// overlapping ones under a global lock, the lock is over-broad and sharding
+    /// it would recover the difference.
+    ///
+    /// The comparison is run in one process against one warm fixture, with the
+    /// global and sharded paths alternating, and each reporting the best of
+    /// several rounds. Two separate processes cannot answer this: the fixture
+    /// and the page cache state dominate, which is exactly how the earlier
+    /// count-path comparison produced two contradictory numbers.
+    ///
+    /// ```text
+    /// BENCH_LOCK_TAGS=20000 BENCH_LOCK_BATCH=200 BENCH_LOCK_CONCURRENCY=8 \\
+    ///     cargo test --release --lib db::turso::bench::tests::db_bench_count_lock \\
+    ///     -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "manual benchmark: global vs sharded tag count lock"]
+    fn db_bench_count_lock() {
+        let tags = env_u64("BENCH_LOCK_TAGS", 20_000).max(4);
+        let batch = env_u64("BENCH_LOCK_BATCH", 200).max(1) as usize;
+        let concurrency = env_u64("BENCH_LOCK_CONCURRENCY", 8).max(1) as usize;
+        let rounds = env_u64("BENCH_LOCK_ROUNDS", 3).max(1);
+        let shards = env_u64("BENCH_LOCK_SHARDS", 32).max(1) as usize;
+        let threshold = 5i64;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            println!(
+                "\nBENCH tag count lock: {tags} tags, {batch} tags per fold-in, \
+                 {concurrency} concurrent writers, {shards} shards"
+            );
+
+            let path = bench_db_path("taglock");
+            bench_remove(&path);
+            let should_exit = Arc::new(AtomicBool::new(false));
+            let db = TursoDatabase::new_with_exit(&path, should_exit).await;
+            let conn = db.connect().unwrap();
+
+            let mut ns_set = HashSet::new();
+            for ns in 0..4 {
+                ns_set.insert(GenericNamespaceObj {
+                    name: format!("lock_ns_{ns}"),
+                    description: None,
+                });
+            }
+            db.namespace_ensure_set(&ns_set).await.unwrap();
+
+            let tag_set: HashSet<Tag> = (0..tags)
+                .map(|i| Tag {
+                    name: format!("lock_tag_{i}"),
+                    namespace: GenericNamespaceObj {
+                        name: format!("lock_ns_{}", i % 4),
+                        description: None,
+                    },
+                })
+                .collect();
+            let inserted = db.tag_add_bulk(&conn, &tag_set).await.unwrap();
+            let mut tag_ids: Vec<u64> = inserted.iter().map(|t| t.id as u64).collect();
+            tag_ids.sort_unstable();
+
+            // Seed a count so the rows exist at a realistic width.
+            for chunk in tag_ids.chunks(SQL_CHUNK_SIZE) {
+                let (sql, params) = crate::db::turso::relationship::tag_count_seed_sql_for_bench(chunk);
+                conn.execute(&sql, params_from_iter(params)).await.unwrap();
+            }
+
+            // Each round: `concurrency` writers each fold in `batch` deltas.
+            // `overlap` decides whether the writers share tags. Disjoint sets
+            // are the case a sharded lock can parallelise; fully overlapping
+            // sets are the case it cannot.
+            //
+            // The fold-in is driven through the real `tag_counts_apply`, so the
+            // lock under test is the production one. The sharded variant is
+                    // simulated by running the same folds-in concurrently but
+                    // grouping the batch by shard first, which is the shape a
+                    // sharded implementation would produce.
+                // One round: `concurrency` writers each fold in `batch` deltas
+            // through the real `tag_counts_apply`, so the lock under test is
+            // the production one. `overlap` picks whether the writers share
+            // tags: disjoint sets are what a sharded lock could parallelise,
+            // fully overlapping sets are what it cannot.
+            async fn fold_round(
+                db: &Arc<TursoDatabase>,
+                tag_ids: &[u64],
+                batch: usize,
+                concurrency: usize,
+                tags: u64,
+                overlap: bool,
+            ) -> Duration {
+                let started = Instant::now();
+                let mut handles = Vec::with_capacity(concurrency);
+                for w in 0..concurrency {
+                    let db = db.clone();
+                    let ids: Vec<u64> = tag_ids.to_vec();
+                    handles.push(tokio::spawn(async move {
+                        let mut deltas: HashMap<u64, u64> = HashMap::new();
+                        for b in 0..batch {
+                            let idx = if overlap {
+                                b % tags as usize
+                            } else {
+                                (w * batch + b) % tags as usize
+                            };
+                            *deltas.entry(ids[idx]).or_default() += 1;
+                        }
+                        db.tag_counts_apply(&deltas, &HashMap::new()).await.unwrap();
+                    }));
+                }
+                for h in handles {
+                    h.await.unwrap();
+                }
+                started.elapsed()
+            }
+
+            let mut disjoint = f64::MAX;
+            let mut overlap_ms = f64::MAX;
+            for _ in 0..rounds {
+                let e = fold_round(&db, &tag_ids, batch, concurrency, tags, false).await;
+                disjoint = disjoint.min(e.as_secs_f64() * 1_000.0);
+                let e = fold_round(&db, &tag_ids, batch, concurrency, tags, true).await;
+                overlap_ms = overlap_ms.min(e.as_secs_f64() * 1_000.0);
+            }
+
+            let per_writer = |ms: f64| ms / concurrency as f64;
+            println!(
+                "  disjoint tag sets:   {disjoint:>9.2} ms total  ({:.2} ms/writer)",
+                per_writer(disjoint)
+            );
+            println!(
+                "  overlapping sets:    {overlap_ms:>9.2} ms total  ({:.2} ms/writer)",
+                per_writer(overlap_ms)
+            );
+            println!(
+                "  disjoint is {:.2}x {}",
+                overlap_ms / disjoint.max(0.001),
+                if disjoint < overlap_ms * 0.9 {
+                    "FASTER -- the global lock serialises work that need not conflict"
+                } else {
+                    "about the same -- the lock is not the constraint"
+                }
+            );
+            let _ = threshold;
+        });
+    }
+
+    /// BENCH tag count sharding: does splitting one `Tags.count` row into N
+    /// counter rows per tag actually buy anything?
+    ///
+    /// The claim under test is that the count fold-in is expensive not because
+    /// of the global `tag_count_lock` but because of MVCC version chains: every
+    /// writer bumps the *same* row, so that row accumulates one version per
+    /// write and every reader walks the chain. `db_bench_count_lock` measured
+    /// the lock and found it was not the constraint; this measures the thing it
+    /// blamed instead.
+    ///
+    /// The design isolates the mechanism by aiming every update at one tag.
+    /// Both arms then write exactly the same number of rows, so the only
+    /// difference is how those writes are spread:
+    ///
+    ///   * `one row`   — all updates land on `(tag 0, shard 0)`, the production
+    ///     shape. One row, deep chain.
+    ///   * `sharded`   — the same updates spread over `shards` rows for tag 0.
+    ///     Shallow chains, but reads must now sum `shards` rows.
+    ///
+    /// Each arm gets a freshly recreated table. Version chains persist for the
+    /// life of the row, so running both arms against one fixture would let the
+    /// first arm's churn set the second arm's starting depth — which is how a
+    /// comparison like this ends up reporting the order the arms ran in.
+    ///
+    /// Reports write throughput and, before and after the churn, the read cost
+    /// of the hot tag (point read) and of every tag (the `count DESC` list).
+    /// Sharding only pays if the shorter chain beats the wider read.
+    ///
+    /// ```text
+    /// BENCH_SHARD_TAGS=2000 BENCH_SHARD_UPDATES=20000 BENCH_SHARD_CONCURRENCY=8 \
+    /// BENCH_SHARD_SHARDS=32 cargo test --release --lib \
+    ///     db::turso::bench::tests::db_bench_tag_count_shard -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "manual benchmark: sharded tag counters vs one row per tag"]
+    fn db_bench_tag_count_shard() {
+        let tags = env_u64("BENCH_SHARD_TAGS", 2_000).max(2);
+        let updates = env_u64("BENCH_SHARD_UPDATES", 20_000).max(1);
+        let concurrency = env_u64("BENCH_SHARD_CONCURRENCY", 8).max(1) as usize;
+        let shards = env_u64("BENCH_SHARD_SHARDS", 32).max(1) as u64;
+        let batch = env_u64("BENCH_SHARD_BATCH", 100).max(1) as usize;
+        let rounds = env_u64("BENCH_SHARD_ROUNDS", 3).max(1);
+        let all_tags = env_u64("BENCH_SHARD_SCAN_ALL", 200).max(1) as u64;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            println!(
+                "\nBENCH tag count shard: {tags} tags, {updates} updates all on tag 0, \
+                 {concurrency} writers, {shards} shards, batch {batch}, {rounds} rounds"
+            );
+
+            let path = bench_db_path("tagshard");
+            bench_remove(&path);
+            let should_exit = Arc::new(AtomicBool::new(false));
+            let db = TursoDatabase::new_with_exit(&path, should_exit).await;
+            let conn = db.connect().unwrap();
+
+            // The checkpoint threshold bounds how many row versions survive
+            // before the oldest are folded away. If the superlinear write cost
+            // above is really chain depth, lowering this should flatten it --
+            // and that would be a one-line fix rather than a sharded schema.
+            let ckpt = env_u64("BENCH_SHARD_CKPT", 0);
+            if ckpt > 0 {
+                conn.execute_batch(&format!(
+                    "PRAGMA mvcc_checkpoint_threshold = {ckpt};"
+                ))
+                .await
+                .unwrap();
+                println!("  (mvcc_checkpoint_threshold = {ckpt}, default 4120000)");
+            }
+
+            // Read the hot tag and the popularity list. Both are measured as a
+            // batch of point reads so the per-read figure is not drowned in
+            // round-trip overhead.
+            async fn read_hot(conn: &Connection, passes: u64) -> f64 {
+                let mut best = f64::MAX;
+                for _ in 0..3 {
+                    let started = Instant::now();
+                    for _ in 0..passes {
+                        let mut rows = conn
+                            .query(
+                                "SELECT count FROM TagCount WHERE tag_id = 0 AND shard = 0;",
+                                (),
+                            )
+                            .await
+                            .unwrap();
+                        while let Ok(Some(_)) = rows.next().await {}
+                    }
+                    best = best.min(started.elapsed().as_secs_f64() * 1_000.0);
+                }
+                best
+            }
+
+            // The sharded read: the same value now costs a scan over the tag's
+            // shards, which is the price the design pays for the shorter chain.
+            async fn read_hot_sharded(conn: &Connection, passes: u64) -> f64 {
+                let mut best = f64::MAX;
+                for _ in 0..3 {
+                    let started = Instant::now();
+                    for _ in 0..passes {
+                        let mut rows = conn
+                            .query("SELECT SUM(count) FROM TagCount WHERE tag_id = 0;", ())
+                            .await
+                            .unwrap();
+                        while let Ok(Some(_)) = rows.next().await {}
+                    }
+                    best = best.min(started.elapsed().as_secs_f64() * 1_000.0);
+                }
+                best
+            }
+
+            async fn read_all(conn: &Connection, tags: u64) -> f64 {
+                let mut best = f64::MAX;
+                for _ in 0..3 {
+                    let started = Instant::now();
+                    let mut rows = conn
+                        .query(
+                            "SELECT tag_id, SUM(count) FROM TagCount \
+                             WHERE tag_id < ?1 GROUP BY tag_id;",
+                            (tags as i64,),
+                        )
+                        .await
+                        .unwrap();
+                    while let Ok(Some(_)) = rows.next().await {}
+                    best = best.min(started.elapsed().as_secs_f64() * 1_000.0);
+                }
+                best
+            }
+
+            // Recreate the fixture. `spread` false puts every row on shard 0
+            // (the production shape); true spreads them over all shards.
+            async fn reset(conn: &Connection, tags: u64, shards: u64, spread: bool) {
+                conn.execute_batch("DROP TABLE IF EXISTS TagCount;")
+                    .await
+                    .unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE TagCount (
+                         tag_id INTEGER NOT NULL,
+                         shard  INTEGER NOT NULL,
+                         count  INTEGER NOT NULL DEFAULT 0,
+                         PRIMARY KEY (tag_id, shard));",
+                )
+                .await
+                .unwrap();
+
+                let width = if spread { shards } else { 1 };
+                for start in (0..tags).step_by(100) {
+                    let end = (start + 100).min(tags);
+                    // Each tag contributes `width` rows, so the placeholder
+                    // list is per row, not per tag.
+                    let rows = (end - start) * width;
+                    let holders: Vec<String> =
+                        std::iter::repeat_n("(?, ?, 0)".to_string(), rows as usize).collect();
+                    let mut params: Vec<Value> = Vec::with_capacity(rows as usize * 2);
+                    for tag_id in start..end {
+                        for shard in 0..width {
+                            params.push(Value::from(tag_id as i64));
+                            params.push(Value::from(shard as i64));
+                        }
+                    }
+                    conn.execute(
+                        format!(
+                            "INSERT INTO TagCount (tag_id, shard, count) VALUES {}",
+                            holders.join(", ")
+                        ),
+                        params_from_iter(params),
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+
+            // One arm: `concurrency` writers each apply their share of the
+            // updates in batches, one transaction per batch. A transaction per
+            // batch is what `tag_counts_apply` does, so the version count per
+            // row matches production rather than being an artefact of autocommit.
+            async fn churn(
+                db: &Arc<TursoDatabase>,
+                updates: u64,
+                concurrency: usize,
+                batch: usize,
+                shards: u64,
+                spread: bool,
+                ckpt: u64,
+            ) -> f64 {
+                let per_writer = (updates / concurrency as u64).max(1);
+                let started = Instant::now();
+                let mut handles = Vec::with_capacity(concurrency);
+                for w in 0..concurrency {
+                    let db = db.clone();
+                    handles.push(tokio::spawn(async move {
+                        let mut conn = db.connect().unwrap();
+                        // `connect()` in production sets a 1 s busy timeout;
+                        // without it a writer that loses the race for the write
+                        // lock fails instantly instead of waiting its turn.
+                        let _ = conn.busy_timeout(std::time::Duration::from_secs(1));
+                        if ckpt > 0 {
+                            let _ = conn
+                                .execute_batch(&format!(
+                                    "PRAGMA mvcc_checkpoint_threshold = {ckpt};"
+                                ))
+                                .await;
+                        }
+                        let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ (w as u64 + 1);
+                        let mut next = move || {
+                            state ^= state << 13;
+                            state ^= state >> 7;
+                            state ^= state << 17;
+                            state
+                        };
+                        // `serialized_tx_behavior` (BEGIN IMMEDIATE) is what
+                        // production uses. It still returns `Busy` rather than
+                        // waiting, so the write is wrapped in the same bounded
+                        // retry `retry_mvcc` gives production: lose the race,
+                        // back off, try the batch again.
+                        let mut done = 0u64;
+                        while done < per_writer {
+                            let n = batch.min((per_writer - done) as usize) as u64;
+                            let mut attempts = 0u32;
+                            loop {
+                                let started = conn
+                                    .transaction_with_behavior(
+                                        TursoDatabase::serialized_tx_behavior(),
+                                    )
+                                    .await;
+                                let tx = match started {
+                                    Ok(tx) => tx,
+                                    Err(error) if is_busy(&error) => {
+                                        attempts += 1;
+                                        assert!(attempts < 64, "writer never got the lock: {error}");
+                                        tokio::time::sleep(std::time::Duration::from_millis(5))
+                                            .await;
+                                        continue;
+                                    }
+                                    Err(error) => panic!("begin failed: {error}"),
+                                };
+                                let mut failed = None;
+                                for _ in 0..n {
+                                    let shard = if spread { next() % shards } else { 0 };
+                                    if let Err(error) = tx
+                                        .execute(
+                                            "UPDATE TagCount SET count = count + 1 \
+                                             WHERE tag_id = 0 AND shard = ?1;",
+                                            (shard as i64,),
+                                        )
+                                        .await
+                                    {
+                                        failed = Some(error);
+                                        break;
+                                    }
+                                }
+                                if failed.is_none() {
+                                    match tx.commit().await {
+                                        Ok(()) => break,
+                                        Err(error) if is_busy(&error) => {
+                                            attempts += 1;
+                                            assert!(
+                                                attempts < 64,
+                                                "writer never committed: {error}"
+                                            );
+                                            tokio::time::sleep(
+                                                std::time::Duration::from_millis(5),
+                                            )
+                                            .await;
+                                            continue;
+                                        }
+                                        Err(error) => panic!("commit failed: {error}"),
+                                    }
+                                }
+                                let error = failed.unwrap();
+                                if is_busy(&error) {
+                                    attempts += 1;
+                                    assert!(attempts < 64, "writer never wrote: {error}");
+                                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                                    continue;
+                                }
+                                panic!("update failed: {error}");
+                            }
+                            done += n;
+                        }
+                    }));
+                }
+                for h in handles {
+                    h.await.unwrap();
+                }
+                started.elapsed().as_secs_f64() * 1_000.0
+            }
+
+            let passes = 200u64;
+            let mut report: Vec<(&str, f64, f64, f64, f64, f64)> = Vec::new();
+
+            for (label, spread) in [("one row (production)", false), ("sharded", true)] {
+                // Best of `rounds` full cycles, so a single unlucky pass does
+                // not decide the comparison.
+                let mut best = (
+                    f64::MAX, f64::MAX, f64::MAX, f64::MAX, f64::MAX,
+                );
+                for _ in 0..rounds {
+                    reset(&conn, tags, shards, spread).await;
+                    // Arm-consistent read: the sharded design pays the SUM even
+                    // when cold, so comparing its cold SUM against the single
+                    // row's cold point read measures the wrong thing.
+                    let before_hot = if spread {
+                        read_hot_sharded(&conn, passes).await
+                    } else {
+                        read_hot(&conn, passes).await
+                    };
+                    let before_all = read_all(&conn, all_tags).await;
+                    let write_ms =
+                        churn(&db, updates, concurrency, batch, shards, spread, ckpt).await;
+                    let after_hot = if spread {
+                        read_hot_sharded(&conn, passes).await
+                    } else {
+                        read_hot(&conn, passes).await
+                    };
+                    let after_all = read_all(&conn, all_tags).await;
+                    // Control: within this one table, read the churned row and
+                    // an untouched row back to back. Any difference is version
+                    // depth and nothing else -- same index, same table, same
+                    // page cache. The across-arm comparison cannot say this,
+                    // because the two arms also differ in row count and index
+                    // width.
+                    let mut churned = f64::MAX;
+                    let mut untouched = f64::MAX;
+                    for _ in 0..3 {
+                        let started = Instant::now();
+                        for _ in 0..passes {
+                            let mut rows = conn
+                                .query(
+                                    "SELECT count FROM TagCount WHERE tag_id = 0 AND shard = 0;",
+                                    (),
+                                )
+                                .await
+                                .unwrap();
+                            while let Ok(Some(_)) = rows.next().await {}
+                        }
+                        churned = churned.min(started.elapsed().as_secs_f64() * 1_000.0);
+
+                        let started = Instant::now();
+                        for _ in 0..passes {
+                            let mut rows = conn
+                                .query(
+                                    "SELECT count FROM TagCount WHERE tag_id = 1 AND shard = 0;",
+                                    (),
+                                )
+                                .await
+                                .unwrap();
+                            while let Ok(Some(_)) = rows.next().await {}
+                        }
+                        untouched = untouched.min(started.elapsed().as_secs_f64() * 1_000.0);
+                    }
+                    println!(
+                        "    {label:<22} churned row {churned:>8.3} ms                            untouched row {untouched:>8.3} ms                            ({:.2}x)",
+                        churned / untouched.max(0.0001)
+                    );
+                    best = (
+                        best.0.min(before_hot),
+                        best.1.min(before_all),
+                        best.2.min(write_ms),
+                        best.3.min(after_hot),
+                        best.4.min(after_all),
+                    );
+                }
+                report.push((label, best.0, best.1, best.2, best.3, best.4));
+            }
+
+            // Plans, so a slow figure is attributed rather than guessed at.
+            // Printed once: they do not vary between rounds.
+            for (label, spread) in [("one row (production)", false), ("sharded", true)] {
+                reset(&conn, tags, shards, spread).await;
+                println!("  plans [{label}]:");
+                explain(&conn, "SELECT count FROM TagCount WHERE tag_id = 0 AND shard = 0;").await;
+                explain(&conn, "SELECT SUM(count) FROM TagCount WHERE tag_id = 0;").await;
+                explain(
+                    &conn,
+                    "SELECT tag_id, SUM(count) FROM TagCount WHERE tag_id < 1 GROUP BY tag_id;",
+                )
+                .await;
+            }
+
+            println!(
+                "  {:<22} {:>11} {:>11} {:>11} {:>11} {:>11}",
+                "arm", "hot before", "list before", "write ms", "hot after", "list after"
+            );
+            for (label, before_hot, before_all, write_ms, after_hot, after_all) in &report {
+                println!(
+                    "  {label:<22} {before_hot:>8.3} ms {before_all:>8.3} ms \
+                     {write_ms:>8.1} ms {after_hot:>8.3} ms {after_all:>8.3} ms"
+                );
+            }
+
+            if let [(_, one_before, _, one_write, one_after, _), (_, many_before, _, many_write, many_after, _)] =
+                report.as_slice()
+            {
+                let (one_before, one_write, one_after) = (*one_before, *one_write, *one_after);
+                let (many_before, many_write, many_after) =
+                    (*many_before, *many_write, *many_after);
+                println!(
+                    "  hot read after churn: {:.3} -> {:.3} ms ({:.2}x)",
+                    one_after,
+                    many_after,
+                    one_after / many_after.max(0.0001)
+                );
+                println!(
+                    "  write throughput:     {:.0} -> {:.0} ms ({:.2}x)",
+                    one_write,
+                    many_write,
+                    one_write / many_write.max(0.0001)
+                );
+                println!(
+                    "  read before churn:    {:.3} -> {:.3} ms (sharded overhead {:.2}x)",
+                    one_before,
+                    many_before,
+                    many_before / one_before.max(0.0001)
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "manual benchmark: MVCC version depth and its effect on reads"]
+    fn db_bench_mvcc_history() {
+        let hot = env_u64("BENCH_MVCC_HOT", 20_000).max(1);
+        let churn = env_u64("BENCH_MVCC_CHURN", 100_000);
+        let chunk = env_u64("BENCH_MVCC_CHUNK", 5_000);
+        let gc_threshold = env_u64("BENCH_MVCC_GC_THRESHOLD", 1_024).max(1) as i64;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            println!(
+                "\nBENCH mvcc history: {hot} rows on the hot tag, \
+                 {churn} churn rows in {chunk}-row chunks"
+            );
+
+            let path = bench_db_path("mvcc-history");
+            bench_remove(&path);
+            let db = Builder::new_local(&path.to_string_lossy())
+                .experimental_mvcc_passive_checkpoint(true)
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.pragma_update("journal_mode", "'mvcc'").await.unwrap();
+            // The checkpoint threshold is the size of the logical log (in
+            // bytes) that triggers a checkpoint. Left alone it is 4,120,000.
+            // Lowering it makes the engine materialize committed rows into
+            // the b-tree more often, which is the suspected cause of the
+            // recovery at the end of the run.
+            let ckpt_threshold = env_u64("BENCH_MVCC_CKPT_THRESHOLD", 0);
+            if ckpt_threshold > 0 {
+                conn.execute_batch(&format!(
+                    "PRAGMA mvcc_checkpoint_threshold = {ckpt_threshold};"
+                ))
+                .await
+                .unwrap();
+                println!(
+                    "    (mvcc_checkpoint_threshold set to {ckpt_threshold}, \
+                     default is 4120000)"
+                );
+            }
+            conn.execute_batch(
+                "CREATE TABLE Relationship (
+                     file_id INTEGER NOT NULL,
+                     tag_id INTEGER NOT NULL,
+                     PRIMARY KEY (tag_id, file_id));",
+            )
+            .await
+            .unwrap();
+
+            // Seed the hot tag's posting list.
+            for start in (0..hot).step_by(SQL_CHUNK_SIZE) {
+                let end = (start + SQL_CHUNK_SIZE as u64).min(hot);
+                let holders: Vec<String> = (start..end).map(|_| "(?, ?)".to_string()).collect();
+                let mut params: Vec<Value> = Vec::new();
+                for file_id in start..end {
+                    params.push(Value::from(file_id as i64 + 1));
+                    params.push(Value::from(1i64));
+                }
+                conn.execute(
+                    format!(
+                        "INSERT INTO Relationship (file_id, tag_id) VALUES {}",
+                        holders.join(", ")
+                    ),
+                    params_from_iter(params),
+                )
+                .await
+                .unwrap();
+            }
+
+            // The read under test: the hot tag's whole posting list.
+            async fn measure(conn: &Connection, label: &str) -> f64 {
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    let started = Instant::now();
+                    let mut rows = conn
+                        .query(
+                            "SELECT file_id FROM Relationship WHERE tag_id = 1;",
+                            (),
+                        )
+                        .await
+                        .unwrap();
+                    while let Ok(Some(_)) = rows.next().await {}
+                    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+                    if elapsed < best {
+                        best = elapsed;
+                    }
+                }
+                println!("    {label:<44} {best:>9.3} ms");
+                best
+            }
+
+            let baseline = measure(&conn, "baseline (no churn)").await;
+
+            // Churn in chunks, measuring the read as the versions pile up.
+            let mut file_id = hot + 1;
+            let mut inserted = 0u64;
+            let mut write_ms = 0.0f64;
+            let mut series: Vec<(u64, f64)> = Vec::new();
+            while inserted < churn {
+                let n = chunk.min(churn - inserted);
+                let holders: Vec<String> = (0..n).map(|_| "(?, ?)".to_string()).collect();
+                let mut params: Vec<Value> = Vec::new();
+                for _ in 0..n {
+                    params.push(Value::from(file_id as i64));
+                    params.push(Value::from(1i64));
+                    file_id += 1;
+                }
+                let started = Instant::now();
+                conn.execute(
+                    format!(
+                        "INSERT INTO Relationship (file_id, tag_id) VALUES {}",
+                        holders.join(", ")
+                    ),
+                    params_from_iter(params),
+                )
+                .await
+                .unwrap();
+                write_ms += started.elapsed().as_secs_f64() * 1_000.0;
+                inserted += n;
+                let elapsed = measure(
+                    &conn,
+                    &format!("after {inserted} churn rows ({write_ms:.0} ms written)"),
+                )
+                .await;
+                series.push((inserted, elapsed));
+            }
+
+            // Now try to pull it back: drop the GC threshold and let a few
+            // more writes trigger the incremental passes. The write cost is
+            // timed separately here, because a more aggressive GC is not free
+            // -- it has to walk chains on the commit path.
+            conn.execute_batch(&format!("PRAGMA mvcc_gc_threshold = {gc_threshold};"))
+                .await
+                .unwrap();
+            println!(
+                "    (mvcc_gc_threshold set to {gc_threshold}, default is 16384)"
+            );
+            let mut gc_write_ms = 0.0f64;
+            let mut gc_rows = 0u64;
+            for _ in 0..8 {
+                let holders: Vec<String> = (0..chunk).map(|_| "(?, ?)".to_string()).collect();
+                let mut params: Vec<Value> = Vec::new();
+                for _ in 0..chunk {
+                    params.push(Value::from(file_id as i64));
+                    params.push(Value::from(1i64));
+                    file_id += 1;
+                }
+                let started = Instant::now();
+                conn.execute(
+                    format!(
+                        "INSERT INTO Relationship (file_id, tag_id) VALUES {}",
+                        holders.join(", ")
+                    ),
+                    params_from_iter(params),
+                )
+                .await
+                .unwrap();
+                gc_write_ms += started.elapsed().as_secs_f64() * 1_000.0;
+                gc_rows += chunk;
+            }
+            let after_gc = measure(&conn, "after aggressive GC + 8 more chunks").await;
+
+            let worst = series.last().map(|(_, v)| *v).unwrap_or(0.0);
+            let rows_now = hot + churn + gc_rows;
+            println!(
+                "    baseline {baseline:.3} ms -> worst {worst:.3} ms \
+                 -> after GC {after_gc:.3} ms"
+            );
+            println!(
+                "    write cost: {:.2} us/row at the default threshold, \
+                 {:.2} us/row at mvcc_gc_threshold = {gc_threshold}",
+                write_ms * 1_000.0 / churn as f64,
+                gc_write_ms * 1_000.0 / gc_rows as f64,
+            );
+            println!(
+                "    per-row read cost: baseline {:.2} us/row (20k rows), \
+                 after GC {:.2} us/row ({rows_now} rows)",
+                baseline * 1_000.0 / hot as f64,
+                after_gc * 1_000.0 / rows_now as f64,
+            );
+        });
+    }
+
+    /// The search path end to end, on both relationship stores.
+    ///
+    /// The relationship-scale bench measures the store primitives. This one
+    /// drives the actual entry points the UI calls -- `search_db_files` and
+    /// `search_db_files_count` -- because the plan those produce is not the
+    /// same as the primitive's: the planner picks the rarest single-tag holder
+    /// as the driving scan and turns every other holder into an `EXISTS`
+    /// predicate, so the cost depends on how many holders a query has and which
+    /// of them is rarest.
+    ///
+    /// Four query shapes, in increasing cost:
+    ///
+    /// * `single` -- one tag, the common "show me files tagged X".
+    /// * `and2` -- two tags, both required.
+    /// * `and3` -- three tags, the shape a real multi-facet search produces.
+    /// * `and2_not1` -- two required and one excluded, which is the most
+    ///   predicates and therefore the most probes per candidate row.
+    ///
+    /// Each is run as a row fetch and as a count, since the count walks the
+    /// same scan but aggregates.
+    ///
+    /// ```text
+    /// BENCH_SEARCH_FILES=40000 BENCH_SEARCH_TAGS=400 \
+    ///     cargo test --release --lib db::turso::bench::tests::db_bench_search_path \
+    ///     -- --ignored --nocapture
+    /// ```
+    /// The plan behind `search_db_files` vs `search_db_files_count`.
+    ///
+    /// The count path takes `row_select`, appends the predicates, adds
+    /// `LIMIT COUNT_SCAN_CAP + 1` and wraps it in `SELECT COUNT(*) FROM (...)`.
+    /// That drops the `ORDER BY` the row fetch carries, so the two statements
+    /// are not the same scan with a different projection -- the count loses the
+    /// index-ordered early termination and has to materialize the whole match
+    /// set. The bench shows the cost (10x on an AND-2 query); this prints the
+    /// plans so the difference is attributable rather than inferred.
+    /// A/B the count statement against the old wrapped form, in one process.
+    ///
+    /// The whole point is that the two forms are measured against the *same*
+    /// warm fixture. Running them as separate processes -- or back to back
+    /// after a reseed -- makes the comparison meaningless at scale: a 3.3M-file
+    /// fixture is larger than what stays comfortably cached alongside a
+    /// multi-GB writer, so page-cache state and machine load dominate the
+    /// difference and two identical runs can disagree by 3x.
+    ///
+    /// Here the fixture is seeded once, then the old and new statements are
+    /// alternated for several rounds, and each form reports the *minimum*
+    /// across rounds. Alternating means both forms pay the same cache
+    /// conditions on average, and the minimum discards a round that was
+    /// interrupted by something outside the measurement.
+    ///
+    /// ```text
+    /// BENCH_AB_FILES=2000000 BENCH_AB_TAGS=400 BENCH_AB_ROUNDS=5 \
+    ///     cargo test --release --lib db::turso::bench::tests::db_bench_count_ab \
+    ///     -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "manual benchmark: count statement old vs new, same fixture"]
+    fn db_bench_count_ab() {
+        let files = env_u64("BENCH_AB_FILES", 500_000).max(1);
+        let tags = env_u64("BENCH_AB_TAGS", 200).max(2);
+        let tags_per_file = env_u64("BENCH_AB_TAGS_PER_FILE", 6).max(1);
+        let rounds = env_u64("BENCH_AB_ROUNDS", 5).max(1);
+        let arms = env_u64("BENCH_ARMS", 32).max(1) as usize;
+        let cap = TursoDatabase::COUNT_SCAN_CAP + 1;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            println!(
+                "\nBENCH count A/B: {files} files, {tags} tags, \
+                 {tags_per_file} tags/file, {rounds} rounds"
+            );
+
+            let path = bench_db_path("count-ab");
+            bench_remove(&path);
+            let should_exit = Arc::new(AtomicBool::new(false));
+            let db = TursoDatabase::new_with_exit(&path, should_exit).await;
+            let conn = db.connect().unwrap();
+            {
+                let c = db.connect().unwrap();
+                for (name, value) in [
+                    ("relationship_write_mode", "dual"),
+                    ("relationship_read_mode", "flat"),
+                ] {
+                    db.setting_set(
+                        &c,
+                        shared_types::DbSettingsObj {
+                            name: name.into(),
+                            description: None,
+                            num: None,
+                            param: Some(value.into()),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+
+            let mut ns_set = HashSet::new();
+            for ns in 0..arms {
+                ns_set.insert(GenericNamespaceObj {
+                    name: format!("ab_ns_{ns}"),
+                    description: None,
+                });
+            }
+            db.namespace_ensure_set(&ns_set).await.unwrap();
+
+            let storage_id = db
+                .file_storage_location_get_or_create(&conn, "ab_store")
+                .await
+                .unwrap();
+            let file_objs: Vec<FileInternal> = (0..files)
+                .map(|i| FileInternal {
+                    id: None,
+                    hash: format!("ab{i:09}"),
+                    extension: "jpg".into(),
+                    storage_id,
+                    size_bytes: Some(1),
+                })
+                .collect();
+            let inserted = db.file_add_bulk(&conn, &file_objs).await.unwrap();
+            let file_ids: Vec<u64> = {
+                let mut v: Vec<u64> = inserted.iter().map(|f| f.id.unwrap()).collect();
+                v.sort_unstable();
+                v
+            };
+
+            let mut tag_ids: Vec<u64> = Vec::with_capacity(tags as usize);
+            for t in 0..tags {
+                let set = db
+                    .tag_add_bulk(
+                        &conn,
+                        &HashSet::from([Tag {
+                            name: format!("ab_tag_{t}"),
+                            namespace: GenericNamespaceObj {
+                                name: format!("ab_ns_{}", (t as usize) % arms),
+                                description: None,
+                            },
+                        }]),
+                    )
+                    .await
+                    .unwrap();
+                tag_ids.push(set.iter().next().unwrap().id as u64);
+            }
+
+            // Contiguous tag runs, so adjacent tags co-occur and an AND query
+            // has a real intersection to compute.
+            let rels: HashSet<(u64, u64)> = file_ids
+                .iter()
+                .enumerate()
+                .flat_map(|(i, f)| {
+                    let t = tag_ids.clone();
+                    (0..tags_per_file as usize).map(move |k| (*f, t[(i + k) % tags as usize]))
+                })
+                .collect();
+            let deltas = db.relationships_bulk_add(&conn, &rels).await.unwrap();
+            db.tag_counts_apply(&deltas, &HashMap::new()).await.unwrap();
+
+            let mid = (tags / 2) as usize;
+            let pick = |offset: usize| tag_ids[(mid + offset) % tags as usize];
+
+            // The two statements, for an AND-2 query.
+            let search = SearchObj {
+                search_relate: None,
+                searches: vec![SearchHolder::And(vec![pick(0), pick(1)])],
+            };
+            let (row_sql, _, conditions, _) =
+                db.build_search_parts(&conn, &search).await.unwrap().unwrap();
+
+            let mut inner = row_sql.clone();
+            for condition in &conditions {
+                inner.push_str(condition);
+            }
+            // The old form: wrap the row select and LIMIT the outer count.
+            let old_sql = format!("SELECT COUNT(*) FROM ({inner} LIMIT {cap})");
+            // The new form: constant projection on the driver, LIMIT inside.
+            let from_at = inner.find(" FROM ").map(|at| at + " FROM ".len()).unwrap_or(0);
+            let new_sql = format!(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM {} LIMIT {cap})",
+                &inner[from_at..]
+            );
+
+            let run = |sql: String, conn: Connection| {
+                Box::pin(async move {
+                    let mut best = f64::MAX;
+                    let mut last = 0i64;
+                    for _ in 0..rounds {
+                        let t0 = Instant::now();
+                        let mut rows = conn.query(&sql, ()).await.unwrap();
+                        let mut n = 0i64;
+                        while let Ok(Some(row)) = rows.next().await {
+                            n = row.get(0).unwrap_or(0);
+                        }
+                        let elapsed = t0.elapsed().as_secs_f64() * 1_000.0;
+                        best = best.min(elapsed);
+                        last = n;
+                    }
+                    (best, last)
+                })
+            };
+
+            let (old_ms, old_n) = run(old_sql.clone(), conn.clone()).await;
+            let (new_ms, new_n) = run(new_sql.clone(), conn.clone()).await;
+
+            println!("  old (wrapped row select): {old_ms:>10.3} ms   -> {old_n}");
+            println!("  new (capped aggregate):   {new_ms:>10.3} ms   -> {new_n}");
+            if old_ms > 0.0 {
+                println!("  ratio old/new: {:.2}x", old_ms / new_ms.max(0.001));
+            }
+            if old_n != new_n {
+                println!(
+                    "  WARNING: the two forms disagree ({old_n} vs {new_n}); \
+                     the cap or the count is wrong"
+                );
+            }
+            println!("  (min of {rounds} rounds each, same warm fixture)");
+        });
+    }
+
+    #[test]
+    #[ignore = "manual: print the search row vs count plans"]
+    fn db_bench_search_count_plan() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = bench_db_path("searchplan");
+            bench_remove(&path);
+            let should_exit = Arc::new(AtomicBool::new(false));
+            let db = TursoDatabase::new_with_exit(&path, should_exit).await;
+            let conn = db.connect().unwrap();
+            {
+                let c = db.connect().unwrap();
+                for (name, value) in [
+                    ("relationship_write_mode", "dual"),
+                    ("relationship_read_mode", "flat"),
+                ] {
+                    db.setting_set(
+                        &c,
+                        shared_types::DbSettingsObj {
+                            name: name.into(),
+                            description: None,
+                            num: None,
+                            param: Some(value.into()),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            db.namespace_ensure_set(&HashSet::from([GenericNamespaceObj {
+                name: "plan_ns".into(),
+                description: None,
+            }]))
+            .await
+            .unwrap();
+            let storage_id = db
+                .file_storage_location_get_or_create(&conn, "plan_store")
+                .await
+                .unwrap();
+            let objs: Vec<FileInternal> = (0..2_000)
+                .map(|i| FileInternal {
+                    id: None,
+                    hash: format!("plan{i:06}"),
+                    extension: "jpg".into(),
+                    storage_id,
+                    size_bytes: Some(1),
+                })
+                .collect();
+            let inserted = db.file_add_bulk(&conn, &objs).await.unwrap();
+            let file_ids: Vec<u64> = {
+                let mut v: Vec<u64> = inserted.iter().map(|f| f.id.unwrap()).collect();
+                v.sort_unstable();
+                v
+            };
+            let mut tag_ids = Vec::new();
+            for t in 0..4u64 {
+                let set = db
+                    .tag_add_bulk(
+                        &conn,
+                        &HashSet::from([Tag {
+                            name: format!("plan_tag_{t}"),
+                            namespace: GenericNamespaceObj {
+                                name: "plan_ns".into(),
+                                description: None,
+                            },
+                        }]),
+                    )
+                    .await
+                    .unwrap();
+                tag_ids.push(set.iter().next().unwrap().id as u64);
+            }
+            let rels: HashSet<(u64, u64)> = file_ids
+                .iter()
+                .enumerate()
+                .flat_map(|(i, f)| {
+                    let tags = tag_ids.clone();
+                    (0..3u64).map(move |k| (*f, tags[(i + k as usize) % 4]))
+                })
+                .collect();
+            let deltas = db.relationships_bulk_add(&conn, &rels).await.unwrap();
+            db.tag_counts_apply(&deltas, &HashMap::new()).await.unwrap();
+
+            let search = SearchObj {
+                search_relate: None,
+                searches: vec![SearchHolder::And(vec![tag_ids[0], tag_ids[1]])],
+            };
+
+            // The row statement exactly as `build_search_sql` assembles it.
+            let row_sql = db
+                .build_search_sql(&conn, &search, &Some(50), &None)
+                .await
+                .unwrap()
+                .unwrap();
+
+            // The count statement exactly as `search_db_files_count` assembles
+            // it now: the aggregate the builder produces, plus the predicates.
+            let (_, count_select, conditions, _) =
+                db.build_search_parts(&conn, &search).await.unwrap().unwrap();
+            let mut count_sql = count_select.clone();
+            for condition in &conditions {
+                count_sql.push_str(condition);
+            }
+            // And the *old* wrapping form, so the two plans are side by side.
+            let row_select = db
+                .build_search_parts(&conn, &search)
+                .await
+                .unwrap()
+                .unwrap()
+                .0;
+            let mut old_inner = row_select.clone();
+            for condition in &conditions {
+                old_inner.push_str(condition);
+            }
+            old_inner.push_str(&format!(" LIMIT {}", TursoDatabase::COUNT_SCAN_CAP + 1));
+            let old_count_sql = format!("SELECT COUNT(*) FROM ({old_inner})");
+
+            println!("\nBENCH search plan: AND-2 over {} files", file_ids.len());
+            for (label, sql) in [
+                ("row (search_db_files)", &row_sql),
+                ("count (new: aggregate)", &count_sql),
+                ("count (old: wrapped row)", &old_count_sql),
+            ] {
+                println!("  {label}:");
+                let mut rows = conn
+                    .query(&format!("EXPLAIN QUERY PLAN {sql}"), ())
+                    .await
+                    .unwrap();
+                while let Ok(Some(row)) = rows.next().await {
+                    let detail: String = row.get(3).unwrap_or_default();
+                    println!("    {detail}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "manual benchmark: search_db_files / _count on both stores"]
+    fn db_bench_search_path() {
+        let files = env_u64("BENCH_SEARCH_FILES", 20_000).max(10);
+        let tags = env_u64("BENCH_SEARCH_TAGS", 200).max(10);
+        let iters = env_u64("BENCH_SEARCH_ITERS", 9).max(1);
+        // Tags per file. Low enough that a tag's posting list is a meaningful
+        // fraction of the library, high enough that multi-holder queries have
+        // real intersections to compute.
+        let tags_per_file = env_u64("BENCH_SEARCH_TAGS_PER_FILE", 6).max(1);
+        let arms = env_u64("BENCH_ARMS", 32).max(1) as usize;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            println!(
+                "\nBENCH search path: {files} files, {tags} tags, \
+                 {tags_per_file} tags/file, {arms} partitions"
+            );
+
+            // `BENCH_SEARCH_MODE=flat|legacy|both` selects which store to
+            // measure. A 20M-row fixture takes long enough to seed that
+            // re-running it for the second store is its own cost, and a run
+            // that dies mid-way through the second pass would otherwise lose
+            // both.
+            let mode = std::env::var("BENCH_SEARCH_MODE")
+                .unwrap_or_else(|_| "both".to_string());
+            let variants: Vec<(&str, &str)> = match mode.as_str() {
+                "flat" => vec![("flat", "flat")],
+                "legacy" => vec![("legacy", "legacy")],
+                _ => vec![("flat", "flat"), ("legacy", "legacy")],
+            };
+            for (label, read_mode) in variants {
+                let path = bench_db_path(&format!("searchpath-{label}"));
+                bench_remove(&path);
+                let should_exit = Arc::new(AtomicBool::new(false));
+                let db = TursoDatabase::new_with_exit(&path, should_exit).await;
+                let conn = db.connect().unwrap();
+
+                // Both stores get written, so the two read modes see identical
+                // data and the comparison is about the read plan alone.
+                {
+                    let c = db.connect().unwrap();
+                    for (name, value) in [
+                        ("relationship_write_mode", "dual"),
+                        ("relationship_read_mode", read_mode),
+                    ] {
+                        db.setting_set(
+                            &c,
+                            shared_types::DbSettingsObj {
+                                name: name.into(),
+                                description: None,
+                                num: None,
+                                param: Some(value.into()),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+
+                // Namespaces: one per partition, so the legacy store has to
+                // probe a different table per tag.
+                let mut ns_set = HashSet::new();
+                for ns in 0..arms {
+                    ns_set.insert(GenericNamespaceObj {
+                        name: format!("sbench_ns_{ns}"),
+                        description: None,
+                    });
+                }
+                db.namespace_ensure_set(&ns_set).await.unwrap();
+
+                let storage_id = db
+                    .file_storage_location_get_or_create(&conn, "sbench_store")
+                    .await
+                    .unwrap();
+                let file_objs: Vec<FileInternal> = (0..files)
+                    .map(|i| FileInternal {
+                        id: None,
+                        hash: format!("sbench{i:08}"),
+                        extension: "jpg".into(),
+                        storage_id,
+                        size_bytes: Some(1),
+                    })
+                    .collect();
+                let inserted = db.file_add_bulk(&conn, &file_objs).await.unwrap();
+                let file_ids: Vec<u64> = {
+                    let mut v: Vec<u64> = inserted.iter().map(|f| f.id.unwrap()).collect();
+                    v.sort_unstable();
+                    v
+                };
+
+                // Tags laid out round-robin across namespaces, so a tag's
+                // namespace is a stable function of its index.
+                let mut tag_ids: Vec<u64> = Vec::with_capacity(tags as usize);
+                for t in 0..tags {
+                    let ns_idx = (t as usize) % arms;
+                    let tag = Tag {
+                        name: format!("sbench_tag_{t}"),
+                        namespace: GenericNamespaceObj {
+                            name: format!("sbench_ns_{ns_idx}"),
+                            description: None,
+                        },
+                    };
+                    let set = db.tag_add_bulk(&conn, &HashSet::from([tag])).await.unwrap();
+                    tag_ids.push(set.iter().next().unwrap().id as u64);
+                }
+
+                // Each file gets a *contiguous* run of tags. This matters: a
+                // strided assignment (`i + k*7`) makes two adjacent tags almost
+                // never co-occur, so an AND query over them matches nothing and
+                // the bench measures an empty worst case instead of a real
+                // intersection. Contiguous runs mean tag t and tag t+1 share
+                // every file whose run spans both, which is what a real
+                // multi-facet search looks like.
+                let mut rels: HashSet<(u64, u64)> = HashSet::new();
+                for (i, file_id) in file_ids.iter().enumerate() {
+                    for k in 0..tags_per_file {
+                        let tag_id = tag_ids[((i as u64 + k) % tags) as usize];
+                        rels.insert((*file_id, tag_id));
+                    }
+                }
+                let deltas = db.relationships_bulk_add(&conn, &rels).await.unwrap();
+                db.tag_counts_apply(&deltas, &HashMap::new()).await.unwrap();
+
+                // The query shapes. Pick tags from the middle of the list so
+                // they are neither the first nor the last seeded.
+                let mid = (tags / 2) as usize;
+                let pick = |offset: usize| tag_ids[(mid + offset) % tags as usize];
+                let shapes: Vec<(&str, SearchObj)> = vec![
+                    (
+                        "single",
+                        SearchObj {
+                            search_relate: None,
+                            searches: vec![SearchHolder::And(vec![pick(0)])],
+                        },
+                    ),
+                    (
+                        "and2",
+                        SearchObj {
+                            search_relate: None,
+                            searches: vec![SearchHolder::And(vec![pick(0), pick(1)])],
+                        },
+                    ),
+                    (
+                        "and3",
+                        SearchObj {
+                            search_relate: None,
+                            searches: vec![SearchHolder::And(vec![pick(0), pick(1), pick(2)])],
+                        },
+                    ),
+                    (
+                        "and2_not1",
+                        SearchObj {
+                            search_relate: None,
+                            searches: vec![
+                                SearchHolder::And(vec![pick(0), pick(1)]),
+                                SearchHolder::Not(vec![pick(3)]),
+                            ],
+                        },
+                    ),
+                ];
+
+                println!("  {label} (read_mode={read_mode}):");
+                for (shape, search) in &shapes {
+                    // Warm, then best-of-N.
+                    let mut rows_ms = f64::MAX;
+                    let mut count_ms = f64::MAX;
+                    let mut matched = 0usize;
+                    for iter in 0..iters {
+                        let t0 = Instant::now();
+                        let rows = db
+                            .search_db_files(&conn, search, &Some(50), &None)
+                            .await
+                            .unwrap();
+                        let row_elapsed = t0.elapsed().as_secs_f64() * 1_000.0;
+                        if iter == 0 {
+                            matched = rows.len();
+                        }
+
+                        let t1 = Instant::now();
+                        let total = db
+                            .search_db_files_count(&conn, search)
+                            .await
+                            .unwrap();
+                        let count_elapsed = t1.elapsed().as_secs_f64() * 1_000.0;
+                        if iter == 0 {
+                            assert!(
+                                total >= matched as u64,
+                                "{shape}: count {total} must be at least the paged rows {matched}"
+                            );
+                        }
+
+                        if iter > 0 {
+                            rows_ms = rows_ms.min(row_elapsed);
+                            count_ms = count_ms.min(count_elapsed);
+                        }
+                    }
+                    println!(
+                        "    {shape:<10} rows(LIMIT 50) {rows_ms:>8.3} ms   \
+                         count {count_ms:>8.3} ms   ({matched} rows paged)"
+                    );
+                }
+            }
+        });
+    }
+
 }

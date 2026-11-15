@@ -909,6 +909,55 @@ pub fn import_file_async(
 ) -> impl std::future::Future<Output = Result<String, Box<dyn std::error::Error + Send + Sync>>> {
     crate::init_data_request_async(crate::SupportedDBRequests::ImportFile(path, action))
 }
+/// Deletes a file from the library.
+///
+/// Returns `(deleted, path_removed)`. `deleted` is false when the id was
+/// already gone, which is a normal answer rather than an error — two
+/// reviewers deleting the same duplicate should not make the second an
+/// error.
+///
+/// `delete_from_disk` is passed through rather than decided here: the DB row
+/// and the bytes are separable, and the caller is the one that knows whether
+/// the reviewer wanted the file gone from the index or from the disk too.
+///
+/// Relationships and `FileHashes` are removed regardless of the disk flag, so
+/// a file left on disk stops showing up in searches and tag pages.
+///
+#[allow(clippy::too_many_arguments)]
+pub fn delete_file(
+    file_id: u64,
+    delete_from_disk: bool,
+) -> Result<(bool, bool), Box<dyn std::error::Error>> {
+    crate::init_data_request(crate::SupportedDBRequests::DeleteFile(
+        file_id,
+        delete_from_disk,
+    ))
+}
+/// Deletes a file from the library.
+///
+/// Returns `(deleted, path_removed)`. `deleted` is false when the id was
+/// already gone, which is a normal answer rather than an error — two
+/// reviewers deleting the same duplicate should not make the second an
+/// error.
+///
+/// `delete_from_disk` is passed through rather than decided here: the DB row
+/// and the bytes are separable, and the caller is the one that knows whether
+/// the reviewer wanted the file gone from the index or from the disk too.
+///
+/// Relationships and `FileHashes` are removed regardless of the disk flag, so
+/// a file left on disk stops showing up in searches and tag pages.
+///
+#[allow(clippy::too_many_arguments)]
+pub fn delete_file_async(
+    file_id: u64,
+    delete_from_disk: bool,
+) -> impl std::future::Future<Output = Result<(bool, bool), Box<dyn std::error::Error + Send + Sync>>>
+{
+    crate::init_data_request_async(crate::SupportedDBRequests::DeleteFile(
+        file_id,
+        delete_from_disk,
+    ))
+}
 /// Runs one CLI command (the words one would type after `intscrape` in a
 /// terminal) against this database, returning everything the command
 /// prints. Failures come back as `error: ...` lines.

@@ -19,6 +19,23 @@ async fn new_test_db() -> Arc<TursoDatabase> {
 async fn put_tags_to_file_creates_namespace_partition_without_ddl_error() {
     let db = new_test_db().await;
 
+    // This asserts the relationship landed in the namespace's partition, so it
+    // needs the dual store; the shipped default writes only the flat table.
+    {
+        let conn = db.connect().unwrap();
+        db.setting_set(
+            &conn,
+            shared_types::DbSettingsObj {
+                name: "relationship_write_mode".into(),
+                description: None,
+                num: None,
+                param: Some("dual".into()),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
     let conn = db.connect().unwrap();
     let storage_id = db
         .file_storage_location_get_or_create(&conn, "test_storage")

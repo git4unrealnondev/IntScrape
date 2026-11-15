@@ -17,6 +17,40 @@ async fn new_test_db() -> Arc<TursoDatabase> {
     TursoDatabase::new_with_exit(&db_path, should_exit).await
 }
 
+
+/// Forces the legacy partition store for a test that asserts on
+/// `Relationship_{ns}` directly, or that exercises the union read path.
+///
+/// The default is `single` (flat table only), so a test about the partitions
+/// has to say so explicitly rather than inheriting whatever the default
+/// happens to be.
+async fn use_legacy_store(db: &TursoDatabase, conn: &Connection) {
+    db.setting_set(
+        conn,
+        shared_types::DbSettingsObj {
+            name: "relationship_write_mode".into(),
+            description: None,
+            num: None,
+            param: Some("legacy".into()),
+        },
+    )
+    .await
+    .unwrap();
+    db.setting_set(
+        conn,
+        shared_types::DbSettingsObj {
+            name: "relationship_read_mode".into(),
+            description: None,
+            num: None,
+            param: Some("legacy".into()),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+
+
 // ---------------------------------------------------------------------
 // Relationship write-path scale bench.
 //
@@ -266,6 +300,9 @@ async fn file_to_tag_lookup_pushes_its_filter_into_every_namespace_arm() {
 
     let db = new_test_db().await;
     let conn = db.connect().unwrap();
+    // This test is about the union's plan, so it must run against the
+    // partitions rather than the flat table.
+    use_legacy_store(&db, &conn).await;
 
     let mut ns_set = HashSet::new();
     for name in NAMESPACES {
@@ -535,6 +572,9 @@ async fn bulk_delete_handles_sets_far_past_the_expression_depth_limit() {
 
     let db = new_test_db().await;
     let conn = db.connect().unwrap();
+    // This test counts rows in `Relationship_1` directly, so it is about the
+    // legacy partition store.
+    use_legacy_store(&db, &conn).await;
 
     let mut tag_ids: Vec<u64> = Vec::new();
     for t in 0..TAGS {
@@ -829,4 +869,310 @@ async fn count_fold_in_only_writes_shadow_when_membership_changes() {
         db.tags_search_fts("straypop", 10).await.unwrap().is_empty(),
         "a non-crossing delta must still evict a wrongly-present shadow row"
     );
+}
+
+
+// ---------------------------------------------------------------------
+// The v15 flat relationship table.
+//
+// The per-namespace partitions were introduced to make the *import* path
+// filter rows per namespace without a full scan; they never helped the read
+// path, because a file's tags can live in any namespace and so every
+// partition had to be probed anyway. The flat table replaces the union with
+// one seek. These pin the two things that must not regress: a write lands in
+// both stores while the mode says `dual`, and flipping the read mode gives
+// the same answers from either.
+// ---------------------------------------------------------------------
+
+/// Creates `count` files in one namespace and returns their ids.
+async fn seed_files(db: &TursoDatabase, conn: &Connection, count: u64) -> Vec<u64> {
+    let storage_id = db
+        .file_storage_location_get_or_create(conn, "flatstore")
+        .await
+        .unwrap();
+    let objs: Vec<FileInternal> = (0..count)
+        .map(|i| FileInternal {
+            id: None,
+            hash: format!("flatstore{i:06}"),
+            extension: "jpg".into(),
+            storage_id,
+            size_bytes: Some(1),
+        })
+        .collect();
+    let inserted = db.file_add_bulk(conn, &objs).await.unwrap();
+    let mut ids: Vec<u64> = inserted.iter().map(|f| f.id.unwrap()).collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// Resolves a tag name in a namespace to its id, creating it if needed.
+async fn tag_id(db: &TursoDatabase, conn: &Connection, name: &str, namespace: &str) -> u64 {
+    let tags = HashSet::from([Tag {
+        name: name.into(),
+        namespace: GenericNamespaceObj {
+            name: namespace.into(),
+            description: None,
+        },
+    }]);
+    db.tag_add_bulk(conn, &tags)
+        .await
+        .unwrap()
+        .iter()
+        .next()
+        .unwrap()
+        .id as u64
+}
+
+/// A write in `dual` mode must land in both the flat table and the legacy
+/// partition, and the flat table must carry the tag's namespace so a
+/// per-namespace read and the recount stay correct.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dual_write_populates_both_the_flat_table_and_the_partition() {
+    let db = new_test_db().await;
+    let conn = db.connect().unwrap();
+    db.namespace_ensure_set(&HashSet::from([GenericNamespaceObj {
+        name: "dualtest".into(),
+        description: None,
+    }]))
+    .await
+    .unwrap();
+
+    // The default is `single`, so `dual` has to be selected explicitly: this
+    // test is about the dual path, not the default.
+    db.setting_set(
+        &conn,
+        shared_types::DbSettingsObj {
+            name: "relationship_write_mode".into(),
+            description: None,
+            num: None,
+            param: Some("dual".into()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let file_id = seed_files(&db, &conn, 1).await[0];
+    let tag_id = tag_id(&db, &conn, "dualtag", "dualtest").await;
+    let namespace_id = db.tag_namespace_id(&conn, tag_id).await.unwrap().unwrap();
+
+    db.relationships_bulk_add(&conn, &HashSet::from([(file_id, tag_id)]))
+        .await
+        .unwrap();
+
+    // Flat row, with the namespace denormalized onto it.
+    let mut rows = conn
+        .query(
+            "SELECT namespace FROM Relationship WHERE file_id = ?1 AND tag_id = ?2;",
+            params_from_iter([Value::from(file_id as i64), Value::from(tag_id as i64)]),
+        )
+        .await
+        .unwrap();
+    let flat_namespace: Option<i64> = rows.next().await.unwrap().map(|r| r.get(0).unwrap());
+    assert_eq!(
+        flat_namespace,
+        Some(namespace_id as i64),
+        "the flat row must carry the tag's namespace"
+    );
+
+    // Legacy partition row, kept in step.
+    let mut rows = conn
+        .query(
+            &format!(
+                "SELECT 1 FROM Relationship_{namespace_id} WHERE file_id = ?1 AND tag_id = ?2;"
+            ),
+            params_from_iter([Value::from(file_id as i64), Value::from(tag_id as i64)]),
+        )
+        .await
+        .unwrap();
+    assert!(
+        rows.next().await.unwrap().is_some(),
+        "dual mode must also write the legacy partition"
+    );
+
+    // A delete in dual mode must clear both.
+    db.relationship_bulk_delete(&conn, &HashSet::from([(file_id, tag_id)]))
+        .await
+        .unwrap();
+
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM Relationship WHERE file_id = ?1 AND tag_id = ?2;",
+            params_from_iter([Value::from(file_id as i64), Value::from(tag_id as i64)]),
+        )
+        .await
+        .unwrap();
+    assert!(
+        rows.next().await.unwrap().is_none(),
+        "a dual delete must clear the flat row"
+    );
+    let mut rows = conn
+        .query(
+            &format!(
+                "SELECT 1 FROM Relationship_{namespace_id} WHERE file_id = ?1 AND tag_id = ?2;"
+            ),
+            params_from_iter([Value::from(file_id as i64), Value::from(tag_id as i64)]),
+        )
+        .await
+        .unwrap();
+    assert!(
+        rows.next().await.unwrap().is_none(),
+        "a dual delete must clear the legacy partition"
+    );
+}
+
+/// The default (`single`) must write only the flat table. This is the
+/// behaviour the migration exists for, so it is pinned rather than assumed:
+/// the legacy partition must stay empty, while the flat table and the tag
+/// count still get their rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_write_mode_skips_the_legacy_partition() {
+    let db = new_test_db().await;
+    let conn = db.connect().unwrap();
+    db.namespace_ensure_set(&HashSet::from([GenericNamespaceObj {
+        name: "singletest".into(),
+        description: None,
+    }]))
+    .await
+    .unwrap();
+
+    let file_id = seed_files(&db, &conn, 1).await[0];
+    let tag_id = tag_id(&db, &conn, "single_tag", "singletest").await;
+    let namespace_id = db.tag_namespace_id(&conn, tag_id).await.unwrap().unwrap();
+
+    db.relationships_bulk_add(&conn, &HashSet::from([(file_id, tag_id)]))
+        .await
+        .unwrap();
+
+    // Flat row present.
+    let flat: i64 = {
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM Relationship WHERE file_id = ?1 AND tag_id = ?2;",
+                params_from_iter([Value::from(file_id as i64), Value::from(tag_id as i64)]),
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    assert_eq!(flat, 1, "the flat table must receive the row");
+
+    // Partition untouched.
+    let partition: i64 = {
+        let mut rows = conn
+            .query(
+                &format!("SELECT COUNT(*) FROM Relationship_{namespace_id};"),
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    };
+    assert_eq!(
+        partition, 0,
+        "the default single mode must not write the legacy partition"
+    );
+}
+
+/// Both read modes must answer the same queries. The flat mode is the
+/// default after v15; the legacy mode is what a rollback selects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flat_and_legacy_read_modes_agree() {
+    const NAMESPACES: [&str; 2] = ["flat_ns_a", "flat_ns_b"];
+    const FILES: u64 = 12;
+
+    let db = new_test_db().await;
+    let conn = db.connect().unwrap();
+    let mut ns_set = HashSet::new();
+    for name in NAMESPACES {
+        ns_set.insert(GenericNamespaceObj {
+            name: name.into(),
+            description: None,
+        });
+    }
+    db.namespace_ensure_set(&ns_set).await.unwrap();
+
+    // This test reads back in *both* modes, so the writes have to reach both
+    // stores. The default is `single`, which only writes the flat table.
+    db.setting_set(
+        &conn,
+        shared_types::DbSettingsObj {
+            name: "relationship_write_mode".into(),
+            description: None,
+            num: None,
+            param: Some("dual".into()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let file_ids = seed_files(&db, &conn, FILES).await;
+
+    // Three tags per file, alternating namespace, so both partitions hold
+    // rows and a file's tag set spans them.
+    let mut rels: HashSet<(u64, u64)> = HashSet::new();
+    for (index, file_id) in file_ids.iter().enumerate() {
+        let ns_name = NAMESPACES[index % NAMESPACES.len()];
+        for slot in 0..3 {
+            let tag_id = tag_id(&db, &conn, &format!("flat_tag_{slot}"), ns_name).await;
+            rels.insert((*file_id, tag_id));
+        }
+    }
+    db.relationships_bulk_add(&conn, &rels).await.unwrap();
+
+    let probe_file = file_ids[0];
+    let probe_tag = tag_id(&db, &conn, "flat_tag_0", NAMESPACES[0]).await;
+    let ns_a = db
+        .namespace_get(&conn, NAMESPACES[0])
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Read in flat mode.
+    db.setting_set(
+        &conn,
+        shared_types::DbSettingsObj {
+            name: "relationship_read_mode".into(),
+            description: None,
+            num: None,
+            param: Some("flat".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let flat_tags = db.relationship_get_tag_id(&conn, probe_file).await.unwrap();
+    let flat_first = db.first_file_id_for_tag(&conn, probe_tag).await.unwrap();
+    let flat_files = db.relationship_get_file_id(&conn, probe_tag).await.unwrap();
+    let flat_parents = db.relationship_get_parent_file_id(&conn, probe_tag).await.unwrap();
+    let flat_filtered = db
+        .file_id_get_tag_ids_filtered(&conn, probe_file, ns_a)
+        .await
+        .unwrap_or_default();
+
+    // Read in legacy mode.
+    db.setting_set(
+        &conn,
+        shared_types::DbSettingsObj {
+            name: "relationship_read_mode".into(),
+            description: None,
+            num: None,
+            param: Some("legacy".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let legacy_tags = db.relationship_get_tag_id(&conn, probe_file).await.unwrap();
+    let legacy_first = db.first_file_id_for_tag(&conn, probe_tag).await.unwrap();
+    let legacy_files = db.relationship_get_file_id(&conn, probe_tag).await.unwrap();
+    let legacy_parents = db.relationship_get_parent_file_id(&conn, probe_tag).await.unwrap();
+    let legacy_filtered = db
+        .file_id_get_tag_ids_filtered(&conn, probe_file, ns_a)
+        .await
+        .unwrap_or_default();
+
+    assert_eq!(flat_tags.len(), 3, "every file must see its three tags");
+    assert_eq!(flat_tags, legacy_tags, "file -> tags must agree across modes");
+    assert_eq!(flat_first, legacy_first, "first file for a tag must agree");
+    assert_eq!(flat_files, legacy_files, "tag -> files must agree");
+    assert_eq!(flat_parents, legacy_parents, "parent files must agree");
+    assert_eq!(flat_filtered, legacy_filtered, "filtered tags must agree");
 }

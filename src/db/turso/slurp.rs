@@ -13,6 +13,8 @@ use turso::{Connection, Result, Value, params_from_iter};
 
 use crate::db::SQL_CHUNK_SIZE;
 use crate::db::turso::TursoDatabase;
+use crate::db::turso::relationship::POPULARITY_FOLD_CHUNK;
+use crate::db::turso::relationship_store::ReadMode;
 
 /// Destination batch size for the tags stage. Imported tags arrive in source
 /// id order, which is random relative to the (name, namespace) unique key, so
@@ -1549,7 +1551,7 @@ impl TursoDatabase {
                                 .await?;
                             covering_dropped = true;
                         }
-                        slurp_recount_namespace(&conn, target_namespace).await?;
+                        self.slurp_recount_namespace(&conn, target_namespace).await?;
                         log::info!(
                             "Slurp count recalculation for namespace {} complete in {:?}",
                             target_namespace,
@@ -1749,7 +1751,7 @@ impl TursoDatabase {
                                     .await?;
                                 covering_dropped = true;
                             }
-                            slurp_recount_namespace(&conn, target_namespace).await?;
+                            self.slurp_recount_namespace(&conn, target_namespace).await?;
                             log::info!(
                                 "Slurp count recalculation for namespace {} complete in {:?}",
                                 target_namespace,
@@ -2151,6 +2153,7 @@ impl TursoDatabase {
         relationships: &[(u64, u64)],
     ) -> Result<usize> {
         let mut added = 0_u64;
+        let write_mode = self.relationship_write_mode(conn).await;
         for chunk in relationships.chunks(SLURP_RELATIONSHIP_WRITE_BATCH) {
             let mut holders = Vec::with_capacity(chunk.len());
             let mut params = Vec::with_capacity(chunk.len() * 2);
@@ -2159,16 +2162,54 @@ impl TursoDatabase {
                 params.push(Value::from(file_id as i64));
                 params.push(Value::from(tag_id as i64));
             }
-            added += conn
-                .execute(
-                    format!(
-                        "INSERT OR IGNORE INTO Relationship_{namespace_id} (file_id, tag_id)
-                         VALUES {}",
-                        holders.join(", ")
-                    ),
-                    params_from_iter(params),
-                )
-                .await?;
+            // The flat table is the destination that matters; the legacy
+            // partition is kept in step only while the write mode says so.
+            // Counting the flat insert means a dual write does not double the
+            // reported `added`.
+            if write_mode.writes_flat() {
+                let mut holders = Vec::with_capacity(chunk.len());
+                let mut params = Vec::with_capacity(chunk.len() * 3);
+                for &(file_id, tag_id) in chunk {
+                    holders.push("(?, ?, ?)");
+                    params.push(Value::from(file_id as i64));
+                    params.push(Value::from(tag_id as i64));
+                    params.push(Value::from(namespace_id as i64));
+                }
+                added += conn
+                    .execute(
+                        format!(
+                            "INSERT OR IGNORE INTO Relationship (file_id, tag_id, namespace)
+                             VALUES {}",
+                            holders.join(", ")
+                        ),
+                        params_from_iter(params),
+                    )
+                    .await?;
+            }
+            if write_mode.writes_partitions() {
+                if write_mode.writes_flat() {
+                    conn.execute(
+                        format!(
+                            "INSERT OR IGNORE INTO Relationship_{namespace_id} (file_id, tag_id)
+                             VALUES {}",
+                            holders.join(", ")
+                        ),
+                        params_from_iter(params),
+                    )
+                    .await?;
+                } else {
+                    added += conn
+                        .execute(
+                            format!(
+                                "INSERT OR IGNORE INTO Relationship_{namespace_id} (file_id, tag_id)
+                                 VALUES {}",
+                                holders.join(", ")
+                            ),
+                            params_from_iter(params),
+                        )
+                        .await?;
+                }
+            }
         }
         Ok(added as usize)
     }
@@ -2430,25 +2471,68 @@ fn tag_count_set_sql(counts: &[(u64, u64)]) -> (String, Vec<Value>) {
 /// in a single concurrent transaction. The partition's PRIMARY KEY
 /// (tag_id, file_id) covers the GROUP BY, so it costs one index scan rather
 /// than one probe per Tags row. See `tag_count_set_sql`.
-async fn slurp_recount_namespace(conn: &Connection, namespace_id: u64) -> Result<()> {
+impl TursoDatabase {
+    /// Recomputes a namespace's `Tags.count` from its freshly loaded
+    /// relationships. Zeroing first, then one `GROUP BY` aggregate over tags
+    /// (instead of a correlated `COUNT(*)` per tag) prevents stale counts from
+    /// drifting and runs in a single concurrent transaction. See
+    /// `tag_count_set_sql`.
+    ///
+    /// This is the one `Tags.count` writer that does **not** maintain the
+    /// `Tags_Popular` shadow. The slurp rebuilds the shadow wholesale at the
+    /// end of the run, so that is normally enough, but a crash between a
+    /// recount and that rebuild leaves the shadow stale with nothing to heal
+    /// it: `table_ensure_tags_popular` only checks that the FTS index resolves,
+    /// never that its rows still match `Tags`. `sync_tags_popular` after the
+    /// chunk loop is what closes that window.
+    pub(in crate::db::turso) async fn slurp_recount_namespace(
+        &self,
+        conn: &Connection,
+        namespace_id: u64,
+    ) -> Result<()> {
     // Build the authoritative per-tag counts with one GROUP BY over the freshly
-    // landed partition, then emit every tag in the namespace (zeros included)
-    // as bounded per-chunk updates. A single `UPDATE Tags SET count = 0
-    // WHERE namespace = ?` would sweep the whole 15M-row Tags tree into a new
-    // MVCC image even when only one namespace changes - some fragment shapes
-    // never finish that rematerialization (RSS pins at ~10GB with zero wal).
+    // landed relationships, then emit every tag in the namespace (zeros
+    // included) as bounded per-chunk updates. A single `UPDATE Tags SET count
+    // = 0 WHERE namespace = ?` would sweep the whole 15M-row Tags tree into a
+    // new MVCC image even when only one namespace changes - some fragment
+    // shapes never finish that rematerialization (RSS pins at ~10GB with no
+    // wal).
+    //
+    // Which store to count from follows the *read* mode, because that is what
+    // decides where the live rows are. Under the shipped `single` mode the flat
+    // table holds them and the partitions are frozen at their pre-migration
+    // contents, so counting a partition would resurrect deleted relationships
+    // and zero out everything added since the switch. Counting the wrong store
+    // is silent -- the recount still reports success -- so the choice is made
+    // explicitly rather than assumed.
     let mut counts: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-    let mut rows = conn
-        .query(
-            format!(
-                "SELECT tag_id, COUNT(*) AS count FROM Relationship_{namespace_id}
-                 GROUP BY tag_id"
-            ),
-            (),
-        )
-        .await?;
-    while let Some(row) = rows.next().await? {
-        counts.insert(row.get(0)?, row.get(1)?);
+    if self.relationship_read_mode(conn).await == ReadMode::Flat {
+        let mut rows = conn
+            .query(
+                "SELECT tag_id, COUNT(*) AS count FROM Relationship
+                 WHERE namespace = ?1
+                 GROUP BY tag_id",
+                (namespace_id as i64,),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            counts.insert(row.get(0)?, row.get(1)?);
+        }
+    } else {
+        // The legacy partitions cover the GROUP BY with their
+        // `(tag_id, file_id)` primary key, so this is one index scan.
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT tag_id, COUNT(*) AS count FROM Relationship_{namespace_id}
+                     GROUP BY tag_id"
+                ),
+                (),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            counts.insert(row.get(0)?, row.get(1)?);
+        }
     }
     let mut tag_rows = conn
         .query(
@@ -2463,13 +2547,23 @@ async fn slurp_recount_namespace(conn: &Connection, namespace_id: u64) -> Result
     }
 
     conn.execute("BEGIN IMMEDIATE", ()).await?;
-    for chunk in pairs.chunks(SQL_CHUNK_SIZE) {
+    // The shadow has to move with the counts. Only tags whose count crosses
+    // the popularity threshold actually change shadow membership, and the
+    // pre-read that decides which those are is cheap relative to the recount
+    // itself; passing all of them to `sync_tags_popular` would also work but
+    // costs an FTS segment flush per tag.
+    for chunk in pairs.chunks(POPULARITY_FOLD_CHUNK) {
         let (count_sql, count_params) = tag_count_set_sql(chunk);
         conn.execute(count_sql, params_from_iter(count_params))
             .await?;
+        let shadow_ids = self.tags_with_shadow_drift(conn, chunk).await?;
+        if !shadow_ids.is_empty() {
+            self.sync_tags_popular(conn, &shadow_ids).await?;
+        }
     }
     conn.execute("COMMIT", ()).await?;
-    Ok(())
+        Ok(())
+    }
 }
 
 #[cfg(test)]

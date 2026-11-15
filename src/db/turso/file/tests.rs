@@ -432,3 +432,236 @@ async fn file_add_bulk_honors_pinned_id() {
     let stored = db.file_get(&conn, &777).await.unwrap();
     assert_eq!(stored.hash, "aaa");
 }
+
+
+/// Reports how much of the live database actually carries an ImageHash.
+///
+/// This is the coverage check for the perceptual-hash feature: it answers
+/// "does my library have hashes to compare" rather than "does the hasher work".
+/// Run it explicitly against a real database copy:
+///
+/// ```text
+/// INTSCRAPE_DB_PATH=/path/to/turso.db \
+///   cargo test --release --lib report_image_hash_coverage -- --ignored --nocapture
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "reads a real database; set INTSCRAPE_DB_PATH"]
+async fn report_image_hash_coverage() {
+    let path = match std::env::var("INTSCRAPE_DB_PATH") {
+        Ok(path) => std::path::PathBuf::from(path),
+        Err(_) => {
+            eprintln!("set INTSCRAPE_DB_PATH to a database to report on");
+            return;
+        }
+    };
+    let should_exit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let db = TursoDatabase::new_with_exit(&path, should_exit).await;
+    let conn = db.connect().expect("connect");
+
+    let total: i64 = conn
+        .query("SELECT COUNT(*) FROM File;", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    let hashed: i64 = conn
+        .query("SELECT COUNT(DISTINCT file_id) FROM FileHashes WHERE algorithm = 'ImageHash';", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    let sha: i64 = conn
+        .query("SELECT COUNT(DISTINCT file_id) FROM FileHashes WHERE algorithm = 'SHA512';", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+
+    let pct = if total > 0 { hashed as f64 * 100.0 / total as f64 } else { 0.0 };
+    eprintln!(
+        "files {total}, with SHA512 {sha}, with ImageHash {hashed} ({pct:.1}%)"
+    );
+    // The point of the measurement: if this is low, the perceptual filter has
+    // nothing to work with on most of the library.
+    assert!(total > 0, "no files in {path}", path = path.display());
+}
+
+/// Deleting a file removes its row, its hashes, and every relationship, in both
+/// the flat and the per-namespace store, and is a no-op for an unknown id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_delete_removes_row_hashes_and_relationships() {
+    let db = new_test_db().await;
+    let conn = db.connect().unwrap();
+
+    // A namespace, with its partition table created the same way every other
+    // namespace-creation path does. `create_db` does not make it: a fresh
+    // database only gains `Relationship_{ns}` when a namespace is created
+    // through the proper path, and inserting the Namespace row directly skips
+    // that.
+    conn.execute(
+        "INSERT INTO Namespace (name, description) VALUES ('subject', NULL);",
+        (),
+    )
+    .await
+    .unwrap();
+    let namespace_id: i64 = conn
+        .query("SELECT id FROM Namespace LIMIT 1;", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+
+    // Two files; only one is deleted, so the other proves the delete is scoped.
+    conn.execute(
+        "INSERT INTO File (extension, storage_id) VALUES ('jpg', NULL), ('png', NULL);",
+        (),
+    )
+    .await
+    .unwrap();
+    let ids: Vec<i64> = {
+        let mut rows = conn.query("SELECT id FROM File ORDER BY id;", ()).await.unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            out.push(row.get(0).unwrap());
+        }
+        out
+    };
+    let (keep, drop) = (ids[0], ids[1]);
+
+    db.relationship_partition_create(&conn, namespace_id as u64)
+        .await
+        .unwrap();
+
+    // Both hash rows and both relationship stores for the doomed file.
+    conn.execute(
+        "INSERT INTO FileHashes (file_id, algorithm, digest) VALUES (?1, 'SHA512', 'deadbeef'), (?1, 'ImageHash', 'cafe');",
+        (drop,),
+    )
+    .await
+    .unwrap();
+
+    // A tag to point the relationships at.
+    conn.execute(
+        "INSERT INTO Tags (name, namespace, count) VALUES ('mammal', ?1, 0);",
+        (namespace_id,),
+    )
+    .await
+    .unwrap();
+    let tag_id: i64 = conn
+        .query("SELECT id FROM Tags LIMIT 1;", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+
+    for table in [
+        "Relationship",
+        &format!("Relationship_{namespace_id}"),
+    ] {
+        conn.execute(
+            format!("INSERT OR IGNORE INTO {table} (file_id, tag_id) VALUES (?1, ?2), (?3, ?2);"),
+            (drop, tag_id, keep),
+        )
+        .await
+        .unwrap();
+    }
+
+    // No disk removal: these fixtures have no bytes on disk.
+    let (deleted, path_removed) = db.file_delete(&conn, drop as u64, false).await.unwrap();
+    assert!(deleted, "the existing row must be deleted");
+    assert!(!path_removed, "no disk path was asked for");
+
+    // The row and its hashes are gone.
+    let remaining: i64 = conn
+        .query("SELECT COUNT(*) FROM File WHERE id = ?1;", (drop,))
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(remaining, 0, "the File row must be gone");
+
+    let hashes: i64 = conn
+        .query("SELECT COUNT(*) FROM FileHashes WHERE file_id = ?1;", (drop,))
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(hashes, 0, "FileHashes must go with the row");
+
+    for table in [
+        "Relationship",
+        &format!("Relationship_{namespace_id}"),
+    ] {
+        let left: i64 = conn
+            .query(format!("SELECT COUNT(*) FROM {table} WHERE file_id = ?1;"), (drop,))
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(left, 0, "{table} must lose the deleted file's rows");
+    }
+
+    // The other file is untouched: its row and its relationship survive.
+    let kept: i64 = conn
+        .query("SELECT COUNT(*) FROM File WHERE id = ?1;", (keep,))
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(kept, 1, "the other file must survive");
+    let kept_rel: i64 = conn
+        .query(
+            format!("SELECT COUNT(*) FROM Relationship_{namespace_id} WHERE file_id = ?1;"),
+            (keep,),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(kept_rel, 1, "the other file's relationship must survive");
+
+    // Deleting an unknown id is a no-op, not an error: two reviewers racing on
+    // the same duplicate should not make the second one fail.
+    let (deleted, _) = db.file_delete(&conn, 999_999, false).await.unwrap();
+    assert!(!deleted, "an unknown id must report not-deleted");
+}
