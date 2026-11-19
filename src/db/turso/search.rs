@@ -261,7 +261,6 @@ impl TursoDatabase {
         }
     }
 
-
     /// Resolves the searched tags and renders the statement `search_db_files`
     /// runs. Split out from the executor so tests can inspect, and
     /// `EXPLAIN QUERY PLAN`, the exact SQL the hot path emits.
@@ -424,8 +423,12 @@ impl TursoDatabase {
                     // the driving scan is a range seek that already yields
                     // `file_id` in order, exactly as the partition did.
                     (
-                        format!("SELECT d.file_id AS file_id FROM Relationship d WHERE d.tag_id = {tag_id}"),
-                        format!("SELECT COUNT(d.file_id) FROM Relationship d WHERE d.tag_id = {tag_id}"),
+                        format!(
+                            "SELECT d.file_id AS file_id FROM Relationship d WHERE d.tag_id = {tag_id}"
+                        ),
+                        format!(
+                            "SELECT COUNT(d.file_id) FROM Relationship d WHERE d.tag_id = {tag_id}"
+                        ),
                         "d.file_id",
                     )
                 } else {

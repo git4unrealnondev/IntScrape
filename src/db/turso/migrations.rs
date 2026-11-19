@@ -491,7 +491,9 @@ DROP TABLE Parents_old;
             conn,
             shared_types::DbSettingsObj {
                 name: super::relationship_store::READ_MODE_SETTING.to_string(),
-                description: Some("Which tables a relationship read uses: flat or legacy.".to_string()),
+                description: Some(
+                    "Which tables a relationship read uses: flat or legacy.".to_string(),
+                ),
                 num: None,
                 param: Some("flat".to_string()),
             },

@@ -772,11 +772,7 @@ impl TursoDatabase {
                 .execute(
                     "INSERT OR IGNORE INTO Relationship (file_id, tag_id, namespace)
                      VALUES (?1, ?2, ?3);",
-                    (
-                        file_id as i64,
-                        tag_id as i64,
-                        namespace_id as i64,
-                    ),
+                    (file_id as i64, tag_id as i64, namespace_id as i64),
                 )
                 .await?;
         }
@@ -784,9 +780,7 @@ impl TursoDatabase {
             let sql = format!(
                 "INSERT OR IGNORE INTO Relationship_{namespace_id} (file_id, tag_id) VALUES (?1, ?2);"
             );
-            let partition_inserted = conn
-                .execute(sql, (file_id as i64, tag_id as i64))
-                .await?;
+            let partition_inserted = conn.execute(sql, (file_id as i64, tag_id as i64)).await?;
             if !write_mode.writes_flat() {
                 inserted = partition_inserted;
             }
@@ -1419,9 +1413,7 @@ impl TursoDatabase {
 /// seed. Exists so the lock bench seeds counts through the same statement shape
 /// production uses rather than a hand-written variant.
 #[cfg(test)]
-pub(in crate::db::turso) fn tag_count_seed_sql_for_bench(
-    ids: &[u64],
-) -> (String, Vec<Value>) {
+pub(in crate::db::turso) fn tag_count_seed_sql_for_bench(ids: &[u64]) -> (String, Vec<Value>) {
     let clauses: Vec<String> = ids.iter().map(|_| "WHEN ? THEN ?".to_string()).collect();
     // Placeholders are numbered across both blocks: the CASE pairs come first,
     // then the IN list, so the numbering has to continue rather than restart.

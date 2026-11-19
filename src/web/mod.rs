@@ -2,7 +2,11 @@ use shared_types::{FileInternal, FileManager};
 
 pub mod downloading;
 pub mod manager;
+pub mod manager_human;
 pub mod ratelimit;
+
+/// How many jobs we can run at the same time for a plugin
+pub const MAX_CONCURRENT_JOBS: usize = 5;
 
 #[derive(Debug)]
 enum FileReturn {

@@ -3298,11 +3298,7 @@ async fn concurrent_set_on_same_file_keeps_both_tags() {
         regression_tag_count(&db, "racer-a").await,
         regression_tag_count(&db, "racer-b").await,
     );
-    assert_eq!(
-        a + b,
-        1,
-        "exactly one racer may remain, got a={a} b={b}"
-    );
+    assert_eq!(a + b, 1, "exactly one racer may remain, got a={a} b={b}");
     assert_eq!(regression_tag_count(&db, "seed").await, 0);
 }
 

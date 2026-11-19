@@ -228,16 +228,14 @@ impl TursoDatabase {
         let tag_ids_vec: Vec<u64> = tag_ids.iter().copied().collect();
         if self.relationship_read_mode(conn).await == ReadMode::Flat {
             for chunk in tag_ids_vec.chunks(SQL_CHUNK_SIZE) {
-                let placeholders =
-                    std::iter::repeat_n("?", chunk.len())
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                let placeholders = std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let sql = format!(
                     "SELECT tag_id, MIN(file_id) FROM Relationship \
                      WHERE tag_id IN ({placeholders}) GROUP BY tag_id;"
                 );
-                let params: Vec<Value> =
-                    chunk.iter().map(|id| Value::from(*id as i64)).collect();
+                let params: Vec<Value> = chunk.iter().map(|id| Value::from(*id as i64)).collect();
                 let mut rows = conn.query(&sql, params_from_iter(params)).await?;
                 while let Some(row) = rows.next().await? {
                     let tag_id: u64 = row.get(0)?;
@@ -431,8 +429,7 @@ impl TursoDatabase {
                      JOIN Namespace n ON t.namespace = n.id
                      WHERE r.file_id IN ({placeholders})"
                 );
-                let params: Vec<Value> =
-                    chunk.iter().map(|id| Value::from(*id as i64)).collect();
+                let params: Vec<Value> = chunk.iter().map(|id| Value::from(*id as i64)).collect();
 
                 let mut rows = conn.query(sql, params_from_iter(params)).await?;
                 while let Some(row) = rows.next().await? {

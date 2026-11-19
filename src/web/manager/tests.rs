@@ -854,19 +854,29 @@ async fn page_state_tail_flush_commits_buffered_files_and_tags() {
     let hash_a = format!("{:0128X}", 0x21);
     // Two landings for the same file merge into one buffered entry.
     let mut first = vec![page_add_action(vec![page_tag("landing-1", "regression")])];
-    state.buffer_file(page_manager(&hash_a, None), &mut first).await;
+    state
+        .buffer_file(page_manager(&hash_a, None), &mut first)
+        .await;
     let mut second = vec![page_add_action(vec![page_tag("landing-2", "regression")])];
-    state.buffer_file(page_manager(&hash_a, None), &mut second).await;
+    state
+        .buffer_file(page_manager(&hash_a, None), &mut second)
+        .await;
     // A different file lands alongside.
     let hash_b = format!("{:0128X}", 0x22);
     let mut other = vec![page_add_action(vec![page_tag("other", "regression")])];
-    state.buffer_file(page_manager(&hash_b, None), &mut other).await;
+    state
+        .buffer_file(page_manager(&hash_b, None), &mut other)
+        .await;
 
     let ok = state
         .flush_files(db.clone(), "test", 1, &keep, "tail flush failed")
         .await;
     assert!(ok, "tail flush must succeed");
-    assert_eq!(state.buffered_file_count().await, 0, "buffer must be empty after tail flush");
+    assert_eq!(
+        state.buffered_file_count().await,
+        0,
+        "buffer must be empty after tail flush"
+    );
 
     let file_id = page_file_id(&db, &hash_a).await;
     let mut expected = HashSet::new();
@@ -1007,9 +1017,10 @@ async fn page_state_lock_bench() {
 
             let flush_state = state.clone();
             let flush_db = db.clone();
-            let flush = tokio::spawn(async move {
-                run_flush(flush_state, flush_db, commit_ms, hold).await
-            });
+            let flush =
+                tokio::spawn(
+                    async move { run_flush(flush_state, flush_db, commit_ms, hold).await },
+                );
 
             // Let the flush task reach its lock acquisition. Not a correctness
             // signal -- just enough of a head start that the probe is
@@ -1037,7 +1048,10 @@ async fn page_state_lock_bench() {
             .await;
         best = best.min(started.elapsed().as_secs_f64() * 1_000.0);
     }
-    println!("  {label:<28} {best:>8.3} ms   (uncontended reference)", label = "no contention");
+    println!(
+        "  {label:<28} {best:>8.3} ms   (uncontended reference)",
+        label = "no contention"
+    );
     let _ = keep;
 }
 
@@ -1052,7 +1066,10 @@ async fn page_state_flushes_only_at_threshold() {
     for i in 0..(FLUSH_BATCH_SIZE - 1) {
         let mut tags = Vec::new();
         state
-            .buffer_file(page_manager(&format!("{:0128X}", 0x30 + i), None), &mut tags)
+            .buffer_file(
+                page_manager(&format!("{:0128X}", 0x30 + i), None),
+                &mut tags,
+            )
             .await;
     }
     // Below the threshold: nothing committed, everything still buffered.
@@ -1069,7 +1086,10 @@ async fn page_state_flushes_only_at_threshold() {
     // Crossing the threshold commits the whole batch.
     let mut tags = Vec::new();
     state
-        .buffer_file(page_manager(&format!("{:0128X}", 0x30 + FLUSH_BATCH_SIZE), None), &mut tags)
+        .buffer_file(
+            page_manager(&format!("{:0128X}", 0x30 + FLUSH_BATCH_SIZE), None),
+            &mut tags,
+        )
         .await;
     let ok = state
         .flush_files_if_full(db.clone(), "test", 1, &keep)
@@ -1209,7 +1229,12 @@ async fn commit_file_return_already_present_attaches_tags_to_existing_row() {
         .await
         .expect("count");
     assert_eq!(
-        rows.next().await.expect("row").expect("count").get::<i64>(0).expect("count"),
+        rows.next()
+            .await
+            .expect("row")
+            .expect("count")
+            .get::<i64>(0)
+            .expect("count"),
         1,
         "dedup hit must not create a duplicate row"
     );
@@ -1260,16 +1285,24 @@ async fn page_state_drains_tag_accumulator_at_threshold() {
     let below: Vec<shared_types::PluginTag> = (0..ACCUMULATOR_DRAIN_SIZE - 1)
         .map(|i| page_tag(&format!("drain-{i}"), "regression"))
         .collect();
-    state
-        .push_tags(db.clone(), below, "test", 1, &keep)
-        .await;
+    state.push_tags(db.clone(), below, "test", 1, &keep).await;
     let (jobs, tags) = state.counts().await;
-    assert_eq!(tags, ACCUMULATOR_DRAIN_SIZE - 1, "below threshold nothing drains");
+    assert_eq!(
+        tags,
+        ACCUMULATOR_DRAIN_SIZE - 1,
+        "below threshold nothing drains"
+    );
     assert_eq!(jobs, 0);
 
     // Crossing the threshold drains, and the drained tags persist.
     state
-        .push_tags(db.clone(), vec![page_tag("drain-final", "regression")], "test", 1, &keep)
+        .push_tags(
+            db.clone(),
+            vec![page_tag("drain-final", "regression")],
+            "test",
+            1,
+            &keep,
+        )
         .await;
     let (_, tags) = state.counts().await;
     assert_eq!(tags, 0, "crossing the threshold must drain the accumulator");
@@ -1322,7 +1355,11 @@ async fn prefetch_page_dedup_resolves_all_three_maps() {
     )];
 
     let files = HashSet::from([probe]);
-    let dedup = fx.scraper.prefetch_page_dedup(&files).await.expect("prefetch");
+    let dedup = fx
+        .scraper
+        .prefetch_page_dedup(&files)
+        .await
+        .expect("prefetch");
 
     let source_status = dedup
         .source_files
@@ -1335,9 +1372,8 @@ async fn prefetch_page_dedup_resolves_all_three_maps() {
         "source url must resolve to the seeded file"
     );
 
-    let key = crate::db::hashes_supported_to_key(&shared_types::HashesSupported::Sha512(
-        hash.clone(),
-    ));
+    let key =
+        crate::db::hashes_supported_to_key(&shared_types::HashesSupported::Sha512(hash.clone()));
     assert_eq!(
         dedup.hash_files.get(&key).expect("hash must resolve").id,
         Some(seeded_id),
@@ -1348,9 +1384,12 @@ async fn prefetch_page_dedup_resolves_all_three_maps() {
         .skip_files
         .get(&("artist".to_string(), "skipme".to_string()))
         .expect("skip tag must resolve");
-    assert_eq!(skip.id, Some(seeded_id), "skip tag must resolve to its owner");
+    assert_eq!(
+        skip.id,
+        Some(seeded_id),
+        "skip tag must resolve to its owner"
+    );
 }
-
 
 // ---------------------------------------------------------------------------
 // Perceptual hash (ImageHash) agreement between host and plugin
@@ -1365,7 +1404,10 @@ mod image_hash_agreement {
         let path = dir.path().join(format!("grad-{seed}.png"));
         let mut img = image::RgbaImage::new(w, h);
         for (x, y, pixel) in img.enumerate_pixels_mut() {
-            let v = (x.wrapping_mul(3).wrapping_add(y.wrapping_mul(5)).wrapping_add(seed as u32)) as u8;
+            let v = (x
+                .wrapping_mul(3)
+                .wrapping_add(y.wrapping_mul(5))
+                .wrapping_add(seed as u32)) as u8;
             *pixel = image::Rgba([v, 255u8.wrapping_sub(v), (x ^ y) as u8, 255]);
         }
         let mut file = std::fs::File::create(&path).unwrap();
@@ -1400,7 +1442,8 @@ mod image_hash_agreement {
         // 64-bit Median hash -> 11 base64 chars (STANDARD_NO_PAD, no padding).
         assert_eq!(a.len(), 11, "unexpected hash width for {a}");
         assert!(
-            a.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/'),
+            a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/'),
             "unexpected base64 alphabet in {a}"
         );
     }
@@ -1447,7 +1490,8 @@ mod image_hash_agreement {
         let img = image::open(&path).expect("decode");
         let reencoded = std::path::PathBuf::from("/tmp/opencode/reencode-test.png");
         let mut out = std::fs::File::create(&reencoded).unwrap();
-        img.write_to(&mut out, image::ImageFormat::Png).expect("reencode");
+        img.write_to(&mut out, image::ImageFormat::Png)
+            .expect("reencode");
         let hb = image_hash_from_path(&reencoded).expect("hash b");
 
         let left = ImageHash::<Box<[u8]>>::from_base64(&ha).expect("parse a");

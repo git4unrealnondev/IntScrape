@@ -670,10 +670,8 @@ impl TursoDatabase {
                         placeholders
                     ),
                     {
-                        let mut params: Vec<Value> = urls
-                            .iter()
-                            .map(|url| Value::from(url.as_str()))
-                            .collect();
+                        let mut params: Vec<Value> =
+                            urls.iter().map(|url| Value::from(url.as_str())).collect();
                         params.insert(0, Value::from(source_url_namespace_id as i64));
                         params
                     },
@@ -691,10 +689,8 @@ impl TursoDatabase {
                         placeholders
                     ),
                     {
-                        let mut params: Vec<Value> = urls
-                            .iter()
-                            .map(|url| Value::from(url.as_str()))
-                            .collect();
+                        let mut params: Vec<Value> =
+                            urls.iter().map(|url| Value::from(url.as_str())).collect();
                         params.insert(0, Value::from(source_url_namespace_id as i64));
                         params
                     },

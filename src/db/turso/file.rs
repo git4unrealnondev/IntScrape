@@ -393,9 +393,7 @@ impl TursoDatabase {
         let path = if delete_from_disk {
             match self.file_get(conn, &file_id).await {
                 Ok(file) => match self.file_storage_get_all(conn).await {
-                    Ok(bases) => bases
-                        .values()
-                        .find_map(|base| file_on_disk(&file, base)),
+                    Ok(bases) => bases.values().find_map(|base| file_on_disk(&file, base)),
                     Err(_) => None,
                 },
                 Err(_) => None,
@@ -434,7 +432,10 @@ impl TursoDatabase {
         // migrations and not every database has foreign keys enforced, so the
         // deletes are explicit rather than relying on the cascade.
         let _ = conn
-            .execute("DELETE FROM Relationship WHERE file_id = ?1;", (file_id as i64,))
+            .execute(
+                "DELETE FROM Relationship WHERE file_id = ?1;",
+                (file_id as i64,),
+            )
             .await;
         // `relationship_union_tables` already yields `Relationship_{id}` for
         // every namespace, so the table names are not rebuilt here.
@@ -462,7 +463,10 @@ impl TursoDatabase {
                     removed = true;
                 }
                 Err(error) => {
-                    log::warn!("Could not remove {} for file {file_id}: {error}", path.display());
+                    log::warn!(
+                        "Could not remove {} for file {file_id}: {error}",
+                        path.display()
+                    );
                 }
             }
         }

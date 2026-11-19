@@ -1,5 +1,6 @@
 use std::{
     error::Error,
+    fs::remove_file,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -16,18 +17,18 @@ use fast_log::{
     },
 };
 use intscrape::{
-    db::turso::TursoDatabase,
     db::{
         SYSTEM_DATABASE_BACKUP_SITE, SYSTEM_DATABASE_SLURP_SITE, SYSTEM_FILE_HASH_SITE,
-        SYSTEM_FILE_SIZE_SITE, SYSTEM_STORAGE_CHECK_SITE,
+        SYSTEM_FILE_SIZE_SITE, SYSTEM_STORAGE_CHECK_SITE, turso::TursoDatabase,
     },
     ipc::IpcServer,
     plugins::PluginManager,
-    web::manager::DownloadsManager,
+    web::{manager::DownloadsManager, manager_human::DownloadManager},
 };
 use rayon::ThreadPoolBuilder;
 
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Used to wait before we halt jobs
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default data paths. Each can be overridden with an environment variable
 /// so the daemon does not have to be run from the source tree:
@@ -70,6 +71,9 @@ fn worker_threads() -> usize {
 /// from previous runs survive a restart.
 ///
 fn setup_log(log_path: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if log_path.exists() {
+        remove_file(log_path);
+    }
     fast_log::init(
         fast_log::Config::new()
             .level(log::LevelFilter::Info)
@@ -315,9 +319,9 @@ async fn run_app() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // Ctrl-C stops new work first; allow active downloads to finish and release
     // their in-progress URL guards before the manager is dropped.
-    while !download_manager.downloads_complete().await
-        || !download_manager.all_jobs_complete().await
-    {
+    //while !download_manager.downloads_complete().await
+    //    || !download_manager.all_jobs_complete().await
+    while !download_manager.all_jobs_complete().await {
         if tokio::time::Instant::now() >= shutdown_deadline {
             log::error!("Shutdown timeout reached with downloads or workers still active");
             break;

@@ -908,9 +908,8 @@ impl Scraper {
                             // lookup each instead of per-file DB round trips;
                             // the per-file tasks answer all their "already in
                             // db" questions from memory.
-                            let dedup_owned = self
-                                .prefetch_page_dedup(&scraper_object.files)
-                                .await?;
+                            let dedup_owned =
+                                self.prefetch_page_dedup(&scraper_object.files).await?;
                             let existing_source_files = Arc::new(dedup_owned.source_files);
                             let existing_hash_files = Arc::new(dedup_owned.hash_files);
                             let existing_skip_files = Arc::new(dedup_owned.skip_files);
@@ -1664,9 +1663,9 @@ impl Scraper {
         self.download_manager.heavy_processing_pool.spawn(move || {
             let _ = result_sender.send(db.hashes_files_get_sync_blocking(&chunk_hashes));
         });
-        let existing_hash_files = result_receiver.await.map_err(|_| {
-            std::io::Error::other("hash lookup task failed")
-        })?;
+        let existing_hash_files = result_receiver
+            .await
+            .map_err(|_| std::io::Error::other("hash lookup task failed"))?;
 
         // Resolve the page's skip-if tags in one batched lookup instead of
         // two DB round trips plus a fresh connection per tag per file.

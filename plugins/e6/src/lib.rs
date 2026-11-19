@@ -82,6 +82,15 @@ impl Site {
         }
     }
 
+    /// Whether the site's API answers `posts.json` with the current e621
+    /// shape: a bare JSON array and, by default, a flat `tags` list with no
+    /// category. Those sites need `mode=extended` to get the category map
+    /// back. The legacy Danbooru-based sites already return categories by
+    /// default, so their URLs stay untouched.
+    fn needs_extended_mode(&self) -> bool {
+        matches!(self, Site::E6)
+    }
+
     /// CDN host the API's `file.url` points at, used for the
     /// no-`file.url` fallback data URL. e621/e6ai serve
     /// `static1.<site>.net`; blep serves `cdn.blep.art`.
@@ -268,6 +277,100 @@ pub fn url_dump_impl(
     out
 }
 
+/// A decoded `posts.json` / `pools.json` response body.
+struct Payload<'a> {
+    /// Posts to parse, when the body is a post list.
+    posts: Option<Vec<&'a json::JsonValue>>,
+    /// Pool array to parse, when the body is a pool list.
+    pools: Option<&'a json::JsonValue>,
+}
+
+/// Classifies a response body.
+///
+/// Current e621 answers both `posts.json` and `pools.json` with a bare JSON
+/// array, while the older Danbooru-based sites (blep, floofgens) still wrap
+/// posts in `{"posts": [...]}`. A `posts.json?md5=...` lookup answers with a
+/// single post object rather than a list. Bodies are told apart by shape so
+/// one code path serves every site.
+fn classify_payload(payload: &json::JsonValue) -> Payload<'_> {
+    // Legacy Danbooru shape: `{"posts": [...]}`.
+    if payload["posts"].is_array() {
+        return Payload {
+            posts: Some(payload["posts"].members().collect()),
+            pools: None,
+        };
+    }
+
+    // A `posts.json?md5=...` lookup answers with a single post: wrapped as
+    // `{"post": {...}}` on the legacy sites, bare on current e621.
+    if payload["post"].is_object() {
+        return Payload {
+            posts: Some(vec![&payload["post"]]),
+            pools: None,
+        };
+    }
+
+    if payload.is_object() && (payload["files"].is_object() || payload["file"].is_object()) {
+        return Payload {
+            posts: Some(vec![&payload]),
+            pools: None,
+        };
+    }
+
+    // Bare array: posts carry a `file`/`files` object, pools carry `post_ids`.
+    if payload.is_array() {
+        let is_pool_list = payload
+            .members()
+            .next()
+            .is_some_and(|item| item["post_ids"].is_array());
+
+        return if is_pool_list {
+            Payload {
+                posts: None,
+                pools: Some(payload),
+            }
+        } else {
+            Payload {
+                posts: Some(payload.members().collect()),
+                pools: None,
+            }
+        };
+    }
+
+    Payload {
+        posts: None,
+        pools: None,
+    }
+}
+
+/// File details of a post.
+///
+/// Current e621 nests them under `files` (`files.meta.md5`, `files.meta.ext`,
+/// `files.original.url`); the older Danbooru-based sites keep them flat under
+/// `file`.
+struct PostFile<'a> {
+    md5: Option<&'a str>,
+    ext: Option<&'a str>,
+    url: Option<&'a str>,
+}
+
+fn post_file(post: &json::JsonValue) -> PostFile<'_> {
+    let legacy = &post["file"];
+    let current = &post["files"];
+
+    PostFile {
+        md5: legacy["md5"]
+            .as_str()
+            .or_else(|| current["meta"]["md5"].as_str()),
+        ext: legacy["ext"]
+            .as_str()
+            .or_else(|| current["meta"]["ext"].as_str()),
+        url: legacy["url"]
+            .as_str()
+            .or_else(|| current["original"]["url"].as_str()),
+    }
+}
+
 #[unsafe(no_mangle)]
 /// # Safety
 ///
@@ -334,8 +437,10 @@ pub fn parser_call_impl(
     let is_logged_in = !login_params.is_empty();
 
     if let Ok(payload) = json::parse(text_input) {
-        if !payload["posts"].is_empty() {
-            for post in payload["posts"].members() {
+        let classified = classify_payload(&payload);
+
+        if let Some(posts) = classified.posts.filter(|posts| !posts.is_empty()) {
+            for post in posts {
                 let mut tag_vec = Vec::new();
 
                 // Extract the post ID
@@ -449,7 +554,27 @@ pub fn parser_call_impl(
                     }
                 }
 
-                // Gets all tags from a post
+                // Gets all tags from a post. Current e621 returns a flat
+                // `tags` array in default mode (no category); `mode=extended`
+                // restores the category map. Fall back to the general
+                // namespace when only a flat list is available so tags are
+                // not silently dropped.
+                if post["tags"].is_array() {
+                    let namespace_obj = nsobjplg(&NsIdent::General, &site);
+
+                    for raw_tag in post["tags"].members() {
+                        if let Some(tag_name) = raw_tag.as_str() {
+                            tag_vec.push(PluginTag {
+                                tag: Tag {
+                                    name: tag_name.to_string(),
+                                    namespace: namespace_obj.clone(),
+                                },
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+
                 for (category_name, entry) in post["tags"].entries() {
                     let ns_ident = match category_name {
                         "general" => NsIdent::General,
@@ -482,18 +607,19 @@ pub fn parser_call_impl(
                 }
 
                 // Only attempt to bypass the source url IF we're not logged in
-                let md5 = post["file"]["md5"].as_str();
+                let file = post_file(post);
+                let md5 = file.md5;
                 // The static URL path is case-sensitive on the CDN, so the
                 // fallback URL uses the lowercase digest. The
                 // `HashesSupported` emitted below intentionally stays
                 // site-verbatim: the main software normalizes it on ingestion.
                 let md5_lower = md5.map(|s| s.trim().to_ascii_lowercase());
-                let source = post["file"]["url"]
-                    .as_str()
+                let source = file
+                    .url
                     .map(|u| FileSource::Url(u.to_string()))
                     .or_else(|| {
                         let hash = md5_lower.as_deref()?;
-                        let extension = post["file"]["ext"].as_str()?;
+                        let extension = file.ext?;
 
                         if is_logged_in {
                             return None;
@@ -534,8 +660,8 @@ pub fn parser_call_impl(
                 }
             }
         // Used for pools parsing
-        } else if payload["posts"].is_empty() {
-            for item in payload.members() {
+        } else if let Some(pools) = classified.pools {
+            for item in pools.members() {
                 // Does pool parsing
                 if let Some(pool_id) = item["id"].as_u64()
                     && let Some(pool_updated) = item["updated_at"].as_str()
@@ -850,6 +976,14 @@ pub(crate) fn build_url(
         url += &format!("?tags={}", tags.join("+"));
     }
 
+    // Current e621 returns a flat `tags` array by default, which carries no
+    // category. `mode=extended` keeps the category map the parser needs.
+    // The legacy Danbooru-based sites already return categories by default,
+    // so their URLs stay untouched.
+    if site.needs_extended_mode() {
+        url += "&mode=extended";
+    }
+
     if let Some(pagenum) = pagenum {
         url += &format!("&page={}", pagenum);
     }
@@ -900,7 +1034,7 @@ mod tests {
         );
         assert_eq!(
             build_url(&params, None, &Site::E6).as_deref(),
-            Some("https://e621.net/posts.json?tags=anthro")
+            Some("https://e621.net/posts.json?tags=anthro&mode=extended")
         );
         assert_eq!(
             build_url(&params, None, &Site::E6AI).as_deref(),
@@ -915,6 +1049,160 @@ mod tests {
             nsobjplg(&NsIdent::General, &Site::Blep).name,
             "Blep_General"
         );
+    }
+
+    #[test]
+    fn build_url_keeps_login_params() {
+        let params = vec![
+            ScraperParam::Login(shared_types::LoginType::Api(
+                "user".into(),
+                Some("key".into()),
+            )),
+            ScraperParam::Normal("anthro".into()),
+        ];
+
+        assert_eq!(
+            build_url(&params, None, &Site::E6).as_deref(),
+            Some("https://e621.net/posts.json?api_key=user&login=key&tags=anthro&mode=extended")
+        );
+    }
+
+    /// Shape of `https://e621.net/posts.json?tags=...&mode=extended` as of the
+    /// 2026 API change: a bare array, `files` instead of `file`, and a
+    /// category map under `tags`.
+    const E6_POST: &str = r#"{
+        "id":6243578,
+        "rating":"e",
+        "description":"Back Alley",
+        "sources":["https://www.furaffinity.net/user/rozalid"],
+        "pools":[54993],
+        "relationships":{"parent_id":null,"children":[]},
+        "tags":{"general":["anthro"],"artist":["rozalid"],"species":["naga"]},
+        "files":{
+            "meta":{"md5":"3b90e3cc3ddbcd681cf41288cf41477d","ext":"png"},
+            "original":{"url":"https://static1.e621.net/data/3b/90/3b90e3cc3ddbcd681cf41288cf41477d.png"}
+        }
+    }"#;
+
+    fn parse_e6(payload: &str) -> Vec<shared_types::ScraperReturn> {
+        let scraperdata = shared_types::ScraperDataReturn {
+            job: shared_types::PluginJob {
+                site: "e621".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        parser_call_impl(payload, "https://e621.net/posts.json", &scraperdata)
+    }
+
+    fn parsed_data(payload: &str) -> shared_types::ScraperObject {
+        let out = parse_e6(payload);
+        let ScraperReturn::Data(data) = &out[0] else {
+            panic!("expected parsed data, got {out:?}");
+        };
+        data.clone()
+    }
+
+    fn parsed_names(payload: &str) -> Vec<(String, String)> {
+        let data = parsed_data(payload);
+
+        data.files
+            .iter()
+            .flat_map(|file| file.tag_list.iter())
+            .flat_map(|action| action.tags.iter())
+            .map(|plugin_tag| &plugin_tag.tag)
+            .chain(data.tags.iter().map(|plugin_tag| &plugin_tag.tag))
+            .map(|tag| (tag.name.clone(), tag.namespace.name.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn parses_a_current_e621_post() {
+        let names = parsed_names(&format!("[{E6_POST}]"));
+
+        assert!(names.contains(&("6243578".into(), "E621_Id".into())));
+        assert!(names.contains(&("e".into(), "E621_Rating".into())));
+        assert!(names.contains(&("anthro".into(), "E621_General".into())));
+        assert!(names.contains(&("rozalid".into(), "E621_Artist".into())));
+        assert!(names.contains(&("naga".into(), "E621_Species".into())));
+        assert!(names.contains(&(
+            "https://www.furaffinity.net/user/rozalid".into(),
+            "E621_Sources".into()
+        )));
+
+        let data = parsed_data(&format!("[{E6_POST}]"));
+        assert_eq!(data.files.len(), 1);
+        let file = data.files.iter().next().unwrap();
+        assert_eq!(
+            file.hash,
+            vec![HashesSupported::Md5(
+                "3b90e3cc3ddbcd681cf41288cf41477d".into()
+            )]
+        );
+        assert!(matches!(
+            &file.source,
+            Some(FileSource::Url(url)) if url == "https://static1.e621.net/data/3b/90/3b90e3cc3ddbcd681cf41288cf41477d.png"
+        ));
+    }
+
+    #[test]
+    fn parses_a_current_e621_pool_list() {
+        // `pools.json` also answers with a bare array now.
+        let payload = r#"[{
+            "id":54993,
+            "name":"Rozalid's AD Chat",
+            "description":"Community sketches",
+            "created_at":"2026-03-12T07:59:43.507-04:00",
+            "updated_at":"2026-11-17T17:35:12.472-05:00",
+            "post_ids":[6255088,6243578]
+        }]"#;
+
+        let names = parsed_names(payload);
+
+        // `Pool_Id` is attached as a relation context rather than a
+        // standalone tag, so only the pool metadata shows up here.
+        assert!(names.contains(&("Rozalid's AD Chat".into(), "E621_Pool_Name".into())));
+        assert!(names.contains(&("Community sketches".into(), "E621_Pool_Description".into())));
+        assert!(names.contains(&("0".into(), "E621_Pool_Position".into())));
+        assert!(names.contains(&("1".into(), "E621_Pool_Position".into())));
+    }
+
+    #[test]
+    fn parses_a_post_without_a_file_url() {
+        // Deleted/absent originals still carry the md5 + ext; the parser
+        // rebuilds the CDN URL from them.
+        let payload = r#"[{
+            "id":1,
+            "rating":"s",
+            "relationships":{"parent_id":null,"children":[]},
+            "tags":{"general":["anthro"]},
+            "files":{"meta":{"md5":"3b90e3cc3ddbcd681cf41288cf41477d","ext":"png"}}
+        }]"#;
+
+        let data = parsed_data(payload);
+        let file = data.files.iter().next().unwrap();
+        assert!(matches!(
+            &file.source,
+            Some(FileSource::Url(url)) if url == "https://static1.e621.net/data/3b/90/3b90e3cc3ddbcd681cf41288cf41477d.png"
+        ));
+    }
+
+    #[test]
+    fn falls_back_to_general_tags_without_categories() {
+        // Default (non-extended) e621 mode returns a flat tag array.
+        let payload = r#"[{
+            "id":1,
+            "rating":"s",
+            "relationships":{"parent_id":null,"children":[]},
+            "tags":["anthro","naga"],
+            "files":{"meta":{"md5":"3b90e3cc3ddbcd681cf41288cf41477d","ext":"png"}}
+        }]"#;
+
+        let names = parsed_names(payload);
+
+        assert!(names.contains(&("anthro".into(), "E621_General".into())));
+        assert!(names.contains(&("naga".into(), "E621_General".into())));
     }
 
     #[test]
@@ -975,9 +1263,6 @@ mod tests {
         assert!(names.contains(&("anthro".into(), "FloofGens_General".into())));
         assert!(names.contains(&("comet_husky".into(), "FloofGens_Artist".into())));
         assert!(names.contains(&("canine".into(), "FloofGens_Species".into())));
-        assert!(names.contains(&(
-            "https://t.me/comet_yiff".into(),
-            "FloofGens_Sources".into()
-        )));
+        assert!(names.contains(&("https://t.me/comet_yiff".into(), "FloofGens_Sources".into())));
     }
 }

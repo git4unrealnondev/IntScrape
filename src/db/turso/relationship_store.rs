@@ -107,10 +107,7 @@ impl TursoDatabase {
     }
 
     /// Which tables a relationship read uses.
-    pub(in crate::db::turso) async fn relationship_read_mode(
-        &self,
-        conn: &Connection,
-    ) -> ReadMode {
+    pub(in crate::db::turso) async fn relationship_read_mode(&self, conn: &Connection) -> ReadMode {
         match self
             .setting_get_sql(conn, READ_MODE_SETTING)
             .await
@@ -228,7 +225,10 @@ mod tests {
         // Default state: safe.
         assert!(
             !matches!(
-                (db.relationship_write_mode(&conn).await, db.relationship_read_mode(&conn).await),
+                (
+                    db.relationship_write_mode(&conn).await,
+                    db.relationship_read_mode(&conn).await
+                ),
                 (WriteMode::Single, ReadMode::Legacy)
             ),
             "the default combination must not be the warned one"
@@ -247,7 +247,10 @@ mod tests {
         .unwrap();
         assert!(
             matches!(
-                (db.relationship_write_mode(&conn).await, db.relationship_read_mode(&conn).await),
+                (
+                    db.relationship_write_mode(&conn).await,
+                    db.relationship_read_mode(&conn).await
+                ),
                 (WriteMode::Single, ReadMode::Legacy)
             ),
             "single write with legacy read must be detected as the unsafe combination"
@@ -266,7 +269,10 @@ mod tests {
         .await
         .unwrap();
         assert!(!matches!(
-            (db.relationship_write_mode(&conn).await, db.relationship_read_mode(&conn).await),
+            (
+                db.relationship_write_mode(&conn).await,
+                db.relationship_read_mode(&conn).await
+            ),
             (WriteMode::Single, ReadMode::Legacy)
         ));
     }

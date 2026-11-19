@@ -433,7 +433,6 @@ async fn file_add_bulk_honors_pinned_id() {
     assert_eq!(stored.hash, "aaa");
 }
 
-
 /// Reports how much of the live database actually carries an ImageHash.
 ///
 /// This is the coverage check for the perceptual-hash feature: it answers
@@ -469,7 +468,10 @@ async fn report_image_hash_coverage() {
         .get(0)
         .unwrap();
     let hashed: i64 = conn
-        .query("SELECT COUNT(DISTINCT file_id) FROM FileHashes WHERE algorithm = 'ImageHash';", ())
+        .query(
+            "SELECT COUNT(DISTINCT file_id) FROM FileHashes WHERE algorithm = 'ImageHash';",
+            (),
+        )
         .await
         .unwrap()
         .next()
@@ -479,7 +481,10 @@ async fn report_image_hash_coverage() {
         .get(0)
         .unwrap();
     let sha: i64 = conn
-        .query("SELECT COUNT(DISTINCT file_id) FROM FileHashes WHERE algorithm = 'SHA512';", ())
+        .query(
+            "SELECT COUNT(DISTINCT file_id) FROM FileHashes WHERE algorithm = 'SHA512';",
+            (),
+        )
         .await
         .unwrap()
         .next()
@@ -489,10 +494,12 @@ async fn report_image_hash_coverage() {
         .get(0)
         .unwrap();
 
-    let pct = if total > 0 { hashed as f64 * 100.0 / total as f64 } else { 0.0 };
-    eprintln!(
-        "files {total}, with SHA512 {sha}, with ImageHash {hashed} ({pct:.1}%)"
-    );
+    let pct = if total > 0 {
+        hashed as f64 * 100.0 / total as f64
+    } else {
+        0.0
+    };
+    eprintln!("files {total}, with SHA512 {sha}, with ImageHash {hashed} ({pct:.1}%)");
     // The point of the measurement: if this is low, the perceptual filter has
     // nothing to work with on most of the library.
     assert!(total > 0, "no files in {path}", path = path.display());
@@ -535,7 +542,10 @@ async fn file_delete_removes_row_hashes_and_relationships() {
     .await
     .unwrap();
     let ids: Vec<i64> = {
-        let mut rows = conn.query("SELECT id FROM File ORDER BY id;", ()).await.unwrap();
+        let mut rows = conn
+            .query("SELECT id FROM File ORDER BY id;", ())
+            .await
+            .unwrap();
         let mut out = Vec::new();
         while let Some(row) = rows.next().await.unwrap() {
             out.push(row.get(0).unwrap());
@@ -574,10 +584,7 @@ async fn file_delete_removes_row_hashes_and_relationships() {
         .get(0)
         .unwrap();
 
-    for table in [
-        "Relationship",
-        &format!("Relationship_{namespace_id}"),
-    ] {
+    for table in ["Relationship", &format!("Relationship_{namespace_id}")] {
         conn.execute(
             format!("INSERT OR IGNORE INTO {table} (file_id, tag_id) VALUES (?1, ?2), (?3, ?2);"),
             (drop, tag_id, keep),
@@ -605,7 +612,10 @@ async fn file_delete_removes_row_hashes_and_relationships() {
     assert_eq!(remaining, 0, "the File row must be gone");
 
     let hashes: i64 = conn
-        .query("SELECT COUNT(*) FROM FileHashes WHERE file_id = ?1;", (drop,))
+        .query(
+            "SELECT COUNT(*) FROM FileHashes WHERE file_id = ?1;",
+            (drop,),
+        )
         .await
         .unwrap()
         .next()
@@ -616,12 +626,12 @@ async fn file_delete_removes_row_hashes_and_relationships() {
         .unwrap();
     assert_eq!(hashes, 0, "FileHashes must go with the row");
 
-    for table in [
-        "Relationship",
-        &format!("Relationship_{namespace_id}"),
-    ] {
+    for table in ["Relationship", &format!("Relationship_{namespace_id}")] {
         let left: i64 = conn
-            .query(format!("SELECT COUNT(*) FROM {table} WHERE file_id = ?1;"), (drop,))
+            .query(
+                format!("SELECT COUNT(*) FROM {table} WHERE file_id = ?1;"),
+                (drop,),
+            )
             .await
             .unwrap()
             .next()

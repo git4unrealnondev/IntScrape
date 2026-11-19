@@ -17,7 +17,6 @@ async fn new_test_db() -> Arc<TursoDatabase> {
     TursoDatabase::new_with_exit(&db_path, should_exit).await
 }
 
-
 /// Forces the legacy partition store for a test that asserts on
 /// `Relationship_{ns}` directly, or that exercises the union read path.
 ///
@@ -48,8 +47,6 @@ async fn use_legacy_store(db: &TursoDatabase, conn: &Connection) {
     .await
     .unwrap();
 }
-
-
 
 // ---------------------------------------------------------------------
 // Relationship write-path scale bench.
@@ -871,7 +868,6 @@ async fn count_fold_in_only_writes_shadow_when_membership_changes() {
     );
 }
 
-
 // ---------------------------------------------------------------------
 // The v15 flat relationship table.
 //
@@ -1142,7 +1138,10 @@ async fn flat_and_legacy_read_modes_agree() {
     let flat_tags = db.relationship_get_tag_id(&conn, probe_file).await.unwrap();
     let flat_first = db.first_file_id_for_tag(&conn, probe_tag).await.unwrap();
     let flat_files = db.relationship_get_file_id(&conn, probe_tag).await.unwrap();
-    let flat_parents = db.relationship_get_parent_file_id(&conn, probe_tag).await.unwrap();
+    let flat_parents = db
+        .relationship_get_parent_file_id(&conn, probe_tag)
+        .await
+        .unwrap();
     let flat_filtered = db
         .file_id_get_tag_ids_filtered(&conn, probe_file, ns_a)
         .await
@@ -1163,14 +1162,20 @@ async fn flat_and_legacy_read_modes_agree() {
     let legacy_tags = db.relationship_get_tag_id(&conn, probe_file).await.unwrap();
     let legacy_first = db.first_file_id_for_tag(&conn, probe_tag).await.unwrap();
     let legacy_files = db.relationship_get_file_id(&conn, probe_tag).await.unwrap();
-    let legacy_parents = db.relationship_get_parent_file_id(&conn, probe_tag).await.unwrap();
+    let legacy_parents = db
+        .relationship_get_parent_file_id(&conn, probe_tag)
+        .await
+        .unwrap();
     let legacy_filtered = db
         .file_id_get_tag_ids_filtered(&conn, probe_file, ns_a)
         .await
         .unwrap_or_default();
 
     assert_eq!(flat_tags.len(), 3, "every file must see its three tags");
-    assert_eq!(flat_tags, legacy_tags, "file -> tags must agree across modes");
+    assert_eq!(
+        flat_tags, legacy_tags,
+        "file -> tags must agree across modes"
+    );
     assert_eq!(flat_first, legacy_first, "first file for a tag must agree");
     assert_eq!(flat_files, legacy_files, "tag -> files must agree");
     assert_eq!(flat_parents, legacy_parents, "parent files must agree");

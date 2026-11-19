@@ -10,8 +10,8 @@ use turso::{
 };
 
 use crate::DB_VERSION;
-use crate::plugins::PluginManager;
 use crate::db::turso::relationship_store::{ReadMode, WriteMode};
+use crate::plugins::PluginManager;
 
 mod cache;
 mod dead_url;
@@ -32,10 +32,10 @@ mod tag;
 mod api;
 #[cfg(test)]
 mod bench;
-#[cfg(test)]
-mod vecprobe;
 mod ipc;
 mod migrations;
+#[cfg(test)]
+mod vecprobe;
 
 #[allow(dead_code)]
 const TAG_CACHE_LIMIT: usize = 100_000;
@@ -467,24 +467,18 @@ impl TursoDatabase {
             }
         } else {
             match conn
-                .execute_batch(&format!(
-                    "PRAGMA mvcc_checkpoint_threshold = {threshold};"
-                ))
+                .execute_batch(&format!("PRAGMA mvcc_checkpoint_threshold = {threshold};"))
                 .await
             {
                 Ok(_) => threshold,
                 Err(error) => {
-                    log::error!(
-                        "Could not set mvcc_checkpoint_threshold = {threshold}: {error}"
-                    );
+                    log::error!("Could not set mvcc_checkpoint_threshold = {threshold}: {error}");
                     -1
                 }
             }
         };
         if value > 0 && value != threshold {
-            log::info!(
-                "mvcc_checkpoint_threshold in force: {value} (requested {threshold})"
-            );
+            log::info!("mvcc_checkpoint_threshold in force: {value} (requested {threshold})");
         }
         value
     }

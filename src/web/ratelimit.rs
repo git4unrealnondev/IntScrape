@@ -15,6 +15,7 @@ pub struct RatelimitManager {
     priority_queue: Arc<Mutex<Vec<(u64, u64)>>>,
     counter: AtomicU64,
     notify: Arc<Notify>,
+    storage_params: (u32, Duration),
 }
 
 impl Debug for RatelimitManager {
@@ -57,7 +58,13 @@ impl RatelimitManager {
             priority_queue: Arc::new(Mutex::new(Vec::new())),
             counter: AtomicU64::new(0),
             notify: Arc::new(Notify::new()),
+            storage_params: (regen_tokens, time_per_regen),
         }
+    }
+
+    // Used to get printable parameters for logging and stuff
+    pub fn get_params(&self) -> (u32, Duration) {
+        self.storage_params
     }
 
     pub async fn wait(&self, priority: u64) {

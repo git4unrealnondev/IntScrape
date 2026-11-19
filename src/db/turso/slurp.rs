@@ -1551,7 +1551,8 @@ impl TursoDatabase {
                                 .await?;
                             covering_dropped = true;
                         }
-                        self.slurp_recount_namespace(&conn, target_namespace).await?;
+                        self.slurp_recount_namespace(&conn, target_namespace)
+                            .await?;
                         log::info!(
                             "Slurp count recalculation for namespace {} complete in {:?}",
                             target_namespace,
@@ -1751,7 +1752,8 @@ impl TursoDatabase {
                                     .await?;
                                 covering_dropped = true;
                             }
-                            self.slurp_recount_namespace(&conn, target_namespace).await?;
+                            self.slurp_recount_namespace(&conn, target_namespace)
+                                .await?;
                             log::info!(
                                 "Slurp count recalculation for namespace {} complete in {:?}",
                                 target_namespace,
@@ -2490,78 +2492,78 @@ impl TursoDatabase {
         conn: &Connection,
         namespace_id: u64,
     ) -> Result<()> {
-    // Build the authoritative per-tag counts with one GROUP BY over the freshly
-    // landed relationships, then emit every tag in the namespace (zeros
-    // included) as bounded per-chunk updates. A single `UPDATE Tags SET count
-    // = 0 WHERE namespace = ?` would sweep the whole 15M-row Tags tree into a
-    // new MVCC image even when only one namespace changes - some fragment
-    // shapes never finish that rematerialization (RSS pins at ~10GB with no
-    // wal).
-    //
-    // Which store to count from follows the *read* mode, because that is what
-    // decides where the live rows are. Under the shipped `single` mode the flat
-    // table holds them and the partitions are frozen at their pre-migration
-    // contents, so counting a partition would resurrect deleted relationships
-    // and zero out everything added since the switch. Counting the wrong store
-    // is silent -- the recount still reports success -- so the choice is made
-    // explicitly rather than assumed.
-    let mut counts: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-    if self.relationship_read_mode(conn).await == ReadMode::Flat {
-        let mut rows = conn
-            .query(
-                "SELECT tag_id, COUNT(*) AS count FROM Relationship
+        // Build the authoritative per-tag counts with one GROUP BY over the freshly
+        // landed relationships, then emit every tag in the namespace (zeros
+        // included) as bounded per-chunk updates. A single `UPDATE Tags SET count
+        // = 0 WHERE namespace = ?` would sweep the whole 15M-row Tags tree into a
+        // new MVCC image even when only one namespace changes - some fragment
+        // shapes never finish that rematerialization (RSS pins at ~10GB with no
+        // wal).
+        //
+        // Which store to count from follows the *read* mode, because that is what
+        // decides where the live rows are. Under the shipped `single` mode the flat
+        // table holds them and the partitions are frozen at their pre-migration
+        // contents, so counting a partition would resurrect deleted relationships
+        // and zero out everything added since the switch. Counting the wrong store
+        // is silent -- the recount still reports success -- so the choice is made
+        // explicitly rather than assumed.
+        let mut counts: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+        if self.relationship_read_mode(conn).await == ReadMode::Flat {
+            let mut rows = conn
+                .query(
+                    "SELECT tag_id, COUNT(*) AS count FROM Relationship
                  WHERE namespace = ?1
                  GROUP BY tag_id",
+                    (namespace_id as i64,),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                counts.insert(row.get(0)?, row.get(1)?);
+            }
+        } else {
+            // The legacy partitions cover the GROUP BY with their
+            // `(tag_id, file_id)` primary key, so this is one index scan.
+            let mut rows = conn
+                .query(
+                    &format!(
+                        "SELECT tag_id, COUNT(*) AS count FROM Relationship_{namespace_id}
+                     GROUP BY tag_id"
+                    ),
+                    (),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                counts.insert(row.get(0)?, row.get(1)?);
+            }
+        }
+        let mut tag_rows = conn
+            .query(
+                "SELECT id FROM Tags WHERE namespace = ?1",
                 (namespace_id as i64,),
             )
             .await?;
-        while let Some(row) = rows.next().await? {
-            counts.insert(row.get(0)?, row.get(1)?);
+        let mut pairs: Vec<(u64, u64)> = Vec::new();
+        while let Some(row) = tag_rows.next().await? {
+            let id: u64 = row.get(0)?;
+            pairs.push((id, counts.get(&id).copied().unwrap_or(0)));
         }
-    } else {
-        // The legacy partitions cover the GROUP BY with their
-        // `(tag_id, file_id)` primary key, so this is one index scan.
-        let mut rows = conn
-            .query(
-                &format!(
-                    "SELECT tag_id, COUNT(*) AS count FROM Relationship_{namespace_id}
-                     GROUP BY tag_id"
-                ),
-                (),
-            )
-            .await?;
-        while let Some(row) = rows.next().await? {
-            counts.insert(row.get(0)?, row.get(1)?);
-        }
-    }
-    let mut tag_rows = conn
-        .query(
-            "SELECT id FROM Tags WHERE namespace = ?1",
-            (namespace_id as i64,),
-        )
-        .await?;
-    let mut pairs: Vec<(u64, u64)> = Vec::new();
-    while let Some(row) = tag_rows.next().await? {
-        let id: u64 = row.get(0)?;
-        pairs.push((id, counts.get(&id).copied().unwrap_or(0)));
-    }
 
-    conn.execute("BEGIN IMMEDIATE", ()).await?;
-    // The shadow has to move with the counts. Only tags whose count crosses
-    // the popularity threshold actually change shadow membership, and the
-    // pre-read that decides which those are is cheap relative to the recount
-    // itself; passing all of them to `sync_tags_popular` would also work but
-    // costs an FTS segment flush per tag.
-    for chunk in pairs.chunks(POPULARITY_FOLD_CHUNK) {
-        let (count_sql, count_params) = tag_count_set_sql(chunk);
-        conn.execute(count_sql, params_from_iter(count_params))
-            .await?;
-        let shadow_ids = self.tags_with_shadow_drift(conn, chunk).await?;
-        if !shadow_ids.is_empty() {
-            self.sync_tags_popular(conn, &shadow_ids).await?;
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+        // The shadow has to move with the counts. Only tags whose count crosses
+        // the popularity threshold actually change shadow membership, and the
+        // pre-read that decides which those are is cheap relative to the recount
+        // itself; passing all of them to `sync_tags_popular` would also work but
+        // costs an FTS segment flush per tag.
+        for chunk in pairs.chunks(POPULARITY_FOLD_CHUNK) {
+            let (count_sql, count_params) = tag_count_set_sql(chunk);
+            conn.execute(count_sql, params_from_iter(count_params))
+                .await?;
+            let shadow_ids = self.tags_with_shadow_drift(conn, chunk).await?;
+            if !shadow_ids.is_empty() {
+                self.sync_tags_popular(conn, &shadow_ids).await?;
+            }
         }
-    }
-    conn.execute("COMMIT", ()).await?;
+        conn.execute("COMMIT", ()).await?;
         Ok(())
     }
 }

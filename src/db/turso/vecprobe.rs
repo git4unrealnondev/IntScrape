@@ -87,7 +87,11 @@ mod tests {
     /// A Float1Bit literal from a 0/1 dimension list, via the engine's own
     /// constructor so the blob layout is the engine's rather than a guess.
     fn bit_literal(dims: &[i32]) -> String {
-        let list = dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",");
+        let list = dims
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         format!("vector1bit(vector32('[{list}]'))")
     }
 
@@ -124,32 +128,85 @@ mod tests {
         // --- Engine and constructors ---
         run(&conn, "version", "SELECT sqlite_version();").await;
         run(&conn, "vector32", "SELECT vector32('[1,2,3,4]');").await;
-        run(&conn, "vector1bit hex", &format!("SELECT hex({});", bit_literal(&[1,0,1,0]))).await;
+        run(
+            &conn,
+            "vector1bit hex",
+            &format!("SELECT hex({});", bit_literal(&[1, 0, 1, 0])),
+        )
+        .await;
 
         // --- Is Float1Bit cosine really Hamming distance? ---
         // Two 4-dim vectors differing in one bit must be distance 1.
-        run(&conn, "hamming 1100 vs 1000 (want 1)", &format!(
-            "SELECT vector_distance_cos({}, {});",
-            bit_literal(&[1,1,0,0]), bit_literal(&[1,0,0,0]))).await;
-        run(&conn, "hamming 1010 vs 0101 (want 4)", &format!(
-            "SELECT vector_distance_cos({}, {});",
-            bit_literal(&[1,0,1,0]), bit_literal(&[0,1,0,1]))).await;
+        run(
+            &conn,
+            "hamming 1100 vs 1000 (want 1)",
+            &format!(
+                "SELECT vector_distance_cos({}, {});",
+                bit_literal(&[1, 1, 0, 0]),
+                bit_literal(&[1, 0, 0, 0])
+            ),
+        )
+        .await;
+        run(
+            &conn,
+            "hamming 1010 vs 0101 (want 4)",
+            &format!(
+                "SELECT vector_distance_cos({}, {});",
+                bit_literal(&[1, 0, 1, 0]),
+                bit_literal(&[0, 1, 0, 1])
+            ),
+        )
+        .await;
 
         // --- Can Float1Bit be indexed? ---
         run(&conn, "drop bit table", "DROP TABLE IF EXISTS B;").await;
-        run(&conn, "create bit table", "CREATE TABLE B (id INTEGER PRIMARY KEY, h BLOB);").await;
-        run(&conn, "index bit table", "CREATE INDEX b_idx ON B USING toy_vector_sparse_ivf (h);").await;
-        run(&conn, "insert bit", &format!(
-            "INSERT INTO B (id, h) VALUES (1, {});", bit_literal(&[1,0,1,0]))).await;
+        run(
+            &conn,
+            "create bit table",
+            "CREATE TABLE B (id INTEGER PRIMARY KEY, h BLOB);",
+        )
+        .await;
+        run(
+            &conn,
+            "index bit table",
+            "CREATE INDEX b_idx ON B USING toy_vector_sparse_ivf (h);",
+        )
+        .await;
+        run(
+            &conn,
+            "insert bit",
+            &format!(
+                "INSERT INTO B (id, h) VALUES (1, {});",
+                bit_literal(&[1, 0, 1, 0])
+            ),
+        )
+        .await;
 
         // --- Sparse: the type the index accepts ---
         run(&conn, "drop sparse", "DROP TABLE IF EXISTS S;").await;
-        run(&conn, "create sparse", "CREATE TABLE S (id INTEGER PRIMARY KEY, h BLOB);").await;
-        run(&conn, "index sparse", "CREATE INDEX s_idx ON S USING toy_vector_sparse_ivf (h);").await;
+        run(
+            &conn,
+            "create sparse",
+            "CREATE TABLE S (id INTEGER PRIMARY KEY, h BLOB);",
+        )
+        .await;
+        run(
+            &conn,
+            "index sparse",
+            "CREATE INDEX s_idx ON S USING toy_vector_sparse_ivf (h);",
+        )
+        .await;
         for i in 1..=4i32 {
             let bits: Vec<bool> = (0..8).map(|j| (i + j) % 2 == 0).collect();
-            run(&conn, "insert sparse", &format!(
-                "INSERT INTO S (id, h) VALUES ({i}, {});", sparse_literal(&bits))).await;
+            run(
+                &conn,
+                "insert sparse",
+                &format!(
+                    "INSERT INTO S (id, h) VALUES ({i}, {});",
+                    sparse_literal(&bits)
+                ),
+            )
+            .await;
         }
         run(&conn, "count sparse", "SELECT count(*) FROM S;").await;
 
@@ -158,13 +215,18 @@ mod tests {
         //   ORDER BY distance LIMIT ?
         // Alias must be `distance`; a positional parameter is expected.
         let q = "SELECT id, vector_distance_jaccard(h, ?) as distance FROM S  ORDER BY distance LIMIT 2;";
-        run(&conn, "plan exact pattern", &format!("EXPLAIN QUERY PLAN {q}")).await;
+        run(
+            &conn,
+            "plan exact pattern",
+            &format!("EXPLAIN QUERY PLAN {q}"),
+        )
+        .await;
         {
             let mut st = conn.prepare(q).await.expect("prepare");
             let mut rows = st
-                .query(turso::params_from_iter(vec![turso::Value::from(sparse_literal(
-                    &[true, false, true, false, true, false, true, false],
-                ))]))
+                .query(turso::params_from_iter(vec![turso::Value::from(
+                    sparse_literal(&[true, false, true, false, true, false, true, false]),
+                )]))
                 .await
                 .expect("query");
             println!("  OK   query with bound parameter");
@@ -270,11 +332,7 @@ mod tests {
 
         // Average set size, which is what decides whether Jaccard ordering can
         // stand in for Hamming at all.
-        let density = corpus
-            .iter()
-            .flat_map(|v| v.iter())
-            .filter(|b| **b)
-            .count() as f64
+        let density = corpus.iter().flat_map(|v| v.iter()).filter(|b| **b).count() as f64
             / (rows * dims) as f64;
 
         println!(
@@ -317,14 +375,18 @@ mod tests {
                         println!("  insert {i} failed after {inserted}: {e}");
                     }
                     failures += 1;
-                    if failures > 3 { break; }
+                    if failures > 3 {
+                        break;
+                    }
                 }
             }
         }
         // Which ids are missing? A gap means the INSERT was rejected or
         // overwritten, not that the count is wrong.
         {
-            let c = conn.query("SELECT min(id), max(id), count(*) FROM R;", ()).await;
+            let c = conn
+                .query("SELECT min(id), max(id), count(*) FROM R;", ())
+                .await;
             match c {
                 Ok(mut r) => match r.next().await {
                     Ok(Some(row)) => {
@@ -337,31 +399,36 @@ mod tests {
                 },
                 Err(e) => println!("  id range failed: {e}"),
             }
-            match conn.query("SELECT count(*) FROM R WHERE id = 9000;", ()).await {
+            match conn
+                .query("SELECT count(*) FROM R WHERE id = 9000;", ())
+                .await
+            {
                 Ok(mut r) => match r.next().await {
-                    Ok(Some(row)) => println!("  id 9000 present: {}", row.get::<i64>(0).unwrap_or(-1)),
+                    Ok(Some(row)) => {
+                        println!("  id 9000 present: {}", row.get::<i64>(0).unwrap_or(-1))
+                    }
                     _ => {}
                 },
                 Err(e) => println!("  id 9000 check failed: {e}"),
             }
         }
         println!("  seeded {inserted} of {rows} rows");
-            if inserted < rows {
-                println!("  (insertion stopped early; treating as a partial corpus)");
-            }
-            // Verify the rows actually landed. A prepared INSERT whose result
-            // rows are never drained can report Ok while writing nothing.
-            match conn.query("SELECT count(*) FROM R;", ()).await {
-                Ok(mut r) => match r.next().await {
-                    Ok(Some(row)) => {
-                        let n = row.get::<i64>(0).unwrap_or(-1);
-                        println!("  stored rows: {n}");
-                        assert!(n > 0, "inserts reported success but the table is empty");
-                    }
-                    _ => println!("  stored rows: unknown"),
-                },
-                Err(e) => println!("  count failed: {e}"),
-            }
+        if inserted < rows {
+            println!("  (insertion stopped early; treating as a partial corpus)");
+        }
+        // Verify the rows actually landed. A prepared INSERT whose result
+        // rows are never drained can report Ok while writing nothing.
+        match conn.query("SELECT count(*) FROM R;", ()).await {
+            Ok(mut r) => match r.next().await {
+                Ok(Some(row)) => {
+                    let n = row.get::<i64>(0).unwrap_or(-1);
+                    println!("  stored rows: {n}");
+                    assert!(n > 0, "inserts reported success but the table is empty");
+                }
+                _ => println!("  stored rows: unknown"),
+            },
+            Err(e) => println!("  count failed: {e}"),
+        }
 
         let sql = "SELECT id, vector_distance_jaccard(h, ?) as distance FROM R  ORDER BY distance LIMIT ?;";
 
@@ -379,41 +446,57 @@ mod tests {
                 .expect("query");
             let mut got: Vec<i64> = Vec::new();
             while let Ok(Some(row)) = rows_out.next().await {
-                if let Ok(id) = row.get::<i64>(0) { got.push(id); }
+                if let Ok(id) = row.get::<i64>(0) {
+                    got.push(id);
+                }
             }
             println!("  [sanity] scan with NO index, self as query: {got:?}");
             println!("  [sanity] expected id {q} first, truth {:?}", truth[0]);
-            println!("  [sanity] literal text head: {}",
-                &sparse_literal(&target)[..sparse_literal(&target).len().min(120)]);
+            println!(
+                "  [sanity] literal text head: {}",
+                &sparse_literal(&target)[..sparse_literal(&target).len().min(120)]
+            );
             let lit_sql = format!(
                 "SELECT id, vector_distance_jaccard(h, {}) as distance FROM R ORDER BY distance LIMIT ?;",
-                sparse_literal(&target));
-            match conn.query(&lit_sql, turso::params_from_iter(vec![turso::Value::from(topk)])).await {
+                sparse_literal(&target)
+            );
+            match conn
+                .query(
+                    &lit_sql,
+                    turso::params_from_iter(vec![turso::Value::from(topk)]),
+                )
+                .await
+            {
                 Ok(mut r) => {
                     let mut ids = Vec::new();
                     while let Ok(Some(row)) = r.next().await {
-                        if let Ok(id) = row.get::<i64>(0) { ids.push(id); }
+                        if let Ok(id) = row.get::<i64>(0) {
+                            ids.push(id);
+                        }
                     }
                     println!("  [sanity] literal-arg query: {ids:?}");
-            // Does distance work on a stored column at all?
-            for sql in [
-                "SELECT count(*) FROM R;",
-                "SELECT vector_distance_jaccard(h, vector32_sparse('[1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0]')) FROM R WHERE id = 1;",
-                "SELECT vector_distance_jaccard(vector32_sparse('[1.0,0.0]'), vector32_sparse('[1.0,0.0]'));",
-                "SELECT length(h) FROM R WHERE id = 1;",
-            ] {
-                match conn.query(sql, ()).await {
-                    Ok(mut r) => {
-                        let mut vals = Vec::new();
-                        while let Ok(Some(row)) = r.next().await {
-                            if let Ok(v) = row.get::<f64>(0) { vals.push(v.to_string()); }
-                            else if let Ok(v) = row.get::<i64>(0) { vals.push(v.to_string()); }
+                    // Does distance work on a stored column at all?
+                    for sql in [
+                        "SELECT count(*) FROM R;",
+                        "SELECT vector_distance_jaccard(h, vector32_sparse('[1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0]')) FROM R WHERE id = 1;",
+                        "SELECT vector_distance_jaccard(vector32_sparse('[1.0,0.0]'), vector32_sparse('[1.0,0.0]'));",
+                        "SELECT length(h) FROM R WHERE id = 1;",
+                    ] {
+                        match conn.query(sql, ()).await {
+                            Ok(mut r) => {
+                                let mut vals = Vec::new();
+                                while let Ok(Some(row)) = r.next().await {
+                                    if let Ok(v) = row.get::<f64>(0) {
+                                        vals.push(v.to_string());
+                                    } else if let Ok(v) = row.get::<i64>(0) {
+                                        vals.push(v.to_string());
+                                    }
+                                }
+                                println!("  [probe] {sql:.70}... -> {:?}", vals);
+                            }
+                            Err(e) => println!("  [probe] {sql:.50}... failed: {e}"),
                         }
-                        println!("  [probe] {sql:.70}... -> {:?}", vals);
                     }
-                    Err(e) => println!("  [probe] {sql:.50}... failed: {e}"),
-                }
-            }
                 }
                 Err(e) => println!("  [sanity] literal-arg query failed: {e}"),
             }
@@ -471,8 +554,7 @@ mod tests {
                 // Recall = |got ∩ truth| / |truth|. Counting membership rather
                 // than position, so a correct-but-reordered answer is not
                 // penalised differently from a wrong one.
-                let want: std::collections::HashSet<i64> =
-                    truth[qi].iter().copied().collect();
+                let want: std::collections::HashSet<i64> = truth[qi].iter().copied().collect();
                 let hits = got.iter().filter(|id| want.contains(id)).count();
                 recall_hits += hits;
                 recall_total += want.len();

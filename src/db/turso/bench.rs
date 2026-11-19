@@ -37,8 +37,8 @@ mod tests {
 
     use shared_types::{
         FileInternal, FileManager, FileTagAction, GenericNamespaceObj, PluginJob,
-        ScraperDataReturn, ScraperParam, SearchHolder, SearchObj, Tag, TagOperation,
-        TagParents, TagType, Url,
+        ScraperDataReturn, ScraperParam, SearchHolder, SearchObj, Tag, TagOperation, TagParents,
+        TagType, Url,
     };
     use turso::{Builder, Connection, Value, params_from_iter};
 
@@ -244,10 +244,7 @@ mod tests {
     /// `retry_mvcc` retries in production. Used here so the bench's writers
     /// queue the way real ones do instead of panicking on the first collision.
     fn is_busy(error: &turso::Error) -> bool {
-        matches!(
-            error,
-            turso::Error::Busy(_) | turso::Error::BusySnapshot(_)
-        )
+        matches!(error, turso::Error::Busy(_) | turso::Error::BusySnapshot(_))
     }
 
     /// Prints a statement's query plan, so a slow number can be attributed to a
@@ -3870,7 +3867,11 @@ mod tests {
                     }
                 };
 
-                let index_cols = if covering { "file_id, tag_id" } else { "file_id" };
+                let index_cols = if covering {
+                    "file_id, tag_id"
+                } else {
+                    "file_id"
+                };
                 let mut ddl = String::new();
                 if partitioned {
                     for arm in 0..arms {
@@ -3980,10 +3981,7 @@ mod tests {
                         };
                         let params: Vec<Value> =
                             chunk.iter().map(|id| Value::from(*id as i64)).collect();
-                        let mut rows = conn
-                            .query(&sql, params_from_iter(params))
-                            .await
-                            .unwrap();
+                        let mut rows = conn.query(&sql, params_from_iter(params)).await.unwrap();
                         while let Ok(Some(_)) = rows.next().await {
                             rows_seen += 1;
                         }
@@ -4045,10 +4043,7 @@ mod tests {
                 let mut tag_ms = f64::MAX;
                 for iter in 0..iters + 1 {
                     let started = Instant::now();
-                    let sql = format!(
-                        "SELECT file_id FROM {} WHERE tag_id = ?1",
-                        table_for(1)
-                    );
+                    let sql = format!("SELECT file_id FROM {} WHERE tag_id = ?1", table_for(1));
                     let mut rows = conn
                         .query(&sql, params_from_iter([Value::from(1i64)]))
                         .await
@@ -4120,9 +4115,8 @@ mod tests {
                         // Numbered placeholders throughout: the tag id takes
                         // ?1 and the file list starts at ?2, so the two
                         // parameter blocks cannot collide.
-                        let placeholders: Vec<String> = (2..=file_ids.len() + 1)
-                            .map(|i| format!("?{i}"))
-                            .collect();
+                        let placeholders: Vec<String> =
+                            (2..=file_ids.len() + 1).map(|i| format!("?{i}")).collect();
                         let mut params: Vec<Value> = vec![Value::from(tag_id as i64)];
                         params.extend(file_ids.iter().map(|id| Value::from(*id as i64)));
                         deleted += conn
@@ -4232,7 +4226,8 @@ mod tests {
             // Parent rows, then the two `Tags` shapes with identical content.
             for chunk_start in (0..parents).step_by(SQL_CHUNK_SIZE) {
                 let end = (chunk_start + SQL_CHUNK_SIZE as u64).min(parents);
-                let holders: Vec<String> = (chunk_start..end).map(|_| "(?, ?)".to_string()).collect();
+                let holders: Vec<String> =
+                    (chunk_start..end).map(|_| "(?, ?)".to_string()).collect();
                 let mut params: Vec<Value> = Vec::new();
                 for id in chunk_start..end {
                     params.push(Value::from(id as i64));
@@ -4251,8 +4246,9 @@ mod tests {
             for table in ["Tags_fk", "Tags_nofk"] {
                 for chunk_start in (0..rows).step_by(SQL_CHUNK_SIZE) {
                     let end = (chunk_start + SQL_CHUNK_SIZE as u64).min(rows);
-                    let holders: Vec<String> =
-                        (chunk_start..end).map(|_| "(?, ?, ?)".to_string()).collect();
+                    let holders: Vec<String> = (chunk_start..end)
+                        .map(|_| "(?, ?, ?)".to_string())
+                        .collect();
                     let mut params: Vec<Value> = Vec::new();
                     for id in chunk_start..end {
                         params.push(Value::from(id as i64));
@@ -4284,7 +4280,9 @@ mod tests {
                 for id in &probes {
                     let mut rows = conn
                         .query(
-                            &format!("SELECT id, name, namespace, count FROM {table} WHERE id = ?1"),
+                            &format!(
+                                "SELECT id, name, namespace, count FROM {table} WHERE id = ?1"
+                            ),
                             params_from_iter([Value::from(*id)]),
                         )
                         .await
@@ -4408,7 +4406,10 @@ mod tests {
                 .await
                 .unwrap();
             let conn_a = db_a.connect().unwrap();
-            conn_a.pragma_update("journal_mode", "'mvcc'").await.unwrap();
+            conn_a
+                .pragma_update("journal_mode", "'mvcc'")
+                .await
+                .unwrap();
             conn_a
                 .execute_batch(
                     "CREATE TABLE Relationship (
@@ -4439,7 +4440,10 @@ mod tests {
                 .await
                 .unwrap();
             let conn_b = db_b.connect().unwrap();
-            conn_b.pragma_update("journal_mode", "'mvcc'").await.unwrap();
+            conn_b
+                .pragma_update("journal_mode", "'mvcc'")
+                .await
+                .unwrap();
             conn_b
                 .execute_batch(
                     "CREATE TABLE Relationship (
@@ -4755,8 +4759,9 @@ mod tests {
             // value the relationship rows imply.
             for chunk_start in (0..tags).step_by(SQL_CHUNK_SIZE) {
                 let end = (chunk_start + SQL_CHUNK_SIZE as u64).min(tags);
-                let holders: Vec<String> =
-                    (chunk_start..end).map(|_| "(?, ?, ?)".to_string()).collect();
+                let holders: Vec<String> = (chunk_start..end)
+                    .map(|_| "(?, ?, ?)".to_string())
+                    .collect();
                 let mut params: Vec<Value> = Vec::new();
                 for id in chunk_start..end {
                     params.push(Value::from(id as i64 + 1));
@@ -4809,7 +4814,10 @@ mod tests {
                 let mut counts: std::collections::HashMap<i64, i64> =
                     std::collections::HashMap::new();
                 let mut rows = conn
-                    .query("SELECT tag_id, COUNT(*) FROM Relationship GROUP BY tag_id;", ())
+                    .query(
+                        "SELECT tag_id, COUNT(*) FROM Relationship GROUP BY tag_id;",
+                        (),
+                    )
                     .await
                     .unwrap();
                 while let Ok(Some(row)) = rows.next().await {
@@ -4960,7 +4968,10 @@ mod tests {
                     .await
                     .unwrap();
                 let mut rows = conn
-                    .query(&shadow_preread_sql.0, params_from_iter(shadow_preread_sql.1.clone()))
+                    .query(
+                        &shadow_preread_sql.0,
+                        params_from_iter(shadow_preread_sql.1.clone()),
+                    )
                     .await
                     .unwrap();
                 let mut crossing = 0i64;
@@ -4977,12 +4988,18 @@ mod tests {
                 // A with a crossing: the two shadow statements run as well,
                 // and each one flushes a Tantivy segment.
                 let started = Instant::now();
-                conn.execute(&shadow_delete_sql.0, params_from_iter(shadow_delete_sql.1.clone()))
-                    .await
-                    .unwrap();
-                conn.execute(&shadow_insert_sql.0, params_from_iter(shadow_insert_sql.1.clone()))
-                    .await
-                    .unwrap();
+                conn.execute(
+                    &shadow_delete_sql.0,
+                    params_from_iter(shadow_delete_sql.1.clone()),
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    &shadow_insert_sql.0,
+                    params_from_iter(shadow_insert_sql.1.clone()),
+                )
+                .await
+                .unwrap();
                 let a_cross = a + started.elapsed().as_secs_f64() * 1_000.0;
 
                 // B: count fold-in only.
@@ -5051,7 +5068,8 @@ mod tests {
                 for (id, count) in chunk {
                     params.push(Value::from(**id));
                     params.push(Value::from(**count));
-                }                for (id, _) in chunk {
+                }
+                for (id, _) in chunk {
                     params.push(Value::from(**id));
                 }
                 conn.execute(
@@ -5204,10 +5222,7 @@ mod tests {
                  {rare_tags} rare tags x {rare_files} files), {arms} arms"
             );
 
-            for (label, partitioned) in [
-                ("partitioned", true),
-                ("single", false),
-            ] {
+            for (label, partitioned) in [("partitioned", true), ("single", false)] {
                 let path = bench_db_path(&format!("relscale-{}", label));
                 bench_remove(&path);
                 let db = Builder::new_local(&path.to_string_lossy())
@@ -5402,9 +5417,7 @@ mod tests {
                 let recount_arms = if partitioned { arms } else { 1 };
                 for arm in 0..recount_arms {
                     let sql = if partitioned {
-                        format!(
-                            "SELECT tag_id, COUNT(*) FROM Relationship_{arm} GROUP BY tag_id;"
-                        )
+                        format!("SELECT tag_id, COUNT(*) FROM Relationship_{arm} GROUP BY tag_id;")
                     } else {
                         "SELECT tag_id, COUNT(*) FROM Relationship GROUP BY tag_id;".to_string()
                     };
@@ -5424,9 +5437,8 @@ mod tests {
                 // rows that already exist measures the index lookup, not the
                 // write.
                 let novel_base = total_rows + 1;
-                let rewrite_rows: Vec<(u64, u64)> = (0..rewrite)
-                    .map(|f| (novel_base + f, hot_tag))
-                    .collect();
+                let rewrite_rows: Vec<(u64, u64)> =
+                    (0..rewrite).map(|f| (novel_base + f, hot_tag)).collect();
                 let mut rewrite_per_table: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
                 for &(file_id, tag_id) in &rewrite_rows {
                     rewrite_per_table
@@ -5471,14 +5483,14 @@ mod tests {
                 let churn_started = Instant::now();
                 for round in 0..churn_rounds {
                     let base = novel_base + rewrite + round * churn_rows;
-                    for &(file_id, tag_id) in
-                        &(0..churn_rows).map(|f| (base + f, hot_tag)).collect::<Vec<_>>()
+                    for &(file_id, tag_id) in &(0..churn_rows)
+                        .map(|f| (base + f, hot_tag))
+                        .collect::<Vec<_>>()
                     {
                         let _ = (file_id, tag_id);
                     }
-                    let rows_in: Vec<(u64, u64)> = (0..churn_rows)
-                        .map(|f| (base + f, hot_tag))
-                        .collect();
+                    let rows_in: Vec<(u64, u64)> =
+                        (0..churn_rows).map(|f| (base + f, hot_tag)).collect();
                     let holders: Vec<&str> = rows_in.iter().map(|_| "(?, ?)").collect();
                     let mut params: Vec<Value> = Vec::with_capacity(rows_in.len() * 2);
                     for (file_id, tag_id) in &rows_in {
@@ -5662,7 +5674,8 @@ mod tests {
 
             // Seed a count so the rows exist at a realistic width.
             for chunk in tag_ids.chunks(SQL_CHUNK_SIZE) {
-                let (sql, params) = crate::db::turso::relationship::tag_count_seed_sql_for_bench(chunk);
+                let (sql, params) =
+                    crate::db::turso::relationship::tag_count_seed_sql_for_bench(chunk);
                 conn.execute(&sql, params_from_iter(params)).await.unwrap();
             }
 
@@ -5673,10 +5686,10 @@ mod tests {
             //
             // The fold-in is driven through the real `tag_counts_apply`, so the
             // lock under test is the production one. The sharded variant is
-                    // simulated by running the same folds-in concurrently but
-                    // grouping the batch by shard first, which is the shape a
-                    // sharded implementation would produce.
-                // One round: `concurrency` writers each fold in `batch` deltas
+            // simulated by running the same folds-in concurrently but
+            // grouping the batch by shard first, which is the shape a
+            // sharded implementation would produce.
+            // One round: `concurrency` writers each fold in `batch` deltas
             // through the real `tag_counts_apply`, so the lock under test is
             // the production one. `overlap` picks whether the writers share
             // tags: disjoint sets are what a sharded lock could parallelise,
@@ -6239,10 +6252,7 @@ mod tests {
                 for _ in 0..5 {
                     let started = Instant::now();
                     let mut rows = conn
-                        .query(
-                            "SELECT file_id FROM Relationship WHERE tag_id = 1;",
-                            (),
-                        )
+                        .query("SELECT file_id FROM Relationship WHERE tag_id = 1;", ())
                         .await
                         .unwrap();
                     while let Ok(Some(_)) = rows.next().await {}
@@ -6298,9 +6308,7 @@ mod tests {
             conn.execute_batch(&format!("PRAGMA mvcc_gc_threshold = {gc_threshold};"))
                 .await
                 .unwrap();
-            println!(
-                "    (mvcc_gc_threshold set to {gc_threshold}, default is 16384)"
-            );
+            println!("    (mvcc_gc_threshold set to {gc_threshold}, default is 16384)");
             let mut gc_write_ms = 0.0f64;
             let mut gc_rows = 0u64;
             for _ in 0..8 {
@@ -6512,8 +6520,11 @@ mod tests {
                 search_relate: None,
                 searches: vec![SearchHolder::And(vec![pick(0), pick(1)])],
             };
-            let (row_sql, _, conditions, _) =
-                db.build_search_parts(&conn, &search).await.unwrap().unwrap();
+            let (row_sql, _, conditions, _) = db
+                .build_search_parts(&conn, &search)
+                .await
+                .unwrap()
+                .unwrap();
 
             let mut inner = row_sql.clone();
             for condition in &conditions {
@@ -6522,7 +6533,10 @@ mod tests {
             // The old form: wrap the row select and LIMIT the outer count.
             let old_sql = format!("SELECT COUNT(*) FROM ({inner} LIMIT {cap})");
             // The new form: constant projection on the driver, LIMIT inside.
-            let from_at = inner.find(" FROM ").map(|at| at + " FROM ".len()).unwrap_or(0);
+            let from_at = inner
+                .find(" FROM ")
+                .map(|at| at + " FROM ".len())
+                .unwrap_or(0);
             let new_sql = format!(
                 "SELECT COUNT(*) FROM (SELECT 1 FROM {} LIMIT {cap})",
                 &inner[from_at..]
@@ -6661,8 +6675,11 @@ mod tests {
 
             // The count statement exactly as `search_db_files_count` assembles
             // it now: the aggregate the builder produces, plus the predicates.
-            let (_, count_select, conditions, _) =
-                db.build_search_parts(&conn, &search).await.unwrap().unwrap();
+            let (_, count_select, conditions, _) = db
+                .build_search_parts(&conn, &search)
+                .await
+                .unwrap()
+                .unwrap();
             let mut count_sql = count_select.clone();
             for condition in &conditions {
                 count_sql.push_str(condition);
@@ -6724,8 +6741,7 @@ mod tests {
             // re-running it for the second store is its own cost, and a run
             // that dies mid-way through the second pass would otherwise lose
             // both.
-            let mode = std::env::var("BENCH_SEARCH_MODE")
-                .unwrap_or_else(|_| "both".to_string());
+            let mode = std::env::var("BENCH_SEARCH_MODE").unwrap_or_else(|_| "both".to_string());
             let variants: Vec<(&str, &str)> = match mode.as_str() {
                 "flat" => vec![("flat", "flat")],
                 "legacy" => vec![("legacy", "legacy")],
@@ -6880,10 +6896,7 @@ mod tests {
                         }
 
                         let t1 = Instant::now();
-                        let total = db
-                            .search_db_files_count(&conn, search)
-                            .await
-                            .unwrap();
+                        let total = db.search_db_files_count(&conn, search).await.unwrap();
                         let count_elapsed = t1.elapsed().as_secs_f64() * 1_000.0;
                         if iter == 0 {
                             assert!(
@@ -6905,5 +6918,4 @@ mod tests {
             }
         });
     }
-
 }

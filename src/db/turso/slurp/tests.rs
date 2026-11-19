@@ -1914,7 +1914,11 @@ async fn recount_moves_the_popular_shadow_with_the_count() {
         rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
     }
 
-    assert_eq!(shadow_count(&conn, tag_id).await, 0, "the tag starts out popular-less");
+    assert_eq!(
+        shadow_count(&conn, tag_id).await,
+        0,
+        "the tag starts out popular-less"
+    );
 
     db.slurp_recount_namespace(&conn, ns_id).await.unwrap();
 
@@ -1936,9 +1940,12 @@ async fn recount_moves_the_popular_shadow_with_the_count() {
     );
 
     // And the reverse crossing: drop back below and the shadow must empty.
-    conn.execute("DELETE FROM Relationship WHERE tag_id = ?1;", params_from_iter([Value::from(tag_id as i64)]))
-        .await
-        .unwrap();
+    conn.execute(
+        "DELETE FROM Relationship WHERE tag_id = ?1;",
+        params_from_iter([Value::from(tag_id as i64)]),
+    )
+    .await
+    .unwrap();
     db.slurp_recount_namespace(&conn, ns_id).await.unwrap();
     let count_after: i64 = {
         let mut rows = conn
@@ -1957,4 +1964,3 @@ async fn recount_moves_the_popular_shadow_with_the_count() {
         "the shadow must empty when the count drops below the threshold"
     );
 }
-
