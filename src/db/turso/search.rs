@@ -16,8 +16,16 @@ enum Driver {
     /// already restricted to files carrying `tag_id`, so the result is bounded
     /// by that tag's file count.
     Tag { namespace_id: u64, tag_id: u64 },
+    /// The union of a multi-tag OR group's posting lists, deduplicated. Used
+    /// only when no single tag can drive *and* that union is small relative to
+    /// the library: scanning a short posting list and sorting it beats a full
+    /// `File` scan with a correlated `EXISTS` probe per row (measured ~120x
+    /// faster for a union of 120 files out of 8000). The members are the
+    /// `(namespace_id, tag_id)` pairs to union.
+    AnyTags { tags: Vec<(u64, u64)> },
     /// The whole library. Required when no positive holder resolves to a single
-    /// tag (a not-only search, or one made purely of multi-tag groups).
+    /// tag (a not-only search, or one made purely of multi-tag groups whose
+    /// union is too large to scan instead).
     AllFiles,
 }
 
@@ -26,7 +34,7 @@ impl Driver {
     /// partition exposes `file_id`.
     fn key_column(&self) -> &'static str {
         match self {
-            Driver::Tag { .. } => "file_id",
+            Driver::Tag { .. } | Driver::AnyTags { .. } => "file_id",
             Driver::AllFiles => "id",
         }
     }
@@ -222,6 +230,20 @@ impl TursoDatabase {
     /// displays "{cap}+". The page fetch already early-terminates the same way.
     pub(crate) const COUNT_SCAN_CAP: u64 = 20_000;
 
+    /// A multi-tag OR union is scanned directly (rather than probed from a full
+    /// `File` scan) only when its size is below this fraction of the library.
+    ///
+    /// Scanning the union and `GROUP BY`-deduping it costs a sorter over the
+    /// union, so it wins only while the union is small. A full `File` scan with
+    /// a correlated `EXISTS` per row costs `O(files * members)` and does not
+    /// early-terminate on `LIMIT`. The crossover is measured: at 8000 files a
+    /// union of 120 was ~120x faster scanned (5ms vs 525ms), a union of ~1000
+    /// was a wash, and a union covering half the library was ~10x slower
+    /// scanned (129ms vs 12ms). Staying under an eighth keeps the scan a clear
+    /// win across that range.
+    const ANY_TAGS_UNION_FRACTION_NUM: u64 = 1;
+    const ANY_TAGS_UNION_FRACTION_DEN: u64 = 8;
+
     /// Counts the files a search matches, running the same driving scan and
     /// predicates as `search_db_files` but aggregating instead of shipping
     /// rows. A paged UI asks for this once per search instead of `len()`-ing a
@@ -346,48 +368,85 @@ impl TursoDatabase {
         // Pass 1: pick the driving scan. A one-element AND/OR holder is just
         // "has this tag", so it is the one shape that can drive; the rarest such
         // tag bounds the result most tightly.
-        let mut saw_positive = false;
         let mut driver: Option<Driver> = None;
+        // The smallest multi-tag OR union seen, as (member probes, summed size).
+        // Sum-of-counts is an upper bound on the union (a file carrying two OR
+        // tags is counted twice), which is the conservative direction for the
+        // size test below.
+        let mut best_or: Option<(Vec<(u64, u64)>, i64)> = None;
         for search_holder in search.searches.iter() {
             let (ids, kind) = classify(search_holder);
             if ids.is_empty() || matches!(kind, Predicate::None) {
                 continue;
             }
-            saw_positive = true;
-            if ids.len() != 1 {
-                continue;
-            }
-            let probes = probes_of(ids);
-            let [(namespace_id, tag_id)] = probes[..] else {
-                continue;
-            };
-            let count = id_info.get(&tag_id).map(|(_, c)| *c).unwrap_or(0);
-            let better = match &driver {
-                Some(Driver::Tag {
-                    tag_id: current, ..
-                }) => {
-                    let best = id_info.get(current).map(|(_, c)| *c).unwrap_or(0);
-                    count < best
+            if ids.len() == 1 {
+                let probes = probes_of(ids);
+                let [(namespace_id, tag_id)] = probes[..] else {
+                    continue;
+                };
+                let count = id_info.get(&tag_id).map(|(_, c)| *c).unwrap_or(0);
+                let better = match &driver {
+                    Some(Driver::Tag {
+                        tag_id: current, ..
+                    }) => {
+                        let best = id_info.get(current).map(|(_, c)| *c).unwrap_or(0);
+                        count < best
+                    }
+                    _ => true,
+                };
+                if better {
+                    driver = Some(Driver::Tag {
+                        namespace_id,
+                        tag_id,
+                    });
                 }
-                _ => true,
-            };
-            if better {
-                driver = Some(Driver::Tag {
-                    namespace_id,
-                    tag_id,
-                });
+            } else {
+                // A multi-tag positive holder is an OR group. Track the
+                // smallest-union one as the candidate union driver.
+                let probes = probes_of(ids);
+                if probes.is_empty() {
+                    continue;
+                }
+                let size: i64 = probes
+                    .iter()
+                    .map(|(_, tag_id)| id_info.get(tag_id).map(|(_, c)| *c).unwrap_or(0))
+                    .sum();
+                let better = match &best_or {
+                    Some((_, best)) => size < *best,
+                    None => true,
+                };
+                if better {
+                    best_or = Some((probes, size));
+                }
             }
         }
-        // Without a resolvable positive holder the driver has to be the whole
-        // library, which is what a not-only search means.
-        let driver = match (saw_positive, driver) {
-            (true, Some(driver)) => driver,
-            _ => Driver::AllFiles,
+
+        // Without a single-tag driver, decide between scanning a small OR union
+        // and scanning the whole library. The union scan only pays off while the
+        // union is a small fraction of the library; otherwise the full scan's
+        // early-terminating index order is cheaper than sorting the union.
+        let driver = match driver {
+            Some(driver) => driver,
+            None => match best_or {
+                Some((tags, size)) => {
+                    let file_count = self.file_count_approx(conn).await;
+                    let union = size.max(0) as u64;
+                    let small_enough = union * Self::ANY_TAGS_UNION_FRACTION_DEN
+                        <= file_count * Self::ANY_TAGS_UNION_FRACTION_NUM;
+                    if small_enough {
+                        Driver::AnyTags { tags }
+                    } else {
+                        Driver::AllFiles
+                    }
+                }
+                None => Driver::AllFiles,
+            },
         };
 
         // Pass 2: turn each holder into a predicate on the driving row. A
-        // single-tag positive holder that *is* the driver needs no predicate —
-        // the scan's own `tag_id =` restriction already guarantees it.
+        // positive holder the driving scan already guarantees needs no predicate:
+        // a single-tag driver that *is* that tag, or an `AnyTags` driver whose
+        // union *is* that OR group.
         let mut conditions: Vec<String> = Vec::new();
         for search_holder in search.searches.iter() {
             let (ids, kind) = classify(search_holder);
@@ -398,10 +457,18 @@ impl TursoDatabase {
             if probes.is_empty() {
                 continue;
             }
-            if !matches!(kind, Predicate::None)
-                && matches!(driver, Driver::Tag { tag_id, .. } if tag_id == probes[0].1)
-                && probes.len() == 1
-            {
+            let satisfied_by_driver = match &driver {
+                Driver::Tag { tag_id, .. } => {
+                    !matches!(kind, Predicate::None) && probes.len() == 1 && probes[0].1 == *tag_id
+                }
+                Driver::AnyTags { tags } => {
+                    // The union scan already enforces membership in exactly these
+                    // tags. Skip the holder whose probe set matches it.
+                    !matches!(kind, Predicate::None) && same_tag_set(&probes, tags)
+                }
+                Driver::AllFiles => false,
+            };
+            if satisfied_by_driver {
                 continue;
             }
             conditions.push(render_predicate(kind, &probes, driver.key_column(), flat));
@@ -445,6 +512,54 @@ impl TursoDatabase {
                     )
                 }
             }
+            Driver::AnyTags { tags } => {
+                // The union of these tags' posting lists, deduplicated with a
+                // `GROUP BY` on the file key. That `GROUP BY` is the whole point
+                // of this driver: it replaces the `EXISTS(..) OR EXISTS(..)`
+                // predicate the `AllFiles` driver would run per `File` row.
+                //
+                // The dedup is nested as a subquery aliased `d`, so the outer
+                // row source is a plain relation exposing `d.file_id`, exactly
+                // like the other drivers. That keeps the predicate list uniform:
+                // conditions append as `AND EXISTS(..)` against `d.file_id` and
+                // resolve per deduplicated row, with no `HAVING` special case.
+                let union = if flat {
+                    // One table holds every namespace's relationships, so a
+                    // single `IN` covers the union and the primary key
+                    // `(tag_id, file_id)` drives the range scan.
+                    let in_list = tags
+                        .iter()
+                        .map(|(_, tag_id)| tag_id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("SELECT file_id FROM Relationship WHERE tag_id IN ({in_list})")
+                } else {
+                    // Tags can live in different partitions, so the union is a
+                    // `UNION ALL` across the partitions the members touch. Each
+                    // arm is a plain range scan on that partition's primary key;
+                    // the outer `GROUP BY` dedups across arms.
+                    let arms: Vec<String> = tags
+                        .iter()
+                        .map(|(namespace_id, tag_id)| {
+                            format!(
+                                "SELECT file_id FROM Relationship_{namespace_id} WHERE tag_id = {tag_id}"
+                            )
+                        })
+                        .collect();
+                    arms.join(" UNION ALL ")
+                };
+                (
+                    format!(
+                        "SELECT d.file_id AS file_id \
+                         FROM (SELECT file_id FROM ({union}) u GROUP BY file_id) d WHERE 1"
+                    ),
+                    format!(
+                        "SELECT COUNT(d.file_id) \
+                         FROM (SELECT file_id FROM ({union}) u GROUP BY file_id) d"
+                    ),
+                    "d.file_id",
+                )
+            }
             Driver::AllFiles => (
                 "SELECT d.id AS file_id FROM File d WHERE 1".to_string(),
                 "SELECT COUNT(d.id) FROM File d WHERE 1".to_string(),
@@ -452,6 +567,24 @@ impl TursoDatabase {
             ),
         };
         Ok(Some((row_sql, count_sql, conditions, order_by)))
+    }
+
+    /// Approximate library size for the union-vs-full-scan threshold. `File.id`
+    /// is a dense `INTEGER PRIMARY KEY` assigned from a monotonic counter, so
+    /// `MAX(id)` is a cheap index read and a good proxy for `COUNT(*)` without
+    /// walking the table. Returns 0 when the table is empty or not yet created,
+    /// which makes the caller fall back to the full scan.
+    async fn file_count_approx(&self, conn: &Connection) -> u64 {
+        match conn
+            .query("SELECT COALESCE(MAX(id), 0) FROM File;", ())
+            .await
+        {
+            Ok(mut rows) => match rows.next().await {
+                Ok(Some(row)) => row.get::<i64>(0).map(|n| n.max(0) as u64).unwrap_or(0),
+                _ => 0,
+            },
+            Err(_) => 0,
+        }
     }
 
     /// Renders the `ORDER BY` / `LIMIT` / `OFFSET` tail. `ORDER BY` stays
@@ -529,6 +662,19 @@ fn classify(search_holder: &SearchHolder) -> (&[u64], Predicate) {
         SearchHolder::Or(ids) => (ids, Predicate::Any),
         SearchHolder::Not(ids) => (ids, Predicate::None),
     }
+}
+
+/// Whether two probe sets carry the same tags, ignoring order. Used to skip the
+/// OR holder an `AnyTags` driver already enforces.
+fn same_tag_set(a: &[(u64, u64)], b: &[(u64, u64)]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a = a.to_vec();
+    a.sort_unstable();
+    let mut b = b.to_vec();
+    b.sort_unstable();
+    a == b
 }
 
 /// Renders one holder as a boolean predicate over the driving row.

@@ -172,8 +172,12 @@ impl PluginStorage {
             }
 
             // Only send urls & url_posts to the dltext method
-            for url_param in scraper_data.job.param.iter().filter(|pred| matches!(pred, ScraperParam::Url(_) | ScraperParam::UrlPost(_))) {
-
+            for url_param in scraper_data
+                .job
+                .param
+                .iter()
+                .filter(|pred| matches!(pred, ScraperParam::Url(_) | ScraperParam::UrlPost(_)))
+            {
             }
 
             dbg!(&scraper_data);

@@ -1383,3 +1383,258 @@ fn tags_obj(searches: Vec<SearchHolder>) -> SearchObj {
         searches,
     }
 }
+
+/// Builds a library where each tag covers a small, disjoint-ish slice of the
+/// files, so a multi-tag OR union is *selective* — the case the `AnyTags`
+/// driver exists for. Tag `t` covers files where `file_index % tags == t`,
+/// giving `files / tags` files per tag and overlaps only when `tags` collide,
+/// which they do not here. Returns `(file_ids, tag_id -> its files)` like
+/// `seed`, so `expected` can be reused unchanged.
+async fn seed_selective(
+    db: &TursoDatabase,
+    files: u64,
+    tag_count: u64,
+) -> (Vec<u64>, HashMap<u64, BTreeSet<u64>>) {
+    let conn = db.connect().unwrap();
+    let mut ns_set = HashSet::new();
+    for name in ["alpha", "beta"] {
+        ns_set.insert(GenericNamespaceObj {
+            name: name.into(),
+            description: None,
+        });
+    }
+    db.namespace_ensure_set(&ns_set).await.unwrap();
+    let storage_id = db
+        .file_storage_location_get_or_create(&conn, "test_storage")
+        .await
+        .unwrap();
+    let mut file_objs = Vec::new();
+    for i in 0..files {
+        file_objs.push(FileInternal {
+            id: None,
+            hash: format!("selhash{i}"),
+            extension: "jpg".into(),
+            storage_id,
+            size_bytes: Some(1),
+        });
+    }
+    let inserted = db.file_add_bulk(&conn, &file_objs).await.unwrap();
+    let file_ids: Vec<u64> = inserted.iter().map(|f| f.id.unwrap()).collect();
+
+    let mut tag_objs = HashSet::new();
+    for t in 0..tag_count {
+        tag_objs.insert(Tag {
+            name: format!("sel-tag-{t}"),
+            namespace: GenericNamespaceObj {
+                name: "alpha".into(),
+                description: None,
+            },
+        });
+    }
+    let tag_set = db.tag_add_bulk(&conn, &tag_objs).await.unwrap();
+    let mut tag_ids: Vec<u64> = tag_set.iter().map(|t| t.id as u64).collect();
+    tag_ids.sort_unstable();
+
+    let mut rels = HashSet::new();
+    let mut truth: HashMap<u64, BTreeSet<u64>> = HashMap::new();
+    for (t_index, &tag_id) in tag_ids.iter().enumerate() {
+        for (f_index, &file_id) in file_ids.iter().enumerate() {
+            if (f_index as u64) % tag_count == t_index as u64 {
+                rels.insert((file_id, tag_id));
+                truth.entry(tag_id).or_default().insert(file_id);
+            }
+        }
+    }
+    let deltas = db.relationships_bulk_add(&conn, &rels).await.unwrap();
+    db.tag_counts_apply(&deltas, &HashMap::new()).await.unwrap();
+    drop(conn);
+    (file_ids, truth)
+}
+
+/// A selective multi-tag OR search must drive from the OR group's posting
+/// lists, not a full `File` scan, and must agree with the reference semantics
+/// for OR-only, OR+AND, and OR+NOT shapes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selective_or_drives_from_posting_lists() {
+    let db = new_test_db().await;
+    // 600 files, 30 tags -> each tag covers ~20 files (selective). An OR of
+    // three tags unions ~60 files out of 600 (10%), under the 1/8 threshold,
+    // so the driver is the OR group's posting lists rather than a File scan.
+    let (file_ids, truth) = seed_selective(&db, 600, 30).await;
+    let conn = db.connect().unwrap();
+
+    let mut tag_ids: Vec<u64> = truth.keys().copied().collect();
+    tag_ids.sort_unstable();
+    let (a, b, c) = (tag_ids[0], tag_ids[1], tag_ids[2]);
+    let and_tag = tag_ids[10];
+    let not_tag = tag_ids[11];
+
+    let shapes: Vec<(Vec<SearchHolder>, Option<u64>)> = vec![
+        // OR-only, the shape that used to fall to a full File scan.
+        (vec![SearchHolder::Or(vec![a, b, c])], None),
+        (vec![SearchHolder::Or(vec![a, b, c])], Some(10)),
+        // OR intersected with a single AND tag.
+        (
+            vec![
+                SearchHolder::And(vec![and_tag]),
+                SearchHolder::Or(vec![a, b, c]),
+            ],
+            None,
+        ),
+        // OR with a NOT subtracted.
+        (
+            vec![
+                SearchHolder::Or(vec![a, b, c]),
+                SearchHolder::Not(vec![not_tag]),
+            ],
+            None,
+        ),
+        // Two OR groups: one drives, the other is a predicate.
+        (
+            vec![
+                SearchHolder::Or(vec![a, b, c]),
+                SearchHolder::Or(vec![and_tag, not_tag]),
+            ],
+            None,
+        ),
+    ];
+
+    for (searches, limit) in shapes {
+        let want = expected(&file_ids, &truth, &searches, &limit);
+        let got = db
+            .search_db_files(&conn, &tags_obj(searches.clone()), &limit, &None)
+            .await
+            .unwrap();
+        assert_eq!(
+            got, want,
+            "selective OR search disagreed with reference semantics for {searches:?} limit={limit:?}"
+        );
+
+        // The count aggregate must agree with the row scan.
+        let counted = db
+            .search_db_files_count(&conn, &tags_obj(searches.clone()))
+            .await
+            .unwrap();
+        let unlimited = db
+            .search_db_files(&conn, &tags_obj(searches.clone()), &None, &None)
+            .await
+            .unwrap();
+        assert_eq!(
+            counted,
+            unlimited.len() as u64,
+            "COUNT must equal the result size for {searches:?}"
+        );
+    }
+
+    // The OR-only plan must be driven by the relationship index, never a full
+    // scan of `File` (which is what the old AllFiles fallback emitted).
+    let sql = db
+        .build_search_sql(
+            &conn,
+            &tags_obj(vec![SearchHolder::Or(vec![a, b, c])]),
+            &None,
+            &None,
+        )
+        .await
+        .unwrap()
+        .expect("selective OR must produce a statement");
+    assert!(
+        sql.contains("Relationship") && sql.contains("GROUP BY"),
+        "selective OR must dedup over the relationship posting lists, got: {sql}"
+    );
+    assert!(
+        !sql.contains("FROM File"),
+        "selective OR must not scan the whole File table, got: {sql}"
+    );
+
+    drop(conn);
+    db.shutdown().await;
+}
+
+/// The same selective OR search must be correct when the legacy per-namespace
+/// partitions are the read source, where the union spans partitions and is
+/// rendered as a `UNION ALL` of per-partition range scans. Data is written in
+/// `dual` mode so both the flat table and the partitions are populated, then
+/// read back in `legacy` mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selective_or_legacy_read_mode() {
+    use crate::db::turso::relationship_store::{READ_MODE_SETTING, WRITE_MODE_SETTING};
+
+    let db = new_test_db().await;
+    let conn = db.connect().unwrap();
+    db.setting_set(
+        &conn,
+        shared_types::DbSettingsObj {
+            name: WRITE_MODE_SETTING.into(),
+            description: None,
+            num: None,
+            param: Some("dual".into()),
+        },
+    )
+    .await
+    .unwrap();
+    drop(conn);
+
+    let (file_ids, truth) = seed_selective(&db, 600, 30).await;
+
+    let conn = db.connect().unwrap();
+    db.setting_set(
+        &conn,
+        shared_types::DbSettingsObj {
+            name: READ_MODE_SETTING.into(),
+            description: None,
+            num: None,
+            param: Some("legacy".into()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut tag_ids: Vec<u64> = truth.keys().copied().collect();
+    tag_ids.sort_unstable();
+    let (a, b, c) = (tag_ids[0], tag_ids[1], tag_ids[2]);
+    let and_tag = tag_ids[10];
+    let not_tag = tag_ids[11];
+
+    for (searches, limit) in [
+        (vec![SearchHolder::Or(vec![a, b, c])], None),
+        (
+            vec![
+                SearchHolder::And(vec![and_tag]),
+                SearchHolder::Or(vec![a, b, c]),
+            ],
+            None,
+        ),
+        (
+            vec![
+                SearchHolder::Or(vec![a, b, c]),
+                SearchHolder::Not(vec![not_tag]),
+            ],
+            None,
+        ),
+    ] {
+        let want = expected(&file_ids, &truth, &searches, &limit);
+        let got = db
+            .search_db_files(&conn, &tags_obj(searches.clone()), &limit, &None)
+            .await
+            .unwrap();
+        assert_eq!(
+            got, want,
+            "legacy selective OR disagreed with reference semantics for {searches:?} limit={limit:?}"
+        );
+
+        // The plan must read the partitions, not scan File.
+        let sql = db
+            .build_search_sql(&conn, &tags_obj(searches.clone()), &None, &None)
+            .await
+            .unwrap()
+            .expect("legacy selective OR must produce a statement");
+        assert!(
+            sql.contains("Relationship_") && !sql.contains("FROM File"),
+            "legacy selective OR must read the partitions, not File: {sql}"
+        );
+    }
+
+    drop(conn);
+    db.shutdown().await;
+}

@@ -362,10 +362,11 @@ DROP TABLE Parents_old;
     /// to read them) -- but note that a rollback needs the partitions
     /// refilled first, since rows written under `single` never reached them.
     ///
-    /// The backfill is set-based and restartable: `INSERT OR IGNORE` against
-    /// the flat table's primary key makes a re-run of the migration a no-op,
-    /// and the per-namespace copy is chunked so no single statement is
-    /// larger than `SQL_CHUNK_SIZE` rows.
+    /// The backfill is set-based and restartable: one `INSERT OR IGNORE ...
+    /// SELECT ... FROM Relationship_{ns}` per partition, with the namespace as
+    /// a literal per arm. Conflicts on the flat table's primary key make a
+    /// re-run a no-op, and the engine streams the scan/insert server-side, so
+    /// nothing has to be chunked to bound statement size or memory.
     pub(in crate::db) async fn update_db_14_to_15(&self, conn: &Connection) -> Result<()> {
         log::info!(
             "Migration 14->15: adding the flat Relationship table and backfilling it \
@@ -402,68 +403,28 @@ DROP TABLE Parents_old;
         partitions.sort_by_key(|(_, namespace_id)| *namespace_id);
 
         for (table, namespace_id) in &partitions {
-            let mut copied = 0u64;
-            // Keyset-paginated: the flat table's primary key is
-            // `(tag_id, file_id)`, so the source is read in that order and
-            // the cursor advances past the last row of each batch. A plain
-            // `LIMIT` without a cursor would re-read the same first chunk
-            // forever.
+            // One set-based statement per partition. The flat table's primary
+            // key is `(tag_id, file_id)` and `INSERT OR IGNORE` conflicts on
+            // exactly that, so a re-run (or a partition whose rows already
+            // exist) is a no-op rather than a duplicate -- the copy stays
+            // restartable without any Rust-side cursor.
             //
-            // Tag ids are rowids starting at 1, so a `-1` sentinel is
-            // unambiguously "before the first row" and the first page needs
-            // no special case.
-            let mut last_tag_id: i64 = -1;
-            let mut last_file_id: i64 = -1;
-            loop {
-                let mut stmt = conn
-                    .prepare(&format!(
-                        "SELECT tag_id, file_id FROM {table}
-                         WHERE tag_id > ?1 OR (tag_id = ?1 AND file_id > ?2)
-                         ORDER BY tag_id, file_id
-                         LIMIT {chunk};",
-                        chunk = crate::db::SQL_CHUNK_SIZE
-                    ))
-                    .await?;
-                let mut rows = stmt
-                    .query(turso::params_from_iter([
-                        turso::Value::from(last_tag_id),
-                        turso::Value::from(last_file_id),
-                    ]))
-                    .await?;
-                let mut batch: Vec<(i64, i64)> = Vec::new();
-                while let Some(row) = rows.next().await? {
-                    batch.push((row.get(0)?, row.get(1)?));
-                }
-                drop(rows);
-                if batch.is_empty() {
-                    break;
-                }
-                let holders: Vec<&str> = batch.iter().map(|_| "(?, ?, ?)").collect();
-                let mut params: Vec<turso::Value> = Vec::with_capacity(batch.len() * 3);
-                for (tag_id, file_id) in &batch {
-                    params.push(turso::Value::from(*file_id));
-                    params.push(turso::Value::from(*tag_id));
-                    params.push(turso::Value::from(*namespace_id as i64));
-                }
-                conn.execute(
+            // The namespace is a literal per arm: the partitions are separate
+            // tables, so a single `SELECT` cannot read more than one; the loop
+            // is over partitions, not over chunks. The engine streams the scan
+            // and insert server-side, so memory is O(1) regardless of how many
+            // rows a partition holds -- unlike the old keyset-paginated copy,
+            // which pulled every row into a `Vec` and rebuilt a
+            // `VALUES (?,?,?),...` statement per chunk.
+            let copied = conn
+                .execute(
                     format!(
                         "INSERT OR IGNORE INTO Relationship (file_id, tag_id, namespace)
-                         VALUES {}",
-                        holders.join(", ")
+                         SELECT file_id, tag_id, {namespace_id} FROM {table}"
                     ),
-                    turso::params_from_iter(params),
+                    (),
                 )
                 .await?;
-                copied += batch.len() as u64;
-                if batch.len() < crate::db::SQL_CHUNK_SIZE {
-                    break;
-                }
-                let Some(&(tag_id, file_id)) = batch.last() else {
-                    break;
-                };
-                last_tag_id = tag_id;
-                last_file_id = file_id;
-            }
             log::info!(
                 "Migration 14->15: backfilled {copied} rows from {table} into Relationship."
             );
@@ -588,7 +549,7 @@ mod tests {
 
     use turso::Builder;
 
-    async fn temp_db_path(label: &str) -> std::path::PathBuf {
+    pub(super) async fn temp_db_path(label: &str) -> std::path::PathBuf {
         let dir = tempfile::tempdir().unwrap();
         // Leak the guard: the path has to outlive the call, and the test
         // process cleans /tmp anyway.
@@ -596,7 +557,7 @@ mod tests {
         path.join(format!("intscrape-mig-{label}-{}.db", std::process::id()))
     }
 
-    fn remove_db(path: &std::path::Path) {
+    pub(super) fn remove_db(path: &std::path::Path) {
         let _ = std::fs::remove_file(path);
         for suffix in ["-log", "-wal", "-shm"] {
             let mut side = path.to_path_buf().into_os_string();
@@ -607,7 +568,7 @@ mod tests {
 
     /// A v14 database: namespaces, tags, files, and per-namespace relationship
     /// partitions with no flat `Relationship` table.
-    async fn build_v14(path: &std::path::Path, namespaces: usize, rows_per_ns: u64) {
+    pub(super) async fn build_v14(path: &std::path::Path, namespaces: usize, rows_per_ns: u64) {
         remove_db(path);
         let db = Builder::new_local(&path.to_string_lossy())
             .experimental_index_method(true)
@@ -796,5 +757,207 @@ mod tests {
         };
         assert_eq!(total, 0);
         remove_db(&path);
+    }
+}
+
+
+#[cfg(test)]
+mod bench_14_15 {
+    use super::*;
+    use super::tests::{build_v14, remove_db, temp_db_path};
+    use std::time::Instant;
+    use turso::Builder;
+
+    async fn fresh_v14_raw(path: &std::path::Path, namespaces: usize, rows_per_ns: u64) {
+        // Build a v14-shaped db via the test helper (leaves SYSTEM_VERSION=14,
+        // partitions populated, no flat table).
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("seed.db");
+        build_v14(&tmp, namespaces, rows_per_ns).await;
+        // Copy the file to `path`.
+        let _ = std::fs::remove_file(path);
+        std::fs::copy(&tmp, path).unwrap();
+        for suffix in ["-log", "-wal", "-shm"] {
+            let mut s = tmp.to_path_buf().into_os_string();
+            s.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(s));
+        }
+    }
+
+    async fn list_partitions(conn: &Connection) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND lower(name) LIKE 'relationship\\_%' ESCAPE '\\';",
+            )
+            .await
+            .unwrap();
+        let mut rows = stmt.query(()).await.unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            let name: String = row.get(0).unwrap();
+            let lowered = name.to_ascii_lowercase();
+            let Some(suffix) = lowered.strip_prefix("relationship_") else {
+                continue;
+            };
+            let Ok(ns) = suffix.parse::<u64>() else { continue };
+            out.push((name, ns));
+        }
+        out.sort_by_key(|(_, ns)| *ns);
+        out
+    }
+
+    /// Old keyset-paginated copy, inlined verbatim from the pre-change code.
+    async fn copy_old(conn: &Connection, partitions: &[(String, u64)]) -> u64 {
+        let chunk = crate::db::SQL_CHUNK_SIZE;
+        let mut total = 0u64;
+        for (table, namespace_id) in partitions {
+            let mut last_tag_id: i64 = -1;
+            let mut last_file_id: i64 = -1;
+            loop {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT tag_id, file_id FROM {table}
+                         WHERE tag_id > ?1 OR (tag_id = ?1 AND file_id > ?2)
+                         ORDER BY tag_id, file_id
+                         LIMIT {chunk};"
+                    ))
+                    .await
+                    .unwrap();
+                let mut rows = stmt
+                    .query(turso::params_from_iter([
+                        turso::Value::from(last_tag_id),
+                        turso::Value::from(last_file_id),
+                    ]))
+                    .await
+                    .unwrap();
+                let mut batch: Vec<(i64, i64)> = Vec::new();
+                while let Some(row) = rows.next().await.unwrap() {
+                    batch.push((row.get(0).unwrap(), row.get(1).unwrap()));
+                }
+                drop(rows);
+                if batch.is_empty() {
+                    break;
+                }
+                let holders: Vec<&str> = batch.iter().map(|_| "(?, ?, ?)").collect();
+                let mut params: Vec<turso::Value> = Vec::with_capacity(batch.len() * 3);
+                for (tag_id, file_id) in &batch {
+                    params.push(turso::Value::from(*file_id));
+                    params.push(turso::Value::from(*tag_id));
+                    params.push(turso::Value::from(*namespace_id as i64));
+                }
+                conn.execute(
+                    format!(
+                        "INSERT OR IGNORE INTO Relationship (file_id, tag_id, namespace)
+                         VALUES {}",
+                        holders.join(", ")
+                    ),
+                    turso::params_from_iter(params),
+                )
+                .await
+                .unwrap();
+                total += batch.len() as u64;
+                if batch.len() < chunk {
+                    break;
+                }
+                let Some(&(t, f)) = batch.last() else { break };
+                last_tag_id = t;
+                last_file_id = f;
+            }
+        }
+        total
+    }
+
+    /// New set-based copy.
+    async fn copy_new(conn: &Connection, partitions: &[(String, u64)]) -> u64 {
+        let mut total = 0u64;
+        for (table, namespace_id) in partitions {
+            let n = conn
+                .execute(
+                    format!(
+                        "INSERT OR IGNORE INTO Relationship (file_id, tag_id, namespace)
+                         SELECT file_id, tag_id, {namespace_id} FROM {table}"
+                    ),
+                    (),
+                )
+                .await
+                .unwrap();
+            total += n as u64;
+        }
+        total
+    }
+
+    async fn setup(path: &std::path::Path, namespaces: usize, rows_per_ns: u64) -> Connection {
+        fresh_v14_raw(path, namespaces, rows_per_ns).await;
+        let db = Builder::new_local(&path.to_string_lossy())
+            .experimental_index_method(true)
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        // create the flat table the migration would create, but DO NOT stamp
+        // the version, so we can run the copy twice on identical data.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS Relationship (
+                 file_id INTEGER NOT NULL,
+                 tag_id INTEGER NOT NULL,
+                 namespace INTEGER NOT NULL,
+                 PRIMARY KEY (tag_id, file_id));
+             CREATE INDEX IF NOT EXISTS idx_relationship_file_tag ON Relationship (file_id, tag_id);",
+        )
+        .await
+        .unwrap();
+        conn
+    }
+
+    async fn run_case(namespaces: usize, rows_per_ns: u64) {
+        let label = format!("{namespaces}ns x {rows_per_ns} rows");
+        // old
+        let path_old = temp_db_path("old").await;
+        let conn_old = setup(&path_old, namespaces, rows_per_ns).await;
+        let parts_old = list_partitions(&conn_old).await;
+        let t = Instant::now();
+        let old_rows = copy_old(&conn_old, &parts_old).await;
+        let old_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        // new
+        let path_new = temp_db_path("new").await;
+        let conn_new = setup(&path_new, namespaces, rows_per_ns).await;
+        let parts_new = list_partitions(&conn_new).await;
+        let t = Instant::now();
+        let new_rows = copy_new(&conn_new, &parts_new).await;
+        let new_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        async fn count(conn: &Connection) -> u64 {
+            let mut r = conn
+                .query("SELECT COUNT(*) FROM Relationship;", ())
+                .await
+                .unwrap();
+            r.next().await.unwrap().unwrap().get::<i64>(0).unwrap() as u64
+        }
+        let old_cnt = count(&conn_old).await;
+        let new_cnt = count(&conn_new).await;
+        println!(
+            "{label:28} OLD={old_ms:8.2}ms (rows={old_rows}, tbl={old_cnt})  NEW={new_ms:8.2}ms (rows={new_rows}, tbl={new_cnt})  speedup={:.2}x",
+            old_ms / new_ms
+        );
+        assert_eq!(old_cnt, new_cnt, "row counts must match for {label}");
+
+        drop(conn_old);
+        drop(conn_new);
+        remove_db(&path_old);
+        remove_db(&path_new);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual benchmark: 14->15 old keyset vs new set-based"]
+    async fn bench_14_15() {
+        // Warm both paths once on a tiny db.
+        run_case(2, 100).await;
+        println!("\n== 14->15 backfill: old keyset-paginated vs new set-based ==");
+        run_case(3, 5_000).await;
+        run_case(8, 5_000).await;
+        run_case(3, 50_000).await;
+        run_case(16, 20_000).await;
     }
 }

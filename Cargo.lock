@@ -1563,19 +1563,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cloudflare_bypass"
-version = "1.0.0"
-dependencies = [
- "client",
- "log",
- "regex",
- "serde",
- "serde_json",
- "shared_types",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
