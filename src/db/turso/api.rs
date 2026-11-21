@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use shared_types::helpers::collect_namespaces;
 use shared_types::{
-    DbSettingsObj, FileAction, FileInternal, FileManager, FileTagAction, HashesSupported,
-    PluginJob, Tag,
+    DbSettingsObj, FileAction, FileInternal, FileManager, FileTagAction, GenericNamespaceObj,
+    HashesSupported, PluginJob, PluginTag, Tag,
 };
 use turso::Result;
 
@@ -256,8 +256,34 @@ impl TursoDatabase {
             ],
         };
         file_manager.normalize_hashes();
+
+        // Record where the file came from, mirroring the `source_url` tag a
+        // downloaded file gets: namespace `source_path`, tag name = the path
+        // the file was imported from.
+        let source_path_tag = FileTagAction::add(vec![PluginTag {
+            tag: Tag {
+                name: path.to_string_lossy().into_owned(),
+                namespace: GenericNamespaceObj {
+                    name: "source_path".into(),
+                    description: Some("A source path for a file".into()),
+                },
+            },
+            ..Default::default()
+        }]);
+
+        // Namespace creation (row + Relationship_{id} partition) is DDL, which
+        // turso only permits inside an exclusive transaction. Ensure it exists
+        // up front, while nothing else is open, so the concurrent tag-add
+        // transaction in `process_scraper_chunk_human` stays DML-only.
+        if let Err(error) = self
+            .namespace_ensure_set(&collect_namespaces(std::slice::from_ref(&source_path_tag)))
+            .await
+        {
+            return Err(format!("failed to ensure source_path namespace: {error}"));
+        }
+
         let mut map = HashMap::new();
-        map.insert(file_manager, Vec::new());
+        map.insert(file_manager, vec![source_path_tag]);
         if !self
             .process_scraper_chunk_human(map)
             .await

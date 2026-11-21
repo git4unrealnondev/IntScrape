@@ -531,6 +531,22 @@ mod tests {
         assert!(file.id.is_some());
         assert_eq!(file.extension, "png");
 
+        // The import recorded the original path as a `source_path` tag, using
+        // the same convention `source_url` uses for downloads, so the file can
+        // be resolved back from where it was imported from.
+        let source_path_tag = shared_types::Tag {
+            name: source.to_string_lossy().into_owned(),
+            namespace: shared_types::GenericNamespaceObj {
+                name: "source_path".into(),
+                description: None,
+            },
+        };
+        let tagged = db
+            .ipc_get_tag_file(&source_path_tag)
+            .await
+            .expect("imported file should resolve from its source_path tag");
+        assert_eq!(tagged.id, file.id);
+
         // Re-importing is idempotent: same file id, no error.
         import_one_file(&db, &source, &cli_structs::FileAction::Copy)
             .await
