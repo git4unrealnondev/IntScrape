@@ -19,7 +19,8 @@ use fast_log::{
 use intscrape::{
     db::{
         SYSTEM_DATABASE_BACKUP_SITE, SYSTEM_DATABASE_SLURP_SITE, SYSTEM_FILE_HASH_SITE,
-        SYSTEM_FILE_SIZE_SITE, SYSTEM_STORAGE_CHECK_SITE, turso::TursoDatabase,
+        SYSTEM_FILE_IMPORT_SITE, SYSTEM_FILE_SIZE_SITE, SYSTEM_STORAGE_CHECK_SITE,
+        turso::TursoDatabase,
     },
     ipc::IpcServer,
     plugins::PluginManager,
@@ -222,6 +223,7 @@ async fn run_app() -> Result<(), Box<dyn Error + Send + Sync>> {
                     SYSTEM_DATABASE_BACKUP_SITE.to_string(),
                     SYSTEM_FILE_SIZE_SITE.to_string(),
                     SYSTEM_FILE_HASH_SITE.to_string(),
+                    SYSTEM_FILE_IMPORT_SITE.to_string(),
                     SYSTEM_STORAGE_CHECK_SITE.to_string(),
                 ]
                 .into_iter()

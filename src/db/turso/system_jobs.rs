@@ -8,8 +8,8 @@ use walkdir::WalkDir;
 use bytes::Bytes;
 use rayon::prelude::*;
 use shared_types::{
-    DEFAULT_PRIORITY, DbJobRecreation, DbJobsObj, FileInternal, HashesSupported, PluginJob,
-    ScraperParam, Url,
+    DEFAULT_PRIORITY, DbJobRecreation, DbJobsObj, FileAction, FileInternal, HashesSupported,
+    PluginJob, ScraperParam, Url,
 };
 use strum::IntoEnumIterator;
 use turso::Connection;
@@ -17,7 +17,7 @@ use turso::Connection;
 use crate::backup_path::dated_backup_destination;
 use crate::db::{
     SQL_CHUNK_SIZE, SYSTEM_DATABASE_BACKUP_SITE, SYSTEM_DATABASE_SLURP_SITE, SYSTEM_FILE_HASH_SITE,
-    SYSTEM_FILE_SIZE_SITE, SYSTEM_STORAGE_CHECK_FILENAME_MODE,
+    SYSTEM_FILE_IMPORT_SITE, SYSTEM_FILE_SIZE_SITE, SYSTEM_STORAGE_CHECK_FILENAME_MODE,
     SYSTEM_STORAGE_CHECK_REDOWNLOAD_MODE, SYSTEM_STORAGE_CHECK_SITE,
 };
 use crate::web::manager::hash_bytes;
@@ -75,6 +75,7 @@ impl TursoDatabase {
         let success = match job.config.site.as_str() {
             SYSTEM_DATABASE_BACKUP_SITE => self.run_backup_job(job).await,
             SYSTEM_DATABASE_SLURP_SITE => self.run_slurp_job(job).await,
+            SYSTEM_FILE_IMPORT_SITE => self.run_import_job(job).await,
             SYSTEM_FILE_SIZE_SITE => match self.update_missing_file_sizes().await {
                 Ok(_) => true,
                 Err(error) => {
@@ -122,6 +123,55 @@ impl TursoDatabase {
                 false
             }
         }
+    }
+
+    /// Imports every file under a directory into the db as a system job.
+    ///
+    /// `param[0]` is the directory to walk; an optional `param[1]` selects the
+    /// `copy` / `move` / `hardlink` file action (defaults to `copy`). Each file
+    /// is hashed and stored exactly like a downloaded file via `import_file`,
+    /// so hash-based dedupe and lookups work and re-imports are idempotent.
+    async fn run_import_job(&self, job: &DbJobsObj) -> bool {
+        let Some(ScraperParam::Normal(location)) = job.config.param.first() else {
+            log::error!("File-import job {} has no directory", job.id);
+            self.complete_system_job(job).await;
+            return false;
+        };
+
+        let action = match job.config.param.get(1) {
+            Some(ScraperParam::Normal(value)) if value.eq_ignore_ascii_case("move") => {
+                FileAction::Move
+            }
+            Some(ScraperParam::Normal(value)) if value.eq_ignore_ascii_case("hardlink") => {
+                FileAction::HardLink
+            }
+            _ => FileAction::Copy,
+        };
+
+        let mut imported = 0usize;
+        let mut failed = 0usize;
+        for entry in WalkDir::new(location).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            match self.import_file(entry.path(), action).await {
+                Ok(()) => imported += 1,
+                Err(error) => {
+                    failed += 1;
+                    log::error!(
+                        "File-import job {} failed for {}: {error}",
+                        job.id,
+                        entry.path().display()
+                    );
+                }
+            }
+        }
+
+        log::info!(
+            "File-import job {} finished: {imported} imported, {failed} failed",
+            job.id
+        );
+        failed == 0
     }
 
     async fn run_slurp_job(&self, job: &DbJobsObj) -> bool {
@@ -920,6 +970,7 @@ pub fn is_system_job(job: &DbJobsObj) -> bool {
         job.config.site.as_str(),
         SYSTEM_DATABASE_BACKUP_SITE
             | SYSTEM_DATABASE_SLURP_SITE
+            | SYSTEM_FILE_IMPORT_SITE
             | SYSTEM_FILE_SIZE_SITE
             | SYSTEM_FILE_HASH_SITE
             | SYSTEM_STORAGE_CHECK_SITE

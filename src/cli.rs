@@ -18,6 +18,7 @@ use std::sync::Arc;
 pub mod cli_structs;
 
 const DB_SLURP_JOB_ALIAS: &str = "db-slurp";
+const FILE_IMPORT_JOB_ALIAS: &str = "import";
 
 ///
 /// Parses strings into NORMAL inputs as scraperparam
@@ -256,6 +257,8 @@ async fn run(
 
                     let site = if addstruct.site == DB_SLURP_JOB_ALIAS {
                         SYSTEM_DATABASE_SLURP_SITE.to_string()
+                    } else if addstruct.site == FILE_IMPORT_JOB_ALIAS {
+                        crate::db::SYSTEM_FILE_IMPORT_SITE.to_string()
                     } else {
                         addstruct.site.clone()
                     };
@@ -266,8 +269,10 @@ async fn run(
                         site,
                         param: if addstruct.site == DB_SLURP_JOB_ALIAS
                             || addstruct.site == SYSTEM_DATABASE_SLURP_SITE
+                            || addstruct.site == FILE_IMPORT_JOB_ALIAS
+                            || addstruct.site == crate::db::SYSTEM_FILE_IMPORT_SITE
                         {
-                            // A database path is one value, including when it contains spaces.
+                            // A path is one value, including when it contains spaces.
                             vec![shared_types::ScraperParam::Normal(addstruct.query.clone())]
                         } else {
                             parse_string_to_scraperparam(&addstruct.query)

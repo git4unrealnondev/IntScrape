@@ -15,7 +15,10 @@ use tokio::sync::RwLock;
 use crate::{
     db::turso::TursoDatabase,
     plugins::PluginManager,
-    web::{MAX_CONCURRENT_JOBS, manager::semaphore_priority, ratelimit::RatelimitManager},
+    web::{
+        MAX_CONCURRENT_DOWNLOADS, MAX_CONCURRENT_JOBS, manager::semaphore_priority,
+        ratelimit::RatelimitManager,
+    },
 };
 
 pub struct DownloadManager {
@@ -153,11 +156,7 @@ impl PluginStorage {
 
         'scraperloop: for scraper_data in plugin_data_return.iter() {
             // Stops processing asap
-            if self
-                .download_manager
-                .should_exit
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
+            if self.should_exit() {
                 break 'scraperloop;
             }
 
@@ -171,19 +170,71 @@ impl PluginStorage {
                 continue 'scraperloop;
             }
 
-            // Only send urls & url_posts to the dltext method
-            for url_param in scraper_data
-                .job
-                .param
-                .iter()
-                .filter(|pred| matches!(pred, ScraperParam::Url(_) | ScraperParam::UrlPost(_)))
+            // Gets all dumps from the url_dump for the job
+            let url_dump_list;
             {
+                let job_config = job.config.clone();
+                let plugin = self.plugin.clone();
+                let self_temp = self.clone();
+                if let Ok(url_dump) = tokio::task::spawn_blocking(move || {
+                    self_temp.download_manager.plugin_manager.url_dump(
+                        &ScraperDataReturn {
+                            job: job_config,
+                            ..Default::default()
+                        },
+                        &plugin,
+                    )
+                })
+                .await
+                {
+                    match url_dump {
+                        Ok(out) => {
+                            url_dump_list = out;
+                        }
+                        Err(err) => {
+                            continue 'scraperloop;
+                        }
+                    }
+                } else {
+                    // Handles issue with tokio
+                    continue 'scraperloop;
+                }
+            }
+
+            for scraper_return in url_dump_list {
+                if self.should_exit() {
+                    break 'scraperloop;
+                }
             }
 
             dbg!(&scraper_data);
         }
 
         Ok(())
+    }
+
+    /// Should we exit from caller?
+    fn should_exit(&self) -> bool {
+        self.download_manager
+            .should_exit
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Returns the number of concurrent downloads we can run on a plugin
+    /// Returns a semaphore so we can limit downloads based on job priority
+    fn get_concurrent_downloads_limiter(&self) -> Arc<PrioritySemaphore> {
+        let mut max_concurrent_downloads: Option<usize> = None;
+        for property in self.plugin.properties.iter() {
+            if let PluginProperties::ThreadNum(download_num) = property {
+                let dl = *download_num;
+                max_concurrent_downloads = Some(dl.try_into().unwrap_or(MAX_CONCURRENT_DOWNLOADS));
+                break;
+            }
+        }
+
+        let num = max_concurrent_downloads.unwrap_or(MAX_CONCURRENT_DOWNLOADS);
+
+        Arc::new(PrioritySemaphore::new(num))
     }
 
     ///
@@ -420,7 +471,7 @@ impl DownloadManager {
                 }
 
                 // Check if we need to load login data
-                let _ = self.handle_login_db(&plugin);
+                self.handle_login_db(&plugin);
 
                 let max_concurrent_jobs = plugin
                     .properties

@@ -8,6 +8,9 @@ pub mod ratelimit;
 /// How many jobs we can run at the same time for a plugin
 pub const MAX_CONCURRENT_JOBS: usize = 5;
 
+/// How many concurrent downloads can we have running at once for a plugin
+const MAX_CONCURRENT_DOWNLOADS: usize = 5;
+
 #[derive(Debug)]
 enum FileReturn {
     File(FileManager),
