@@ -148,28 +148,78 @@ impl TursoDatabase {
             _ => FileAction::Copy,
         };
 
+        let location_path = Path::new(location);
+        if !location_path.is_dir() {
+            log::error!(
+                "File-import job {} directory does not exist or is not a directory: {}",
+                job.id,
+                location
+            );
+            self.complete_system_job(job).await;
+            return false;
+        }
+
+        let started = std::time::Instant::now();
+        log::info!(
+            "File-import job {} starting: directory={}, action={:?}",
+            job.id,
+            location,
+            action
+        );
+
+        let mut scanned = 0usize;
         let mut imported = 0usize;
         let mut failed = 0usize;
-        for entry in WalkDir::new(location).into_iter().filter_map(Result::ok) {
+
+        for entry in WalkDir::new(location_path).into_iter() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    log::warn!(
+                        "File-import job {} could not read a path under {}: {error}",
+                        job.id,
+                        location
+                    );
+                    continue;
+                }
+            };
+
             if !entry.file_type().is_file() {
                 continue;
             }
-            match self.import_file(entry.path(), action).await {
-                Ok(()) => imported += 1,
+
+            scanned += 1;
+            let path = entry.path();
+            match self.import_file(path, action).await {
+                Ok(()) => {
+                    imported += 1;
+                    log::info!("File-import job {} imported {}", job.id, path.display());
+                }
                 Err(error) => {
                     failed += 1;
                     log::error!(
-                        "File-import job {} failed for {}: {error}",
+                        "File-import job {} failed to import {}: {error}",
                         job.id,
-                        entry.path().display()
+                        path.display()
                     );
                 }
+            }
+
+            // Heartbeat so a long import is visibly progressing.
+            if scanned % 100 == 0 {
+                log::info!(
+                    "File-import job {} progress: {scanned} files seen, {imported} imported, {failed} failed",
+                    job.id
+                );
             }
         }
 
         log::info!(
-            "File-import job {} finished: {imported} imported, {failed} failed",
-            job.id
+            "File-import job {} finished in {:?}: {imported} imported, {failed} failed ({} files seen) from {}",
+            job.id,
+            started.elapsed(),
+            scanned,
+            location
         );
         failed == 0
     }
