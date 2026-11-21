@@ -20,6 +20,10 @@ pub mod cli_structs;
 const DB_SLURP_JOB_ALIAS: &str = "db-slurp";
 const FILE_IMPORT_JOB_ALIAS: &str = "import";
 
+/// Files per database batch for the interactive `tasks import` command. Kept
+/// modest so the per-batch progress line stays informative on a terminal.
+const CLI_IMPORT_BATCH_SIZE: usize = 1000;
+
 ///
 /// Parses strings into NORMAL inputs as scraperparam
 ///
@@ -95,6 +99,7 @@ fn import_extension(path: &Path) -> String {
 /// (copy / move / hardlink per `file_action`), then records it in the DB
 /// exactly like a downloaded file (SHA-512 primary hash plus MD5/SHA1/SHA256
 /// identifying hashes, so hash-based dedupe and lookups work).
+#[cfg(test)]
 async fn import_one_file(
     db: &TursoDatabase,
     path: &Path,
@@ -332,20 +337,25 @@ async fn run(
                 let mut files: Vec<_> = files.into_iter().collect();
                 files.sort();
 
+                let action = match directory.file_action {
+                    cli_structs::FileAction::Copy => shared_types::FileAction::Copy,
+                    cli_structs::FileAction::Move => shared_types::FileAction::Move,
+                    cli_structs::FileAction::HardLink => shared_types::FileAction::HardLink,
+                };
+
+                let total = files.len();
                 let mut imported = 0usize;
                 let mut failed = 0usize;
-                for file in &files {
-                    match import_one_file(db, file, &directory.file_action).await {
-                        Ok(()) => {
-                            imported += 1;
-                            cli_out(format!("Imported {}", file.display()));
-                        }
-                        Err(error) => {
-                            failed += 1;
-                            cli_out(format!("Failed to import {}: {error}", file.display()));
-                            log::error!("Failed to import {}: {error}", file.display());
-                        }
-                    }
+                let mut processed = 0usize;
+                for batch in files.chunks(CLI_IMPORT_BATCH_SIZE) {
+                    let (ok, bad) = db.import_files_batch(batch, action).await;
+                    imported += ok;
+                    failed += bad;
+                    processed += batch.len();
+                    cli_out(format!(
+                        "Imported {processed}/{total} ({} ok, {} failed)",
+                        imported, failed
+                    ));
                 }
 
                 cli_out(format!(
@@ -592,6 +602,75 @@ mod tests {
             .await
             .expect("move import should succeed");
         assert!(!source.exists(), "move should remove the source");
+    }
+
+    /// The batched import records every file and its `source_path` tag, and
+    /// two files with identical content (same FileManager) still resolve their
+    /// distinct source_path tags to the same stored file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn import_files_batch_records_every_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = TursoDatabase::new_with_exit(
+            &temp_dir.path().join("test.db"),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        let storage_dir = temp_dir.path().join("storage");
+        assert!(
+            db.setting_set_sync(&shared_types::DbSettingsObj {
+                name: "SYSTEM_file_location".into(),
+                description: None,
+                num: None,
+                param: Some(storage_dir.to_string_lossy().into_owned()),
+            })
+            .await
+        );
+
+        // Three distinct files plus a duplicate of the first under another name.
+        let contents: Vec<Vec<u8>> = (0..3)
+            .map(|i| format!("batch contents {i}").into_bytes())
+            .collect();
+        let mut sources = Vec::new();
+        for (i, data) in contents.iter().enumerate() {
+            let path = temp_dir.path().join(format!("batch_{i}.bin"));
+            std::fs::write(&path, data).unwrap();
+            sources.push(path);
+        }
+        let duplicate = temp_dir.path().join("batch_dup.bin");
+        std::fs::write(&duplicate, &contents[0]).unwrap();
+        sources.push(duplicate.clone());
+
+        let (imported, failed) = db
+            .import_files_batch(&sources, shared_types::FileAction::Copy)
+            .await;
+        assert_eq!(failed, 0, "no file should fail to import");
+        assert_eq!(imported, 4, "all four source paths should be placed");
+
+        // Each source path resolves to a file, and the duplicate resolves to
+        // the same file id as the original content.
+        let mut first_id = None;
+        for source in &sources {
+            let tag = shared_types::Tag {
+                name: source.to_string_lossy().into_owned(),
+                namespace: shared_types::GenericNamespaceObj {
+                    name: "source_path".into(),
+                    description: None,
+                },
+            };
+            let file = db
+                .ipc_get_tag_file(&tag)
+                .await
+                .unwrap_or_else(|| panic!("missing source_path tag for {}", source.display()));
+            if source == &sources[0] {
+                first_id = file.id;
+            } else if source == &duplicate {
+                assert_eq!(
+                    file.id,
+                    first_id,
+                    "duplicate content must resolve to the same file"
+                );
+            }
+        }
     }
 
     /// The IPC CLI runner: `--help` comes back as output, bad input as

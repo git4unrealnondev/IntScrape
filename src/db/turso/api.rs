@@ -174,125 +174,104 @@ impl TursoDatabase {
         path: &Path,
         action: FileAction,
     ) -> std::result::Result<(), String> {
-        use std::fs::File;
-
-        let file = File::open(path).map_err(|error| error.to_string())?;
-        let size_bytes = file.metadata().map_err(|error| error.to_string())?.len();
-        if size_bytes == 0 {
-            return Err("empty file".into());
-        }
-
-        // Hash the whole file in memory (same approach as the CLI importer).
-        let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|error| error.to_string())? };
-        let bytes = bytes::Bytes::from(mmap.to_vec());
-        drop(mmap);
-
-        let hash = |kind: &HashesSupported| crate::web::manager::hash_bytes(&bytes, kind).0;
-        let md5 = hash(&HashesSupported::Md5(String::new()));
-        let sha1 = hash(&HashesSupported::Sha1(String::new()));
-        let sha256 = hash(&HashesSupported::Sha256(String::new()));
-        let sha512 = hash(&HashesSupported::Sha512(String::new()));
-
-        let extension = path
-            .extension()
-            .map(|ext| ext.to_string_lossy().into_owned())
-            .filter(|ext| !ext.is_empty())
-            .unwrap_or_else(|| "bin".to_string());
-
-        let Some((storage_path, storage_id)) = self
-            .file_download_location_get_sync(&sha512, &extension)
-            .await
-        else {
+        let Some((base, storage_id)) = self.import_storage_root().await else {
             return Err("no file storage location configured".into());
         };
 
-        // Place the file at its storage destination. A file that is already
-        // stored is left alone; the DB insert below is idempotent, so
-        // re-importing the same file is always safe.
-        let already_stored = storage_path.exists()
-            && std::fs::canonicalize(path).ok().as_deref()
-                == std::fs::canonicalize(&storage_path).ok().as_deref();
-        if !already_stored {
-            if !storage_path.exists() {
-                let parent = storage_path
-                    .parent()
-                    .ok_or("storage path has no parent directory")?;
-                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-                match action {
-                    FileAction::Copy => {
-                        std::fs::copy(path, &storage_path).map_err(|error| error.to_string())?;
-                    }
-                    FileAction::Move => {
-                        if std::fs::rename(path, &storage_path).is_err() {
-                            std::fs::copy(path, &storage_path)
-                                .map_err(|error| error.to_string())?;
-                            std::fs::remove_file(path).map_err(|error| error.to_string())?;
-                        }
-                    }
-                    FileAction::HardLink => {
-                        std::fs::hard_link(path, &storage_path)
-                            .map_err(|error| error.to_string())?;
-                    }
-                }
-            } else if matches!(action, FileAction::Move) {
-                // Already stored: a move still means the source goes away.
-                std::fs::remove_file(path).map_err(|error| error.to_string())?;
-            }
+        let (file_manager, source_path_tag) =
+            prepare_import_file(path, action, &base, storage_id)?;
+
+        self.record_import_batch(HashMap::from([(file_manager, vec![source_path_tag])]))
+            .await
+    }
+
+    /// Resolves the storage root path and its id once, so a batched import
+    /// does not re-query it per file.
+    async fn import_storage_root(&self) -> Option<(PathBuf, u64)> {
+        let conn = self.db.connect().ok()?;
+        self.file_download_location_get(&conn).await.ok()
+    }
+
+    /// Records a batch of prepared files (and their tags) in the database.
+    ///
+    /// One `namespace_ensure_set` plus one `process_scraper_chunk_human`, so
+    /// the whole batch costs three chunked transactions instead of three per
+    /// file — the dominant cost under write contention.
+    async fn record_import_batch(
+        &self,
+        map: HashMap<FileManager, Vec<FileTagAction>>,
+    ) -> std::result::Result<(), String> {
+        if map.is_empty() {
+            return Ok(());
         }
-
-        let mut file_manager = FileManager {
-            internal: FileInternal {
-                id: None,
-                hash: sha512.clone(),
-                extension,
-                storage_id,
-                size_bytes: Some(size_bytes),
-            },
-            identifying_hashes: vec![
-                HashesSupported::Md5(md5),
-                HashesSupported::Sha1(sha1),
-                HashesSupported::Sha256(sha256),
-                HashesSupported::Sha512(sha512),
-            ],
-        };
-        file_manager.normalize_hashes();
-
-        // Record where the file came from, mirroring the `source_url` tag a
-        // downloaded file gets: namespace `source_path`, tag name = the path
-        // the file was imported from.
-        let source_path_tag = FileTagAction::add(vec![PluginTag {
-            tag: Tag {
-                name: path.to_string_lossy().into_owned(),
-                namespace: GenericNamespaceObj {
-                    name: "source_path".into(),
-                    description: Some("A source path for a file".into()),
-                },
-            },
-            ..Default::default()
-        }]);
 
         // Namespace creation (row + Relationship_{id} partition) is DDL, which
         // turso only permits inside an exclusive transaction. Ensure it exists
         // up front, while nothing else is open, so the concurrent tag-add
         // transaction in `process_scraper_chunk_human` stays DML-only.
-        if let Err(error) = self
-            .namespace_ensure_set(&collect_namespaces(std::slice::from_ref(&source_path_tag)))
-            .await
-        {
-            return Err(format!("failed to ensure source_path namespace: {error}"));
+        let all_tags: Vec<FileTagAction> = map.values().flatten().cloned().collect();
+        if let Err(error) = self.namespace_ensure_set(&collect_namespaces(&all_tags)).await {
+            return Err(format!("failed to ensure import namespaces: {error}"));
         }
 
-        let mut map = HashMap::new();
-        map.insert(file_manager, vec![source_path_tag]);
         if !self
             .process_scraper_chunk_human(map)
             .await
             .map_err(|error| error.to_string())?
         {
-            return Err("database failed to record the imported file".into());
+            return Err("database failed to record the imported files".into());
         }
 
         Ok(())
+    }
+
+    /// Prepares and records a batch of files in one shot.
+    ///
+    /// Each file is hashed and placed into storage (no database writes), then
+    /// the whole batch is recorded together so the import amortizes the
+    /// per-transaction cost that made per-file imports crawl under contention.
+    /// Returns `(imported, failed)`; per-file preparation failures are logged
+    /// and counted without aborting the batch.
+    pub async fn import_files_batch(
+        &self,
+        files: &[PathBuf],
+        action: FileAction,
+    ) -> (usize, usize) {
+        if files.is_empty() {
+            return (0, 0);
+        }
+
+        let Some((base, storage_id)) = self.import_storage_root().await else {
+            log::error!("File import has no storage location configured");
+            return (0, files.len());
+        };
+
+        let mut map: HashMap<FileManager, Vec<FileTagAction>> = HashMap::new();
+        let mut imported = 0usize;
+        let mut failed = 0usize;
+
+        for path in files {
+            match prepare_import_file(path, action, &base, storage_id) {
+                Ok((file_manager, tag)) => {
+                    imported += 1;
+                    // Merge tags when the same content is imported from
+                    // multiple paths (same FileManager, different source_path).
+                    map.entry(file_manager).or_default().push(tag);
+                }
+                Err(error) => {
+                    failed += 1;
+                    log::error!("Failed to import {}: {error}", path.display());
+                }
+            }
+        }
+
+        if let Err(error) = self.record_import_batch(map).await {
+            log::error!("Failed to record import batch of {imported} file(s): {error}");
+            failed += imported;
+            imported = 0;
+        }
+
+        (imported, failed)
     }
 
     ///
@@ -547,6 +526,119 @@ impl TursoDatabase {
     pub fn recache_roaring_db(&self) {
         log::warn!("recache_roaring_db is not supported on the turso backend");
     }
+}
+
+/// Hashes one file and places it at its content-addressed storage location,
+/// returning the `FileManager` and its `source_path` tag. Pure I/O + hashing
+/// with no database writes, so callers can prepare many files and record them
+/// in a single batched transaction.
+///
+/// `base`/`storage_id` come from one up-front `import_storage_root` so a batch
+/// resolves the storage root only once.
+fn prepare_import_file(
+    path: &Path,
+    action: FileAction,
+    base: &Path,
+    storage_id: u64,
+) -> std::result::Result<(FileManager, FileTagAction), String> {
+    use std::fs::File;
+
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let size_bytes = file.metadata().map_err(|error| error.to_string())?.len();
+    if size_bytes == 0 {
+        return Err("empty file".into());
+    }
+
+    // Hash the whole file in memory (same approach as the CLI importer).
+    let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|error| error.to_string())? };
+    let bytes = bytes::Bytes::from(mmap.to_vec());
+    drop(mmap);
+
+    let hash = |kind: &HashesSupported| crate::web::manager::hash_bytes(&bytes, kind).0;
+    let md5 = hash(&HashesSupported::Md5(String::new()));
+    let sha1 = hash(&HashesSupported::Sha1(String::new()));
+    let sha256 = hash(&HashesSupported::Sha256(String::new()));
+    let sha512 = hash(&HashesSupported::Sha512(String::new()));
+
+    let extension = path
+        .extension()
+        .map(|ext| ext.to_string_lossy().into_owned())
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or_else(|| "bin".to_string());
+
+    // Content-addressed path: base/[0..2]/[2..4]/[4..6]/[full_hash].[ext],
+    // matching `file_download_location_get_sync`.
+    let mut storage_path = base.to_path_buf();
+    storage_path.push(&sha512[0..2]);
+    storage_path.push(&sha512[2..4]);
+    storage_path.push(&sha512[4..6]);
+    storage_path.push(&sha512);
+    let storage_path = storage_path.with_extension(&extension);
+
+    // Place the file at its storage destination. A file already stored is left
+    // alone; the DB insert is idempotent, so re-imports are always safe.
+    let already_stored = storage_path.exists()
+        && std::fs::canonicalize(path).ok().as_deref()
+            == std::fs::canonicalize(&storage_path).ok().as_deref();
+    if !already_stored {
+        if !storage_path.exists() {
+            let parent = storage_path
+                .parent()
+                .ok_or("storage path has no parent directory")?;
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            match action {
+                FileAction::Copy => {
+                    std::fs::copy(path, &storage_path).map_err(|error| error.to_string())?;
+                }
+                FileAction::Move => {
+                    if std::fs::rename(path, &storage_path).is_err() {
+                        std::fs::copy(path, &storage_path)
+                            .map_err(|error| error.to_string())?;
+                        std::fs::remove_file(path).map_err(|error| error.to_string())?;
+                    }
+                }
+                FileAction::HardLink => {
+                    std::fs::hard_link(path, &storage_path)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+        } else if matches!(action, FileAction::Move) {
+            // Already stored: a move still means the source goes away.
+            std::fs::remove_file(path).map_err(|error| error.to_string())?;
+        }
+    }
+
+    let mut file_manager = FileManager {
+        internal: FileInternal {
+            id: None,
+            hash: sha512.clone(),
+            extension,
+            storage_id,
+            size_bytes: Some(size_bytes),
+        },
+        identifying_hashes: vec![
+            HashesSupported::Md5(md5),
+            HashesSupported::Sha1(sha1),
+            HashesSupported::Sha256(sha256),
+            HashesSupported::Sha512(sha512),
+        ],
+    };
+    file_manager.normalize_hashes();
+
+    // Record where the file came from, mirroring the `source_url` tag a
+    // downloaded file gets: namespace `source_path`, tag name = the path.
+    let source_path_tag = FileTagAction::add(vec![PluginTag {
+        tag: Tag {
+            name: path.to_string_lossy().into_owned(),
+            namespace: GenericNamespaceObj {
+                name: "source_path".into(),
+                description: Some("A source path for a file".into()),
+            },
+        },
+        ..Default::default()
+    }]);
+
+    Ok((file_manager, source_path_tag))
 }
 
 const _: () = {

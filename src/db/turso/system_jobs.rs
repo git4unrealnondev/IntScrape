@@ -42,6 +42,12 @@ const REDOWNLOAD_SCAN_PAGE: usize = 512;
 /// so this is the unit the whole walk is metered in.
 const STORAGE_CHECK_BATCH: usize = 1000;
 
+/// Files per database batch during a directory import. Each batch is one
+/// `namespace_ensure_set` + one `process_scraper_chunk_human` (three chunked
+/// transactions total), so this bounds the transaction size while amortizing
+/// the per-transaction cost that made per-file imports crawl under contention.
+const IMPORT_BATCH_SIZE: usize = 1000;
+
 /// Outcome of one storage-check (cleanup) run.
 #[derive(Default, Debug)]
 pub(crate) struct StorageCheckSummary {
@@ -128,9 +134,11 @@ impl TursoDatabase {
     /// Imports every file under a directory into the db as a system job.
     ///
     /// `param[0]` is the directory to walk; an optional `param[1]` selects the
-    /// `copy` / `move` / `hardlink` file action (defaults to `copy`). Each file
-    /// is hashed and stored exactly like a downloaded file via `import_file`,
-    /// so hash-based dedupe and lookups work and re-imports are idempotent.
+    /// `copy` / `move` / `hardlink` file action (defaults to `copy`). Files are
+    /// hashed and placed like downloads, then recorded in batches: one
+    /// `process_scraper_chunk_human` per `IMPORT_BATCH_SIZE` files instead of
+    /// three transactions per file. That amortization is the difference between
+    /// a crawl and a fast import on a busy, write-contended server.
     async fn run_import_job(&self, job: &DbJobsObj) -> bool {
         let Some(ScraperParam::Normal(location)) = job.config.param.first() else {
             log::error!("File-import job {} has no directory", job.id);
@@ -160,17 +168,10 @@ impl TursoDatabase {
         }
 
         let started = std::time::Instant::now();
-        log::info!(
-            "File-import job {} starting: directory={}, action={:?}",
-            job.id,
-            location,
-            action
-        );
 
-        let mut scanned = 0usize;
-        let mut imported = 0usize;
-        let mut failed = 0usize;
-
+        // Collect the file set first so imports run in bounded batches, each
+        // recorded with a single transaction group instead of one per file.
+        let mut files: Vec<PathBuf> = Vec::new();
         for entry in WalkDir::new(location_path).into_iter() {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -183,42 +184,49 @@ impl TursoDatabase {
                     continue;
                 }
             };
-
-            if !entry.file_type().is_file() {
-                continue;
-            }
-
-            scanned += 1;
-            let path = entry.path();
-            match self.import_file(path, action).await {
-                Ok(()) => {
-                    imported += 1;
-                    log::info!("File-import job {} imported {}", job.id, path.display());
-                }
-                Err(error) => {
-                    failed += 1;
-                    log::error!(
-                        "File-import job {} failed to import {}: {error}",
-                        job.id,
-                        path.display()
-                    );
-                }
-            }
-
-            // Heartbeat so a long import is visibly progressing.
-            if scanned % 100 == 0 {
-                log::info!(
-                    "File-import job {} progress: {scanned} files seen, {imported} imported, {failed} failed",
-                    job.id
-                );
+            if entry.file_type().is_file() {
+                files.push(entry.path().to_path_buf());
             }
         }
 
+        let total = files.len();
         log::info!(
-            "File-import job {} finished in {:?}: {imported} imported, {failed} failed ({} files seen) from {}",
+            "File-import job {} starting: directory={}, action={:?}, {} files",
+            job.id,
+            location,
+            action,
+            total
+        );
+
+        let mut imported = 0usize;
+        let mut failed = 0usize;
+        let mut processed = 0usize;
+
+        for batch in files.chunks(IMPORT_BATCH_SIZE) {
+            if self.should_exit() {
+                log::warn!(
+                    "File-import job {} aborting: {processed} of {total} files processed",
+                    job.id
+                );
+                return false;
+            }
+
+            let (ok, bad) = self.import_files_batch(batch, action).await;
+            imported += ok;
+            failed += bad;
+            processed += batch.len();
+
+            log::info!(
+                "File-import job {} progress: {processed}/{total} files, {imported} imported, {failed} failed",
+                job.id
+            );
+        }
+
+        log::info!(
+            "File-import job {} finished in {:?}: {imported} imported, {failed} failed ({} files) from {}",
             job.id,
             started.elapsed(),
-            scanned,
+            total,
             location
         );
         failed == 0
